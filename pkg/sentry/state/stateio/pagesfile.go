@@ -15,12 +15,21 @@
 package stateio
 
 import (
+	"golang.org/x/sys/unix"
+
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 )
 
 const (
-	pagesFileFDDefaultMaxIOBytes  = 256 << 10
-	pagesFileFDDefaultMaxParallel = 128
+	// pagesFileFDDefaultMaxIOBytes is the default maximum number of bytes
+	// per I/O operation. Increased to 2MB to reduce syscall overhead for
+	// large checkpoint files.
+	pagesFileFDDefaultMaxIOBytes = 2 << 20
+	// pagesFileFDDefaultMaxParallel is the default maximum number of
+	// parallel I/O operations. Reduced from 128 to 32 to avoid excessive
+	// memory usage from larger I/O buffers while still saturating storage.
+	pagesFileFDDefaultMaxParallel = 32
 )
 
 // NewPagesFileFDReader returns a FDReader that reads a pages file from the
@@ -30,6 +39,11 @@ const (
 // - hostarch.PageSize <= maxReadBytes <= linux.MAX_RW_COUNT.
 // - maxParallel > 0.
 func NewPagesFileFDReader(fd int32, maxReadBytes uint64, maxParallel int) *FDReader {
+	// Hint to the kernel that we will read this file sequentially, which
+	// enables readahead and improves restore performance.
+	if err := unix.Fadvise(int(fd), 0, 0, unix.FADV_SEQUENTIAL); err != nil {
+		log.Warningf("fadvise(FADV_SEQUENTIAL) on pages file FD %d failed: %v", fd, err)
+	}
 	// Provision one range per page of maxReadBytes, since this is the maximum
 	// number of ranges that async page loading will use.
 	return NewFDReader(fd, maxReadBytes, int(maxReadBytes/hostarch.PageSize), maxParallel)

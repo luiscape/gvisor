@@ -83,15 +83,16 @@ func (s *Stats) sample(id typeID) {
 
 // start starts a sample.
 func (s *Stats) start(id typeID) {
-	last := s.stack[len(s.stack)-1]
-	s.sample(last)
 	s.stack = append(s.stack, id)
 }
 
 // done finishes the current sample.
 func (s *Stats) done() {
 	last := s.stack[len(s.stack)-1]
-	s.sample(last)
+	if len(s.byType) <= int(last) {
+		// Allocate all the missing entries in one fell swoop.
+		s.byType = append(s.byType, make([]statEntry, 1+int(last)-len(s.byType))...)
+	}
 	s.byType[last].count++
 	s.stack = s.stack[:len(s.stack)-1]
 }

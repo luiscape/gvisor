@@ -616,6 +616,11 @@ func (ds *decodeState) Load(obj reflect.Value) {
 		Failf("object missing")
 	}
 
+	// Pre-allocate the objectsByID slice now that we know the total count.
+	if numObjects > 0 && len(ds.objectsByID) == 0 {
+		ds.objectsByID = make([]*objectDecodeState, 0, numObjects)
+	}
+
 	// Decode all objects.
 	var (
 		encoded wire.Object

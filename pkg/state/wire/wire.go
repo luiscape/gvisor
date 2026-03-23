@@ -327,7 +327,9 @@ func loadRef(r *Reader) Ref {
 		Root: loadUint(r),
 	}
 	l := loadUint(r)
-	ref.Dots = make([]Dot, l)
+	if l > 0 {
+		ref.Dots = make([]Dot, l)
+	}
 	for i := 0; i < int(l); i++ {
 		// Disambiguate between an Index (non-negative) and a field
 		// name (negative). This does some space and avoids a dedicate

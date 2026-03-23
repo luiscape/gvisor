@@ -23,6 +23,7 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/devutil"
@@ -199,9 +200,15 @@ func (r *restorer) restore(l *Loader) error {
 	// old kernel is released.
 	l.k.RootNetworkNamespace().ResetStack()
 
-	p, err := createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile)
-	if err != nil {
-		return fmt.Errorf("creating platform: %v", err)
+	var p platform.Platform
+	var err error
+	if r.deviceFile != nil {
+		p, err = createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile)
+		if err != nil {
+			return fmt.Errorf("creating platform: %v", err)
+		}
+	} else {
+		p = l.k.Platform
 	}
 
 	// Start the old watchdog before replacing it with a new one below.
