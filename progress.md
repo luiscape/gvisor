@@ -168,7 +168,9 @@ go refillPool()                           // replenish in background
 | 0 | Baseline (fastbuild) | 109.3ms | — |
 | 1 | Opt build baseline | 102.4ms | −6.3% |
 | 2-3 | + all code changes | 96.9ms | −11.3% |
-| 11 | + precreate (sandbox pool simulation) | **32.8ms** | **−70%** |
+| 11 | + precreate (shell out to runsc) | 32.8ms | −70% |
+| 14 | + precreate (Go API, no shell-out) | 15.6ms | −86% |
+| 15 | + precreate (Rust URPC direct) | **14.1ms** | **−87%** |
 
 ### Large container (1 GiB memory)
 
@@ -178,7 +180,9 @@ go refillPool()                           // replenish in background
 | 5 | + 2 MiB reads / 128 goroutines | 209ms | 110ms | 9,726 MB/s | −7.5% |
 | 6 | + 2 MiB reads / 32 goroutines | 198ms | 103ms | 10,433 MB/s | −12.4% |
 | 7 | + `FADV_SEQUENTIAL` on pages file | 188ms | 96ms | 11,121 MB/s | −16.8% |
-| 12 | + precreate (sandbox pool simulation) | **129ms** | 96ms | 11,121 MB/s | **−42.9%** |
+| 12 | + precreate (shell out) | 129ms | 96ms | 11,121 MB/s | −42.9% |
+| 16 | + precreate (Go API) | 109ms | 96ms | 11,121 MB/s | −51.8% |
+| 17 | + precreate+bg (Rust URPC direct) | **96ms** | async | 11,121 MB/s | **−57.5%** |
 
 ### Very large container (10 GiB memory)
 
@@ -187,7 +191,8 @@ go refillPool()                           // replenish in background
 | 8 | 10G Baseline (256 KiB / 128 goroutines) | 1.195s | 13.1s | 816 MB/s | — |
 | 9 | 10G Optimized (2 MiB / 32 goroutines + FADV_SEQUENTIAL) | 1.19s | 1.1s | 9,679 MB/s | warm: ~same, cold: 12× faster |
 | 10 | 10G Optimized + `--background` | 181ms | 446ms | 9,679 MB/s (async) | warm: −85%, cold: −97% |
-| 13 | 10G Optimized + precreate + `--background` | **130ms** | **213ms** | 9,679 MB/s (async) | **warm: −89%, cold: −98%** |
+| 13 | 10G Optimized + precreate + `--background` (shell) | 130ms | 213ms | 9,679 MB/s (async) | warm: −89%, cold: −98% |
+| 18 | 10G + precreate + bg (Rust URPC direct) | **91ms** | — | 9,679 MB/s (async) | **warm: −92%, cold: −99%** |
 
 Step 13 combines all optimizations: I/O tuning (2 MiB / 32 goroutines / FADV_SEQUENTIAL), pre-created sandbox (eliminates fork/exec/re-exec), and background page loading (defers page I/O). The result is **~130ms restore latency for a 10 GiB container** — effectively independent of memory size.
 
@@ -325,15 +330,17 @@ The I/O tuning improvements (2 MiB reads, 32 goroutines, FADV_SEQUENTIAL) hold w
 
 A proposed feature adds `runsc wait --fsrestore <container-id>`, which waits only for **filesystem restore operations** (gofer reconnection, VFS `CompleteRestore`) to finish for a specific container — not the whole sandbox's restore including background page loading. This is distinct from the existing `runsc wait --restore`, which blocks until `onRestoreDone()` fires (after all background page loading completes).
 
-We measured the gap empirically at 10 GiB (precreate + background):
+We merged all 24 upstream commits through `afa183ad4a` and measured the actual gap at 10 GiB (precreate + background):
 
-| Phase | Time | What it waits for |
-|-------|------|-------------------|
-| `restore --detach --background` | 60–136ms | Kernel state load + metadata |
-| `wait --restore` | **+899–1366ms** | Background page loading (10 GiB @ ~10 GB/s) |
-| `wait --fsrestore` (proposed) | **~0ms** | VFS `CompleteRestore` (already done inside `kernel.LoadFrom`) |
+| Phase | Iteration 1 | Iteration 2 | Iteration 3 | What it waits for |
+|-------|------------|------------|------------|-------------------|
+| `restore --detach --background` | 77ms | 232ms | 106ms | Kernel state load + metadata |
+| `+ wait --fsrestore` | **+21ms** | **+53ms** | **+63ms** | VFS `CompleteRestore` + gofer reconnection |
+| `+ wait --restore` | +11,744ms | +1,919ms | +3,582ms | Background page loading (10 GiB) |
+| **FS ready at** | **98ms** | **285ms** | **169ms** | |
+| **Fully loaded at** | 11,842ms | 2,204ms | 3,751ms | |
 
-The `wait --restore` blocks for **~1 extra second** after `restore --background` returns, waiting for all 10 GiB of pages to finish loading in the background. The `--fsrestore` flag would return immediately since the filesystem layer (gofer reconnection, VFS `CompleteRestore`) completes during `kernel.LoadFrom()`, well before page loading finishes.
+`wait --fsrestore` confirms filesystem readiness in **21–63ms**. `wait --restore` blocks for **1.9–11.7 seconds** waiting for all 10 GiB of background pages — a **30–170× difference**. The filesystem layer (gofer reconnection, VFS `CompleteRestore`) completes during `kernel.LoadFrom()`, well before page loading finishes.
 
 This creates a precise synchronization point for orchestration:
 
@@ -358,23 +365,23 @@ Without `--fsrestore`, an orchestrator has two choices after `restore --detach -
 
 `wait --fsrestore` fills the gap: it confirms the filesystem is ready (gofer FDs reconnected, mount tree restored, `CompleteRestore` done) while pages are still loading asynchronously. This is the right "ready to serve" signal.
 
-The practical impact: combined with our precreate approach, the total time from "restore request" to "container ready to serve traffic" would be:
+The practical impact: combined with our precreate approach, the total time from "restore request" to "container ready to serve traffic" was measured at 10 GiB:
 
-| Phase | Duration |
-|-------|----------|
-| `runsc restore --detach --background` | ~60–136ms (with precreate) |
-| `runsc wait --fsrestore` | ~0ms (VFS already complete) |
-| **Total to "ready to serve"** | **~60–136ms** |
-| `runsc wait --restore` (alternative) | +899–1366ms (waits for all pages) |
-| Background page loading continues | ~1.1s for 10 GiB at 10 GB/s |
+| Phase | Duration (measured) |
+|-------|---------------------|
+| `runsc restore --detach --background` | 77–232ms (with precreate) |
+| `runsc wait --fsrestore` | +21–63ms |
+| **Total to "FS ready to serve"** | **98–285ms** |
+| `runsc wait --restore` (alternative) | +1,919–11,744ms (waits for all pages) |
+| Background page loading continues | 1.9–11.7s for 10 GiB (varies with cache pressure) |
 
 Without `--fsrestore`, an orchestrator must choose between:
 - **Not waiting**: risk that gofer connections aren't established (filesystem operations may fail)
-- **`wait --restore`**: blocks an extra ~1s at 10 GiB waiting for all background pages — defeating `--background`
+- **`wait --restore`**: blocks an extra **1.9–11.7s** at 10 GiB waiting for all background pages — defeating `--background`
 
-`--fsrestore` fills this gap: it confirms the filesystem is ready while pages load asynchronously. This turns `--background` from "hope it's ready" into "know it's ready."
+`--fsrestore` fills this gap: it confirms the filesystem is ready while pages load asynchronously. This turns `--background` from "hope it's ready" into "know it's ready." The measured data shows a **30–170× reduction** in wait time compared to `wait --restore`.
 
-The feature requires commit `afa183ad4a` ("Add runsc wait --fscheckpoint/fsrestore") which depends on 3 prerequisite commits (`9ca1678bc` "Implement filesystem-only checkpointing", `bf19fbd37` "Add support for filesystem restore", and `d76d4bd4c`). These total ~2100 lines of new filesystem checkpoint infrastructure and don't cleanly cherry-pick onto our branch (24 commits behind), but the measured gap above validates the value.
+The feature was merged from commit `afa183ad4a` ("Add runsc wait --fscheckpoint/fsrestore") along with its 24 prerequisite commits including `9ca1678bc` ("Implement filesystem-only checkpointing") and `bf19fbd37` ("Add support for filesystem restore").
 
 ### Recommended configuration
 
@@ -385,11 +392,64 @@ For the "lots of resources" scenario, the recommended configuration is: **precre
 | Sleep (0 MiB) | 109.3ms | 32.8ms | **−70%** |
 | 1 GiB | 226ms | 129ms | **−43%** |
 | 10 GiB | 1.195s (warm) / 13.1s (cold) | 130ms (background) | **−89% / −99%** |
-
-With `wait --fsrestore` as the readiness signal, the production-ready pipeline becomes:
-1. `runsc restore --detach --background` → **~60–136ms** (container process starts, with precreate)
-2. `runsc wait --fsrestore` → **~0ms** (filesystem already confirmed ready)
-3. Route traffic → **~60–136ms total** from restore request to serving
+                   
+With `wait --fsrestore` as the readiness signal, the measured production-ready pipeline at 10 GiB:
+1. `runsc restore --detach --background` → **77–232ms** (container process starts, with precreate)
+2. `runsc wait --fsrestore` → **+21–63ms** (filesystem confirmed ready)
+3. Route traffic → **98–285ms total** from restore request to serving
 4. Background: pages load at ~10 GB/s, on-demand faults for early accesses
 
-Compared to `wait --restore` which adds **~1s** for 10 GiB — a **10× improvement** in time-to-ready.
+Compared to `wait --restore` which adds **1.9–11.7s** for 10 GiB — a **30–170× improvement** in time-to-ready.
+
+### Rust URPC direct client (steps 15, 17, 18)
+
+We implemented a Rust client (`tools/restorebench-rs/`) that speaks the gvisor URPC protocol directly over Unix domain sockets — no process spawning on the hot path. The URPC protocol is JSON over `SOCK_STREAM` with `SCM_RIGHTS` for FD passing.
+
+**Per-RPC timing breakdown (0 MiB, precreate):**
+
+| Phase | Time | % of 14ms |
+|-------|------|-----------|
+| Socket connect | 0.03ms | 0.2% |
+| Network loopback RPC | 0.5ms | 3.5% |
+| **Restore RPC** | **13.5ms** | **96%** |
+
+**Inside the 13.5ms restore RPC:**
+
+| Phase | Time |
+|-------|------|
+| URPC receive + JSON parse | ~1ms |
+| Open files, statefile header, MemoryFile | ~1ms |
+| CPUID load | ~0.2ms |
+| **Kernel state decode (`state.Load`)** | **~9ms** |
+| VFS CompleteRestore + network restore | ~0.5ms |
+| Post-restore work | ~1ms |
+| URPC response | ~0.8ms |
+
+**Comparison across client implementations (precreate, 0 MiB):**
+
+| Client | Avg Restore | Overhead vs URPC floor |
+|--------|------------|----------------------|
+| Shell out to `runsc` | 32.8ms | +18.7ms (CLI process spawn) |
+| Go API (Bazel binary) | 15.6ms | +1.5ms (Go runtime) |
+| **Rust URPC direct** | **14.1ms** | **baseline** |
+
+**Full comparison across all sizes (precreate + background):**
+
+| Size | Shell out | Go API | Rust URPC | vs original baseline |
+|------|-----------|--------|-----------|---------------------|
+| 0 MiB | 32ms | 15ms | **14ms** | 109ms → 14ms (−87%) |
+| 1 GiB | 113ms | 99ms | **96ms** | 226ms → 96ms (−58%) |
+| 10 GiB | 164ms | 96ms | **91ms** | 1.2s → 91ms (−92%) |
+
+### The 14ms floor and next steps
+
+The **9ms kernel state decode** is the hard floor. It's single-threaded reflection-based deserialization of ~153 KiB of Go object graph (~17 MB/s decode throughput). For comparison:
+- `serde_json` (Rust): ~500 MB/s
+- Protocol Buffers: ~1 GB/s
+- The Go reflection decoder: ~17 MB/s (**30× slower**)
+
+Potential improvements to break below 9ms:
+1. **Code-generated decoders** — `go_stateify` already generates `StateLoad` methods per type, but the wire format is still parsed via reflection in `decode.go`. Generating type-specific wire decoders could eliminate reflection.
+2. **Simpler binary format** — replace the custom wire format with protobuf/flatbuffers/cap'n proto for the state file. FlatBuffers in particular allows zero-copy mmap'd access.
+3. **Skip network RPC** — move loopback creation to sandbox boot (saves ~0.5ms).
+4. **Pre-send checkpoint FDs** at create time (saves ~1ms file open overhead).
