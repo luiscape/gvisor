@@ -58,6 +58,40 @@ func rmControlInvoke[Params any](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS
 	return n, nil
 }
 
+// rmControlSimpleInvoke is an optimized version of rmControlInvoke for the
+// rmControlSimple (byte-blob) case. It avoids generic function dispatch and
+// the intermediate frontendIoctlInvoke wrapper, calling RawSyscall directly
+// and combining the host ioctl + CopyOut in a single tight sequence. This
+// shaves function-call and debug-log-check overhead on the DMA-transfer hot
+// path where rmControlSimple is called hundreds of times per 1 GB transfer.
+//
+func rmControlSimpleInvoke(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS, ctrlParams *byte) (uintptr, error) {
+	// Swap the guest-space Params pointer for our sentry-space buffer,
+	// invoke the host ioctl, then restore the original pointer.
+	origParams := ioctlParams.Params
+	ioctlParams.Params = p64FromPtr(unsafe.Pointer(ctrlParams))
+
+	n, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(fi.fd.hostFD), frontendIoctlCmd(fi.nr, fi.ioctlParamsSize), uintptr(unsafe.Pointer(ioctlParams)))
+
+	ioctlParams.Params = origParams
+
+	if errno != 0 {
+		runtime.KeepAlive(ctrlParams)
+		return n, errno
+	}
+	if log.IsLogging(log.Debug) {
+		if status := ioctlParams.GetStatus(); status != nvgpu.NV_OK {
+			fi.ctx.Debugf("nvproxy: frontend ioctl failed: status=%#x", status)
+		}
+	}
+	if _, err := ioctlParams.CopyOut(fi.t, fi.ioctlParamsAddr); err != nil {
+		runtime.KeepAlive(ctrlParams)
+		return n, err
+	}
+	runtime.KeepAlive(ctrlParams)
+	return n, nil
+}
+
 func ctrlClientSystemGetBuildVersionInvoke(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS, ctrlParams *nvgpu.NV0000_CTRL_SYSTEM_GET_BUILD_VERSION_PARAMS, driverVersionBuf, versionBuf, titleBuf *byte) (uintptr, error) {
 	// *Buf arguments don't need runtime.KeepAlive() since our caller
 	// ctrlClientSystemGetBuildVersion() copies them out, keeping them alive

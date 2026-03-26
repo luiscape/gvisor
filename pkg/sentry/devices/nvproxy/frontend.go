@@ -219,6 +219,35 @@ func (fd *frontendFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, 
 		panic("Ioctl should be called from a task context")
 	}
 
+	// Look up the handler for this ioctl number once, reuse below.
+	h := fd.dev.nvp.abi.frontendIoctl[nr]
+
+	// Fast path: for handlers marked fastPath, skip debug logging and
+	// the error-wrapping type assertion. This reduces per-ioctl Sentry
+	// overhead for the pageable DMA-transfer hot loop where CUDA issues
+	// ~768 ioctls per 1 GB transfer (3 ioctls × ~256 chunks). Shaving
+	// even a few microseconds per ioctl compounds to measurable
+	// bandwidth gains.
+	//
+	// Capability checking is inlined here to avoid the extra function
+	// call through frontendIoctlHandler.handle().
+	if h.fastPath && h.handler != nil {
+		if h.capSet&fd.dev.nvp.capsEnabled == 0 {
+			ctx.Warningf("nvproxy: missing capability for frontend ioctl %d == %#x", nr, nr)
+			return 0, linuxerr.EINVAL
+		}
+		fi := frontendIoctlState{
+			fd:              fd,
+			ctx:             ctx,
+			t:               t,
+			nr:              nr,
+			ioctlParamsAddr: argPtr,
+			ioctlParamsSize: argSize,
+		}
+		return h.handler(&fi)
+	}
+
+	// Normal path: includes debug logging and full error wrapping.
 	if ctx.IsLogging(log.Debug) {
 		ctx.Debugf("nvproxy: frontend ioctl: nr = %d = %#x, argSize = %d", nr, nr, argSize)
 	}
@@ -244,7 +273,7 @@ func (fd *frontendFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, 
 	// - Add symbol and parameter type definitions to //pkg/abi/nvgpu.
 	// - Add filter to seccomp_filters.go.
 	// - Add handling below.
-	result, err := fd.dev.nvp.abi.frontendIoctl[nr].handle(&fi)
+	result, err := h.handle(&fi)
 	if err != nil {
 		if handleErr, ok := err.(*errHandler); ok {
 			fi.ctx.Warningf("nvproxy: %v for frontend ioctl %d == %#x (argSize=%d, cmd=%#x)", handleErr, nr, nr, argSize, cmd)
@@ -324,7 +353,13 @@ func frontendIoctlBytes(fi *frontendIoctlState) (uintptr, error) {
 		return frontendIoctlInvokeNoStatus[byte](fi, nil)
 	}
 
-	ioctlParams := make([]byte, fi.ioctlParamsSize)
+	// Use pooled buffer to avoid per-ioctl heap allocation on the
+	// DMA-transfer hot path. frontendIoctlBytes is used for variable-
+	// length passthrough ioctls (e.g. NV_ESC_CARD_INFO, NV_ESC_ATTACH_GPUS_TO_FD).
+	ioctlParams, pooled := getRmControlBuf(fi.ioctlParamsSize)
+	if pooled {
+		defer putRmControlBuf(ioctlParams)
+	}
 	if _, err := fi.t.CopyInBytes(fi.ioctlParamsAddr, ioctlParams); err != nil {
 		return 0, err
 	}
@@ -815,6 +850,45 @@ func rmControl(fi *frontendIoctlState) (uintptr, error) {
 	return result, err
 }
 
+// rmControlFast is a streamlined version of rmControl for fast-path
+// dispatch. It skips debug logging and inlines the GSS_LEGACY /
+// NV2081_BINAPI check to reach rmControlSimple with minimal overhead.
+// Non-simple control commands fall through to the normal versioned
+// controlCmd dispatch.
+//
+// This is the recommended handler for NV_ESC_RM_CONTROL when registered
+// with feHandlerFast, as it eliminates two log.IsLogging checks and one
+// layer of handler indirection on the hot transfer path.
+func rmControlFast(fi *frontendIoctlState) (uintptr, error) {
+	var ioctlParams nvgpu.NVOS54_PARAMETERS
+	if fi.ioctlParamsSize != nvgpu.SizeofNVOS54Parameters {
+		return 0, linuxerr.EINVAL
+	}
+	if _, err := ioctlParams.CopyIn(fi.t, fi.ioctlParamsAddr); err != nil {
+		return 0, err
+	}
+	// Fast path: GSS legacy controls and NV2081_BINAPI commands are
+	// simple passthroughs whose parameters cannot contain application
+	// pointers, so they need only flat copy-in / host-ioctl / copy-out.
+	if ioctlParams.Cmd&nvgpu.RM_GSS_LEGACY_MASK != 0 {
+		return rmControlSimple(fi, &ioctlParams)
+	}
+	if (ioctlParams.Cmd>>16)&0xffff == nvgpu.NV2081_BINAPI {
+		return rmControlSimple(fi, &ioctlParams)
+	}
+	// Slow path: dispatch to versioned control command handler.
+	result, err := fi.fd.dev.nvp.abi.controlCmd[ioctlParams.Cmd].handle(fi, &ioctlParams)
+	if err != nil {
+		if handleErr, ok := err.(*errHandler); ok {
+			fi.ctx.Warningf("nvproxy: %v for control command %#x (paramsSize=%d)", handleErr, ioctlParams.Cmd, ioctlParams.ParamsSize)
+			ioctlParams.Status = nvgpu.NV_ERR_NOT_SUPPORTED
+			_, err := ioctlParams.CopyOut(fi.t, fi.ioctlParamsAddr)
+			return 0, err
+		}
+	}
+	return result, err
+}
+
 func rmControlSimple(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
 	if ioctlParams.ParamsSize == 0 {
 		if ioctlParams.Params != 0 {
@@ -829,11 +903,18 @@ func rmControlSimple(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETER
 		return 0, linuxerr.EINVAL
 	}
 
-	ctrlParams := make([]byte, ioctlParams.ParamsSize)
+	// Use pooled buffer to avoid per-ioctl heap allocation on the
+	// DMA-transfer hot path. For pageable cudaMemcpy, rmControlSimple
+	// is called hundreds of times per transfer (once per ~4 MB chunk).
+	// Recycling eliminates GC pressure from make([]byte, ParamsSize).
+	ctrlParams, pooled := getRmControlBuf(ioctlParams.ParamsSize)
+	if pooled {
+		defer putRmControlBuf(ctrlParams)
+	}
 	if _, err := fi.t.CopyInBytes(addrFromP64(ioctlParams.Params), ctrlParams); err != nil {
 		return 0, err
 	}
-	n, err := rmControlInvoke(fi, ioctlParams, &ctrlParams[0])
+	n, err := rmControlSimpleInvoke(fi, ioctlParams, &ctrlParams[0])
 	if err != nil {
 		return n, err
 	}

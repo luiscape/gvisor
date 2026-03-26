@@ -166,16 +166,16 @@ func Init() {
 			// constructed with the entirety of the nvproxy functionality.
 			return &driverABI{
 				frontendIoctl: map[uint32]frontendIoctlHandler{
-					nvgpu.NV_ESC_CARD_INFO:                     feHandler(frontendIoctlBytes, compUtil), // nv_ioctl_card_info_t array
-					nvgpu.NV_ESC_CHECK_VERSION_STR:             feHandler(frontendIoctlSimpleNoStatus[nvgpu.RMAPIVersion], compUtil),
-					nvgpu.NV_ESC_ATTACH_GPUS_TO_FD:             feHandler(frontendIoctlBytes, compUtil), // NvU32 array containing GPU IDs
-					nvgpu.NV_ESC_SYS_PARAMS:                    feHandler(frontendIoctlSimpleNoStatus[nvgpu.IoctlSysParams], compUtil),
+					nvgpu.NV_ESC_CARD_INFO:                     feHandlerFast(frontendIoctlBytes, compUtil), // nv_ioctl_card_info_t array
+					nvgpu.NV_ESC_CHECK_VERSION_STR:             feHandlerFast(frontendIoctlSimpleNoStatus[nvgpu.RMAPIVersion], compUtil),
+					nvgpu.NV_ESC_ATTACH_GPUS_TO_FD:             feHandlerFast(frontendIoctlBytes, compUtil), // NvU32 array containing GPU IDs
+					nvgpu.NV_ESC_SYS_PARAMS:                    feHandlerFast(frontendIoctlSimpleNoStatus[nvgpu.IoctlSysParams], compUtil),
 					nvgpu.NV_ESC_RM_DUP_OBJECT:                 feHandler(rmDupObject, compUtil),
-					nvgpu.NV_ESC_RM_SHARE:                      feHandler(frontendIoctlSimple[nvgpu.NVOS57_PARAMETERS], compUtil),
-					nvgpu.NV_ESC_RM_UNMAP_MEMORY:               feHandler(frontendIoctlSimple[nvgpu.NVOS34_PARAMETERS], compUtil),
-					nvgpu.NV_ESC_RM_MAP_MEMORY_DMA:             feHandler(frontendIoctlSimple[nvgpu.NVOS46_PARAMETERS], nvconf.CapGraphics|nvconf.CapVideo),
-					nvgpu.NV_ESC_RM_UNMAP_MEMORY_DMA:           feHandler(frontendIoctlSimple[nvgpu.NVOS47_PARAMETERS], nvconf.CapGraphics|nvconf.CapVideo),
-					nvgpu.NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO: feHandler(frontendIoctlSimple[nvgpu.NVOS56_PARAMETERS], compUtil),
+					nvgpu.NV_ESC_RM_SHARE:                      feHandlerFast(frontendIoctlSimple[nvgpu.NVOS57_PARAMETERS], compUtil),
+					nvgpu.NV_ESC_RM_UNMAP_MEMORY:               feHandlerFast(frontendIoctlSimple[nvgpu.NVOS34_PARAMETERS], compUtil),
+					nvgpu.NV_ESC_RM_MAP_MEMORY_DMA:             feHandlerFast(frontendIoctlSimple[nvgpu.NVOS46_PARAMETERS], nvconf.CapGraphics|nvconf.CapVideo),
+					nvgpu.NV_ESC_RM_UNMAP_MEMORY_DMA:           feHandlerFast(frontendIoctlSimple[nvgpu.NVOS47_PARAMETERS], nvconf.CapGraphics|nvconf.CapVideo),
+					nvgpu.NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO: feHandlerFast(frontendIoctlSimple[nvgpu.NVOS56_PARAMETERS], compUtil),
 					nvgpu.NV_ESC_REGISTER_FD:                   feHandler(frontendRegisterFD, compUtil),
 					nvgpu.NV_ESC_ALLOC_OS_EVENT:                feHandler(frontendIoctlHasFD[nvgpu.IoctlAllocOSEvent], compUtil),
 					nvgpu.NV_ESC_FREE_OS_EVENT:                 feHandler(frontendIoctlHasFD[nvgpu.IoctlFreeOSEvent], compUtil),
@@ -183,7 +183,7 @@ func Init() {
 					nvgpu.NV_ESC_RM_ALLOC_CONTEXT_DMA2:         feHandler(rmAllocContextDMA2, nvconf.CapGraphics),
 					nvgpu.NV_ESC_RM_ALLOC_MEMORY:               feHandler(rmAllocMemory, compUtil|nvconf.CapGraphics),
 					nvgpu.NV_ESC_RM_FREE:                       feHandler(rmFree, compUtil),
-					nvgpu.NV_ESC_RM_CONTROL:                    feHandler(rmControl, compUtil),
+					nvgpu.NV_ESC_RM_CONTROL:                    feHandlerFast(rmControlFast, compUtil),
 					nvgpu.NV_ESC_RM_ALLOC:                      feHandler(rmAlloc, compUtil),
 					nvgpu.NV_ESC_RM_IDLE_CHANNELS:              feHandler(rmIdleChannels, nvconf.CapGraphics),
 					nvgpu.NV_ESC_RM_VID_HEAP_CONTROL:           feHandler(rmVidHeapControl, compUtil),
@@ -754,8 +754,8 @@ func Init() {
 		// 550.40.07 is an intermediate unqualified version from the main branch.
 		v550_40_07 := func() *driverABI {
 			abi := v545_23_06()
-			abi.frontendIoctl[nvgpu.NV_ESC_WAIT_OPEN_COMPLETE] = feHandler(frontendIoctlSimple[nvgpu.IoctlWaitOpenComplete], compUtil)
-			abi.frontendIoctl[nvgpu.NV_ESC_RM_UNMAP_MEMORY_DMA] = feHandler(frontendIoctlSimple[nvgpu.NVOS47_PARAMETERS_V550], nvconf.CapGraphics|nvconf.CapVideo)
+			abi.frontendIoctl[nvgpu.NV_ESC_WAIT_OPEN_COMPLETE] = feHandlerFast(frontendIoctlSimple[nvgpu.IoctlWaitOpenComplete], compUtil)
+			abi.frontendIoctl[nvgpu.NV_ESC_RM_UNMAP_MEMORY_DMA] = feHandlerFast(frontendIoctlSimple[nvgpu.NVOS47_PARAMETERS_V550], nvconf.CapGraphics|nvconf.CapVideo)
 			abi.controlCmd[nvgpu.NV0000_CTRL_CMD_GPU_ASYNC_ATTACH_ID] = ctrlHandler(rmControlSimple, compUtil)
 			abi.controlCmd[nvgpu.NV0000_CTRL_CMD_GPU_WAIT_ATTACH_ID] = ctrlHandler(rmControlSimple, compUtil)
 			abi.controlCmd[nvgpu.NV0080_CTRL_CMD_PERF_CUDA_LIMIT_SET_CONTROL] = ctrlHandler(rmControlSimple, compUtil)
@@ -946,7 +946,7 @@ func Init() {
 
 		v580_65_06 := addDriverABI(580, 65, 06, "04b10867af585e765cfbfdcf39ed5f4bd112375bebab0172eaa187c6aa5024ff", "e02acdc0d20d4a541aa5026bfddb1b9b4fc6bc64ae3b04ff9cb9c892700cf9c4", func() *driverABI {
 			abi := v575_57_08()
-			abi.frontendIoctl[nvgpu.NV_ESC_RM_MAP_MEMORY_DMA] = feHandler(frontendIoctlSimple[nvgpu.NVOS46_PARAMETERS_V580], nvconf.CapGraphics|nvconf.CapVideo)
+			abi.frontendIoctl[nvgpu.NV_ESC_RM_MAP_MEMORY_DMA] = feHandlerFast(frontendIoctlSimple[nvgpu.NVOS46_PARAMETERS_V580], nvconf.CapGraphics|nvconf.CapVideo)
 			abi.allocationClass[nvgpu.FERMI_VASPACE_A] = allocHandler(rmAllocSimple[nvgpu.NV_VASPACE_ALLOCATION_PARAMETERS_V580], compUtil)
 			abi.allocationClass[nvgpu.NVCEB7_VIDEO_ENCODER] = allocHandler(rmAllocSimple[nvgpu.NV_MSENC_ALLOCATION_PARAMETERS], nvconf.CapVideo)
 			abi.allocationClass[nvgpu.NVD1B7_VIDEO_ENCODER] = allocHandler(rmAllocSimple[nvgpu.NV_MSENC_ALLOCATION_PARAMETERS], nvconf.CapVideo)

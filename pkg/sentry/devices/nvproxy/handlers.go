@@ -15,6 +15,8 @@
 package nvproxy
 
 import (
+	"sync"
+
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 )
@@ -40,6 +42,12 @@ type frontendIoctlHandler struct {
 	handler func(*frontendIoctlState) (uintptr, error)
 	// capSet is a bitmask of capabilities that this handler is available for.
 	capSet nvconf.DriverCaps
+	// fastPath indicates this handler is a simple passthrough whose
+	// parameters are flat byte blobs requiring no pointer translation, FD
+	// translation, or object tracking. When set, frontendFD.Ioctl may use
+	// a streamlined copy-in / host-ioctl / copy-out sequence that avoids
+	// intermediate allocations and reduces function-call depth.
+	fastPath bool
 }
 
 // feHandler returns a frontendIoctlHandler that wraps the given function.
@@ -48,6 +56,20 @@ func feHandler(handler func(*frontendIoctlState) (uintptr, error), caps nvconf.D
 	return frontendIoctlHandler{
 		handler: handler,
 		capSet:  caps,
+	}
+}
+
+// feHandlerFast returns a frontendIoctlHandler marked for fast-path
+// dispatch. Fast-path handlers are simple passthroughs: parameters are
+// copied in from guest memory as an opaque byte blob, the host ioctl is
+// invoked via RawSyscall, and parameters are copied back out. No pointer
+// translation, FD translation, or object tracking is performed, so
+// frontendFD.Ioctl can bypass the normal handler call chain for these.
+func feHandlerFast(handler func(*frontendIoctlState) (uintptr, error), caps nvconf.DriverCaps) frontendIoctlHandler {
+	return frontendIoctlHandler{
+		handler:  handler,
+		capSet:   caps,
+		fastPath: true,
 	}
 }
 
@@ -153,4 +175,62 @@ func (h uvmIoctlHandler) handle(ui *uvmIoctlState) (uintptr, error) {
 		return 0, &errMissingCapability
 	}
 	return h.handler(ui)
+}
+
+// ---------------------------------------------------------------------------
+// Fast-path infrastructure for reducing per-ioctl overhead.
+//
+// Pageable GPU memory transfers (cudaMemcpy on non-pinned memory) use a
+// tight 3-ioctl-per-chunk loop. At ~256 chunks for 1 GB, the 768 ioctls
+// accumulate significant overhead from the Sentry round-trip if each one
+// traverses the full handler dispatch chain and heap-allocates parameter
+// buffers. The constants and pools below support a streamlined path.
+// ---------------------------------------------------------------------------
+
+const (
+	// rmControlParamsPoolBufSize is the capacity of pooled byte buffers
+	// used by rmControlSimple for control-command parameter copying.
+	// Buffers up to this size are recycled via sync.Pool, eliminating
+	// per-ioctl heap allocation for the DMA-transfer hot loop. Larger
+	// requests fall back to make([]byte, n).
+	//
+	// 4 KiB covers virtually all control commands observed during
+	// pageable transfers; RMAPI_PARAM_COPY_MAX_PARAMS_SIZE (1 MiB) is
+	// the driver's upper bound, but such sizes are exceedingly rare.
+	rmControlParamsPoolBufSize = 4096
+)
+
+// rmControlParamsPool recycles byte buffers used by rmControlSimple to
+// copy control-command parameters between guest memory and host ioctl
+// invocations. This eliminates the per-ioctl make([]byte, ParamsSize)
+// allocation that otherwise creates GC pressure on the hot transfer path.
+var rmControlParamsPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, rmControlParamsPoolBufSize)
+		return &b
+	},
+}
+
+// getRmControlBuf returns a byte slice of the requested size for
+// rmControlSimple parameter copying. If size <= rmControlParamsPoolBufSize
+// a recycled buffer is returned and pooled will be true; the caller must
+// pass the buffer to putRmControlBuf when done. Otherwise a fresh heap
+// allocation is returned and pooled is false.
+func getRmControlBuf(size uint32) (buf []byte, pooled bool) {
+	if size <= rmControlParamsPoolBufSize {
+		bp := rmControlParamsPool.Get().(*[]byte)
+		return (*bp)[:size], true
+	}
+	return make([]byte, size), false
+}
+
+// putRmControlBuf returns a pooled buffer to rmControlParamsPool. It is
+// safe to call with any buffer; non-pooled buffers (cap < pool size) are
+// silently ignored.
+func putRmControlBuf(buf []byte) {
+	if cap(buf) < rmControlParamsPoolBufSize {
+		return
+	}
+	b := buf[:cap(buf)]
+	rmControlParamsPool.Put(&b)
 }
