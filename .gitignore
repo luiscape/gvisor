@@ -9,3 +9,7 @@
 /repo.key
 # Generate webhook admission.
 /test/kubernetes/gvisor-injection-admission-webhook.yaml
+venv/
+__pycache__/
+*.pyc
+test/perf/linux/nvproxy_ioctl_overhead/bench_static

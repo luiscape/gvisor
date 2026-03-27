@@ -1,239 +1,169 @@
 #!/usr/bin/env python3
 """
-CPU ⇔ GPU Memory Bandwidth Benchmark (PyTorch, standalone).
+Pageable GPU memory bandwidth benchmark — measures the nvproxy-sensitive path.
 
-Measures host-to-device and device-to-host transfer bandwidth across
-five memory modes:
+Pageable cudaMemcpy is the transfer mode affected by nvproxy ioctl overhead:
+the CUDA driver issues ~3 ioctls per 4 MB chunk, and each round-trips through
+the gVisor Sentry. Pinned transfers bypass this path entirely (zero-copy DMA)
+and serve as the control — if pinned is identical but pageable differs, the
+gap is pure ioctl overhead.
 
-  pinned      – cudaHostAlloc / pin_memory()
-  pageable    – plain malloc (the nvproxy hot path: 3 ioctls per 4 MB chunk)
-  prefaulted  – pageable with every page touched before timing
-  hugepage    – prefaulted + madvise(MADV_HUGEPAGE)
-  registered  – cudaHostRegister on pre-faulted pageable memory
-
-Usage — single run:
+Usage:
+    # Single run (native or inside a container):
     python3 mem_bandwidth.py
-    python3 mem_bandwidth.py --sizes-mb 64,256,1024
 
-Usage — automatic Docker comparison (runc vs gVisor):
+    # Compare runtimes via Docker:
     python3 mem_bandwidth.py --docker-compare
     python3 mem_bandwidth.py --docker-compare --runtimes runc,runsc,runsc-fastpath
 
-The --docker-compare flag builds a tiny container image, runs the benchmark
-inside each requested runtime, collects JSON results, and prints a
-side-by-side table with deltas.
+    # Quick smoke test:
+    python3 mem_bandwidth.py --docker-compare --sizes-mb 256,1024 --repeats 10
 """
 
 from __future__ import annotations
 
 import argparse
-import ctypes
-import ctypes.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 GB = 1024**3
 MB = 1024**2
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _prefault(tensor):
-    """Touch every page so faults happen outside the timed region."""
-    tensor.fill_(0)
-
-
-def _try_madvise_hugepage(tensor):
-    """Hint to back this region with transparent huge pages."""
-    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-    MADV_HUGEPAGE = 14
-    ptr = tensor.data_ptr()
-    nbytes = tensor.nelement() * tensor.element_size()
-    page = 2 * MB
-    aligned = (ptr + page - 1) & ~(page - 1)
-    length = nbytes - (aligned - ptr)
-    if length > 0:
-        libc.madvise(
-            ctypes.c_void_p(aligned), ctypes.c_size_t(length), MADV_HUGEPAGE
-        )
-
-
-def _detect_runtime() -> str:
-    """Best-effort detection of the container runtime."""
-    if os.path.exists("/proc/self/gvisor"):
-        return "gVisor"
-    try:
-        with open("/proc/self/cgroup") as f:
-            data = f.read()
-        if "docker" in data or "containerd" in data:
-            return "container"
-    except OSError:
-        pass
-    return "native"
 
 # ---------------------------------------------------------------------------
 # Core benchmark
 # ---------------------------------------------------------------------------
 
+
+def _detect_runtime() -> str:
+    if os.path.exists("/proc/self/gvisor"):
+        return "gVisor"
+    try:
+        with open("/proc/self/cgroup") as f:
+            if any(k in f.read() for k in ("docker", "containerd")):
+                return "container"
+    except OSError:
+        pass
+    return "native"
+
+
 @dataclass
 class Result:
     size_mb: int
-    direction: str      # "h2d" or "d2h"
-    mode: str           # pinned / pageable / prefaulted / hugepage / registered
-    bw_gbs: float       # GB/s
+    direction: str  # h2d | d2h
+    mode: str  # pageable | pinned
+    bw_gbs: float
     repeats: int
     runtime: str = ""
 
 
 def benchmark_transfer(
-    size_bytes: int,
-    direction: str,
-    mode: str,
-    warmup: int = 5,
-    repeats: int = 20,
+    size_bytes: int, direction: str, pinned: bool, warmup: int = 5, repeats: int = 20
 ) -> float:
-    """Returns bandwidth in GB/s."""
+    """Return bandwidth in GB/s."""
     import torch
 
     device = torch.device("cuda:0")
-    n_floats = size_bytes // 4
-    pinned = mode == "pinned"
+    n = size_bytes // 4
 
     if direction == "h2d":
-        cpu_t = torch.empty(n_floats, dtype=torch.float32)
-        if pinned:
-            cpu_t = cpu_t.pin_memory()
-        elif mode == "prefaulted":
-            _prefault(cpu_t)
-        elif mode == "hugepage":
-            _try_madvise_hugepage(cpu_t)
-            _prefault(cpu_t)
-        elif mode == "registered":
-            _prefault(cpu_t)
-            torch.cuda.cudart().cudaHostRegister(cpu_t.data_ptr(), size_bytes, 0)
-        gpu_t = torch.empty(n_floats, dtype=torch.float32, device=device)
-        transfer = lambda: gpu_t.copy_(cpu_t)
+        cpu = torch.empty(n, dtype=torch.float32, pin_memory=pinned)
+        gpu = torch.empty(n, dtype=torch.float32, device=device)
+        xfer = lambda: gpu.copy_(cpu)
     else:
-        gpu_t = torch.empty(n_floats, dtype=torch.float32, device=device)
-        cpu_t = torch.empty(n_floats, dtype=torch.float32)
-        if pinned:
-            cpu_t = cpu_t.pin_memory()
-        elif mode == "prefaulted":
-            _prefault(cpu_t)
-        elif mode == "hugepage":
-            _try_madvise_hugepage(cpu_t)
-            _prefault(cpu_t)
-        elif mode == "registered":
-            _prefault(cpu_t)
-            torch.cuda.cudart().cudaHostRegister(cpu_t.data_ptr(), size_bytes, 0)
-        transfer = lambda: cpu_t.copy_(gpu_t)
+        gpu = torch.empty(n, dtype=torch.float32, device=device)
+        cpu = torch.empty(n, dtype=torch.float32, pin_memory=pinned)
+        xfer = lambda: cpu.copy_(gpu)
 
     for _ in range(warmup):
-        transfer()
-    torch.cuda.synchronize(device)
+        xfer()
+    torch.cuda.synchronize()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    start.record()
+    t0 = torch.cuda.Event(enable_timing=True)
+    t1 = torch.cuda.Event(enable_timing=True)
+    t0.record()
     for _ in range(repeats):
-        transfer()
-    end.record()
-    torch.cuda.synchronize(device)
+        xfer()
+    t1.record()
+    torch.cuda.synchronize()
 
-    elapsed_s = start.elapsed_time(end) / 1000.0
-
-    if mode == "registered":
-        torch.cuda.cudart().cudaHostUnregister(cpu_t.data_ptr())
-
-    return (size_bytes * repeats) / elapsed_s / GB
-
-
-DIRECTIONS = [("h2d", "CPU → GPU"), ("d2h", "GPU → CPU")]
-MODES = [
-    ("pinned",      "pinned"),
-    ("pageable",    "pageable"),
-    ("prefaulted",  "pre-fault"),
-    ("hugepage",    "huge+pflt"),
-    ("registered",  "hostReg"),
-]
+    elapsed = t0.elapsed_time(t1) / 1000.0  # ms → s
+    return (size_bytes * repeats) / elapsed / GB
 
 
 def run_sweep(
-    sizes_mb: list[int],
-    warmup: int = 5,
-    repeats: int = 20,
-    runtime_label: str = "",
+    sizes_mb: list[int], warmup: int, repeats: int, runtime_label: str = ""
 ) -> list[Result]:
-    results: list[Result] = []
-    for size_mb in sizes_mb:
-        size_bytes = size_mb * MB
-        for dir_key, _ in DIRECTIONS:
-            for mode_key, _ in MODES:
-                bw = benchmark_transfer(size_bytes, dir_key, mode_key, warmup, repeats)
-                results.append(Result(
-                    size_mb=size_mb,
-                    direction=dir_key,
-                    mode=mode_key,
-                    bw_gbs=round(bw, 3),
-                    repeats=repeats,
-                    runtime=runtime_label,
-                ))
+    results = []
+    for sz in sizes_mb:
+        nbytes = sz * MB
+        for direction in ("h2d", "d2h"):
+            for mode, pin in (("pageable", False), ("pinned", True)):
+                bw = benchmark_transfer(nbytes, direction, pin, warmup, repeats)
+                results.append(
+                    Result(sz, direction, mode, round(bw, 3), repeats, runtime_label)
+                )
     return results
 
 
-def print_results(results: list[Result]):
-    dir_labels = dict(DIRECTIONS)
-    mode_labels = dict(MODES)
-    hdr = f"{'Size':>10}  {'Direction':>12}  {'Memory':>10}  {'Bandwidth':>12}  {'Repeat':>7}"
+def print_table(results: list[Result]):
+    dir_label = {"h2d": "CPU → GPU", "d2h": "GPU → CPU"}
+    hdr = f"{'Size':>10}  {'Direction':>10}  {'Mode':>10}  {'BW':>12}"
     print(hdr)
-    print("-" * len(hdr))
-    prev_size = None
+    print("─" * len(hdr))
+    prev = None
     for r in results:
-        if prev_size is not None and r.size_mb != prev_size:
+        if prev and r.size_mb != prev:
             print()
-        prev_size = r.size_mb
+        prev = r.size_mb
         print(
-            f"{r.size_mb:>8} MB  {dir_labels.get(r.direction, r.direction):>12}  "
-            f"{mode_labels.get(r.mode, r.mode):>10}  "
-            f"{r.bw_gbs:>9.2f} GB/s  {r.repeats:>7}x"
+            f"{r.size_mb:>8} MB  {dir_label[r.direction]:>10}  "
+            f"{r.mode:>10}  {r.bw_gbs:>9.2f} GB/s"
         )
 
 
 def print_header():
     import torch
-    device = torch.device("cuda:0")
-    props = torch.cuda.get_device_properties(device)
-    rt = _detect_runtime()
-    print("=" * 64)
-    print("  PyTorch CPU ⇔ GPU Memory Bandwidth Benchmark")
+
+    props = torch.cuda.get_device_properties(0)
+    print("=" * 60)
+    print("  Pageable GPU Memory Bandwidth Benchmark")
     print(f"  GPU     : {props.name}")
     print(f"  VRAM    : {props.total_memory / GB:.1f} GB")
     print(f"  CPUs    : {os.cpu_count()}")
     print(f"  PyTorch : {torch.__version__}")
-    print(f"  Runtime : {rt}")
-    print("=" * 64)
+    print(f"  Runtime : {_detect_runtime()}")
+
+    # PCIe link info (best effort)
+    try:
+        out = subprocess.check_output(
+            "lspci -vvv 2>/dev/null | grep -A2 'NVIDIA' | grep LnkSta | head -1",
+            shell=True,
+            text=True,
+        ).strip()
+        if out:
+            print(f"  PCIe    : {out.split('LnkSta:')[1].strip().split(',')[0]}")
+    except Exception:
+        pass
+    print("=" * 60)
     print()
 
 
 # ---------------------------------------------------------------------------
-# Docker comparison mode
+# Docker comparison
 # ---------------------------------------------------------------------------
 
-DOCKERFILE_TEMPLATE = textwrap.dedent("""\
+DOCKERFILE = textwrap.dedent("""\
     FROM {base_image}
     ENV DEBIAN_FRONTEND=noninteractive
-    RUN apt-get update -qq && \\
-        apt-get install -y -qq python3-pip > /dev/null 2>&1 ; \\
-        pip3 install --break-system-packages --quiet \\
-            torch --index-url https://download.pytorch.org/whl/cu126 || \\
-        pip3 install --quiet torch
+    RUN apt-get update -qq && apt-get install -y -qq python3-pip pciutils > /dev/null 2>&1 && \
+        pip3 install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu126
     COPY mem_bandwidth.py /bench/mem_bandwidth.py
     WORKDIR /bench
     ENTRYPOINT ["python3", "/bench/mem_bandwidth.py"]
@@ -241,233 +171,238 @@ DOCKERFILE_TEMPLATE = textwrap.dedent("""\
 
 
 def docker_compare(
-    sizes_mb: list[int],
-    warmup: int,
-    repeats: int,
-    runtimes: list[str],
-    base_image: str,
+    sizes_mb: list[int], warmup: int, repeats: int, runtimes: list[str], base_image: str
 ):
-    """Build a container, run the benchmark under each runtime, compare."""
+    tmp = Path("/tmp/nvproxy_bw_bench")
+    tmp.mkdir(exist_ok=True, mode=0o777)
+    df = tmp / "Dockerfile"
+    df.write_text(DOCKERFILE.format(base_image=base_image))
+    os.chmod(df, 0o644)
+    dst = tmp / "mem_bandwidth.py"
+    shutil.copy2(Path(__file__).resolve(), dst)
+    os.chmod(dst, 0o644)
 
-    script_path = Path(__file__).resolve()
-    tmp_dir = Path("/tmp/nvproxy_bw_bench")
-    tmp_dir.mkdir(exist_ok=True)
-
-    # Write Dockerfile
-    dockerfile = tmp_dir / "Dockerfile"
-    dockerfile.write_text(DOCKERFILE_TEMPLATE.format(base_image=base_image))
-
-    # Copy this script into the build context
-    import shutil
-    shutil.copy2(script_path, tmp_dir / "mem_bandwidth.py")
-
-    # Build the image
-    image_tag = "nvproxy-bw-bench:latest"
-    print(f"Building container image ({image_tag}) …")
-    subprocess.run(
-        ["docker", "build", "-t", image_tag, "."],
-        cwd=tmp_dir,
-        check=True,
+    tag = "nvproxy-bw-bench:latest"
+    # Skip build if image already exists
+    check = subprocess.run(
+        ["docker", "image", "inspect", tag],
         capture_output=True,
     )
-    print("Build complete.\n")
+    if check.returncode == 0:
+        print(
+            f"Image {tag} already exists, skipping build. (delete with: docker rmi {tag})"
+        )
+    else:
+        print(f"Building image ({tag})…")
+        proc = subprocess.run(
+            ["docker", "build", "--no-cache", "-t", tag, "."],
+            cwd=tmp,
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            print("BUILD FAILED:")
+            for ln in proc.stdout.splitlines()[-20:]:
+                print(f"  {ln}")
+            for ln in proc.stderr.splitlines()[-10:]:
+                print(f"  {ln}")
+            sys.exit(1)
+        print("Done.")
+    print()
 
     sizes_arg = ",".join(str(s) for s in sizes_mb)
     all_results: dict[str, list[Result]] = {}
 
     for rt in runtimes:
-        print(f"{'─'*64}")
-        print(f"  Running under: {rt}")
-        print(f"{'─'*64}")
-        # For runc, use the "nvidia" runtime which wraps runc and injects
-        # GPU devices via nvidia-container-runtime.  gVisor runtimes
-        # (runsc, runsc-fastpath, …) handle GPU access through nvproxy
-        # and work with --gpus all directly.
-        docker_runtime = "nvidia" if rt == "runc" else rt
+        print(f"{'─' * 60}")
+        print(f"  Running: {rt}")
+        print(f"{'─' * 60}")
+        docker_rt = "nvidia" if rt == "runc" else rt
         cmd = [
-            "docker", "run", "--rm",
-            "--runtime", docker_runtime,
-            "--gpus", "all",
-            image_tag,
-            "--sizes-mb", sizes_arg,
-            "--warmup", str(warmup),
-            "--repeats", str(repeats),
+            "docker",
+            "run",
+            "--rm",
+            "--runtime",
+            docker_rt,
+            "--gpus",
+            "all",
+            tag,
+            "--sizes-mb",
+            sizes_arg,
+            "--warmup",
+            str(warmup),
+            "--repeats",
+            str(repeats),
             "--json",
-            "--runtime-label", rt,
+            "--runtime-label",
+            rt,
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
-            print(f"  ✗ FAILED (exit {proc.returncode})")
-            if proc.stderr:
-                for line in proc.stderr.strip().splitlines()[-10:]:
-                    print(f"    {line}")
+            print(f"  FAILED (exit {proc.returncode})")
+            for ln in proc.stderr.strip().splitlines()[-8:]:
+                print(f"    {ln}")
             print()
             continue
-
-        # Parse JSON results from the last line
-        json_line = None
-        for line in reversed(proc.stdout.strip().splitlines()):
-            line = line.strip()
-            if line.startswith("["):
-                json_line = line
-                break
-        if json_line is None:
-            print(f"  ✗ No JSON output found")
-            print(f"  stdout: {proc.stdout[:500]}")
+        # Extract JSON from last matching line
+        json_line = next(
+            (
+                l
+                for l in reversed(proc.stdout.splitlines())
+                if l.strip().startswith("[")
+            ),
+            None,
+        )
+        if not json_line:
+            print(f"  No JSON output.\n  stdout: {proc.stdout[:300]}")
             continue
-
-        rows = json.loads(json_line)
-        results = [Result(**r) for r in rows]
+        results = [Result(**r) for r in json.loads(json_line)]
         all_results[rt] = results
-        print(f"  ✓ {len(results)} measurements collected\n")
+        print(f"  OK — {len(results)} measurements\n")
 
-    if len(all_results) < 1:
-        print("No results to compare.")
+    if not all_results:
+        print("No results.")
         return
 
-    # -----------------------------------------------------------------------
-    # Print comparison table
-    # -----------------------------------------------------------------------
-    print()
-    print("=" * 100)
-    print("  COMPARISON TABLE")
-    print("=" * 100)
-
-    dir_labels = dict(DIRECTIONS)
-    mode_labels = dict(MODES)
+    # ------------------------------------------------------------------
+    # Comparison table
+    # ------------------------------------------------------------------
     rt_names = list(all_results.keys())
+    dir_label = {"h2d": "CPU → GPU", "d2h": "GPU → CPU"}
 
-    # Build lookup: (size, dir, mode) -> {runtime: bw}
+    # build lookup: (size, dir, mode) → {rt: bw}
     lookup: dict[tuple, dict[str, float]] = {}
-    for rt, results in all_results.items():
-        for r in results:
-            key = (r.size_mb, r.direction, r.mode)
-            lookup.setdefault(key, {})[rt] = r.bw_gbs
+    for rt, res in all_results.items():
+        for r in res:
+            lookup.setdefault((r.size_mb, r.direction, r.mode), {})[rt] = r.bw_gbs
 
-    # Header
-    bw_cols = "  ".join(f"{rt:>12}" for rt in rt_names)
-    delta_cols = ""
-    if len(rt_names) == 2:
-        delta_cols = f"  {'Δ%':>8}"
-    elif len(rt_names) > 2:
-        # Show delta of each subsequent runtime vs the first
-        delta_cols = "  ".join(f"{'Δ vs ' + rt_names[0]:>12}" for _ in rt_names[1:])
-        delta_cols = "  " + delta_cols
+    print()
+    print("=" * 90)
+    print("  COMPARISON")
+    print("=" * 90)
 
-    hdr = f"{'Size':>8}  {'Dir':>10}  {'Mode':>10}  {bw_cols}{delta_cols}"
+    bw_hdr = "  ".join(f"{rt:>14}" for rt in rt_names)
+    # If 2+ runtimes, show deltas vs first
+    delta_hdr = ""
+    if len(rt_names) >= 2:
+        delta_hdr = "  ".join(f"{'Δ' + rt_names[0]:>10}" for _ in rt_names[1:])
+        delta_hdr = "  " + delta_hdr
+    hdr = f"{'Size':>8}  {'Dir':>10}  {'Mode':>10}  {bw_hdr}{delta_hdr}"
     print(hdr)
     print("─" * len(hdr))
 
-    prev_size = None
+    prev_sz = None
     for key in sorted(lookup.keys()):
-        size_mb, direction, mode = key
-        if prev_size is not None and size_mb != prev_size:
+        sz, d, mode = key
+        if prev_sz is not None and sz != prev_sz:
             print()
-        prev_size = size_mb
-
+        prev_sz = sz
         bws = [lookup[key].get(rt, float("nan")) for rt in rt_names]
-        bw_strs = "  ".join(f"{bw:>9.2f} GB" for bw in bws)
-
-        delta_strs = ""
+        bw_str = "  ".join(f"{bw:>11.2f} GB" for bw in bws)
+        delta_str = ""
         if len(rt_names) >= 2:
             base = bws[0]
-            deltas = []
+            parts = []
             for bw in bws[1:]:
-                if base > 0 and bw == bw:  # not nan
+                if base > 0 and bw == bw:
                     pct = (bw - base) / base * 100
-                    sign = "+" if pct >= 0 else ""
-                    deltas.append(f"{sign}{pct:>6.1f}%")
+                    parts.append(f"{pct:>+8.1f}%")
                 else:
-                    deltas.append(f"{'—':>8}")
-            delta_strs = "  " + "  ".join(f"{d:>12}" for d in deltas)
-            if len(rt_names) == 2:
-                delta_strs = "  " + "  ".join(f"{d:>8}" for d in deltas)
+                    parts.append(f"{'—':>10}")
+            delta_str = "  " + "  ".join(f"{p:>10}" for p in parts)
+        marker = dir_label.get(d, d)
+        print(f"{sz:>6} MB  {marker:>10}  {mode:>10}  {bw_str}{delta_str}")
 
-        dir_label = dir_labels.get(direction, direction)
-        mode_label = mode_labels.get(mode, mode)
-        print(f"{size_mb:>6} MB  {dir_label:>10}  {mode_label:>10}  {bw_strs}{delta_strs}")
-
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
     print()
-
-    # Summary: average pageable bandwidth per runtime
-    print("─" * 64)
-    print("  Pageable transfer averages (the nvproxy-sensitive path):")
-    for rt in rt_names:
-        pageable_bws = [
-            lookup[k][rt]
-            for k in lookup
-            if k[2] == "pageable" and rt in lookup[k]
-        ]
-        if pageable_bws:
-            avg = sum(pageable_bws) / len(pageable_bws)
-            print(f"    {rt:>20s}:  {avg:>8.2f} GB/s average")
-    print("─" * 64)
+    print("─" * 60)
+    for mode in ("pageable", "pinned"):
+        print(f"  {mode.upper()} averages:")
+        for rt in rt_names:
+            vals = [lookup[k][rt] for k in lookup if k[2] == mode and rt in lookup[k]]
+            if vals:
+                avg = sum(vals) / len(vals)
+                print(f"    {rt:>20s}:  {avg:>8.2f} GB/s")
+        # Show gap between first and rest for pageable
+        if mode == "pageable" and len(rt_names) >= 2:
+            base_vals = [
+                lookup[k][rt_names[0]]
+                for k in lookup
+                if k[2] == "pageable" and rt_names[0] in lookup[k]
+            ]
+            base_avg = sum(base_vals) / len(base_vals) if base_vals else 0
+            for rt in rt_names[1:]:
+                vals = [
+                    lookup[k][rt]
+                    for k in lookup
+                    if k[2] == "pageable" and rt in lookup[k]
+                ]
+                if vals and base_avg:
+                    avg = sum(vals) / len(vals)
+                    pct = (avg - base_avg) / base_avg * 100
+                    ioctls_1g = (1024 // 4) * 3  # 768
+                    # Estimate per-ioctl overhead from 1 GB d2h delta
+                    d2h_base = [
+                        lookup[k][rt_names[0]]
+                        for k in lookup
+                        if k[2] == "pageable"
+                        and k[1] == "d2h"
+                        and k[0] >= 256
+                        and rt_names[0] in lookup[k]
+                    ]
+                    d2h_this = [
+                        lookup[k][rt]
+                        for k in lookup
+                        if k[2] == "pageable"
+                        and k[1] == "d2h"
+                        and k[0] >= 256
+                        and rt in lookup[k]
+                    ]
+                    if d2h_base and d2h_this:
+                        db = sum(d2h_base) / len(d2h_base)
+                        dt = sum(d2h_this) / len(d2h_this)
+                        t_base = 1.0 / db * 1000  # ms for 1 GB
+                        t_this = 1.0 / dt * 1000
+                        delta_ms = t_this - t_base
+                        if delta_ms > 0:
+                            per_ioctl = delta_ms / ioctls_1g * 1000  # µs
+                            print(
+                                f"      {rt} vs {rt_names[0]} d2h gap: "
+                                f"{pct:+.1f}% → ~{per_ioctl:.0f} µs/ioctl overhead "
+                                f"({delta_ms:.1f} ms over {ioctls_1g} ioctls)"
+                            )
+    print("─" * 60)
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint
+# Main
 # ---------------------------------------------------------------------------
+
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="CPU ⇔ GPU memory bandwidth benchmark (PyTorch)"
-    )
-    parser.add_argument(
-        "--sizes-mb", type=str, default="1,4,16,64,256,512,1024",
-        help="Comma-separated transfer sizes in MB (default: 1,4,16,64,256,512,1024)",
-    )
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--repeats", type=int, default=20)
-    parser.add_argument(
-        "--json", action="store_true",
-        help="Append JSON array of results to stdout (for machine parsing)",
-    )
-    parser.add_argument(
-        "--runtime-label", type=str, default="",
-        help="Label to tag results with (e.g. 'runc', 'runsc')",
-    )
-    parser.add_argument(
-        "--docker-compare", action="store_true",
-        help="Run benchmark inside Docker under multiple runtimes and compare",
-    )
-    parser.add_argument(
-        "--runtimes", type=str, default="runc,runsc",
-        help="Comma-separated Docker runtimes for --docker-compare "
-             "(default: runc,runsc). 'runc' is automatically mapped to "
-             "the 'nvidia' Docker runtime for GPU passthrough.",
-    )
-    parser.add_argument(
-        "--base-image", type=str,
-        default="nvidia/cuda:12.6.3-devel-ubuntu22.04",
-        help="Base Docker image for --docker-compare",
-    )
-    args = parser.parse_args()
-
-    sizes_mb = [int(s) for s in args.sizes_mb.split(",")]
+    p = argparse.ArgumentParser(description="Pageable GPU memory bandwidth benchmark")
+    p.add_argument("--sizes-mb", default="1,4,16,64,256,512,1024")
+    p.add_argument("--warmup", type=int, default=5)
+    p.add_argument("--repeats", type=int, default=20)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--runtime-label", default="")
+    p.add_argument("--docker-compare", action="store_true")
+    p.add_argument("--runtimes", default="runc,runsc")
+    p.add_argument("--base-image", default="nvidia/cuda:12.6.3-base-ubuntu22.04")
+    args = p.parse_args()
+    sizes = [int(s) for s in args.sizes_mb.split(",")]
 
     if args.docker_compare:
-        runtimes = [r.strip() for r in args.runtimes.split(",")]
-        docker_compare(
-            sizes_mb=sizes_mb,
-            warmup=args.warmup,
-            repeats=args.repeats,
-            runtimes=runtimes,
-            base_image=args.base_image,
-        )
+        rts = [r.strip() for r in args.runtimes.split(",")]
+        docker_compare(sizes, args.warmup, args.repeats, rts, args.base_image)
         return
 
-    # Direct execution (native or inside container)
     runtime_label = args.runtime_label or _detect_runtime()
-
     print_header()
-    results = run_sweep(
-        sizes_mb=sizes_mb,
-        warmup=args.warmup,
-        repeats=args.repeats,
-        runtime_label=runtime_label,
-    )
-    print_results(results)
-
+    results = run_sweep(sizes, args.warmup, args.repeats, runtime_label)
+    print_table(results)
     if args.json:
         print()
         print(json.dumps([asdict(r) for r in results]))
