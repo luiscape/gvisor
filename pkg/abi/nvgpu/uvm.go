@@ -53,9 +53,12 @@ const (
 	UVM_UNMAP_EXTERNAL                 = 66
 	UVM_ALLOC_SEMAPHORE_POOL           = 68
 	UVM_PAGEABLE_MEM_ACCESS_ON_GPU     = 70
+	UVM_POPULATE_PAGEABLE              = 71
 	UVM_VALIDATE_VA_RANGE              = 72
 	UVM_CREATE_EXTERNAL_RANGE          = 73
+	UVM_MAP_EXTERNAL_SPARSE            = 74
 	UVM_MM_INITIALIZE                  = 75
+	UVM_ALLOC_DEVICE_P2P               = 78
 )
 
 // +marshal
@@ -878,6 +881,84 @@ func (p *UVM_MM_INITIALIZE_PARAMS) GetStatus() uint32 {
 
 // SetStatus implements HasStatus.SetStatus.
 func (p *UVM_MM_INITIALIZE_PARAMS) SetStatus(status uint32) {
+	p.RMStatus = status
+}
+
+// UVM_POPULATE_PAGEABLE_PARAMS
+//
+// +marshal
+type UVM_POPULATE_PAGEABLE_PARAMS struct {
+	_        structs.HostLayout
+	Base     uint64
+	Length   uint64
+	Flags    uint32
+	RMStatus uint32
+}
+
+// GetStatus implements HasStatus.GetStatus.
+func (p *UVM_POPULATE_PAGEABLE_PARAMS) GetStatus() uint32 {
+	return p.RMStatus
+}
+
+// SetStatus implements HasStatus.SetStatus.
+func (p *UVM_POPULATE_PAGEABLE_PARAMS) SetStatus(status uint32) {
+	p.RMStatus = status
+}
+
+// UVM_MAP_EXTERNAL_SPARSE_PARAMS
+//
+// +marshal
+type UVM_MAP_EXTERNAL_SPARSE_PARAMS struct {
+	_        structs.HostLayout
+	Base     uint64
+	Length   uint64
+	GPUUUID  NvUUID
+	RMStatus uint32
+	Pad0     [4]byte
+}
+
+// GetStatus implements HasStatus.GetStatus.
+func (p *UVM_MAP_EXTERNAL_SPARSE_PARAMS) GetStatus() uint32 {
+	return p.RMStatus
+}
+
+// SetStatus implements HasStatus.SetStatus.
+func (p *UVM_MAP_EXTERNAL_SPARSE_PARAMS) SetStatus(status uint32) {
+	p.RMStatus = status
+}
+
+// UVM_ALLOC_DEVICE_P2P_PARAMS
+//
+// +marshal
+type UVM_ALLOC_DEVICE_P2P_PARAMS struct {
+	_        structs.HostLayout
+	Base     uint64
+	Length   uint64
+	Offset   uint64
+	GPUUUID  NvUUID
+	RMCtrlFD int32
+	HClient  uint32
+	HMemory  uint32
+	RMStatus uint32
+}
+
+// GetFrontendFD implements HasFrontendFD.GetFrontendFD.
+func (p *UVM_ALLOC_DEVICE_P2P_PARAMS) GetFrontendFD() int32 {
+	return p.RMCtrlFD
+}
+
+// SetFrontendFD implements HasFrontendFD.SetFrontendFD.
+func (p *UVM_ALLOC_DEVICE_P2P_PARAMS) SetFrontendFD(fd int32) {
+	p.RMCtrlFD = fd
+}
+
+// GetStatus implements HasStatus.GetStatus.
+func (p *UVM_ALLOC_DEVICE_P2P_PARAMS) GetStatus() uint32 {
+	return p.RMStatus
+}
+
+// SetStatus implements HasStatus.SetStatus.
+func (p *UVM_ALLOC_DEVICE_P2P_PARAMS) SetStatus(status uint32) {
 	p.RMStatus = status
 }
 
