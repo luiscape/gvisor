@@ -32,6 +32,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
@@ -125,7 +126,8 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	devicesSub := map[string]kernfs.Inode{
 		"system": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"cpu": cpuDir(ctx, fs, creds),
+			"cpu":  cpuDir(ctx, fs, creds),
+			"node": nodeDir(ctx, fs, creds),
 		}),
 	}
 
@@ -232,6 +234,67 @@ func cpuDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) kernfs
 		})
 	}
 	return fs.newDir(ctx, creds, defaultSysDirMode, children)
+}
+
+// nodeDir returns a directory inode for /sys/devices/system/node that
+// exposes NUMA topology information. gVisor currently models a single NUMA
+// node (node0) containing all CPUs.
+//
+// This is needed because the CUDA driver reads /sys/devices/system/node
+// during initialization to discover NUMA topology and pre-allocate internal
+// bitmaps. Without this, the CUDA driver skips bitmap allocation, and then
+// crashes with a NULL pointer dereference when UVM_REGISTER_GPU returns
+// numaEnabled=true on Grace Hopper (ARM + GPU) platforms.
+func nodeDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) kernfs.Inode {
+	k := kernel.KernelFromContext(ctx)
+	maxCPUCores := k.ApplicationCores()
+
+	cpuMask := fullCPUMask(maxCPUCores) + "\n"
+	var cpuList string
+	if maxCPUCores > 1 {
+		cpuList = fmt.Sprintf("0-%d\n", maxCPUCores-1)
+	} else {
+		cpuList = "0\n"
+	}
+
+	// Model a single NUMA node with all CPUs and all memory.
+	// This is consistent with cpuDir() which places all CPUs in one socket.
+	children := map[string]kernfs.Inode{
+		"online":            fs.newStaticFile(ctx, creds, defaultSysMode, "0\n"),
+		"possible":          fs.newStaticFile(ctx, creds, defaultSysMode, "0\n"),
+		"has_cpu":           fs.newStaticFile(ctx, creds, defaultSysMode, "0\n"),
+		"has_memory":        fs.newStaticFile(ctx, creds, defaultSysMode, "0\n"),
+		"has_normal_memory": fs.newStaticFile(ctx, creds, defaultSysMode, "0\n"),
+		"node0": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"cpulist":  fs.newStaticFile(ctx, creds, defaultSysMode, cpuList),
+			"cpumap":   fs.newStaticFile(ctx, creds, defaultSysMode, cpuMask),
+			"distance": fs.newStaticFile(ctx, creds, defaultSysMode, "10\n"),
+			"meminfo":  fs.newStaticFile(ctx, creds, defaultSysMode, nodeMeminfo(ctx)),
+		}),
+	}
+	return fs.newDir(ctx, creds, defaultSysDirMode, children)
+}
+
+// nodeMeminfo returns the contents of /sys/devices/system/node/node0/meminfo
+// in the format expected by Linux. Only the essential fields are included.
+func nodeMeminfo(ctx context.Context) string {
+	k := kernel.KernelFromContext(ctx)
+	mf := k.MemoryFile()
+	_ = mf.UpdateUsage(nil) // Best effort
+	_, totalUsage := usage.MemoryAccounting.Copy()
+	totalSize := usage.TotalMemory(mf.TotalSize(), totalUsage)
+	memFree := totalSize - totalUsage
+	if memFree > totalSize {
+		memFree = 0
+	}
+	totalKB := totalSize / 1024
+	freeKB := memFree / 1024
+
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "Node 0 MemTotal:       %8d kB\n", totalKB)
+	fmt.Fprintf(&buf, "Node 0 MemFree:        %8d kB\n", freeKB)
+	fmt.Fprintf(&buf, "Node 0 MemUsed:        %8d kB\n", totalKB-freeKB)
+	return buf.String()
 }
 
 // fullCPUMask returns a "hex format ASCII string", consistent with Linux's

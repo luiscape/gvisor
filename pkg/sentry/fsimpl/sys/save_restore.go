@@ -58,7 +58,8 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	}
 	devicesSub := map[string]kernfs.Inode{
 		"system": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"cpu": cpuDir(ctx, fs, creds),
+			"cpu":  cpuDir(ctx, fs, creds),
+			"node": nodeDir(ctx, fs, creds),
 		}),
 	}
 	busSub := make(map[string]kernfs.Inode)

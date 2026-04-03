@@ -85,6 +85,81 @@ func TestReadCPUFile(t *testing.T) {
 	}
 }
 
+func TestReadNodeFile(t *testing.T) {
+	s := newTestSystem(t, "" /*pciTestDir*/)
+	defer s.Destroy()
+	k := kernel.KernelFromContext(s.Ctx)
+	maxCPUCores := k.ApplicationCores()
+
+	// Check that /sys/devices/system/node exists and has expected entries.
+	pop := s.PathOpAtRoot("devices/system/node")
+	s.AssertAllDirentTypes(s.ListDirents(pop), map[string]testutil.DirentType{
+		"online":            linux.DT_REG,
+		"possible":          linux.DT_REG,
+		"has_cpu":           linux.DT_REG,
+		"has_memory":        linux.DT_REG,
+		"has_normal_memory": linux.DT_REG,
+		"node0":             linux.DT_DIR,
+	})
+
+	// Check the topology files report a single NUMA node.
+	for _, fname := range []string{"online", "possible", "has_cpu", "has_memory"} {
+		pop := s.PathOpAtRoot(fmt.Sprintf("devices/system/node/%s", fname))
+		fd, err := s.VFS.OpenAt(s.Ctx, s.Creds, pop, &vfs.OpenOptions{})
+		if err != nil {
+			t.Fatalf("OpenAt(%s) failed: %v", fname, err)
+		}
+		defer fd.DecRef(s.Ctx)
+		content, err := s.ReadToEnd(fd)
+		if err != nil {
+			t.Fatalf("Read(%s) failed: %v", fname, err)
+		}
+		if diff := cmp.Diff("0\n", content); diff != "" {
+			t.Fatalf("node/%s returned unexpected data:\n--- want\n+++ got\n%v", fname, diff)
+		}
+	}
+
+	// Check that node0 contains expected entries.
+	pop = s.PathOpAtRoot("devices/system/node/node0")
+	s.AssertAllDirentTypes(s.ListDirents(pop), map[string]testutil.DirentType{
+		"cpulist":  linux.DT_REG,
+		"cpumap":   linux.DT_REG,
+		"distance": linux.DT_REG,
+		"meminfo":  linux.DT_REG,
+	})
+
+	// Check node0/cpulist matches the CPU range.
+	expectedCPUList := fmt.Sprintf("0-%d\n", maxCPUCores-1)
+	pop = s.PathOpAtRoot("devices/system/node/node0/cpulist")
+	fd, err := s.VFS.OpenAt(s.Ctx, s.Creds, pop, &vfs.OpenOptions{})
+	if err != nil {
+		t.Fatalf("OpenAt(node0/cpulist) failed: %v", err)
+	}
+	defer fd.DecRef(s.Ctx)
+	content, err := s.ReadToEnd(fd)
+	if err != nil {
+		t.Fatalf("Read(node0/cpulist) failed: %v", err)
+	}
+	if diff := cmp.Diff(expectedCPUList, content); diff != "" {
+		t.Fatalf("node0/cpulist returned unexpected data:\n--- want\n+++ got\n%v", diff)
+	}
+
+	// Check node0/distance is "10\n" (single-node self-distance).
+	pop = s.PathOpAtRoot("devices/system/node/node0/distance")
+	fd, err = s.VFS.OpenAt(s.Ctx, s.Creds, pop, &vfs.OpenOptions{})
+	if err != nil {
+		t.Fatalf("OpenAt(node0/distance) failed: %v", err)
+	}
+	defer fd.DecRef(s.Ctx)
+	content, err = s.ReadToEnd(fd)
+	if err != nil {
+		t.Fatalf("Read(node0/distance) failed: %v", err)
+	}
+	if diff := cmp.Diff("10\n", content); diff != "" {
+		t.Fatalf("node0/distance returned unexpected data:\n--- want\n+++ got\n%v", diff)
+	}
+}
+
 func TestSysRootContainsExpectedEntries(t *testing.T) {
 	s := newTestSystem(t, "" /*pciTestDir*/)
 	defer s.Destroy()
