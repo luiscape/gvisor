@@ -190,13 +190,20 @@ func uvmInitialize(ui *uvmIoctlState) (uintptr, error) {
 	if _, err := ioctlParams.CopyIn(ui.t, ui.ioctlParamsAddr); err != nil {
 		return 0, err
 	}
-	origFlags := ioctlParams.Flags
-	// This is necessary to share the host UVM FD between sentry and
-	// application processes.
-	ioctlParams.Flags = ioctlParams.Flags | nvgpu.UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE
+	// NOTE: Previous versions forced UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE
+	// here to "share the host UVM FD between sentry and application processes."
+	// However, in gVisor's model the sentry IS the only host process — the
+	// application runs inside gVisor's virtual kernel and all GPU ioctls are
+	// proxied through the sentry. Multi-process sharing mode is not needed,
+	// and it causes the host UVM driver to disable mm (memory management)
+	// tracking (uvm_va_space_mm_enabled() returns false). This makes
+	// UVM_MM_INITIALIZE return NV_WARN_NOTHING_TO_DO, which causes
+	// CUDA >=13.0 on GH200 (Grace Hopper, NVLink-C2C) to take a broken
+	// multi-process initialization code path that fails with
+	// CUDA_ERROR_SYSTEM_NOT_READY (802). Without the flag, the UVM driver
+	// registers the sentry's mm normally and CUDA's single-process init
+	// path succeeds.
 	n, err := uvmIoctlInvoke(ui, &ioctlParams)
-	// Only expose the MULTI_PROCESS_SHARING_MODE flag if it was already present.
-	ioctlParams.Flags &^= ^origFlags & nvgpu.UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE
 	if err != nil {
 		return n, err
 	}

@@ -719,12 +719,20 @@ func SafeSetupAndMount(src, dst, typ string, flags uint32, procPath string) erro
 		if err := os.MkdirAll(parent, 0777); err != nil {
 			return fmt.Errorf("mkdir(%q) failed: %v", parent, err)
 		}
-		// Create the destination file if it does not exist.
-		f, err := os.OpenFile(dst, unix.O_CREAT, 0777)
-		if err != nil {
-			return fmt.Errorf("open(%q) failed: %v", dst, err)
+		// Create the destination file if it does not exist. We first check
+		// with Lstat because the destination may already exist as a Unix
+		// socket or other special file type that cannot be opened with
+		// open(2) (ENXIO). If it already exists, it is a valid mount point.
+		if _, err := os.Lstat(dst); err != nil {
+			if !os.IsNotExist(err) {
+				return fmt.Errorf("stat(%q) failed: %v", dst, err)
+			}
+			f, err := os.OpenFile(dst, unix.O_CREAT, 0777)
+			if err != nil {
+				return fmt.Errorf("open(%q) failed: %v", dst, err)
+			}
+			f.Close()
 		}
-		f.Close()
 	}
 
 	// Do the mount.
