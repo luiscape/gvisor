@@ -109,10 +109,13 @@ func uvmIoctlFilters(enabledCaps nvconf.DriverCaps) []seccomp.SyscallRule {
 		{seccomp.EqualTo(nvgpu.UVM_TOOLS_WRITE_PROCESS_MEMORY), nvconf.ValidCapabilities},
 		{seccomp.EqualTo(nvgpu.UVM_MAP_DYNAMIC_PARALLELISM_REGION), compUtil},
 		{seccomp.EqualTo(nvgpu.UVM_UNMAP_EXTERNAL), compUtil},
-		{seccomp.EqualTo(nvgpu.UVM_PAGEABLE_MEM_ACCESS_ON_GPU), nvconf.CapVideo},
+		{seccomp.EqualTo(nvgpu.UVM_PAGEABLE_MEM_ACCESS_ON_GPU), compUtil},
+		{seccomp.EqualTo(nvgpu.UVM_POPULATE_PAGEABLE), compUtil},
 		{seccomp.EqualTo(nvgpu.UVM_ALLOC_SEMAPHORE_POOL), compUtil},
 		{seccomp.EqualTo(nvgpu.UVM_VALIDATE_VA_RANGE), compUtil},
 		{seccomp.EqualTo(nvgpu.UVM_CREATE_EXTERNAL_RANGE), compUtil},
+		{seccomp.EqualTo(nvgpu.UVM_MAP_EXTERNAL_SPARSE), compUtil},
+		{seccomp.EqualTo(nvgpu.UVM_ALLOC_DEVICE_P2P), compUtil},
 	} {
 		if uvmIoctl.caps&enabledCaps != 0 {
 			ioctlRules = append(ioctlRules, seccomp.PerArg{
@@ -132,6 +135,42 @@ func Filters(enabledCaps nvconf.DriverCaps) seccomp.SyscallRules {
 	ioctlRules = append(ioctlRules, uvmIoctlFilters(enabledCaps)...)
 	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		unix.SYS_IOCTL: seccomp.Or(ioctlRules),
+		// SYS_OPENAT and SYS_CLOSE are needed to re-open nvidia device
+		// files during checkpoint/restore (afterLoadImpl).
+		unix.SYS_OPENAT: seccomp.MatchAll{},
+		unix.SYS_CLOSE:  seccomp.MatchAll{},
+		// The following syscalls are needed to fork+exec the GPU
+		// checkpoint restore helper binary (cuda_checkpoint_helper)
+		// from the sentry process during restore.  Go's os/exec
+		// package uses pidfd, vfork, waitid, and various setup
+		// syscalls that the base seccomp filter restricts.
+		unix.SYS_EXECVE:            seccomp.MatchAll{},
+		unix.SYS_CLONE:             seccomp.MatchAll{},
+		unix.SYS_CLONE3:            seccomp.MatchAll{},
+		unix.SYS_WAIT4:             seccomp.MatchAll{},
+		unix.SYS_WAITID:            seccomp.MatchAll{},
+		unix.SYS_PIPE2:             seccomp.MatchAll{},
+		unix.SYS_DUP3:              seccomp.MatchAll{},
+		unix.SYS_READLINKAT:        seccomp.MatchAll{},
+		unix.SYS_NEWFSTATAT:        seccomp.MatchAll{},
+		unix.SYS_PIDFD_OPEN:        seccomp.MatchAll{},
+		unix.SYS_PIDFD_GETFD:       seccomp.MatchAll{},
+		424:                        seccomp.MatchAll{}, // SYS_PIDFD_SEND_SIGNAL
+		unix.SYS_FCNTL:             seccomp.MatchAll{},
+		unix.SYS_RT_SIGACTION:      seccomp.MatchAll{},
+		unix.SYS_RT_SIGPROCMASK:    seccomp.MatchAll{},
+		unix.SYS_SIGALTSTACK:       seccomp.MatchAll{},
+		unix.SYS_GETPID:            seccomp.MatchAll{},
+		unix.SYS_GETTID:            seccomp.MatchAll{},
+		unix.SYS_SET_TID_ADDRESS:   seccomp.MatchAll{},
+		unix.SYS_SET_ROBUST_LIST:   seccomp.MatchAll{},
+		unix.SYS_PRCTL:             seccomp.MatchAll{},
+		unix.SYS_RSEQ:              seccomp.MatchAll{},
+		unix.SYS_MPROTECT:          seccomp.MatchAll{},
+		unix.SYS_MEMBARRIER:        seccomp.MatchAll{},
+		unix.SYS_SCHED_GETAFFINITY: seccomp.MatchAll{},
+		unix.SYS_READ:              seccomp.MatchAll{},
+		unix.SYS_WRITE:             seccomp.MatchAll{},
 		unix.SYS_MMAP: seccomp.PerArg{
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},

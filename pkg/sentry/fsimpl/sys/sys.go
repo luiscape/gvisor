@@ -32,6 +32,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
@@ -125,7 +126,8 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	devicesSub := map[string]kernfs.Inode{
 		"system": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"cpu": cpuDir(ctx, fs, creds),
+			"cpu":  cpuDir(ctx, fs, creds),
+			"node": nodeDir(ctx, fs, creds),
 		}),
 	}
 
@@ -230,6 +232,25 @@ func cpuDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) kernfs
 				"thread_siblings": fs.newStaticFile(ctx, creds, defaultSysMode, oneMask),
 			}),
 		})
+	}
+	return fs.newDir(ctx, creds, defaultSysDirMode, children)
+}
+
+func nodeDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) kernfs.Inode {
+	k := kernel.KernelFromContext(ctx)
+	maxCPUCores := k.ApplicationCores()
+	children := map[string]kernfs.Inode{
+		"online":            fs.newStaticFile(ctx, creds, defaultSysMode, "0\n"),
+		"possible":          fs.newStaticFile(ctx, creds, defaultSysMode, "0\n"),
+		"has_cpu":           fs.newStaticFile(ctx, creds, defaultSysMode, "0\n"),
+		"has_memory":        fs.newStaticFile(ctx, creds, defaultSysMode, "0\n"),
+		"has_normal_memory": fs.newStaticFile(ctx, creds, defaultSysMode, "0\n"),
+		"node0": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"cpulist":  fs.newStaticFile(ctx, creds, defaultSysMode, fmt.Sprintf("0-%d\n", maxCPUCores-1)),
+			"cpumap":   fs.newStaticFile(ctx, creds, defaultSysMode, fullCPUMask(maxCPUCores)+"\n"),
+			"distance": fs.newStaticFile(ctx, creds, defaultSysMode, "10\n"),
+			"meminfo":  fs.newNodeMeminfo(ctx, creds, defaultSysMode),
+		}),
 	}
 	return fs.newDir(ctx, creds, defaultSysDirMode, children)
 }
@@ -444,6 +465,35 @@ func (fs *filesystem) newCPUFile(ctx context.Context, creds *auth.Credentials, m
 	c := &cpuFile{maxCores: maxCores}
 	c.DynamicBytesFile.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), c, mode)
 	return c
+}
+
+// +stateify savable
+type nodeMeminfo struct {
+	kernfs.DynamicBytesFile
+}
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (n *nodeMeminfo) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	mf := kernel.KernelFromContext(ctx).MemoryFile()
+	_ = mf.UpdateUsage(nil) // Best effort
+	_, totalUsage := usage.MemoryAccounting.Copy()
+	totalSize := usage.TotalMemory(mf.TotalSize(), totalUsage)
+	memFree := totalSize - totalUsage
+	if memFree > totalSize {
+		// Underflow.
+		memFree = 0
+	}
+	memUsed := totalSize - memFree
+	fmt.Fprintf(buf, "Node 0 MemTotal:       %8d kB\n", totalSize/1024)
+	fmt.Fprintf(buf, "Node 0 MemFree:        %8d kB\n", memFree/1024)
+	fmt.Fprintf(buf, "Node 0 MemUsed:        %8d kB\n", memUsed/1024)
+	return nil
+}
+
+func (fs *filesystem) newNodeMeminfo(ctx context.Context, creds *auth.Credentials, mode linux.FileMode) kernfs.Inode {
+	n := &nodeMeminfo{}
+	n.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), n, mode)
+	return n
 }
 
 // +stateify savable

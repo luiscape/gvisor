@@ -54,3 +54,13 @@ func (fd *uvmFD) beforeSave() {
 func (fd *uvmFD) afterLoad(ctx goContext.Context) {
 	fd.afterLoadImpl(ctx)
 }
+
+// beforeSave is invoked by stateify.
+func (fd *openOnlyFD) beforeSave() {
+	fd.beforeSaveImpl()
+}
+
+// afterLoad is invoked by stateify.
+func (fd *openOnlyFD) afterLoad(ctx goContext.Context) {
+	fd.afterLoadImpl(ctx)
+}

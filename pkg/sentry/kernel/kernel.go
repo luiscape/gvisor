@@ -392,6 +392,17 @@ type Kernel struct {
 	// exec binary.
 	SaveRestoreExecConfig *SaveRestoreExecConfig
 
+	// SaveRestoreExecArgv stores the argv of the save-restore-exec binary
+	// for use during restore.  This is set during the save phase (after the
+	// helper runs) and serialized as a simple []string — unlike
+	// SaveRestoreExecConfig which contains a *Task pointer that pulls in
+	// the entire network namespace chain and causes stateify serialization
+	// panics (the sandboxNetstackCreator type name doesn't round-trip).
+	SaveRestoreExecArgv []string
+
+	// SaveRestoreExecTimeout is the timeout for the save-restore-exec binary.
+	SaveRestoreExecTimeout time.Duration
+
 	// NvidiaDriverVersion is the NVIDIA driver version configured for this
 	// sandbox.
 	NvidiaDriverVersion nvconf.DriverVersion

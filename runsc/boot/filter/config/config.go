@@ -163,6 +163,15 @@ func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, s
 	}
 
 	s.Merge(opt.Platform.SyscallFilters(vars))
+
+	// When NVProxy is enabled, allow executable mappings so that the
+	// GPU checkpoint restore helper can be exec'd from the sentry.
+	// The helper dynamically links libcuda.so (via the ELF loader),
+	// which requires mmap with PROT_EXEC.  Without this, the
+	// DenyNewExecMappings rule kills the process on any PROT_EXEC mmap.
+	if opt.NVProxy {
+		return s, seccomp.SyscallRules{}
+	}
 	return s, seccomp.DenyNewExecMappings
 }
 

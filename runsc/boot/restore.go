@@ -18,6 +18,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	time2 "time"
 
@@ -224,6 +227,13 @@ func (r *restorer) restore(l *Loader) error {
 		pprof.Initialize()
 	}
 
+	// NOTE: GPU checkpoint restore helper runs from the CLI process
+	// (runsc/cmd/restore.go:runGPURestoreFromCLI) AFTER c.Restore()
+	// returns.  We cannot run it here because the sandbox already has
+	// seccomp installed from the create phase — any child process
+	// inherits seccomp and gets killed when dlopen(libcuda.so) triggers
+	// blocked syscalls.  The CLI process has NO seccomp.
+
 	// Seccomp filters have to be applied before vfs restore and before parsing
 	// the state file.
 	if err := l.installSeccompFilters(); err != nil {
@@ -363,6 +373,8 @@ func (r *restorer) restore(l *Loader) error {
 	// Release `l.mu` before calling into callbacks.
 	cu.Clean()
 
+	// NOTE: GPU restore runs from the CLI process (no seccomp), not here.
+
 	r.timer.Reached("Starting sandbox")
 	if err := r.cm.onStart(); err != nil {
 		return fmt.Errorf("restorer.readyToStart callback failed: %w", err)
@@ -451,6 +463,100 @@ func (r *restorer) restore(l *Loader) error {
 	go timer.Log()
 
 	return nil
+}
+
+// findGPURestoreHelper searches for the cuda_checkpoint_helper binary
+// at well-known host paths.  Returns empty string if not found.
+func findGPURestoreHelper() string {
+	self, _ := os.Executable()
+	selfDir := filepath.Dir(self)
+	searchPaths := []string{
+		filepath.Join(selfDir, "cuda_checkpoint_helper"),
+		"/usr/local/bin/cuda_checkpoint_helper",
+		"/tmp/cuda_checkpoint_helper",
+	}
+	// Also check if the nvidia-driver-version flag hints at NVProxy being active
+	for _, p := range searchPaths {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p
+		}
+	}
+	// Check PATH as last resort
+	if p, err := exec.LookPath("cuda_checkpoint_helper"); err == nil {
+		return p
+	}
+	return ""
+}
+
+// runHostGPURestoreHelper exec's the save-restore-exec binary as a child
+// of the sentry process in "restore" mode.  The child calls
+// cuCheckpointProcessRestore targeting the sentry's PID, which restores
+// GPU state from checkpoint data in the sentry's address space.
+//
+// This runs BEFORE onStart(), so application threads are not yet scheduled.
+// The sentry's seccomp filter allows SYS_EXECVE and PROT_EXEC mmap when
+// NVProxy is enabled.
+func runHostGPURestoreHelper(conf *kernel.SaveRestoreExecConfig) error {
+	binaryName := filepath.Base(conf.Argv[0])
+
+	// Search for the helper binary on the host filesystem.
+	self, _ := os.Executable()
+	selfDir := filepath.Dir(self)
+	searchPaths := []string{
+		filepath.Join(selfDir, binaryName),
+		"/usr/local/bin/" + binaryName,
+		"/tmp/" + binaryName,
+	}
+
+	var helperPath string
+	for _, p := range searchPaths {
+		if _, err := os.Stat(p); err == nil {
+			helperPath = p
+			break
+		}
+	}
+	if helperPath == "" {
+		return fmt.Errorf("GPU restore helper %q not found at %v", binaryName, searchPaths)
+	}
+
+	sandboxPID := os.Getpid()
+	log.Infof("Running GPU restore helper: %s (sandbox PID=%d, timeout=%v)",
+		helperPath, sandboxPID, conf.Timeout)
+
+	cmd := exec.Command(helperPath)
+	cmd.Env = append(os.Environ(),
+		"GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE=restore",
+		fmt.Sprintf("GVISOR_SANDBOX_PID=%d", sandboxPID),
+		// Ensure the helper finds the real libcuda.so (not a stub).
+		// The sentry process may run in a minimal mount namespace where
+		// the standard library paths are not available.
+		"LD_LIBRARY_PATH=/usr/lib64:/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib64:/usr/local/cuda/lib64",
+	)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start %s: %w", helperPath, err)
+	}
+
+	timeout := conf.Timeout
+	if timeout == 0 {
+		timeout = 10 * time2.Minute
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("%s failed: %w", helperPath, err)
+		}
+		log.Infof("GPU restore helper completed successfully")
+		return nil
+	case <-time2.After(timeout):
+		cmd.Process.Kill()
+		return fmt.Errorf("%s timed out after %v", helperPath, timeout)
+	}
 }
 
 func (l *Loader) save(o *control.SaveOpts) (err error) {

@@ -27,6 +27,20 @@ declare_mutex(
     prefix = "objs",
 )
 
+declare_mutex(
+    name = "frontend_maps_mutex",
+    out = "frontend_maps_mutex.go",
+    package = "nvproxy",
+    prefix = "frontendMaps",
+)
+
+declare_mutex(
+    name = "uvm_maps_mutex",
+    out = "uvm_maps_mutex.go",
+    package = "nvproxy",
+    prefix = "uvmMaps",
+)
+
 go_template_instance(
     name = "object_free_list",
     out = "object_free_list.go",
@@ -42,8 +56,11 @@ go_template_instance(
 go_library(
     name = "nvproxy",
     srcs = [
+        "alloc_tracker.go",
         "fds_mutex.go",
+        "gpu_checkpoint.go",
         "frontend.go",
+        "frontend_maps_mutex.go",
         "frontend_mmap.go",
         "frontend_mmap_mutex.go",
         "frontend_mmap_unsafe.go",
@@ -60,6 +77,7 @@ go_library(
         "save_restore_impl.go",
         "seccomp_filters.go",
         "uvm.go",
+        "uvm_maps_mutex.go",
         "uvm_mmap.go",
         "uvm_unsafe.go",
         "version.go",

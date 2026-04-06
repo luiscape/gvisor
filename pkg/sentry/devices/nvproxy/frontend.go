@@ -95,12 +95,22 @@ type frontendFD struct {
 	vfs.FileDescriptionDefaultImpl
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.NoLockFD
-	memmap.MappableNoTrackMappings
 
 	dev           *frontendDevice
 	containerName string
 	hostFD        int32
 	memmapFile    frontendFDMemmapFile
+
+	// mapsMu protects mappings.
+	mapsMu   frontendMapsMutex `state:"nosave"`
+	mappings memmap.MappingSet
+
+	// restoredFromCheckpoint is true for FDs that were deserialized from
+	// a checkpoint image (via afterLoadImpl).  It is false for FDs that
+	// were freshly opened (e.g. by the save-restore-exec helper calling
+	// cuInit).  Only restored FDs are subject to the ioctl gate — the
+	// helper's own FDs must not be blocked or the restore deadlocks.
+	restoredFromCheckpoint bool `state:"nosave"`
 
 	// The driver's implementation of poll() for these files,
 	// kernel-open/nvidia/nv.c:nvidia_poll(), unsets
@@ -209,6 +219,22 @@ func (fd *frontendFD) Epollable() bool {
 
 // Ioctl implements vfs.FileDescriptionImpl.Ioctl.
 func (fd *frontendFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
+	// During restore, block ioctls on FDs that were restored from a
+	// checkpoint until the save-restore-exec helper has finished calling
+	// cuCheckpointProcessRestore.  This is safe from deadlock because:
+	//   - Restored FDs have hostFD=-1 (not re-opened yet), so even if
+	//     an ioctl slipped through, it can't reach the host nvidia
+	//     driver and can't contend for driver-level locks.
+	//   - The helper opens its OWN fresh FDs (restoredFromCheckpoint=false)
+	//     so its ioctls bypass this gate entirely.
+	//   - App threads block here until postRestoreImpl calls
+	//     ReopenAllFDs + OpenIoctlGate after the helper finishes.
+	if fd.restoredFromCheckpoint {
+		if !fd.dev.nvp.WaitIoctlGate(ctx) {
+			return 0, linuxerr.EINTR
+		}
+	}
+
 	cmd := args[1].Uint()
 	nr := linux.IOC_NR(cmd)
 	argPtr := args[2].Pointer()
@@ -256,6 +282,34 @@ func (fd *frontendFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, 
 
 // IsNvidiaDeviceFD implements NvidiaDeviceFD.IsNvidiaDeviceFD.
 func (fd *frontendFD) IsNvidiaDeviceFD() {}
+
+// AddMapping implements memmap.Mappable.AddMapping.
+func (fd *frontendFD) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
+	fd.mapsMu.Lock()
+	fd.mappings.AddMapping(ms, ar, offset, writable)
+	fd.mapsMu.Unlock()
+	return nil
+}
+
+// RemoveMapping implements memmap.Mappable.RemoveMapping.
+func (fd *frontendFD) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
+	fd.mapsMu.Lock()
+	fd.mappings.RemoveMapping(ms, ar, offset, writable)
+	fd.mapsMu.Unlock()
+}
+
+// CopyMapping implements memmap.Mappable.CopyMapping.
+func (fd *frontendFD) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
+	return fd.AddMapping(ctx, ms, dstAR, offset, writable)
+}
+
+// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
+func (fd *frontendFD) InvalidateUnsavable(ctx context.Context) error {
+	fd.mapsMu.Lock()
+	defer fd.mapsMu.Unlock()
+	fd.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
+	return nil
+}
 
 func frontendIoctlCmd(nr, argSize uint32) uintptr {
 	return uintptr(linux.IOWR(nvgpu.NV_IOCTL_MAGIC, nr, argSize))

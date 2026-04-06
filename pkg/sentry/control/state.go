@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/fdcollector"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -193,6 +194,15 @@ func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *SaveRestoreExec
 
 // preSave is called before saving the kernel.
 func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *SaveRestoreExecOpts) error {
+	// Write the GPU allocation manifest BEFORE SaveRestoreExec runs.
+	// The save-restore-exec helper calls cuCheckpointProcessCheckpoint
+	// which frees all CUDA sessions — the UVM_FREE ioctls flow through
+	// nvproxy and remove allocations from the tracker.  We must snapshot
+	// the tracker NOW while it still has all the allocation entries.
+	if err := nvproxy.WriteGPUManifestFromVFS(k.VFS()); err != nil {
+		log.Warningf("control: preSave: failed to write GPU manifest: %v", err)
+	}
+
 	if execOpts.Argv != "" {
 		argv := strings.Split(execOpts.Argv, " ")
 		if err := ConfigureSaveRestoreExec(k, argv, execOpts.Timeout, execOpts.ContainerID); err != nil {
@@ -201,6 +211,18 @@ func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *SaveRestoreExecOpts)
 		if err := SaveRestoreExec(k, SaveRestoreExecSave); err != nil {
 			return fmt.Errorf("failed to exec save/restore binary: %w", err)
 		}
+		// Store argv/timeout in SaveRestoreExecArgv (a simple []string
+		// that serializes cleanly) and then clear SaveRestoreExecConfig
+		// (which contains a *Task pointer that pulls in the entire
+		// network namespace chain, causing stateify panics on types
+		// like sandboxNetstackCreator whose package-qualified names
+		// don't round-trip through the state framework).
+		//
+		// On restore, runHostGPURestoreHelper reads SaveRestoreExecArgv
+		// to find the helper binary and timeout.
+		k.SaveRestoreExecArgv = argv
+		k.SaveRestoreExecTimeout = execOpts.Timeout
+		k.SaveRestoreExecConfig = nil
 	}
 	return preSaveImpl(k, o)
 }

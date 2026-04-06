@@ -62,6 +62,9 @@ func (dev *uvmDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry
 	}
 	fd.memmapFile.SetFD(int(fd.hostFD))
 	fd.memmapFile.RequireAddrEqualsFileOffset()
+	dev.nvp.fdsMu.Lock()
+	defer dev.nvp.fdsMu.Unlock()
+	dev.nvp.uvmFDs[fd] = struct{}{}
 	return &fd.vfsfd, nil
 }
 
@@ -73,18 +76,32 @@ type uvmFD struct {
 	vfs.FileDescriptionDefaultImpl
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.NoLockFD
-	memmap.MappableNoTrackMappings
 
 	dev           *uvmDevice
 	containerName string
 	hostFD        int32
 	memmapFile    uvmFDMemmapFile
 
+	// mapsMu protects mappings.
+	mapsMu   uvmMapsMutex `state:"nosave"`
+	mappings memmap.MappingSet
+
+	// restoredFromCheckpoint is true for FDs that were deserialized from
+	// a checkpoint image (via afterLoadImpl).  It is false for FDs that
+	// were freshly opened (e.g. by the save-restore-exec helper calling
+	// cuInit).  Only restored FDs are subject to the ioctl gate — the
+	// helper's own FDs must not be blocked or the restore deadlocks.
+	restoredFromCheckpoint bool `state:"nosave"`
+
 	queue waiter.Queue
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *uvmFD) Release(context.Context) {
+	fd.dev.nvp.fdsMu.Lock()
+	delete(fd.dev.nvp.uvmFDs, fd)
+	fd.dev.nvp.fdsMu.Unlock()
+
 	fdnotifier.RemoveFD(fd.hostFD)
 	fd.queue.Notify(waiter.EventHUp)
 	fd.memmapFile.MappableRelease()
@@ -120,6 +137,17 @@ func (fd *uvmFD) Epollable() bool {
 
 // Ioctl implements vfs.FileDescriptionImpl.Ioctl.
 func (fd *uvmFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
+	// During restore, block ioctls on FDs that were restored from a
+	// checkpoint until the save-restore-exec helper has finished calling
+	// cuCheckpointProcessRestore.  Safe from deadlock because restored
+	// FDs have hostFD=-1 (can't reach host driver), and the helper
+	// opens its own fresh FDs (restoredFromCheckpoint=false).
+	if fd.restoredFromCheckpoint {
+		if !fd.dev.nvp.WaitIoctlGate(ctx) {
+			return 0, linuxerr.EINTR
+		}
+	}
+
 	cmd := args[1].Uint()
 	argPtr := args[2].Pointer()
 
@@ -151,6 +179,34 @@ func (fd *uvmFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 
 // IsNvidiaDeviceFD implements NvidiaDeviceFD.IsNvidiaDeviceFD.
 func (fd *uvmFD) IsNvidiaDeviceFD() {}
+
+// AddMapping implements memmap.Mappable.AddMapping.
+func (fd *uvmFD) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
+	fd.mapsMu.Lock()
+	fd.mappings.AddMapping(ms, ar, offset, writable)
+	fd.mapsMu.Unlock()
+	return nil
+}
+
+// RemoveMapping implements memmap.Mappable.RemoveMapping.
+func (fd *uvmFD) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
+	fd.mapsMu.Lock()
+	fd.mappings.RemoveMapping(ms, ar, offset, writable)
+	fd.mapsMu.Unlock()
+}
+
+// CopyMapping implements memmap.Mappable.CopyMapping.
+func (fd *uvmFD) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
+	return fd.AddMapping(ctx, ms, dstAR, offset, writable)
+}
+
+// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
+func (fd *uvmFD) InvalidateUnsavable(ctx context.Context) error {
+	fd.mapsMu.Lock()
+	defer fd.mapsMu.Unlock()
+	fd.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
+	return nil
+}
 
 // uvmIoctlState holds the state of a call to uvmFD.Ioctl().
 type uvmIoctlState struct {
@@ -191,8 +247,20 @@ func uvmInitialize(ui *uvmIoctlState) (uintptr, error) {
 		return 0, err
 	}
 	origFlags := ioctlParams.Flags
-	// This is necessary to share the host UVM FD between sentry and
-	// application processes.
+	// Force MULTI_PROCESS_SHARING_MODE.  This is required because gVisor's
+	// systrap platform executes host syscalls (including mmap on UVM FDs)
+	// from stub processes whose mm differs from the sentry's mm.  Without
+	// this flag the UVM driver registers the sentry's mm via
+	// UVM_MM_INITIALIZE, then rejects mmaps from stubs because
+	// current->mm != registered mm (returns ENOTSUP).  With the flag the
+	// driver skips mm tracking entirely and allows mmaps from any thread
+	// in the host process.
+	//
+	// Trade-off: the flag disables uvm_va_space_mm_enabled(), which means
+	// cuCheckpointProcessRestore cannot use mm-based access to locate
+	// checkpoint data.  GPU checkpoint/restore must therefore call
+	// cuCheckpointProcessRestore from within the sentry process itself
+	// (same mm context) rather than from an external helper process.
 	ioctlParams.Flags = ioctlParams.Flags | nvgpu.UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE
 	n, err := uvmIoctlInvoke(ui, &ioctlParams)
 	// Only expose the MULTI_PROCESS_SHARING_MODE flag if it was already present.

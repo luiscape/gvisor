@@ -18,6 +18,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"time"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -183,8 +186,46 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 		runArgs.Spec = c.Spec
 	}
 
+	// Run the GPU checkpoint restore helper from the CLI process BEFORE
+	// sending the restore RPC to the sandbox.  The CLI process has NO
+	// seccomp filters, so the helper can freely dlopen(libcuda.so) and
+	// call cuCheckpointProcessRestore.  The helper targets the sandbox
+	// process (which has the checkpoint data in its address space after
+	// the restore RPC loads the checkpoint image).
+	//
+	// However, we need the sandbox to have loaded the checkpoint first
+	// (so the GPU checkpoint data is in memory).  So we run the helper
+	// AFTER c.Restore() returns — but the sandbox hasn't called onStart()
+	// yet if we use a two-phase approach.
+	//
+	// For now, run the helper targeting the sandbox PID after Restore
+	// returns.  The sandbox's ioctl gate blocks app threads from issuing
+	// GPU ioctls until postRestoreImpl opens the gate.  The helper runs
+	// here (no seccomp) and calls cuCheckpointProcessRestore(sandbox_pid).
 	log.Debugf("Restore: %v", r.imagePath)
 	err = c.Restore(conf, r.imagePath, r.direct, r.background)
+
+	// After Restore returns, the sandbox has loaded the checkpoint and
+	// started the kernel.  App threads are running but GPU ioctls are
+	// blocked by the nvproxy ioctl gate.  Run the GPU restore helper
+	// NOW from the CLI process (which has NO seccomp filters) targeting
+	// the sandbox PID.  The helper calls cuCheckpointProcessRestore to
+	// reconstruct GPU state from checkpoint data in the sandbox's memory.
+	// Always try to run the GPU restore helper after Restore returns.
+	// We don't check conf.NVProxy because the restore CLI doesn't receive
+	// --nvproxy (it was only on the create command).  Instead we just
+	// check if the helper binary exists on the host — if it does, we run
+	// it.  If it doesn't, we silently skip.  The helper itself is a no-op
+	// if the sandbox has no CUDA checkpoint data to restore.
+	if err == nil {
+		sandboxPid := c.SandboxPid()
+		log.Infof("GPU restore CLI: sandboxPid=%d, looking for helper", sandboxPid)
+		if sandboxPid > 0 {
+			if herr := runGPURestoreFromCLI(sandboxPid); herr != nil {
+				log.Warningf("GPU restore helper failed: %v (GPU state may not be restored)", herr)
+			}
+		}
+	}
 	if err != nil {
 		return util.Errorf("starting container: %v", err)
 	}
@@ -208,4 +249,60 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	cu.Release()
 
 	return subcommands.ExitSuccess
+}
+
+// runGPURestoreFromCLI exec's the cuda_checkpoint_helper binary from the
+// CLI process (which has NO seccomp filters) targeting the given sandbox PID.
+// The helper calls cuCheckpointProcessRestore(sandboxPid) to reconstruct
+// GPU state from the checkpoint data in the sandbox process's memory.
+func runGPURestoreFromCLI(sandboxPid int) error {
+	searchPaths := []string{
+		"/usr/local/bin/cuda_checkpoint_helper",
+		"/tmp/cuda_checkpoint_helper",
+	}
+	if self, err := os.Executable(); err == nil {
+		searchPaths = append([]string{filepath.Join(filepath.Dir(self), "cuda_checkpoint_helper")}, searchPaths...)
+	}
+
+	var helperPath string
+	for _, p := range searchPaths {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			helperPath = p
+			break
+		}
+	}
+	if helperPath == "" {
+		log.Infof("GPU restore: cuda_checkpoint_helper not found, skipping")
+		return nil
+	}
+
+	log.Infof("GPU restore: running %s from CLI (no seccomp), sandbox PID=%d", helperPath, sandboxPid)
+
+	cmd := exec.Command(helperPath)
+	cmd.Env = append(os.Environ(),
+		"GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE=restore",
+		fmt.Sprintf("GVISOR_SANDBOX_PID=%d", sandboxPid),
+	)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("starting %s: %w", helperPath, err)
+	}
+
+	tmout := 10 * time.Minute
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("%s: %w", helperPath, err)
+		}
+		log.Infof("GPU restore: helper completed successfully")
+		return nil
+	case <-time.After(tmout):
+		cmd.Process.Kill()
+		return fmt.Errorf("%s timed out after %v", helperPath, tmout)
+	}
 }

@@ -5,6 +5,11 @@ package(
     licenses = ["notice"],
 )
 
+config_setting(
+    name = "gpu_cgo",
+    values = {"define": "gpu_cgo=true"},
+)
+
 go_library(
     name = "boot",
     srcs = [

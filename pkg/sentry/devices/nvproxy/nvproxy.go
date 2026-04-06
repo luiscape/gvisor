@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	goSync "sync"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
@@ -77,8 +78,10 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		useDevGofer:            opts.UseDevGofer,
 		procDriverNvidiaParams: opts.HostSettings.ProcDriverNvidiaParams,
 		frontendFDs:            make(map[*frontendFD]struct{}),
+		uvmFDs:                 make(map[*uvmFD]struct{}),
 		clients:                make(map[nvgpu.Handle]*rootClient),
 	}
+	nvp.tracker.Init()
 	// Force ModifyDeviceFiles in /proc/driver/nvidia/params to 0. This is
 	// consistent with libnvidia-container's src/nvc_mount.c:mount_procfs().
 	nvp.procDriverNvidiaParams = strings.Replace(nvp.procDriverNvidiaParams, "ModifyDeviceFiles: 1", "ModifyDeviceFiles: 0", 1)
@@ -206,9 +209,96 @@ type nvproxy struct {
 
 	fdsMu       fdsMutex `state:"nosave"`
 	frontendFDs map[*frontendFD]struct{}
+	uvmFDs      map[*uvmFD]struct{}
 
 	clientsMu sync.RWMutex `state:"nosave"`
 	clients   map[nvgpu.Handle]*rootClient
+
+	// tracker tracks GPU memory allocations (UVM_MAP_EXTERNAL_ALLOCATION)
+	// across all processes in the sandbox. It is serialized during
+	// checkpoint so the restore path knows which GPU memory regions to
+	// re-create and populate.
+	tracker allocTracker
+
+	// stagedData holds GPU memory contents that were copied to host memory
+	// during checkpoint (via UVM_TOOLS_READ_PROCESS_MEMORY). It is keyed
+	// by device virtual address and serialized as part of the checkpoint
+	// image. After restore, the data is written back to GPU memory via
+	// UVM_TOOLS_WRITE_PROCESS_MEMORY and then cleared.
+	stagedData map[uint64][]byte
+
+	// ioctlGate blocks application-issued nvidia ioctls during restore
+	// until the save-restore-exec helper has finished calling
+	// cuCheckpointProcessRestore.  Without this gate, vLLM's engine
+	// core threads resume and immediately issue CUDA ioctls that race
+	// with the restore helper, causing GPU state corruption.
+	//
+	// The gate is armed (closed) in afterLoadImpl and opened either by
+	// the postRestoreImpl callback or by a timeout.  While the gate is
+	// closed, frontend and UVM Ioctl methods block on ioctlGateCh.
+	// The save-restore-exec helper's own ioctls are NOT gated because
+	// it runs as a new process whose FDs are freshly opened (not
+	// restored from the checkpoint image).
+	//
+	// These fields are nosave — only relevant during the restore window.
+	ioctlGateMu goSync.Mutex  `state:"nosave"`
+	ioctlGateCh chan struct{} `state:"nosave"` // closed = gate open; nil = no gate
+}
+
+// ArmIoctlGate closes the ioctl gate. All subsequent application ioctls
+// on restored FDs will block until OpenIoctlGate is called.
+func (nvp *nvproxy) ArmIoctlGate() {
+	nvp.ioctlGateMu.Lock()
+	defer nvp.ioctlGateMu.Unlock()
+	nvp.ioctlGateCh = make(chan struct{})
+	log.Infof("nvproxy: ioctl gate ARMED — app ioctls will block until restore helper finishes")
+}
+
+// OpenIoctlGate opens the ioctl gate, unblocking all waiting ioctls.
+// Safe to call multiple times or when the gate is not armed.
+func (nvp *nvproxy) OpenIoctlGate() {
+	nvp.ioctlGateMu.Lock()
+	defer nvp.ioctlGateMu.Unlock()
+	if nvp.ioctlGateCh != nil {
+		close(nvp.ioctlGateCh)
+		nvp.ioctlGateCh = nil
+		log.Infof("nvproxy: ioctl gate OPENED — app ioctls unblocked")
+	}
+}
+
+// WaitIoctlGate blocks until the ioctl gate is open.  Returns immediately
+// if the gate is not armed.  Returns false if the context is interrupted.
+func (nvp *nvproxy) WaitIoctlGate(ctx context.Context) bool {
+	nvp.ioctlGateMu.Lock()
+	ch := nvp.ioctlGateCh
+	nvp.ioctlGateMu.Unlock()
+	if ch == nil {
+		return true // no gate
+	}
+	select {
+	case <-ch:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// IsIoctlGateOpen returns true if the ioctl gate is open (or not armed).
+// This is a non-blocking check used by Ioctl methods to decide whether to
+// reject ioctls with EAGAIN during the restore window.
+func (nvp *nvproxy) IsIoctlGateOpen() bool {
+	nvp.ioctlGateMu.Lock()
+	ch := nvp.ioctlGateCh
+	nvp.ioctlGateMu.Unlock()
+	if ch == nil {
+		return true // not armed
+	}
+	select {
+	case <-ch:
+		return true // already opened
+	default:
+		return false // still closed
+	}
 }
 
 func nvproxyFromVFS(vfsObj *vfs.VirtualFilesystem) *nvproxy {
