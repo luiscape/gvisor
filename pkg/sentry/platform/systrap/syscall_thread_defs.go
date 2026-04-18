@@ -36,4 +36,13 @@ type syscallSentryMessage struct {
 // Attention: It can be compromised by user threads.
 type syscallStubMessage struct {
 	ret uint64
+	// Data is a shared buffer for passing ioctl parameters between the
+	// sentry and the subprocess. The sentry writes params here, passes
+	// the subprocess-side address as a syscall argument, and reads back
+	// the (potentially modified) params after the syscall completes.
+	Data [64]byte
 }
+
+// syscallStubMessageDataOffset is the offset of the Data field within
+// syscallStubMessage. This is sizeof(ret) = 8.
+const syscallStubMessageDataOffset = 8

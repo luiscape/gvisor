@@ -97,6 +97,13 @@ func attachedThread(flags uintptr, defaultAction seccomp.Action) (*thread, error
 				unix.SYS_MMAP:   seccomp.MatchAll{},
 				unix.SYS_MUNMAP: seccomp.MatchAll{},
 
+				// Injected by InjectSyscall to support nvproxy UVM
+				// ioctls from the subprocess's mm context. This
+				// enables UVM pageable memory access (HMM/ATS) by
+				// allowing UVM_INITIALIZE to run in the application's
+				// address space without MULTI_PROCESS_SHARING_MODE.
+				unix.SYS_IOCTL: seccomp.MatchAll{},
+
 				// For sysmsg threads. Look at sysmsg/sighandler.c for more details.
 				unix.SYS_RT_SIGRETURN: seccomp.MatchAll{},
 				unix.SYS_SCHED_YIELD:  seccomp.MatchAll{},

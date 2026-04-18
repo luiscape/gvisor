@@ -393,6 +393,20 @@ type AddressSpace interface {
 	AddressSpaceIO
 }
 
+// SyscallInjector is an optional interface that AddressSpace implementations
+// can provide to allow injection of arbitrary syscalls into the address
+// space's subprocess context. This is used by nvproxy to call UVM ioctls
+// from the application's mm_struct.
+type SyscallInjector interface {
+	// InjectSyscall executes a syscall in the address space's context.
+	// args contains the 6 syscall arguments. If data is non-nil, it is
+	// copied into shared memory accessible to the subprocess, and the
+	// subprocess-side address is placed in args[dataArgIdx].
+	// After the syscall, the (potentially modified) data is copied back.
+	// Use dataArgIdx=-1 if no data buffer is needed.
+	InjectSyscall(sysno uintptr, args [6]uintptr, data []byte, dataArgIdx int) (uintptr, error)
+}
+
 // AddressSpaceIO supports IO through the memory mappings installed in an
 // AddressSpace.
 //

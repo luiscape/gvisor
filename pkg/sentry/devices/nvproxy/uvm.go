@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -75,10 +76,11 @@ type uvmFD struct {
 	vfs.NoLockFD
 	memmap.MappableNoTrackMappings
 
-	dev           *uvmDevice
-	containerName string
-	hostFD        int32
-	memmapFile    uvmFDMemmapFile
+	dev               *uvmDevice
+	containerName     string
+	hostFD            int32
+	injectedInit bool
+	memmapFile        uvmFDMemmapFile
 
 	queue waiter.Queue
 }
@@ -190,6 +192,42 @@ func uvmInitialize(ui *uvmIoctlState) (uintptr, error) {
 	if _, err := ioctlParams.CopyIn(ui.t, ui.ioctlParamsAddr); err != nil {
 		return 0, err
 	}
+
+	// Try to inject UVM_INITIALIZE into the application's subprocess
+	// (which has the app's full VA space). This avoids
+	// MULTI_PROCESS_SHARING_MODE and enables HMM/ATS pageable access.
+	as := ui.t.MemoryManager().AddressSpace()
+	if injector, ok := as.(platform.SyscallInjector); ok {
+		// Marshal the params into a byte slice.
+		paramsBuf := make([]byte, ioctlParams.SizeBytes())
+		ioctlParams.MarshalBytes(paramsBuf)
+
+		args := [6]uintptr{
+			uintptr(ui.fd.hostFD), // arg0: fd
+			uintptr(ui.cmd),       // arg1: cmd
+			0,                     // arg2: params ptr (filled by InjectSyscall)
+		}
+		_, err := injector.InjectSyscall(unix.SYS_IOCTL, args, paramsBuf, 2)
+		if err == nil {
+			// Unmarshal the response.
+			ioctlParams.UnmarshalBytes(paramsBuf)
+			if ioctlParams.RMStatus == nvgpu.NV_OK {
+				ui.fd.injectedInit = true
+				if _, err := ioctlParams.CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
+					return 0, err
+				}
+				return 0, nil
+			}
+			log.Warningf("nvproxy: injected UVM_INITIALIZE returned status %#x, falling back", ioctlParams.RMStatus)
+			// Re-read params from userspace since we overwrote ioctlParams.
+			if _, err := ioctlParams.CopyIn(ui.t, ui.ioctlParamsAddr); err != nil {
+				return 0, err
+			}
+		} else {
+			log.Warningf("nvproxy: InjectSyscall UVM_INITIALIZE failed: %v, falling back", err)
+		}
+	}
+
 	origFlags := ioctlParams.Flags
 	// This is necessary to share the host UVM FD between sentry and
 	// application processes.
@@ -220,6 +258,36 @@ func uvmMMInitialize(ui *uvmIoctlState) (uintptr, error) {
 	uvmFile, ok := uvmFileGeneric.Impl().(*uvmFD)
 	if !ok {
 		return 0, uvmFailWithStatus(ui, &ioctlParams, nvgpu.NV_ERR_INVALID_ARGUMENT)
+	}
+
+	if uvmFile.injectedInit {
+		// UVM_INITIALIZE was handled via ioctl injection into the
+		// subprocess. Do the same for UVM_MM_INITIALIZE.
+		as := ui.t.MemoryManager().AddressSpace()
+		if injector, ok := as.(platform.SyscallInjector); ok {
+			origFD := ioctlParams.UvmFD
+			ioctlParams.UvmFD = uvmFile.hostFD
+
+			paramsBuf := make([]byte, ioctlParams.SizeBytes())
+			ioctlParams.MarshalBytes(paramsBuf)
+
+			args := [6]uintptr{
+				uintptr(ui.fd.hostFD), // arg0: fd
+				uintptr(ui.cmd),       // arg1: cmd
+				0,                     // arg2: params ptr (filled by InjectSyscall)
+			}
+			_, err := injector.InjectSyscall(unix.SYS_IOCTL, args, paramsBuf, 2)
+			if err == nil {
+				ioctlParams.UnmarshalBytes(paramsBuf)
+				ioctlParams.UvmFD = origFD
+				if _, err := ioctlParams.CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
+					return 0, err
+				}
+				return 0, nil
+			}
+			log.Warningf("nvproxy: InjectSyscall UVM_MM_INITIALIZE failed: %v, falling back", err)
+			ioctlParams.UvmFD = origFD
+		}
 	}
 
 	origFD := ioctlParams.UvmFD

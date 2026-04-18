@@ -1021,6 +1021,51 @@ func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRa
 	return err
 }
 
+// InjectSyscall implements platform.SyscallInjector.InjectSyscall.
+//
+// It executes an arbitrary syscall in the subprocess's context.
+// If data is non-nil, it is copied into the shared stub message page,
+// and the subprocess-side address of that data is placed in args[dataArgIdx].
+// After the syscall, the data is copied back (it may have been modified
+// by the kernel, e.g. ioctl output params).
+//
+// dataArgIdx specifies which argument slot (0-5) should receive the
+// pointer to the shared data. Use -1 if no data is needed.
+func (s *subprocess) InjectSyscall(sysno uintptr, args [6]uintptr, data []byte, dataArgIdx int) (uintptr, error) {
+	s.syscallThreadMu.Lock()
+	defer s.syscallThreadMu.Unlock()
+
+	st := s.syscallThread
+
+	// Copy data into the shared stub message page (writable by both sides).
+	if data != nil && dataArgIdx >= 0 && dataArgIdx < 6 {
+		if len(data) > len(st.stubMessage.Data) {
+			return 0, fmt.Errorf("data too large: %d > %d", len(data), len(st.stubMessage.Data))
+		}
+		copy(st.stubMessage.Data[:], data)
+		// Compute the subprocess-side address of the data buffer.
+		// stubMessage is at subprocess address: st.stubAddr + syscallStubMessageOffset
+		// Data field is at syscallStubMessageDataOffset (after the ret uint64 field).
+		dataAddrInSubprocess := st.stubAddr + syscallStubMessageOffset + syscallStubMessageDataOffset
+		args[dataArgIdx] = dataAddrInSubprocess
+	}
+
+	// Build the syscall arguments.
+	archArgs := make([]arch.SyscallArgument, 6)
+	for i := 0; i < 6; i++ {
+		archArgs[i] = arch.SyscallArgument{Value: args[i]}
+	}
+
+	ret, err := st.syscall(sysno, archArgs...)
+
+	// Copy back potentially modified data.
+	if data != nil && dataArgIdx >= 0 {
+		copy(data, st.stubMessage.Data[:len(data)])
+	}
+
+	return ret, err
+}
+
 // Unmap implements platform.AddressSpace.Unmap.
 func (s *subprocess) Unmap(addr hostarch.Addr, length uint64) {
 	_, err := s.syscall(
