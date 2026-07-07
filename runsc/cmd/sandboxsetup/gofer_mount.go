@@ -487,8 +487,10 @@ func ShouldExposeNvidiaDevice(path string) bool {
 	if path == "/dev/nvidiactl" || path == "/dev/nvidia-uvm" {
 		return true
 	}
+	// /dev/nvidia<N> (GPUs) and /dev/nvidia-fs<N> (GPUDirect Storage).
 	nvidiaDevPathReg := regexp.MustCompile(`^/dev/nvidia(\d+)$`)
-	return nvidiaDevPathReg.MatchString(path)
+	nvidiaFsDevPathReg := regexp.MustCompile(`^/dev/nvidia-fs(\d+)$`)
+	return nvidiaDevPathReg.MatchString(path) || nvidiaFsDevPathReg.MatchString(path)
 }
 
 // ShouldExposeVFIODevice returns true if path refers to a VFIO device

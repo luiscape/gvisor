@@ -125,12 +125,34 @@ func uvmIoctlFilters(enabledCaps nvconf.DriverCaps) []seccomp.SyscallRule {
 	return ioctlRules
 }
 
+func nvfsIoctlFilters(enabledCaps nvconf.DriverCaps) []seccomp.SyscallRule {
+	var ioctlRules []seccomp.SyscallRule
+	for _, nvfsIoctl := range []struct {
+		arg1 seccomp.ValueMatcher
+		caps nvconf.DriverCaps
+	}{
+		{seccomp.EqualTo(nvgpu.NVFS_IOCTL_REMOVE), nvconf.CapGPUDirectStorage},
+		{seccomp.EqualTo(nvgpu.NVFS_IOCTL_MAP), nvconf.CapGPUDirectStorage},
+		{seccomp.EqualTo(nvgpu.NVFS_IOCTL_READ), nvconf.CapGPUDirectStorage},
+		{seccomp.EqualTo(nvgpu.NVFS_IOCTL_WRITE), nvconf.CapGPUDirectStorage},
+	} {
+		if nvfsIoctl.caps&enabledCaps != 0 {
+			ioctlRules = append(ioctlRules, seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				nvfsIoctl.arg1,
+			})
+		}
+	}
+	return ioctlRules
+}
+
 // Filters returns seccomp-bpf filters for this package when using the given
 // set of capabilities.
 func Filters(enabledCaps nvconf.DriverCaps) seccomp.SyscallRules {
 	var ioctlRules []seccomp.SyscallRule
 	ioctlRules = append(ioctlRules, frontendIoctlFilters(enabledCaps)...)
 	ioctlRules = append(ioctlRules, uvmIoctlFilters(enabledCaps)...)
+	ioctlRules = append(ioctlRules, nvfsIoctlFilters(enabledCaps)...)
 	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		unix.SYS_IOCTL: seccomp.Or(ioctlRules),
 		unix.SYS_MMAP: seccomp.PerArg{

@@ -148,6 +148,26 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		nvp.devInfo.FabricIMEXManagementDevMinor = opts.HostSettings.FabricIMEXManagementDevMinor
 	}
 
+	if opts.DriverCaps&nvconf.CapGPUDirectStorage != 0 {
+		nvfsDevMajor, err := vfsObj.GetDynamicCharDevMajor()
+		if err != nil {
+			return nil, fmt.Errorf("allocating device major number for nvidia-fs: %w", err)
+		}
+		nvp.devInfo.NvfsDevMajor = nvfsDevMajor
+		// The nvidia-fs driver exposes nvgpu.NVIDIA_FS_DEV_COUNT nodes
+		// (/dev/nvidia-fs0 .. nvidia-fs15); cuFile opens all of them.
+		for minor := uint32(0); minor < nvgpu.NVIDIA_FS_DEV_COUNT; minor++ {
+			if err := vfsObj.RegisterDevice(vfs.CharDevice, nvfsDevMajor, minor, &nvfsDevice{
+				nvp:   nvp,
+				minor: minor,
+			}, &vfs.RegisterDeviceOptions{
+				GroupName: "nvidia-fs",
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	if imexChannelCount := opts.HostSettings.IMEXChannelCount(); imexChannelCount != 0 {
 		capsIMEXChannelsDevMajor, err := vfsObj.GetDynamicCharDevMajor()
 		if err != nil {
@@ -192,6 +212,10 @@ type DeviceInfo struct {
 	// UVMDevMajor is nvidia-uvm's device major number. If UVMDevMajor is 0,
 	// nvidia-uvm is enabled.
 	UVMDevMajor uint32
+
+	// NvfsDevMajor is nvidia-fs's (GPUDirect Storage) device major number. If
+	// NvfsDevMajor is 0, nvidia-fs is not enabled (CapGPUDirectStorage is off).
+	NvfsDevMajor uint32
 }
 
 // DeviceInfoFromVFS returns device information for nvproxy devices registered

@@ -73,6 +73,37 @@ func newRegularFileFD(mnt *vfs.Mount, d *dentry, flags uint32, creds *auth.Crede
 func (fd *regularFileFD) Release(context.Context) {
 }
 
+// HostFDForGPUDirectStorage returns a host file descriptor for this file,
+// suitable for use as the data-file FD in nvidia-fs (GPUDirect Storage) ioctls
+// forwarded by nvproxy. The write parameter selects a writable rather than
+// readable host FD.
+//
+// It returns EINVAL if the file is not backed by a host FD, which is the case
+// when directfs is disabled (the file is served over the lisafs RPC connection)
+// or no host FD of the requested mode is open. nvproxy requires directfs
+// (enforced at configuration time for CapGPUDirectStorage), which guarantees a
+// host FD here for files on directfs mounts.
+//
+// This is intentionally single-purpose: it is the only way an external package
+// can obtain a gofer file's host FD, so its blast radius is limited to GPUDirect
+// Storage rather than exposing a general host-FD accessor.
+func (fd *regularFileFD) HostFDForGPUDirectStorage(write bool) (int32, error) {
+	i := fd.dentry().inode
+	i.handleMu.RLock()
+	defer i.handleMu.RUnlock()
+	// RacyLoad is safe because handleMu is held.
+	if write {
+		if hostFD := i.writeFD.RacyLoad(); hostFD >= 0 {
+			return hostFD, nil
+		}
+		return -1, linuxerr.EINVAL
+	}
+	if hostFD := i.readFD.RacyLoad(); hostFD >= 0 {
+		return hostFD, nil
+	}
+	return -1, linuxerr.EINVAL
+}
+
 // OnClose implements vfs.FileDescriptionImpl.OnClose.
 func (fd *regularFileFD) OnClose(ctx context.Context) error {
 	if !fd.vfsfd.IsWritable() {

@@ -23,6 +23,32 @@ be handled by the gVisor Sentry.
 For more information about gVisor GPU support, see the
 [user guide](https://gvisor.dev/docs/user_guide/gpu/).
 
+## GPUDirect Storage (experimental)
+
+GPUDirect Storage (GDS) lets the cuFile API DMA data directly between storage
+(e.g. local NVMe) and GPU memory, bypassing a CPU bounce buffer. nvproxy models
+this the same way it models the rest of the NVIDIA driver: by proxying the
+`/dev/nvidia-fs` character device's `ioctl`s and `mmap`s
+(`nvfs.go`/`nvfs_mmap.go`) rather than intercepting the userspace cuFile library.
+
+GDS is gated behind the privileged `gpudirect-storage` driver capability
+(`nvconf.CapGPUDirectStorage`). Like `profiling` and `fabric-imex-mgmt`, it is
+not covered by `all` and must be requested explicitly via
+`--nvproxy-allowed-driver-capabilities`.
+
+Because nvidia-fs performs file I/O on the data-file descriptor carried in its
+read/write ioctls, the descriptor must be a real host FD reachable from the
+Sentry. This is only true under `--directfs`, which donates host FDs to the
+Sentry; consequently `gpudirect-storage` requires directfs (enforced in
+`runsc/config`). Files on non-directfs mounts (overlay, tmpfs, RPC-mode gofer)
+have no usable host FD and must fall back to cuFile compatibility mode.
+
+This support is incomplete and the capability is intentionally excluded from
+`nvconf.SupportedDriverCaps` (so it cannot yet be enabled). The remaining work,
+which requires validation against GPU hardware, is documented in the source:
+shadow-buffer `cpuvaddr` translation and per-mapping tracking (`nvfs_mmap.go`),
+and reconciling the data-file FD's `O_DIRECT` requirement (`nvfs.go`).
+
 ## Adding Support for New Driver Versions
 
 The `nvproxy` package is sensitive to changes in the NVIDIA driver's Application

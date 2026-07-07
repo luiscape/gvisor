@@ -93,6 +93,10 @@ type driverABI struct {
 	uvmIoctl        map[uint32]uvmIoctlHandler
 	controlCmd      map[uint32]controlCmdHandler
 	allocationClass map[nvgpu.ClassID]allocationClassHandler
+	// nvfsIoctl handles ioctls on /dev/nvidia-fs (GPUDirect Storage). It is
+	// version-independent of the GPU driver (nvidia-fs ships separately), so it
+	// is set once in the base ABI and inherited by all versions.
+	nvfsIoctl map[uint32]nvfsIoctlHandler
 
 	getInfo driverABIInfoFunc // lazy constructor for the DriverABIInfo
 }
@@ -471,6 +475,15 @@ func Init() {
 					nvgpu.HOPPER_SEC2_WORK_LAUNCH_A:  allocHandler(rmAllocNoParams, compUtil),
 					nvgpu.NV04_DISPLAY_COMMON:        allocHandler(rmAllocNoParams, nvconf.CapGraphics),
 					nvgpu.NV20_SUBDEVICE_DIAG:        allocHandler(rmAllocNoParams, compUtil),
+				},
+
+				// nvidia-fs (GPUDirect Storage) ioctls. These are gated on
+				// CapGPUDirectStorage and inherited by all driver versions.
+				nvfsIoctl: map[uint32]nvfsIoctlHandler{
+					nvgpu.NVFS_IOCTL_REMOVE: nvfsHandler(nvfsIoctlRemove, nvconf.CapGPUDirectStorage),
+					nvgpu.NVFS_IOCTL_MAP:    nvfsHandler(nvfsIoctlMap, nvconf.CapGPUDirectStorage),
+					nvgpu.NVFS_IOCTL_READ:   nvfsHandler(nvfsIoctlReadWrite, nvconf.CapGPUDirectStorage),
+					nvgpu.NVFS_IOCTL_WRITE:  nvfsHandler(nvfsIoctlReadWrite, nvconf.CapGPUDirectStorage),
 				},
 
 				getInfo: func() *DriverABIInfo {

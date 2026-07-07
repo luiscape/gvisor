@@ -227,6 +227,27 @@ func TestHandlers(t *testing.T) {
 			},
 		)
 	})
+	t.Run("nvfs", func(t *testing.T) {
+		testHandler(
+			t,
+			func(handler nvfsIoctlHandler, ni *nvfsIoctlState) (uintptr, error) {
+				return handler.handle(ni)
+			},
+			nvfsHandler(func(*nvfsIoctlState) (uintptr, error) {
+				return 42, nil
+			}, capCompute),
+			&nvfsIoctlState{
+				fd: &nvfsFD{
+					dev: &nvfsDevice{nvp: capComputeNVP},
+				},
+			},
+			&nvfsIoctlState{
+				fd: &nvfsFD{
+					dev: &nvfsDevice{nvp: capUtilityNVP},
+				},
+			},
+		)
+	})
 }
 
 // TestFilterCapabilities loosely verifies that the seccomp filters have the
@@ -298,6 +319,7 @@ func TestFilterCapabilities(t *testing.T) {
 		t.Run(testName, func(t *testing.T) {
 			frontendIoctls := map[uint32]struct{}{}
 			uvmIoctls := map[uint32]struct{}{}
+			nvfsIoctls := map[uint32]struct{}{}
 			if caps != 0 {
 				for frontendIoctl := range nvproxyOnlyFrontendIoctls {
 					frontendIoctls[frontendIoctl] = struct{}{}
@@ -322,6 +344,11 @@ func TestFilterCapabilities(t *testing.T) {
 							uvmIoctls[ioctl] = struct{}{}
 						}
 					}
+					for ioctl, nh := range abi.nvfsIoctl {
+						if nh.capSet&caps != 0 {
+							nvfsIoctls[ioctl] = struct{}{}
+						}
+					}
 				}
 			}
 			wantFrontendIoctls := len(frontendIoctls)
@@ -331,6 +358,10 @@ func TestFilterCapabilities(t *testing.T) {
 			wantUvmIoctls := len(uvmIoctls)
 			if gotUvmIoctls := len(uvmIoctlFilters(caps)); gotUvmIoctls != wantUvmIoctls {
 				t.Errorf("uvmIoctlFilters(%q) returned %d UVM ioctls, expected %d", caps.String(), gotUvmIoctls, wantUvmIoctls)
+			}
+			wantNvfsIoctls := len(nvfsIoctls)
+			if gotNvfsIoctls := len(nvfsIoctlFilters(caps)); gotNvfsIoctls != wantNvfsIoctls {
+				t.Errorf("nvfsIoctlFilters(%q) returned %d nvidia-fs ioctls, expected %d", caps.String(), gotNvfsIoctls, wantNvfsIoctls)
 			}
 			if t.Failed() {
 				return
@@ -344,7 +375,7 @@ func TestFilterCapabilities(t *testing.T) {
 			if !isOr {
 				t.Fatalf("Filters(%q) returned a non-Or rule for SYS_IOCTL: %v (type: %T)", caps.String(), ioctlRules, ioctlRules)
 			}
-			wantTotalIoctls := wantFrontendIoctls + wantUvmIoctls
+			wantTotalIoctls := wantFrontendIoctls + wantUvmIoctls + wantNvfsIoctls
 			if gotTotalIoctls := len(ioctlOr); gotTotalIoctls != wantTotalIoctls {
 				t.Errorf("Filters(%q) returned %d total ioctl rules, expected %d", caps.String(), gotTotalIoctls, wantTotalIoctls)
 			}

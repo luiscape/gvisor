@@ -1880,6 +1880,22 @@ func createDeviceFiles(ctx context.Context, creds *auth.Credentials, info *conta
 			}
 			nvidiaDevs = append(nvidiaDevs, specs.LinuxDevice{Path: fmt.Sprintf("/dev/nvidia%d", minor), Type: "c", Major: nvgpu.NV_MAJOR_DEVICE_NUMBER, Minor: int64(minor)})
 		}
+		// nvidia-fs<N> (GPUDirect Storage) nodes, when the capability is enabled.
+		// Their host major is dynamic, so use the major nvproxy allocated.
+		if info.nvproxyDevInfo.NvfsDevMajor != 0 {
+			nvidiaFsDeviceRegex := regexp.MustCompile(`^nvidia-fs(\d+)$`)
+			for _, name := range names {
+				ms := nvidiaFsDeviceRegex.FindStringSubmatch(name)
+				if ms == nil {
+					continue
+				}
+				minor, err := strconv.ParseUint(ms[1], 10, 32)
+				if err != nil {
+					return fmt.Errorf("invalid nvidia-fs device name %q: %w", name, err)
+				}
+				nvidiaDevs = append(nvidiaDevs, specs.LinuxDevice{Path: fmt.Sprintf("/dev/nvidia-fs%d", minor), Type: "c", Major: int64(info.nvproxyDevInfo.NvfsDevMajor), Minor: int64(minor)})
+			}
+		}
 		for _, nvidiaDev := range nvidiaDevs {
 			if err := createDeviceFile(ctx, creds, info, vfsObj, root, nvidiaDev); err != nil {
 				return err
@@ -1945,6 +1961,11 @@ func createDeviceFile(ctx context.Context, creds *auth.Credentials, info *contai
 	} else if strings.HasPrefix(devSpec.Path, "/dev/nvidia-caps-imex-channels/") {
 		if info.nvproxyDevInfo.CapsIMEXChannelsDevMajor != 0 && major != info.nvproxyDevInfo.CapsIMEXChannelsDevMajor {
 			major = info.nvproxyDevInfo.CapsIMEXChannelsDevMajor
+			log.Infof("Switching %s device major number from %d to %d", devSpec.Path, devSpec.Major, major)
+		}
+	} else if strings.HasPrefix(devSpec.Path, "/dev/nvidia-fs") {
+		if info.nvproxyDevInfo.NvfsDevMajor != 0 && major != info.nvproxyDevInfo.NvfsDevMajor {
+			major = info.nvproxyDevInfo.NvfsDevMajor
 			log.Infof("Switching %s device major number from %d to %d", devSpec.Path, devSpec.Major, major)
 		}
 	}

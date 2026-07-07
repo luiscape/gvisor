@@ -388,3 +388,16 @@ func (c *rootClient) Restore(ctx goContext.Context) error {
 	temp.ioctlParams.HRoot = c.handle
 	return temp.restore()
 }
+
+// beforeSave is invoked by stateify.
+func (fd *nvfsFD) beforeSave() {
+	// GPUDirect Storage save/restore is not yet implemented (the MAP
+	// registrations and shadow-buffer mappings are not persisted), so refuse to
+	// checkpoint a sandbox with an open /dev/nvidia-fs FD.
+	panic("nvproxy.nvfsFD is not saveable")
+}
+
+// afterLoad is invoked by stateify.
+func (fd *nvfsFD) afterLoad(ctx goContext.Context) {
+	panic("nvproxy.nvfsFD is not restorable")
+}

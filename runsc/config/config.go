@@ -538,6 +538,13 @@ func (c *Config) Validate() error {
 	if unsupported := allowedCaps & ^nvconf.SupportedDriverCaps; unsupported != 0 {
 		return fmt.Errorf("--nvproxy-allowed-driver-capabilities=%q: unsupported capabilities: %v", c.NVProxyAllowedDriverCapabilities, unsupported)
 	}
+	// GPUDirect Storage requires directfs: nvproxy forwards nvidia-fs ioctls
+	// that reference the data file by its host FD, which is only reachable from
+	// the sentry when directfs donates it. Without directfs there is no usable
+	// host FD, so the capability must not be enabled.
+	if allowedCaps&nvconf.CapGPUDirectStorage != 0 && !c.DirectFS {
+		return fmt.Errorf("--nvproxy-allowed-driver-capabilities=%q: gpudirect-storage requires --directfs", c.NVProxyAllowedDriverCapabilities)
+	}
 	return nil
 }
 

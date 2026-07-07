@@ -42,6 +42,7 @@ const (
 	CapFabricIMEXManagement // NV_RM_CAP_SYS_FABRIC_IMEX_MGMT
 	CapProfiling            // GPU hardware performance counter access (Nsight Compute/Systems)
 	CapRDMA                 // GPUDirect RDMA: exporting GPU memory to a dma-buf fd
+	CapGPUDirectStorage     // GPUDirect Storage (cuFile / nvidia-fs); see nvproxy nvidia-fs device
 
 	numValidCaps int = iota
 )
@@ -56,7 +57,12 @@ const (
 
 	// SupportedDriverCaps is the set of driver capabilities that are supported by
 	// nvproxy.
-	SupportedDriverCaps = AllContainerDriverCaps | CapFabricIMEXManagement | CapProfiling | CapRDMA
+	//
+	// CapGPUDirectStorage enables the nvidia-fs (GPUDirect Storage) device proxy.
+	// The REMOVE/MAP/mmap path (cuFile driver init + buffer registration) is
+	// implemented; the READ/WRITE DMA path additionally requires a stable shadow
+	// mapping and runs only against a GDS-capable storage backend.
+	SupportedDriverCaps = AllContainerDriverCaps | CapFabricIMEXManagement | CapProfiling | CapRDMA | CapGPUDirectStorage
 
 	// AllContainerDriverCaps is the subset of SupportedDriverCaps that are
 	// enabled when enabling "all" capabilities is requested, which excludes
@@ -94,6 +100,8 @@ func (c DriverCaps) individualString() string {
 		return "profiling"
 	case CapRDMA:
 		return "rdma"
+	case CapGPUDirectStorage:
+		return "gpudirect-storage"
 	default:
 		panic(fmt.Sprintf("capability has no string mapping: %x", uint16(c)))
 	}

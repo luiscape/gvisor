@@ -51,8 +51,18 @@ func TestNVIDIAFlagsSkipsPrivilegedCaps(t *testing.T) {
 			want: nil,
 		},
 		{
+			name: "gpudirect_storage_only",
+			caps: CapGPUDirectStorage,
+			want: nil,
+		},
+		{
 			name: "compute_and_profiling",
 			caps: CapCompute | CapProfiling,
+			want: []string{"--compute"},
+		},
+		{
+			name: "compute_and_gpudirect_storage",
+			caps: CapCompute | CapGPUDirectStorage,
 			want: []string{"--compute"},
 		},
 	} {
@@ -64,5 +74,25 @@ func TestNVIDIAFlagsSkipsPrivilegedCaps(t *testing.T) {
 				t.Errorf("NVIDIAFlags() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestGPUDirectStorageCapString verifies that the gpudirect-storage capability
+// has a string mapping that round-trips through DriverCapsFromString. The flag
+// parser (--nvproxy-allowed-driver-capabilities) relies on this.
+func TestGPUDirectStorageCapString(t *testing.T) {
+	const name = "gpudirect-storage"
+	if got := CapGPUDirectStorage.String(); got != name {
+		t.Errorf("CapGPUDirectStorage.String() = %q, want %q", got, name)
+	}
+	got, hasAll, err := DriverCapsFromString(name)
+	if err != nil {
+		t.Fatalf("DriverCapsFromString(%q) failed: %v", name, err)
+	}
+	if hasAll {
+		t.Errorf("DriverCapsFromString(%q) reported hasAll = true, want false", name)
+	}
+	if got != CapGPUDirectStorage {
+		t.Errorf("DriverCapsFromString(%q) = %v, want %v", name, got, CapGPUDirectStorage)
 	}
 }

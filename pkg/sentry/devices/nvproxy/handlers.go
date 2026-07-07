@@ -154,3 +154,33 @@ func (h uvmIoctlHandler) handle(ui *uvmIoctlState) (uintptr, error) {
 	}
 	return h.handler(ui)
 }
+
+type nvfsIoctlHandler struct {
+	// handler is the function to call if a capability in capSet is enabled.
+	handler func(*nvfsIoctlState) (uintptr, error)
+	// capSet is a bitmask of capabilities that this handler is available for.
+	capSet nvconf.DriverCaps
+}
+
+// nvfsHandler returns an nvfsIoctlHandler that wraps the given function.
+// The handler will be called if any of the given capabilities are enabled.
+func nvfsHandler(handler func(*nvfsIoctlState) (uintptr, error), caps nvconf.DriverCaps) nvfsIoctlHandler {
+	return nvfsIoctlHandler{
+		handler: handler,
+		capSet:  caps,
+	}
+}
+
+// handle calls the handler if the capability is enabled.
+// Returns errMissingCapability if the caller is missing the required
+// capabilities for this handler.
+// Returns errUndefinedHandler if the handler does not exist.
+func (h nvfsIoctlHandler) handle(ni *nvfsIoctlState) (uintptr, error) {
+	if h.handler == nil {
+		return 0, &errUndefinedHandler
+	}
+	if h.capSet&ni.fd.dev.nvp.capsEnabled == 0 {
+		return 0, &errMissingCapability
+	}
+	return h.handler(ni)
+}
