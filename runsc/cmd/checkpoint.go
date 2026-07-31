@@ -43,6 +43,14 @@ type Checkpoint struct {
 	saveRestoreExecArgv       string
 	saveRestoreExecTimeout    time.Duration
 
+	// pagesLayout selects the layout of the checkpoint pages file: "compact"
+	// (the default) packs saved pages contiguously; "identity" writes each
+	// page at a file offset equal to its offset in the sandbox's memory file,
+	// producing a sparse file that a subsequent restore can adopt in place
+	// with `runsc restore --adopt-pages-file`. "identity" requires
+	// --compression=none.
+	pagesLayout string
+
 	// direct indicates whether O_DIRECT should be used for writing the
 	// checkpoint pages file. It bypasses the kernel page cache. It is beneficial
 	// if the checkpoint files are not expected to be read again on this host.
@@ -76,6 +84,7 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.cudaCheckpointPath, "cuda-checkpoint-path", "", "path to the cuda-checkpoint binary in the container")
 	f.BoolVar(&c.cudaCheckpointSequential, "cuda-checkpoint-sequential", false, "run cuda-checkpoint sequentially in the container")
 	f.StringVar(&c.saveRestoreExecArgv, "save-restore-exec-argv", "", "argv (split by spaces) for a save/restore binary that's automatically executed in the sandbox before saving and after restoring. If the execution fails, the save/restore process will fail.")
+	f.StringVar(&c.pagesLayout, "pages-layout", "compact", "layout of the checkpoint pages file. Values: compact|identity. 'identity' writes pages at file offsets equal to their memory file offsets (sparse), enabling zero-copy restore via 'runsc restore --adopt-pages-file'; requires --compression=none.")
 	f.DurationVar(&c.saveRestoreExecTimeout, "save-restore-exec-timeout", control.DefaultSaveRestoreExecTimeout, "timeout for the binary pointed to by save-restore-exec-argv.")
 
 	// Unimplemented flags necessary for compatibility with docker.
@@ -114,6 +123,21 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		util.Fatalf("making directories at path provided: %v", err)
 	}
 
+	var pagesFileIdentity bool
+	switch c.pagesLayout {
+	case "", "compact":
+	case "identity":
+		pagesFileIdentity = true
+		if c.compression.Level() != statefile.CompressionLevelNone {
+			util.Fatalf("--pages-layout=identity requires --compression=none")
+		}
+		if c.direct {
+			util.Fatalf("--pages-layout=identity is incompatible with --direct")
+		}
+	default:
+		util.Fatalf("invalid --pages-layout %q; must be compact or identity", c.pagesLayout)
+	}
+
 	opts := sandbox.CheckpointOpts{
 		Compression:                c.compression.Level(),
 		Resume:                     c.leaveRunning,
@@ -124,6 +148,7 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		SaveRestoreExecArgv:        c.saveRestoreExecArgv,
 		SaveRestoreExecTimeout:     c.saveRestoreExecTimeout,
 		SaveRestoreExecContainerID: cont.ID,
+		PagesFileIdentity:          pagesFileIdentity,
 	}
 
 	if err := cont.Checkpoint(conf, c.imagePath, opts); err != nil {

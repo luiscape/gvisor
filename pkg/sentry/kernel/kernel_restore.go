@@ -262,6 +262,11 @@ type AsyncMFLoader struct {
 	// MemoryFiles, once they are known. This channel is written to exactly once.
 	privateMFsChan chan map[checkpoint.ResourceID]*pgalloc.MemoryFile
 
+	// adopt is true if the main MemoryFile adopts its backing file (its page
+	// contents are already in place) and no pages file is used; see
+	// NewAdoptingMFLoader. adopt is immutable.
+	adopt bool
+
 	mainMFStartWg   sync.WaitGroup
 	mainMetadataErr error
 
@@ -290,6 +295,24 @@ func NewAsyncMFLoader(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader
 	return mfl
 }
 
+// NewAdoptingMFLoader creates a new AsyncMFLoader for a main MemoryFile that
+// adopts its backing file: mainMF must have been created with
+// pgalloc.MemoryFileOpts.AdoptBackingFile from a pages file in identity
+// layout, so page contents are already in place and only MemoryFile metadata
+// is loaded (from pagesMetadata, which also contains private MemoryFile pages
+// inline). It takes ownership of pagesMetadata and timeline.
+func NewAdoptingMFLoader(pagesMetadata io.ReadCloser, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) *AsyncMFLoader {
+	mfl := &AsyncMFLoader{
+		privateMFsChan: make(chan map[checkpoint.ResourceID]*pgalloc.MemoryFile, 1),
+		adopt:          true,
+	}
+	mfl.mainMFStartWg.Add(1)
+	mfl.metadataWg.Add(1)
+	mfl.loadWg.Add(1)
+	go mfl.backgroundGoroutine(pagesMetadata, nil, mainMF, timeline)
+	return mfl
+}
+
 func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) {
 	defer timeline.End()
 	defer pagesMetadata.Close()
@@ -299,21 +322,27 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
 	})
 	defer cu.Clean()
 
-	mfl.loadWg.Add(1)
-	apfl, err := pgalloc.StartAsyncPagesFileLoad(pagesFile, func(err error) {
-		defer mfl.loadWg.Done()
-		mfl.loadErr = err
-	}, timeline) // transfers ownership of pagesFile
-	if err != nil {
-		mfl.loadWg.Done()
-		log.Warningf("Failed to start async page loading: %v", err)
-		return
-	}
-	cu.Add(apfl.MemoryFilesDone)
-
 	opts := pgalloc.LoadOpts{
-		PagesFile: apfl,
-		Timeline:  timeline,
+		Timeline: timeline,
+	}
+	if mfl.adopt {
+		// Page contents for the main MemoryFile are already in its adopted
+		// backing file; private MemoryFile pages are read inline from
+		// pagesMetadata.
+		opts.AdoptBackingFile = true
+	} else {
+		mfl.loadWg.Add(1)
+		apfl, err := pgalloc.StartAsyncPagesFileLoad(pagesFile, func(err error) {
+			defer mfl.loadWg.Done()
+			mfl.loadErr = err
+		}, timeline) // transfers ownership of pagesFile
+		if err != nil {
+			mfl.loadWg.Done()
+			log.Warningf("Failed to start async page loading: %v", err)
+			return
+		}
+		cu.Add(apfl.MemoryFilesDone)
+		opts.PagesFile = apfl
 	}
 	// Note that we depend on opts.PagesFileOffset being carried between
 	// LoadFrom calls, so the same opts must be used for all calls.
@@ -321,7 +350,7 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
 	timeline.Reached("loading mainMF")
 	log.Infof("Loading metadata for main MemoryFile: %p", mainMF)
 	ctx := context.Background()
-	err = mainMF.LoadFrom(ctx, pagesMetadata, &opts)
+	err := mainMF.LoadFrom(ctx, pagesMetadata, &opts)
 	mfl.metadataErr = err
 	mfl.mainMetadataErr = err
 	mfl.mainMFStartWg.Done()
@@ -333,6 +362,11 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
 	privateMFs := <-mfl.privateMFsChan
 	timeline.Reached("received privateMFs info")
 	log.Infof("Loading metadata for %d private MemoryFiles", len(privateMFs))
+	if mfl.adopt {
+		// Only the main MemoryFile adopts its backing file; private
+		// MemoryFiles load their pages inline from pagesMetadata.
+		opts.AdoptBackingFile = false
+	}
 	if err := loadPrivateMemoryFiles(ctx, pagesMetadata, privateMFs, &opts); err != nil {
 		log.Warningf("Failed to load private MemoryFiles: %v", err)
 		mfl.metadataErr = err

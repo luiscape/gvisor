@@ -57,6 +57,15 @@ type Restore struct {
 	// uncompressed for background to work; if the checkpoint is compressed,
 	// background has no effect.
 	background bool
+
+	// If adoptPagesFile is true, the checkpoint pages file (which must have
+	// been written with `runsc checkpoint --pages-layout=identity`) is
+	// adopted as the sandbox's memory file: its pages are used in place
+	// (zero-copy) rather than being copied into a new memfd. This is most
+	// effective when the checkpoint image is stored on tmpfs. The pages file
+	// is mutated (and eventually destroyed) by the sandbox, so the checkpoint
+	// image can only be restored once this way.
+	adoptPagesFile bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -81,6 +90,7 @@ func (r *Restore) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&r.detach, "detach", false, "detach from the container's process")
 	f.BoolVar(&r.direct, "direct", false, "use O_DIRECT for reading checkpoint pages file")
 	f.BoolVar(&r.background, "background", false, "allow image loading to continue after restore exits (requires uncompressed checkpoint)")
+	f.BoolVar(&r.adoptPagesFile, "adopt-pages-file", false, "adopt the checkpoint pages file as the sandbox's memory file (zero-copy; requires a checkpoint taken with --pages-layout=identity). The pages file is mutated by the sandbox and can only be restored once.")
 
 	// Unimplemented flags necessary for compatibility with docker.
 
@@ -183,8 +193,12 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 		runArgs.Spec = c.Spec
 	}
 
+	if r.adoptPagesFile && r.direct {
+		return util.Errorf("--adopt-pages-file is incompatible with --direct")
+	}
+
 	log.Debugf("Restore: %v", r.imagePath)
-	err = c.Restore(conf, r.imagePath, r.direct, r.background, nil /* networkArgs */)
+	err = c.Restore(conf, r.imagePath, r.direct, r.background, r.adoptPagesFile, nil /* networkArgs */)
 	if err != nil {
 		return util.Errorf("starting container: %v", err)
 	}

@@ -137,6 +137,12 @@ func NewFDWriter(fd int32, maxWriteBytes uint64, maxRanges, maxParallel int) *FD
 	}
 }
 
+// FD returns the host file descriptor that w writes to, or -1 if w has been
+// closed.
+func (w *FDWriter) FD() int32 {
+	return w.fd.Load()
+}
+
 // Close implements AsyncWriter.Close.
 func (w *FDWriter) Close() error {
 	fd := w.fd.Swap(-1)

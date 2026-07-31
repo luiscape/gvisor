@@ -533,7 +533,7 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 }
 
 // Restore sends the restore call for a container in the sandbox.
-func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, direct, background bool, networkArgs *boot.CreateLinksAndRoutesArgs) error {
+func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, direct, background, adoptPagesFile bool, networkArgs *boot.CreateLinksAndRoutesArgs) error {
 	if err := hostsettings.Handle(conf); err != nil {
 		return fmt.Errorf("host settings: %w (use --host-settings=ignore to bypass)", err)
 	}
@@ -541,14 +541,15 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	log.Debugf("Restore sandbox %q from path %q", s.ID, imagePath)
 
 	opt := boot.RestoreOpts{
-		Background: background,
+		Background:     background,
+		AdoptPagesFile: adoptPagesFile,
 	}
 	defer func() {
 		for _, f := range opt.FilePayload.Files {
 			_ = f.Close()
 		}
 	}()
-	if err := s.setRestoreOpts(conf, imagePath, direct, &opt); err != nil {
+	if err := s.setRestoreOpts(conf, imagePath, direct, adoptPagesFile, &opt); err != nil {
 		return err
 	}
 
@@ -591,17 +592,33 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	if err := conn.Call(boot.ContMgrRestore, &opt, nil); err != nil {
 		return fmt.Errorf("restoring container %q: %v", cid, err)
 	}
+	if adoptPagesFile {
+		// The sandbox has adopted the pages file as its memory file and will
+		// mutate it in place, so the checkpoint image is no longer restorable.
+		// Unlink it so that a second restore attempt fails cleanly rather
+		// than restoring corrupt state, and so that its (typically tmpfs)
+		// pages are freed when the sandbox exits.
+		pagesFileName := path.Join(imagePath, checkpointfiles.PagesFileName)
+		if err := os.Remove(pagesFileName); err != nil {
+			log.Warningf("Failed to unlink adopted pages file %q: %v", pagesFileName, err)
+		} else {
+			log.Infof("Unlinked adopted pages file %q; this checkpoint image cannot be restored again", pagesFileName)
+		}
+	}
 	s.Restored = true
 	return nil
 }
 
-func (s *Sandbox) setRestoreOpts(conf *config.Config, imagePath string, direct bool, opt *boot.RestoreOpts) error {
+func (s *Sandbox) setRestoreOpts(conf *config.Config, imagePath string, direct, adoptPagesFile bool, opt *boot.RestoreOpts) error {
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, imagePath, "-allow-checkpoint-reads")
 	if err != nil {
 		return err
 	}
 	if clientSockFile == nil {
-		return s.setRestoreOptsForLocalCheckpointFiles(conf, imagePath, direct, opt)
+		return s.setRestoreOptsForLocalCheckpointFiles(conf, imagePath, direct, adoptPagesFile, opt)
+	}
+	if adoptPagesFile {
+		return fmt.Errorf("adopting the pages file is not supported with the checkpoint gofer")
 	}
 	log.Infof("Restoring from GCS via checkpoint gofer")
 	opt.FilePayload.Files = append(opt.FilePayload.Files, clientSockFile)
@@ -609,7 +626,7 @@ func (s *Sandbox) setRestoreOpts(conf *config.Config, imagePath string, direct b
 	return nil
 }
 
-func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, imagePath string, direct bool, opt *boot.RestoreOpts) error {
+func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, imagePath string, direct, adoptPagesFile bool, opt *boot.RestoreOpts) error {
 	stateFileName := path.Join(imagePath, checkpointfiles.StateFileName)
 	sf, err := os.Open(stateFileName)
 	if err != nil {
@@ -624,6 +641,11 @@ func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, ima
 		opt.FilePayload.Files = append(opt.FilePayload.Files, pmf)
 		pagesFileName := path.Join(imagePath, checkpointfiles.PagesFileName)
 		pagesReadFlags := os.O_RDONLY
+		if adoptPagesFile {
+			// The pages file becomes the main MemoryFile's backing file, so
+			// it must be writable.
+			pagesReadFlags = os.O_RDWR
+		}
 		if direct {
 			// The contents are page-aligned, so it can be opened with O_DIRECT.
 			pagesReadFlags |= syscall.O_DIRECT
@@ -636,6 +658,8 @@ func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, ima
 		opt.HavePagesFile = true
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("opening pages metadata file %q failed: %w", pagesMetadataFileName, err)
+	} else if adoptPagesFile {
+		return fmt.Errorf("adopting the pages file requires a separate pages file (checkpoint taken with --compression=none)")
 	} else {
 		log.Infof("Using single checkpoint file for sandbox %q", s.ID)
 	}
@@ -1617,6 +1641,13 @@ type CheckpointOpts struct {
 	CudaCheckpointPath        string
 	CudaCheckpointSequential  bool
 
+	// If PagesFileIdentity is true, the main MemoryFile's pages are written
+	// to the pages file at file offsets equal to their MemoryFile offsets
+	// ("identity layout"), allowing a subsequent restore to adopt the pages
+	// file as the MemoryFile's backing file (zero-copy restore). Requires
+	// Compression == statefile.CompressionLevelNone.
+	PagesFileIdentity bool
+
 	// Save/restore exec options.
 	SaveRestoreExecArgv        string
 	SaveRestoreExecTimeout     time.Duration
@@ -1634,6 +1665,7 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 		Resume:                         opts.Resume,
 		CudaCheckpointPath:             opts.CudaCheckpointPath,
 		CudaCheckpointSequential:       opts.CudaCheckpointSequential,
+		PagesFileIdentity:              opts.PagesFileIdentity,
 		ExecOpts: control.SaveRestoreExecOpts{
 			Argv:        opts.SaveRestoreExecArgv,
 			Timeout:     opts.SaveRestoreExecTimeout,

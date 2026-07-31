@@ -83,6 +83,12 @@ type SaveOpts struct {
 	// metadata file is provided.
 	HavePagesFile bool `json:"have_pages_file"`
 
+	// PagesFileIdentity indicates that the main MemoryFile's pages should be
+	// written to the pages file at file offsets equal to their MemoryFile
+	// offsets ("identity layout"), allowing a subsequent restore to adopt the
+	// pages file as the MemoryFile's backing file. Requires HavePagesFile.
+	PagesFileIdentity bool `json:"pages_file_identity"`
+
 	// FilePayload contains the following:
 	// 1. checkpoint state file.
 	// 2. optional checkpoint pages metadata file.
@@ -134,6 +140,7 @@ func ConvertToStateSaveOpts(o *SaveOpts) (*state.SaveOpts, error) {
 		Resume:                         o.Resume,
 		CudaCheckpointPath:             o.CudaCheckpointPath,
 		CudaCheckpointSequential:       o.CudaCheckpointSequential,
+		PagesFileIdentity:              o.PagesFileIdentity,
 	}
 	if err := setSaveOpts(o, saveOpts); err != nil {
 		saveOpts.Close()
@@ -143,7 +150,13 @@ func ConvertToStateSaveOpts(o *SaveOpts) (*state.SaveOpts, error) {
 }
 
 func setSaveOpts(o *SaveOpts, saveOpts *state.SaveOpts) error {
+	if o.PagesFileIdentity && !o.HavePagesFile {
+		return fmt.Errorf("PagesFileIdentity requires HavePagesFile")
+	}
 	if o.UseCheckpointGofer {
+		if o.PagesFileIdentity {
+			return fmt.Errorf("PagesFileIdentity is not supported with the checkpoint gofer")
+		}
 		return setSaveOptsForCheckpointGofer(o, saveOpts)
 	}
 	return setSaveOptsForLocalCheckpointFiles(o, saveOpts)

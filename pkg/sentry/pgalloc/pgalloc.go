@@ -384,6 +384,17 @@ type MemoryFileOpts struct {
 	// If DisableMemoryAccounting is true, memory usage observed by the
 	// MemoryFile will not be reported in usage.MemoryAccounting.
 	DisableMemoryAccounting bool
+
+	// If AdoptBackingFile is true, the file passed to NewMemoryFile already
+	// contains this MemoryFile's pages in identity layout (page contents at
+	// file offsets equal to their MemoryFile offsets), as written by a
+	// previous checkpoint with SaveOpts.IdentityPagesFile. The file will not
+	// be truncated on creation; its contents are used in place by a
+	// subsequent call to LoadFrom with LoadOpts.AdoptBackingFile, rather than
+	// being copied into a new file. Note that the file is mutated (and
+	// eventually destroyed) by the MemoryFile, so the checkpoint image can
+	// only be restored once this way.
+	AdoptBackingFile bool
 }
 
 // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
@@ -432,9 +443,11 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 		return nil, fmt.Errorf("invalid MemoryFileOpts.DelayedEviction: %v", opts.DelayedEviction)
 	}
 
-	// Truncate the file to 0 bytes first to ensure that it's empty.
-	if err := file.Truncate(0); err != nil {
-		return nil, err
+	if !opts.AdoptBackingFile {
+		// Truncate the file to 0 bytes first to ensure that it's empty.
+		if err := file.Truncate(0); err != nil {
+			return nil, err
+		}
 	}
 	f := &MemoryFile{
 		opts: opts,

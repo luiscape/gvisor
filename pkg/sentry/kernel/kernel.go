@@ -713,8 +713,14 @@ func savePrivateMFs(ctx context.Context, w io.Writer, mfsToSave map[checkpoint.R
 // SaveTo saves the state of k to stateFile. It takes ownership of stateFile,
 // pagesMetadata, and pagesFile, even if it returns a non-nil error.
 //
+// If pagesFileIdentity is true, the main MemoryFile's pages are written to
+// pagesFile at file offsets equal to their MemoryFile offsets ("identity
+// layout"), allowing a subsequent restore to adopt the pages file as the
+// MemoryFile's backing file; private MemoryFile pages are saved inline into
+// pagesMetadata.
+//
 // Preconditions: The kernel must be paused throughout the call to SaveTo.
-func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool) error {
+func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, pagesFileIdentity bool, appMFExcludeCommittedZeroPages, resume bool) error {
 	if hostarch.PageSize != 4096 {
 		return fmt.Errorf("save is not supported with %dK page size", hostarch.PageSize/1024)
 	}
@@ -763,7 +769,7 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 			mfSaveWg.Add(1)
 			go func() {
 				defer mfSaveWg.Done()
-				mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, mfsToSave, appMFExcludeCommittedZeroPages) // transfers ownership
+				mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, pagesFileIdentity, mfsToSave, appMFExcludeCommittedZeroPages) // transfers ownership
 			}()
 			pagesCleanup.Release()
 			// Defer a Wait() so we wait for k.saveMemoryFiles() to complete even if we
@@ -817,7 +823,7 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 				return mfSaveErr
 			}
 		} else {
-			mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, mfsToSave, appMFExcludeCommittedZeroPages)
+			mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, false, mfsToSave, appMFExcludeCommittedZeroPages)
 			if mfSaveErr != nil {
 				return mfSaveErr
 			}
@@ -846,7 +852,11 @@ func (k *Kernel) BeforeResume(ctx context.Context) {
 // pagesFile must be non-nil, saveMemoryFiles takes ownership of both
 // pagesMetadata and pagesFile (even if it returns a non-nil error), and
 // MemoryFile state will be saved to pagesMetadata and pagesFile.
-func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages bool) error {
+//
+// If pagesFileIdentity is true, the main MemoryFile's pages are written to
+// pagesFile in identity layout, and private MemoryFile pages are saved inline
+// into pagesMetadata; see Kernel.SaveTo.
+func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, pagesFileIdentity bool, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages bool) error {
 	memoryStart := time.Now()
 
 	pmw := w
@@ -867,19 +877,33 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 	)
 	defer asyncPageSaveCleanup.Clean()
 	if pagesFile != nil {
-		asyncPageSaveWg.Add(1)
-		apfs, err := pgalloc.StartAsyncPagesFileSave(pagesFile, func(err error) {
-			defer asyncPageSaveWg.Done()
-			asyncPageSaveErr = err
-		}) // transfers ownership
-		if err != nil {
-			return fmt.Errorf("failed to start async pages file saving: %w", err)
+		if pagesFileIdentity {
+			// The main MemoryFile's pages are written synchronously to
+			// pagesFile at their MemoryFile offsets; private MemoryFiles are
+			// saved inline into pmw below.
+			fdw, ok := pagesFile.(*stateio.FDWriter)
+			if !ok {
+				pagesFile.Close()
+				return fmt.Errorf("pages file identity layout requires a pages file backed by a host FD, got %T", pagesFile)
+			}
+			defer pagesFile.Close()
+			mfOpts.IdentityPagesFile = true
+			mfOpts.IdentityPagesFileFD = fdw.FD()
+		} else {
+			asyncPageSaveWg.Add(1)
+			apfs, err := pgalloc.StartAsyncPagesFileSave(pagesFile, func(err error) {
+				defer asyncPageSaveWg.Done()
+				asyncPageSaveErr = err
+			}) // transfers ownership
+			if err != nil {
+				return fmt.Errorf("failed to start async pages file saving: %w", err)
+			}
+			asyncPageSaveCleanup.Add(func() {
+				apfs.MemoryFilesDone()
+				asyncPageSaveWg.Wait()
+			})
+			mfOpts.PagesFile = apfs
 		}
-		asyncPageSaveCleanup.Add(func() {
-			apfs.MemoryFilesDone()
-			asyncPageSaveWg.Wait()
-		})
-		mfOpts.PagesFile = apfs
 	}
 
 	if err := k.mf.SaveTo(ctx, pmw, &mfOpts); err != nil {
@@ -888,6 +912,10 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 	// appMFExcludeCommittedZeroPages is expected to reflect application memory
 	// usage behavior, but not necessarily usage of private MemoryFiles.
 	mfOpts.ExcludeCommittedZeroPages = false
+	// Private MemoryFiles are not saved in identity layout; when
+	// pagesFileIdentity is true, their pages are saved inline into pmw.
+	mfOpts.IdentityPagesFile = false
+	mfOpts.IdentityPagesFileFD = 0
 	if err := savePrivateMFs(ctx, pmw, mfsToSave, &mfOpts); err != nil {
 		return err
 	}

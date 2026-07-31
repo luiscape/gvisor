@@ -564,6 +564,15 @@ type RestoreOpts struct {
 	HaveDeviceFile bool
 	Background     bool
 
+	// If AdoptPagesFile is true, the checkpoint pages file was saved in
+	// identity layout, and is adopted as the main MemoryFile's backing file:
+	// its pages are used in place (zero-copy) rather than being copied into a
+	// new memfd. The pages file must be open for both reading and writing,
+	// and is mutated (and eventually destroyed) by the sandbox, so the
+	// checkpoint image can only be restored once this way. Requires
+	// HavePagesFile.
+	AdoptPagesFile bool
+
 	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
 	// domain socket connected to a URPC server implementing
 	// stateipc.AsyncFileServer and providing checkpoint files. In this case,
@@ -601,7 +610,7 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 		return fmt.Errorf("at least one file must be passed to Restore")
 	}
 
-	stateFile, pagesMetadata, pagesFile, err := getRestoreReaders(o)
+	stateFile, pagesMetadata, pagesFile, adoptPagesFile, err := getRestoreReaders(o)
 	if err != nil {
 		return err
 	}
@@ -615,6 +624,9 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 		if pagesFile != nil {
 			pagesFile.Close()
 		}
+		if adoptPagesFile != nil {
+			adoptPagesFile.Close()
+		}
 	}()
 	timer.Reached("got restore readers")
 
@@ -625,7 +637,15 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 	}
 
 	// Create the main MemoryFile.
-	cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP)
+	if adoptPagesFile != nil {
+		// Adopt the identity-layout pages file as the main MemoryFile's
+		// backing file; its pages are used in place rather than copied.
+		pf := adoptPagesFile.ReleaseToFile(checkpointfiles.PagesFileName)
+		adoptPagesFile = nil
+		cm.restorer.mainMF, err = adoptMemoryFile(pf, cm.l.root.conf.AppHugePages, cm.l.hostTHP) // transfers ownership
+	} else {
+		cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP)
+	}
 	if err != nil {
 		return fmt.Errorf("creating memory file: %v", err)
 	}
@@ -633,7 +653,11 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 
 	if o.HavePagesFile {
 		// This immediately starts loading the main MemoryFile asynchronously.
-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
+		if o.AdoptPagesFile {
+			cm.restorer.asyncMFLoader = kernel.NewAdoptingMFLoader(pagesMetadata, cm.restorer.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
+		} else {
+			cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
+		}
 		pagesMetadata = nil
 		pagesFile = nil
 		timer.Reached("created async MF loader")
@@ -695,49 +719,68 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 	return cm.restorer.restoreContainerInfo(cm.l, &cm.l.root)
 }
 
-func getRestoreReaders(o *RestoreOpts) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
+// getRestoreReaders returns the state file, pages metadata, and pages file
+// readers for the given RestoreOpts. If o.AdoptPagesFile is true, the pages
+// file is returned as the fourth return value (a raw file to be adopted as
+// the main MemoryFile's backing file) instead of the third.
+func getRestoreReaders(o *RestoreOpts) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, *fd.FD, error) {
 	if o.UseCheckpointGofer {
-		return getRestoreReadersForCheckpointGofer(o)
+		if o.AdoptPagesFile {
+			return nil, nil, nil, nil, fmt.Errorf("AdoptPagesFile is not supported with the checkpoint gofer")
+		}
+		stateFile, pagesMetadata, pagesFile, err := getRestoreReadersForCheckpointGofer(o)
+		return stateFile, pagesMetadata, pagesFile, nil, err
+	}
+	if o.AdoptPagesFile && !o.HavePagesFile {
+		return nil, nil, nil, nil, fmt.Errorf("AdoptPagesFile requires HavePagesFile")
 	}
 	return getRestoreReadersForLocalCheckpointFiles(o)
 }
 
-func getRestoreReadersForLocalCheckpointFiles(o *RestoreOpts) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
+func getRestoreReadersForLocalCheckpointFiles(o *RestoreOpts) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, *fd.FD, error) {
 	stateFile, err := o.ReleaseFD(0)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	cu := cleanup.Make(func() { stateFile.Close() })
 	defer cu.Clean()
 	var stat unix.Stat_t
 	if err := unix.Fstat(stateFile.FD(), &stat); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	if stat.Size == 0 {
-		return nil, nil, nil, fmt.Errorf("statefile cannot be empty")
+		return nil, nil, nil, nil, fmt.Errorf("statefile cannot be empty")
 	}
 
 	if !o.HavePagesFile {
 		cu.Release()
-		return stateFile, nil, nil, nil
+		return stateFile, nil, nil, nil, nil
 	}
 	pagesMetadataFile, err := o.ReleaseFD(1)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	cu.Add(func() { pagesMetadataFile.Close() })
 	pagesFile, err := o.ReleaseFD(2)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	cu.Release()
 	// //pkg/state/wire reads one byte at a time; buffer reads from
 	// pagesMetadataFile to avoid making one syscall per read. For the state
 	// file, this buffering is handled by statefile.NewReader() =>
 	// compressio.Reader or compressio.NewSimpleReader().
+	if o.AdoptPagesFile {
+		return stateFile,
+			stateio.NewBufioReadCloser(pagesMetadataFile),
+			nil,
+			pagesFile,
+			nil
+	}
 	return stateFile,
 		stateio.NewBufioReadCloser(pagesMetadataFile),
 		stateio.NewPagesFileFDReaderDefault(int32(pagesFile.Release())),
+		nil,
 		nil
 }
 

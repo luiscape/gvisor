@@ -54,6 +54,13 @@ type SaveOpts struct {
 	// PagesFile is non-nil. Otherwise this content is stored in Destination.
 	PagesFile stateio.AsyncWriter
 
+	// If PagesFileIdentity is true, the main MemoryFile's pages are written
+	// to PagesFile at file offsets equal to their MemoryFile offsets
+	// ("identity layout"), allowing a subsequent restore to adopt the pages
+	// file as the MemoryFile's backing file. Requires PagesFile to be
+	// non-nil.
+	PagesFileIdentity bool
+
 	// Key is used to enable state integrity check.
 	Key []byte
 
@@ -157,7 +164,7 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	} else {
 		opts.Destination = nil
 		// Save the kernel.
-		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile
+		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.PagesFileIdentity, opts.AppMFExcludeCommittedZeroPages, opts.Resume) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
 	}

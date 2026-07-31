@@ -74,6 +74,12 @@ type memoryFileSaved struct {
 	subreleased  map[uint64]uint64
 	memAcct      *memAcctSet
 	chunks       []chunkInfo
+
+	// identityLayout is true if page contents were saved to a pages file in
+	// identity layout (SaveOpts.IdentityPagesFile); such a checkpoint can
+	// only be restored by adopting the pages file
+	// (LoadOpts.AdoptBackingFile).
+	identityLayout bool
 }
 
 // SaveOpts provides options to MemoryFile.SaveTo().
@@ -81,6 +87,19 @@ type SaveOpts struct {
 	// If PagesFile is not nil, then page contents will be written to PagesFile
 	// rather than to w.
 	PagesFile *AsyncPagesFileSave
+
+	// If IdentityPagesFile is true, page contents will be written
+	// synchronously to the host file descriptor IdentityPagesFileFD, at file
+	// offsets equal to their offsets in the MemoryFile ("identity layout"),
+	// rather than to w or PagesFile. The resulting pages file is sparse:
+	// uncommitted and zero pages are represented by holes. A checkpoint taken
+	// this way can only be restored by adopting the pages file as the
+	// MemoryFile's backing file (MemoryFileOpts.AdoptBackingFile and
+	// LoadOpts.AdoptBackingFile).
+	//
+	// Preconditions: If IdentityPagesFile is true, PagesFile must be nil.
+	IdentityPagesFile   bool
+	IdentityPagesFileFD int32
 
 	// If ExcludeCommittedZeroPages is true, SaveTo() will scan both committed
 	// and possibly-committed pages to find zero pages, whose contents are
@@ -97,6 +116,9 @@ type SaveOpts struct {
 
 // SaveTo writes f's state to the given stream.
 func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) error {
+	if opts.IdentityPagesFile && opts.PagesFile != nil {
+		return fmt.Errorf("SaveOpts.IdentityPagesFile requires SaveOpts.PagesFile == nil")
+	}
 	if err := f.AwaitLoadAll(); err != nil {
 		return fmt.Errorf("previous async page loading failed: %w", err)
 	}
@@ -158,6 +180,10 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		newUncommittedBytes     uint64
 	)
 	asyncWritePages := func(fr memmap.FileRange) {}
+	var (
+		identityWriteErr   error
+		identityBytesSaved uint64
+	)
 	if amfs != nil {
 		asyncWritePages = func(fr memmap.FileRange) {
 			amount := fr.Length()
@@ -169,6 +195,28 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			amfs.pf.saveOff += amount
 			amfs.pf.mu.Unlock()
 			amfs.pf.stStatus.Notify(apsSTPending)
+		}
+	} else if opts.IdentityPagesFile {
+		// Write pages synchronously to the pages file at their MemoryFile
+		// offsets, producing a sparse identity-layout file.
+		identityFD := int(opts.IdentityPagesFileFD)
+		asyncWritePages = func(fr memmap.FileRange) {
+			if identityWriteErr != nil {
+				return
+			}
+			off := fr.Start
+			f.forEachMappingSlice(fr, func(s []byte) {
+				for len(s) != 0 && identityWriteErr == nil {
+					n, err := unix.Pwrite(identityFD, s, int64(off))
+					if err != nil {
+						identityWriteErr = err
+						return
+					}
+					s = s[n:]
+					off += uint64(n)
+					identityBytesSaved += uint64(n)
+				}
+			})
 		}
 	}
 
@@ -383,23 +431,30 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		alreadyCommittedBytes,
 		newCommittedBytes,
 		opts.ExcludeCommittedZeroPages)
+	if identityWriteErr != nil {
+		return fmt.Errorf("failed to write pages to identity pages file: %w", identityWriteErr)
+	}
+	if opts.IdentityPagesFile {
+		log.Infof("MemoryFile(%p): saved %d bytes to identity pages file", f, identityBytesSaved)
+	}
 
 	// Save metadata.
 	timeMetadataStart := gohacks.Nanotime()
 	if _, err := state.Save(ctx, w, &memoryFileSaved{
-		unwasteSmall: &f.unwasteSmall,
-		unwasteHuge:  &f.unwasteHuge,
-		unfreeSmall:  &f.unfreeSmall,
-		unfreeHuge:   &f.unfreeHuge,
-		subreleased:  f.subreleased,
-		memAcct:      &f.memAcct,
-		chunks:       f.chunksLoad(),
+		unwasteSmall:   &f.unwasteSmall,
+		unwasteHuge:    &f.unwasteHuge,
+		unfreeSmall:    &f.unfreeSmall,
+		unfreeHuge:     &f.unfreeHuge,
+		subreleased:    f.subreleased,
+		memAcct:        &f.memAcct,
+		chunks:         f.chunksLoad(),
+		identityLayout: opts.IdentityPagesFile,
 	}); err != nil {
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
 	log.Infof("MemoryFile(%p): saved metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
 
-	if amfs == nil {
+	if amfs == nil && !opts.IdentityPagesFile {
 		// Save committed pages.
 		ww := wire.Writer{Writer: w}
 		timePagesStart := gohacks.Nanotime()
@@ -915,6 +970,15 @@ type LoadOpts struct {
 	PagesFileOffset uint64
 	DoneCallback    func(error)
 
+	// If AdoptBackingFile is true, the MemoryFile's backing file already
+	// contains page contents in identity layout, as written by a checkpoint
+	// with SaveOpts.IdentityPagesFile; page contents are used in place rather
+	// than being copied from r or PagesFile. The MemoryFile must have been
+	// created with MemoryFileOpts.AdoptBackingFile.
+	//
+	// Preconditions: If AdoptBackingFile is true, PagesFile must be nil.
+	AdoptBackingFile bool
+
 	// Optional timeline for the restore process.
 	// If async page loading is enabled, a forked timeline will be created, so
 	// ownership of this timeline remains in the hands of the caller of
@@ -938,6 +1002,15 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	var mfs memoryFileSaved
 	if _, err := state.Load(ctx, r, &mfs); err != nil {
 		return fmt.Errorf("failed to load metadata: %w", err)
+	}
+	if opts.AdoptBackingFile && !f.opts.AdoptBackingFile {
+		return fmt.Errorf("LoadOpts.AdoptBackingFile requires a MemoryFile created with MemoryFileOpts.AdoptBackingFile")
+	}
+	if opts.AdoptBackingFile && !mfs.identityLayout {
+		return fmt.Errorf("can't adopt backing file: checkpoint was not saved with identity page layout")
+	}
+	if !opts.AdoptBackingFile && mfs.identityLayout {
+		return fmt.Errorf("checkpoint was saved with identity page layout, which requires restore to adopt the pages file")
 	}
 	f.unwasteSmall.MoveFrom(mfs.unwasteSmall)
 	f.unwasteHuge.MoveFrom(mfs.unwasteHuge)
@@ -997,6 +1070,9 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	// Register this MemoryFile with async page loading if a pages file has
 	// been provided.
 	var amfl *asyncMemoryFileLoad
+	if opts.AdoptBackingFile && opts.PagesFile != nil {
+		return fmt.Errorf("LoadOpts.AdoptBackingFile requires LoadOpts.PagesFile == nil")
+	}
 	if opts.PagesFile != nil {
 		var df stateio.DestinationFile
 		if opts.PagesFile.ar.NeedRegisterDestinationFD() {
@@ -1074,6 +1150,9 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 			amfl.pf.mu.Unlock()
 			opts.PagesFileOffset += amount
 			amfl.pf.lfStatus.Notify(aplLFPending)
+		} else if opts.AdoptBackingFile {
+			// Page contents are already in the backing file; only accounting
+			// (below) is needed.
 		} else {
 			// Verify header.
 			length, object, err := state.ReadHeader(&wr)
@@ -1112,6 +1191,8 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	durPages := time.Duration(gohacks.Nanotime() - timePagesStart)
 	if amfl != nil {
 		log.Infof("MemoryFile(%p): loaded page file offsets in %s; async loading %d bytes", f, durPages, f.knownCommittedBytes)
+	} else if opts.AdoptBackingFile {
+		log.Infof("MemoryFile(%p): adopted backing file with %d committed bytes in %s", f, f.knownCommittedBytes, durPages)
 	} else {
 		log.Infof("MemoryFile(%p): loaded pages in %s (%d bytes, %.3f MB/s)", f, durPages, f.knownCommittedBytes, float64(f.knownCommittedBytes)*1e-6/durPages.Seconds())
 	}

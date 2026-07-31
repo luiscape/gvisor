@@ -996,6 +996,30 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, 
 	}
 	memfile := os.NewFile(uintptr(memfd), memfileName)
 
+	mf, err := pgalloc.NewMemoryFile(memfile, memoryFileOpts(appHugePages, hostTHP))
+	if err != nil {
+		_ = memfile.Close()
+		return nil, fmt.Errorf("error creating pgalloc.MemoryFile: %w", err)
+	}
+	return mf, nil
+}
+
+// adoptMemoryFile creates a MemoryFile that adopts memfile, an identity-layout
+// checkpoint pages file, as its backing file; memfile's existing contents are
+// used in place rather than being copied. It takes ownership of memfile, even
+// on error.
+func adoptMemoryFile(memfile *os.File, appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, error) {
+	mfopts := memoryFileOpts(appHugePages, hostTHP)
+	mfopts.AdoptBackingFile = true
+	mf, err := pgalloc.NewMemoryFile(memfile, mfopts)
+	if err != nil {
+		_ = memfile.Close()
+		return nil, fmt.Errorf("error creating pgalloc.MemoryFile from adopted pages file: %w", err)
+	}
+	return mf, nil
+}
+
+func memoryFileOpts(appHugePages bool, hostTHP HostTHP) pgalloc.MemoryFileOpts {
 	mfopts := pgalloc.MemoryFileOpts{
 		// We can't enable pgalloc.MemoryFileOpts.UseHostMemcgPressure even if
 		// there are memory cgroups specified, because at this point we're already
@@ -1044,12 +1068,7 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, 
 		}
 	}
 
-	mf, err := pgalloc.NewMemoryFile(memfile, mfopts)
-	if err != nil {
-		_ = memfile.Close()
-		return nil, fmt.Errorf("error creating pgalloc.MemoryFile: %w", err)
-	}
-	return mf, nil
+	return mfopts
 }
 
 // installSeccompFilters installs sandbox seccomp filters with the host.
