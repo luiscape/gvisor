@@ -56,6 +56,7 @@ const (
 	NV01_MEMORY_VIRTUAL              = 0x00000070
 	NV01_MEMORY_SYSTEM_OS_DESCRIPTOR = 0x00000071
 	NV01_EVENT_OS_EVENT              = 0x00000079
+	NV_EVENT_BUFFER_BIND             = 0x0000007f
 	NV01_DEVICE_0                    = 0x00000080
 	NV_SEMAPHORE_SURFACE             = 0x000000da
 	RM_USER_SHARED_DATA              = 0x000000de
@@ -78,6 +79,7 @@ const (
 	GF100_ZBC_CLEAR                  = 0x00009096
 	GF100_SUBDEVICE_INFOROM          = 0x000090e7
 	GF100_PROFILER                   = 0x000090cc
+	NV_EVENT_BUFFER                  = 0x000090cd
 	NV01_MEMORY_DEVICELESS           = 0x000090ce
 	MAXWELL_PROFILER_DEVICE          = 0x0000b2cc
 	NV_COUNTER_COLLECTION_UNIT       = 0x0000cbca
@@ -287,6 +289,42 @@ type NV_MEMORY_ALLOCATION_PARAMS_V545 struct {
 	NV_MEMORY_ALLOCATION_PARAMS
 	NumaNode int32
 	_        uint32
+}
+
+// NV_EVENT_BUFFER_ALLOC_PARAMETERS is the alloc params type for NV_EVENT_BUFFER,
+// from src/common/sdk/nvidia/inc/class/cl90cd.h.
+//
+// +marshal
+type NV_EVENT_BUFFER_ALLOC_PARAMETERS struct {
+	_                    structs.HostLayout
+	BufferHeader         P64
+	RecordBuffer         P64
+	RecordSize           uint32
+	RecordCount          uint32
+	VardataBuffer        P64
+	VardataBufferSize    uint32
+	RecordsFreeThreshold uint32
+	NotificationHandle   uint64
+	VardataFreeThreshold uint32
+	HSubDevice           Handle
+	Flags                uint32
+	HBufferHeader        Handle
+	HRecordBuffer        Handle
+	HVardataBuffer       Handle
+}
+
+// NV_EVENT_BUFFER_BIND_PARAMETERS is the alloc params type for
+// NV_EVENT_BUFFER_BIND, from src/common/sdk/nvidia/inc/class/cl90cd.h.
+//
+// +marshal
+type NV_EVENT_BUFFER_BIND_PARAMETERS struct {
+	_                  structs.HostLayout
+	BufferHandle       Handle
+	EventType          uint16
+	EventSubtype       uint16
+	HClientTarget      Handle
+	HSrcResource       Handle
+	KernelCallbackdata P64
 }
 
 // NV503B_BAR1_P2P_DMA_INFO from src/common/sdk/nvidia/inc/class/cl503b.h.
