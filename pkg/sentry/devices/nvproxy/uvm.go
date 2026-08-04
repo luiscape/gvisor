@@ -310,10 +310,27 @@ func uvmIoctlHasFrontendFD[Params any, PtrParams hasFrontendFDAndStatusPtr[Param
 	if err != nil {
 		return n, err
 	}
+	logUvmMapExternalFailure(ui, any(ioctlParams))
 	if _, err := ioctlParams.CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
 		return n, err
 	}
 	return n, nil
+}
+
+// logUvmMapExternalFailure logs the identifying parameters of every
+// UVM_MAP_EXTERNAL_ALLOCATION, the ioctl by which cuda-checkpoint's
+// content-save pass reads allocations (and by which the restore toggle
+// rebuilds mappings). Debug instrumentation for multicast suspend/replay.
+func logUvmMapExternalFailure(ui *uvmIoctlState, params any) {
+	if !ui.ctx.IsLogging(log.Debug) {
+		return
+	}
+	switch p := params.(type) {
+	case *nvgpu.UVM_MAP_EXTERNAL_ALLOCATION_PARAMS:
+		ui.ctx.Debugf("nvproxy: UVM_MAP_EXTERNAL_ALLOCATION: base=%#x length=%#x offset=%#x hClient=%#x hMemory=%#x gpuAttrsCount=%d status=%#x", p.Base, p.Length, p.Offset, p.HClient, p.HMemory, p.GPUAttributesCount, p.RMStatus)
+	case *nvgpu.UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550:
+		ui.ctx.Debugf("nvproxy: UVM_MAP_EXTERNAL_ALLOCATION: base=%#x length=%#x offset=%#x hClient=%#x hMemory=%#x gpuAttrsCount=%d status=%#x", p.Base, p.Length, p.Offset, p.HClient, p.HMemory, p.GPUAttributesCount, p.RMStatus)
+	}
 }
 
 func uvmFailWithStatus[Params any, PtrParams hasStatusPtr[Params]](ui *uvmIoctlState, ioctlParams PtrParams, status uint32) error {

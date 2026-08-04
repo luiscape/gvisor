@@ -20,6 +20,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 )
 
@@ -34,6 +35,11 @@ type object struct {
 	handle nvgpu.Handle // in client.resources, and also nvp.clients if impl is rootClient
 	parent nvgpu.Handle
 	impl   objectImpl
+
+	// taskID is the thread group ID of the task that allocated this object, or
+	// 0 if unknown. It attributes checkpoint blockers to an application
+	// process (e.g. a tensor-parallel rank); see CheckpointBlockers().
+	taskID int32
 
 	// The driver tracks parent/child relationships and "arbitrary dependency"
 	// relationships between objects separately; we treat parent/child
@@ -80,6 +86,9 @@ func (nvp *nvproxy) objAdd(ctx context.Context, client *rootClient, h nvgpu.Hand
 	o.handle = h
 	o.parent = parentH
 	o.impl = oi
+	if t := kernel.TaskFromContext(ctx); t != nil {
+		o.taskID = int32(t.ThreadGroup().ID())
+	}
 	if _, ok := client.resources[h]; ok {
 		ctx.Warningf("nvproxy: handle %v:%v already in use", client.handle, h)
 	}

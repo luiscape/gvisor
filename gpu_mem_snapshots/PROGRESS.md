@@ -3,6 +3,26 @@
 Companion to `HANDOFF.md`. Records the state of the investigation into
 checkpoint/restore of multi-GPU (tensor-parallel) GPU containers under gVisor.
 
+> **SUPERSEDED IN PART — read this first.** The "fabric/multicast is a hard
+> blocker" conclusions below (findings 1, 4 and the TL;DR) predate the
+> in-process suspend/resume line of work, which has since shown multicast
+> **is** checkpointable without NVLS-off flags, via in-process teardown
+> through libcuda around cuda-checkpoint:
+>
+> - `phase0/NCCL_SUSPEND_RESULTS.md` — patched-NCCL `ncclCommSuspend`/`Resume`
+>   extended to NVLS: PASS native + gVisor, single- and multi-process,
+>   NVLS + captured CUDA graphs (requires NCCL fork + engine hook).
+>   Patch design + preserved diff: `phase0/NCCL_PATCH.md` +
+>   `phase0/nccl-nvls-suspend.patch`.
+> - `phase0/mcshim/README.md` — **current frontier**: generic LD_PRELOAD
+>   interposer (no NCCL fork, no engine hooks): multicast round-trip PASS
+>   native + gVisor up to WORLD=4; on stock NCCL the multicast layer
+>   suspends cleanly, with one isolated remaining gap (live VMM UC imports,
+>   R610 job mode doesn't restore them) and a documented, de-risked plan.
+>
+> Start at `phase0/mcshim/README.md` §"Scope and next steps" for the live
+> to-do list.
+
 ## Goal
 
 Enable `runsc checkpoint` / `restore` of multi-GPU tensor-parallel GPU
@@ -146,6 +166,98 @@ piecewise-CUDA-graph** state in the TP workers.
 3. File the cuda-checkpoint restore bug with NVIDIA (repro: `native_ab.sh`).
 4. Separate blocker (out of scope): SGLang TP init hang on 610 — new-in-610
    nvproxy ioctl gaps (`frontend status=0x56` / `uvm status=0x10006`).
+
+## Multicast suspend/restore track (see /TASK.md + gpu_mem_snapshots/phase0/)
+
+Separate track from the vLLM findings above: make multicast (NVLS/symm-mem)
+workloads checkpointable by suspending/replaying 00FD objects at the nvproxy
+layer. Measured + implemented on **this host: 8×H100 NVSwitch, driver
+580.173.02, no docker** (bazelisk-built runsc, bare-OCI harnesses in
+`gpu_mem_snapshots/phase0/`; persistence mode ON is required for restore).
+
+### Phase 0 measurements (all answered — see phase0/README.md "Results")
+1. **IPC taint: NOT TAINTED** — fully-released POSIX-FD exports checkpoint
+   fine ⇒ TASK.md work items 1–4 suffice; unicast stays resident. (Control
+   leg: with a live import, the **importer's** restore fails — the refusal
+   lives importer-side on 580.)
+2. **Attach blocking**: `cuMulticastAddDevice` non-blocking; `cuMulticastBindMem`
+   **blocks until all devices join** ⇒ replay must finish all ATTACH_GPU
+   across clients before any ATTACH_MEM (WI4 moves to the GPU→MEM boundary).
+3. **Census**: `cuda-checkpoint --action checkpoint` **releases the whole root
+   client**; restore `--toggle` recreates everything under a **new client
+   handle** but with **identical child object handles** (verified for 36×
+   vidmem objects). ⇒ multicast replay cannot ride `afterLoad`'s topo sort;
+   it must run post-toggle with old→new client-handle remapping.
+
+### Implemented (this branch, builds + unit tests + E2E pass)
+- **Slice 1 — blocker inventory + gate** (`nvproxy/fabric.go`,
+  `control/state_cuda.go`): `CheckpointBlockers()` walks the object graph for
+  00FD/00F8/00FB (+ per-object `taskID` recorded in `objAdd`) and
+  exported-object FDs (both `EXPORT_OBJECT_TO_FD` and the batched
+  `EXPORT_OBJECTS_TO_FD` — libcuda 580 uses the latter). `preSaveCuda` polls
+  until clear or `runsc checkpoint --cuda-blocker-timeout` (default 10s)
+  expires, then fails with per-client attribution:
+  `"task 1 (client 0xc1d00959): 1 exported-fd, 1 multicast"`.
+- **Slice 2 — recorded state-mutating controls** (`nvproxy/multicast.go`,
+  ABI structs in `nvgpu/ctrl.go` verified against open-gpu-kernel-modules
+  535+580): dedicated `multicastFabricObject` for 00FD allocs; dedicated
+  handlers record `ATTACH_GPU` (device *minor*, not fd number) and
+  `ATTACH_MEM` / remove on `DETACH_MEM` (matched by subdevice+offset); attach
+  adds an objDep multicast→memory. `Restore()` replays alloc + attaches via
+  host ioctls (`controlObjectOnHost`). Unit tests in `multicast_test.go`.
+- **Census instrumentation** (`ObjectGraphCensus`): per-client class
+  histogram + handle values for 0x40/fabric classes, logged around the
+  cuda-checkpoint phases and the restore toggle.
+- **E2E acceptance** (`phase0/run_gate_test.sh`, PASSED): real 2-GPU 00FD
+  object (2× ATTACH_GPU, ~1281× per-granule ATTACH_MEM(!), exported fd,
+  mapped MC VA) under runsc → checkpoint refused with correct per-client
+  message, app unharmed → app teardown → checkpoint + restore PASS.
+
+### Slice 3 — suspend/replay: implemented, R580 boundary pinned
+- Implemented `nvproxy.SuspendMulticastObjects` (host-free 00FD between the
+  lock and checkpoint phases, plant a same-handle/same-size plain-vidmem
+  **substitute** so libcuda's checkpoint content-save UVM-map pass doesn't
+  fault on the freed handle) and `ReplayMulticastObjects` (post-toggle,
+  old→new client remap, alloc + ATTACH_GPU + ATTACH_MEM replay). Gated behind
+  `runsc checkpoint --cuda-multicast-suspend` (default OFF).
+- **Result on R580 AND R610 610.57.04 (this host, both drivers tested):**
+  checkpoint SAVE now succeeds (was a native hang / "out of memory" — the
+  substitute fixed the content-save fault). But `cuda-checkpoint --toggle` on
+  RESTORE fails `"unknown error"` *before* nvproxy replay runs.
+- **R610 verdict (decisive, tested under the real `--launch-job` job
+  protocol; job wrapping verified engaged):**
+  1. Native R610 with the job STILL hangs on a live multicast object
+     (`native_mc_610.py` checkpoint times out at 90s) — even bare
+     create+AddDevice, no bound mem, no MC VA. Job mode does NOT lift the
+     checkpoint hang → nvproxy suspend is required.
+  2. nvproxy suspend makes the R610 SAVE succeed (checkpoint rc=0).
+  3. The restore toggle **proactively refuses**: it recreates ordinary
+     allocations then returns "unknown error" on reaching the multicast object
+     in libcuda's CRIU-preserved state, issuing **zero** 00FD/ATTACH ioctls
+     (no interceptable op). Controls: `MODE=no-mc` restores fine (multicast is
+     the trigger, not memfd/job restore); `MAP_MC_VA=after-restore` still
+     fails (the 00FD object, not the VA mapping, is the cause).
+- **Conclusion:** cuda-checkpoint cannot restore a process whose libcuda state
+  includes a multicast object, on 580 and 610, independent of the driver-side
+  RM state nvproxy controls. NOT fixable from nvproxy (refusal is internal,
+  no ioctl to intercept). This generalizes PROGRESS finding 4 and the R610
+  vLLM-TP finding: the multicast restore wall is a **cuda-checkpoint**
+  limitation on 610 too, not just the fabric-serialization hang. Requires an
+  NVIDIA cuda-checkpoint fix or a libcuda-level teardown (app change =
+  TASK.md non-goal). `native_mc_610.py` is the clean gVisor-free NVIDIA repro.
+- **Convergence:** `--cuda-multicast-suspend` defaults off → multicast stays a
+  hard, cleanly-attributed checkpoint blocker on every driver (no broken
+  restores). With the flag on, nvproxy makes the save half work and the
+  harness reports the cuda-checkpoint restore boundary. Suspend/replay is
+  complete + unit-tested; it becomes end-to-end functional only once
+  cuda-checkpoint stops refusing multicast at restore. Harnesses:
+  `run_suspend_test.sh` (JOB=1 default, MODE=full|no-bind|no-mc,
+  MAP_MC_VA=always|after-restore) and native `native_mc_610.py`.
+- Remaining before R610 multi-rank: MC VA *mapping* replay (keep VA
+  reservation, UVM_UNMAP_EXTERNAL on suspend, re-map at identical VA on
+  replay); batched ATTACH_MEM across clients (phase0 measure #2: bind blocks
+  on all-join); importer-side peers (`IMPORT_OBJECTS_FROM_FD`) tracking; and
+  the ATTACH_MEM-per-granule volume (~1281/obj) may need coalescing.
 
 ## Gotchas (carried from HANDOFF + observed)
 

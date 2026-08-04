@@ -1,0 +1,248 @@
+diff --git a/src/include/transport.h b/src/include/transport.h
+index 3607a5b7..9c851d35 100644
+--- a/src/include/transport.h
++++ b/src/include/transport.h
+@@ -99,6 +99,12 @@ struct ncclNvlsSharedRes {
+   int treeMaxChunkSize;
+   struct ncclShmemCollBuff nvlsShmem;
+   void* nvlsShmemHandle;
++  // Multicast suspend/resume state (ncclCommSuspend NVLS extension): while
++  // suspended, the multicast groups and UC physical memory are released
++  // (their VA reservations are retained) and UC contents live in CPU backups.
++  int mcSuspended;
++  void* buffCpuBackup;
++  void* creditCpuBackup;
+ };
+ 
+ #endif /* CUDART_VERSION >= 12010 */
+@@ -152,6 +158,8 @@ ncclResult_t ncclNvlsInit(struct ncclComm* comm);
+ ncclResult_t ncclNvlsTuning(struct ncclComm* comm);
+ ncclResult_t ncclNvlsSetup(struct ncclComm* comm, struct ncclComm* parent);
+ ncclResult_t ncclNvlsBufferSetup(struct ncclComm* comm);
++ncclResult_t ncclNvlsSuspend(struct ncclComm* comm);
++ncclResult_t ncclNvlsResume(struct ncclComm* comm);
+ ncclResult_t ncclNvlsTreeConnect(struct ncclComm* comm);
+ ncclResult_t ncclNvlsGraphRegisterBuffer(
+   struct ncclComm* comm, const void* sendbuff, void* recvbuff, size_t sendbuffSize, size_t recvbuffSize,
+diff --git a/src/mem_manager.cc b/src/mem_manager.cc
+index e89e07df..cd95ee28 100644
+--- a/src/mem_manager.cc
++++ b/src/mem_manager.cc
+@@ -502,6 +502,12 @@ ncclResult_t ncclCommMemSuspend(struct ncclComm* comm) {
+     entry = entry->next;
+   }
+ 
++  // Step 3: Suspend the NVLS multicast layer (multicast groups + UC backing).
++  // Live multicast objects make the process un-checkpointable
++  // (cuCheckpointProcessCheckpoint hangs on them), so they must be released
++  // here and re-created in ncclCommMemResume.
++  NCCLCHECKGOTO(ncclNvlsSuspend(comm), ret, fail);
++
+   manager->released = 1;
+ 
+   INFO(NCCL_ALLOC,
+@@ -887,6 +893,18 @@ ncclResult_t ncclCommMemResume(struct ncclComm* comm) {
+     entry = entry->next;
+   }
+ 
++  // Step 5: Resume the NVLS multicast layer (re-create groups via the same
++  // rendezvous as setup, re-create UC memory at identical VAs, re-bind, and
++  // re-map MC VAs at identical addresses).
++  ret = ncclNvlsResume(comm);
++  if (ret != ncclSuccess) {
++    if (allCounts) free(allCounts);
++    if (localInfos) free(localInfos);
++    if (allInfos) free(allInfos);
++    WARN("MemManager: NVLS resume failed");
++    return ret;
++  }
++
+   manager->released = 0;
+ 
+   // Final barrier to ensure all ranks have completed peer import setup
+diff --git a/src/transport/nvls.cc b/src/transport/nvls.cc
+index 8c5dc618..7f7ac55e 100644
+--- a/src/transport/nvls.cc
++++ b/src/transport/nvls.cc
+@@ -690,6 +690,166 @@ ncclResult_t ncclNvlsFree(struct ncclComm* comm) {
+   return ncclSuccess;
+ }
+ 
++/*
++ * NVLS multicast suspend/resume (ncclCommSuspend/ncclCommResume extension).
++ *
++ * cuda-checkpoint cannot checkpoint a process holding live multicast (00FD)
++ * objects: `cuCheckpointProcessCheckpoint` hangs even on an unbound multicast
++ * group. ncclNvlsSuspend therefore tears the NVLS multicast layer down
++ * through the CUDA API (keeping libcuda's bookkeeping consistent, which is
++ * what makes the process checkpointable):
++ *
++ *   - UC buffer contents are copied to CPU backups (they hold live transport
++ *     FIFO/credit state referenced by persistent conn structs),
++ *   - MC VAs are unmapped (VA reservations retained),
++ *   - UC memory is unbound from the groups and released (VA reservations
++ *     retained),
++ *   - the multicast group handles are released.
++ *
++ * ncclNvlsResume re-creates the multicast groups with the same rendezvous
++ * used at setup (rank 0 creates + exports, peers import via the proxy),
++ * re-creates UC memory at the IDENTICAL VAs, restores contents, re-binds, and
++ * re-maps the MC VAs at their identical addresses. Because every VA is
++ * unchanged, kernels, captured CUDA graphs and conn structs remain valid; the
++ * CUmem handles are new, which only teardown paths observe.
++ *
++ * Like setup, resume is collective across the local ranks of the comm and
++ * must run for all ranks concurrently (grouped ncclCommResume or one thread
++ * per comm): cuMulticastBindMem blocks until every device has been added to
++ * the group.
++ */
++
++static ncclResult_t nvlsSuspendOne(struct ncclComm* comm, const char* what, CUmemGenericAllocationHandle* mcHandle,
++                                   CUmemGenericAllocationHandle* ucHandle, char* mcPtr, char* ucPtr, size_t mcSize,
++                                   size_t ucSize, void** cpuBackup) {
++  int dev = comm->nvlsResources->dev;
++
++  // Preserve UC contents (transport FIFO/credit state) across the physical
++  // release.
++  NCCLCHECK(ncclCudaHostCalloc((char**)cpuBackup, ucSize));
++  CUDACHECK(cudaMemcpy(*cpuBackup, ucPtr, ucSize, cudaMemcpyDeviceToHost));
++
++  // Unmap the MC VA (the reservation at mcPtr is retained).
++  CUCHECKIGNORE(cuMemUnmap((CUdeviceptr)mcPtr, mcSize));
++  // Unbind this device's memory from the group and drop the group handle.
++  CUCHECKIGNORE(cuMulticastUnbind(*mcHandle, dev, 0 /*mcOffset*/, ucSize));
++  CUCHECKIGNORE(cuMemRelease(*mcHandle));
++  *mcHandle = 0;
++  // Unmap and release the UC physical memory (reservation at ucPtr retained).
++  CUCHECKIGNORE(cuMemUnmap((CUdeviceptr)ucPtr, ucSize));
++  CUCHECKIGNORE(cuMemRelease(*ucHandle));
++  *ucHandle = 0;
++
++  INFO(NCCL_NVLS, "NVLS Suspend rank %d dev %d %s: ucptr %p ucsize %zu mcptr %p mcsize %zu released", comm->rank, dev,
++       what, ucPtr, ucSize, mcPtr, mcSize);
++  return ncclSuccess;
++}
++
++static ncclResult_t nvlsResumeOne(struct ncclComm* comm, const char* what, CUmemGenericAllocationHandle* mcHandle,
++                                  CUmemGenericAllocationHandle* ucHandle, char* mcPtr, char* ucPtr, size_t mcSize,
++                                  size_t ucSize, void** cpuBackup) {
++  struct ncclNvlsSharedRes* resources = comm->nvlsResources;
++  char shareableHandle[NVLS_HANDLE_SIZE];
++  CUmulticastObjectProp mcprop;
++  CUmemAllocationProp ucprop;
++  ncclResult_t ret = ncclSuccess;
++
++  // Re-create the multicast group with the same rendezvous as setup.
++  memset(shareableHandle, '\0', sizeof(shareableHandle));
++  memset(&mcprop, 0, sizeof(CUmulticastObjectProp));
++  mcprop.numDevices = comm->localRanks;
++  mcprop.handleTypes = ncclCuMemHandleType;
++  mcprop.flags = 0;
++  mcprop.size = mcSize;
++
++  if (comm->localRank == 0) {
++    NCCLCHECK(ncclNvlsGroupCreate(comm, &mcprop, comm->localRank, comm->localRanks, mcHandle, shareableHandle));
++    NCCLCHECK(bootstrapIntraNodeBroadcast(comm->bootstrap, comm->localRankToRank, comm->localRank, comm->localRanks, 0,
++                                          shareableHandle, NVLS_HANDLE_SIZE));
++  } else {
++    NCCLCHECK(bootstrapIntraNodeBroadcast(comm->bootstrap, comm->localRankToRank, comm->localRank, comm->localRanks, 0,
++                                          shareableHandle, NVLS_HANDLE_SIZE));
++    NCCLCHECK(ncclNvlsGroupConnect(comm, shareableHandle, comm->localRankToRank[0], mcHandle));
++  }
++  CUCHECK(cuMulticastAddDevice(*mcHandle, comm->cudaDev));
++
++  // Re-create UC physical memory and map it at the identical VA.
++  memset(&ucprop, 0, sizeof(CUmemAllocationProp));
++  ucprop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
++  ucprop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++  ucprop.location.id = comm->cudaDev;
++  ucprop.requestedHandleTypes = ncclCuMemHandleType;
++  CUCHECK(cuMemCreate(ucHandle, ucSize, &ucprop, 0));
++  CUCHECK(cuMemMap((CUdeviceptr)ucPtr, ucSize, 0, *ucHandle, 0));
++  CUCHECK(cuMemSetAccess((CUdeviceptr)ucPtr, ucSize, &resources->accessDesc, 1));
++  // Restore preserved contents.
++  CUDACHECK(cudaMemcpy(ucPtr, *cpuBackup, ucSize, cudaMemcpyHostToDevice));
++  ncclCudaHostFree(*cpuBackup);
++  *cpuBackup = NULL;
++
++  // As at setup: barrier before the bind (cuMulticastBindMem blocks until all
++  // devices have joined the group).
++  NCCLCHECK(bootstrapIntraNodeBarrier(comm->bootstrap, comm->localRankToRank, comm->localRank, comm->localRanks,
++                                      comm->localRankToRank[0]));
++  CUCHECK(cuMulticastBindMem(*mcHandle, 0 /*mcOffset*/, *ucHandle, 0 /*memOffset*/, ucSize, 0 /*flags*/));
++
++  // Re-map the MC VA at its identical address.
++  CUCHECK(cuMemMap((CUdeviceptr)mcPtr, mcSize, 0, *mcHandle, 0));
++  CUCHECK(cuMemSetAccess((CUdeviceptr)mcPtr, mcSize, &resources->accessDesc, 1));
++
++  INFO(NCCL_NVLS, "NVLS Resume rank %d dev %d %s: ucptr %p ucsize %zu mcptr %p mcsize %zu restored", comm->rank,
++       comm->cudaDev, what, ucPtr, ucSize, mcPtr, mcSize);
++  return ret;
++}
++
++ncclResult_t ncclNvlsSuspend(struct ncclComm* comm) {
++  struct ncclNvlsSharedRes* resources = comm->nvlsResources;
++  if (comm->nvlsSupport == 0 || resources == NULL) return ncclSuccess;
++  if (resources->mcSuspended) return ncclSuccess;
++  if (resources->refCount > 1) {
++    WARN("NVLS suspend not supported with shared NVLS resources (refCount=%d)", resources->refCount);
++    return ncclInvalidUsage;
++  }
++
++  if (resources->ucCredit) {
++    NCCLCHECK(ncclMemUntrack(comm->memManager, resources->ucCredit, resources->creditUCSize));
++    NCCLCHECK(nvlsSuspendOne(comm, "credit", &resources->mcCreditHandle, &resources->ucCreditHandle,
++                             resources->mcCredit, resources->ucCredit, resources->creditMCSize,
++                             resources->creditUCSize, &resources->creditCpuBackup));
++  }
++  if (resources->inited && resources->ucBuff) {
++    NCCLCHECK(ncclMemUntrack(comm->memManager, resources->ucBuff, resources->buffUCSize));
++    NCCLCHECK(nvlsSuspendOne(comm, "buff", &resources->mcBuffHandle, &resources->ucBuffHandle, resources->mcBuff,
++                             resources->ucBuff, resources->buffMCSize, resources->buffUCSize,
++                             &resources->buffCpuBackup));
++  }
++  resources->mcSuspended = 1;
++  return ncclSuccess;
++}
++
++ncclResult_t ncclNvlsResume(struct ncclComm* comm) {
++  struct ncclNvlsSharedRes* resources = comm->nvlsResources;
++  if (comm->nvlsSupport == 0 || resources == NULL) return ncclSuccess;
++  if (!resources->mcSuspended) return ncclSuccess;
++
++  if (resources->ucCredit) {
++    NCCLCHECK(nvlsResumeOne(comm, "credit", &resources->mcCreditHandle, &resources->ucCreditHandle,
++                            resources->mcCredit, resources->ucCredit, resources->creditMCSize,
++                            resources->creditUCSize, &resources->creditCpuBackup));
++    NCCLCHECK(ncclMemTrack(comm->memManager, resources->ucCredit, resources->creditUCSize, resources->ucCreditHandle,
++                           ncclCuMemHandleType, ncclMemPersist));
++  }
++  if (resources->inited && resources->ucBuff) {
++    NCCLCHECK(nvlsResumeOne(comm, "buff", &resources->mcBuffHandle, &resources->ucBuffHandle, resources->mcBuff,
++                            resources->ucBuff, resources->buffMCSize, resources->buffUCSize,
++                            &resources->buffCpuBackup));
++    NCCLCHECK(ncclMemTrack(comm->memManager, resources->ucBuff, resources->buffUCSize, resources->ucBuffHandle,
++                           ncclCuMemHandleType, ncclMemPersist));
++  }
++  resources->mcSuspended = 0;
++  return ncclSuccess;
++}
++
+ ncclResult_t tryRegisterBuffer(struct ncclComm* comm, uintptr_t userBuff, size_t buffSize, CUdeviceptr* regAddr,
+                                int* regUsed) {
+   ncclResult_t ret = ncclSuccess;
+@@ -1161,6 +1321,14 @@ ncclResult_t ncclNvlsFree(struct ncclComm* comm) {
+   return ncclSuccess;
+ }
+ 
++ncclResult_t ncclNvlsSuspend(struct ncclComm* comm) {
++  return ncclSuccess;
++}
++
++ncclResult_t ncclNvlsResume(struct ncclComm* comm) {
++  return ncclSuccess;
++}
++
+ ncclResult_t ncclNvlsTreeConnect(struct ncclComm* comm) {
+   return ncclSuccess;
+ }

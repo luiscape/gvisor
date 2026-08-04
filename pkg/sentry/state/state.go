@@ -80,6 +80,20 @@ type SaveOpts struct {
 	// CudaCheckpointSequential indicates whether cuda-checkpoint should be run
 	// sequentially (rather than in parallel).
 	CudaCheckpointSequential bool
+
+	// CudaBlockerTimeout is how long to wait for CUDA checkpoint blockers
+	// (multicast/fabric objects, exported-object FDs) to be released before
+	// failing the checkpoint. Zero means a default timeout.
+	CudaBlockerTimeout time.Duration
+
+	// CudaMulticastSuspend enables nvproxy to suspend multicast (00FD)
+	// objects before cuda-checkpoint and replay them after restore, rather
+	// than treating them as a hard checkpoint blocker. This depends on
+	// cuda-checkpoint job semantics (R610+): on older drivers the restore
+	// toggle itself fails to restore a process that held a multicast object,
+	// so it is off by default. See
+	// gpu_mem_snapshots/phase0/README.md "multicast suspend/replay".
+	CudaMulticastSuspend bool
 }
 
 // Close releases resources owned by opts.
