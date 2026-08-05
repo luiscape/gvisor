@@ -514,6 +514,20 @@ func getRootCredentials(spec *specs.Spec, conf *config.Config, userNs *auth.User
 	return creds
 }
 
+// hostAlignedMonotonicForProfiling reports whether the sandbox monotonic
+// clock should track the host's CLOCK_MONOTONIC_RAW. This is required for GPU
+// profiling (nvproxy CapProfiling): profilers like Nsight/CUPTI correlate GPU
+// timestamps, which are anchored in the host CLOCK_MONOTONIC_RAW domain,
+// against the sandbox monotonic clock, and drop GPU activity records unless
+// the two are in the same domain.
+func hostAlignedMonotonicForProfiling(spec *specs.Spec, conf *config.Config) bool {
+	if !specutils.NVProxyEnabled(spec, conf) {
+		return false
+	}
+	caps, err := specutils.NVProxyDriverCapsAllowed(conf)
+	return err == nil && caps&nvconf.CapProfiling != 0
+}
+
 // New initializes a new kernel loader configured by spec.
 // New also handles setting up a kernel for restoring a container.
 func New(args Args) (*Loader, error) {
@@ -674,8 +688,13 @@ func New(args Args) (*Loader, error) {
 
 	// Create timekeeper.
 	tk := kernel.NewTimekeeper()
+	clocks := time.NewCalibratedClocks()
+	if hostAlignedMonotonicForProfiling(args.Spec, args.Conf) {
+		clocks = time.NewProfilingCalibratedClocks()
+		tk.SetHostAlignedMonotonic(true)
+	}
 	params := kernel.NewVDSOParamPage(l.k.MemoryFile(), vdso.ParamPage.FileRange())
-	tk.SetClocks(time.NewCalibratedClocks(), params)
+	tk.SetClocks(clocks, params)
 
 	if err := enableStrace(args.Conf); err != nil {
 		return nil, fmt.Errorf("enabling strace: %w", err)

@@ -238,8 +238,21 @@ type CalibratedClocks struct {
 
 // NewCalibratedClocks creates a CalibratedClocks.
 func NewCalibratedClocks() *CalibratedClocks {
+	return newCalibratedClocks(Monotonic)
+}
+
+// NewProfilingCalibratedClocks creates a CalibratedClocks whose monotonic
+// clock tracks host CLOCK_MONOTONIC_RAW (still addressed as Monotonic). GPU
+// profilers anchor the GPU timeline in the host CLOCK_MONOTONIC_RAW domain,
+// which drifts from CLOCK_MONOTONIC by NTP frequency adjustment; tracking the
+// raw clock keeps the sandbox monotonic clock in the GPU timeline's domain.
+func NewProfilingCalibratedClocks() *CalibratedClocks {
+	return newCalibratedClocks(MonotonicRaw)
+}
+
+func newCalibratedClocks(monotonicRef ClockID) *CalibratedClocks {
 	return &CalibratedClocks{
-		monotonic: NewCalibratedClock(Monotonic),
+		monotonic: NewCalibratedClock(monotonicRef),
 		realtime:  NewCalibratedClock(Realtime),
 	}
 }

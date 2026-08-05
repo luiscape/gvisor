@@ -153,3 +153,78 @@ func TestTimekeeperMonotonicJumpBackwards(t *testing.T) {
 		t.Errorf("GetTime got %d want 100000", now)
 	}
 }
+
+// TestTimekeeperHostAlignedMonotonic tests that monotonic time exposes the
+// backing clock source's time directly when host alignment is enabled.
+func TestTimekeeperHostAlignedMonotonic(t *testing.T) {
+	c := &mockClocks{
+		monotonic: 100000,
+	}
+
+	tk, params := stateTestClocklessTimekeeper(t)
+	tk.SetHostAlignedMonotonic(true)
+	tk.SetClocks(c, params)
+	defer tk.Destroy()
+
+	now, err := tk.GetTime(sentrytime.Monotonic)
+	if err != nil {
+		t.Errorf("GetTime err got %v want nil", err)
+	}
+	if now != 100000 {
+		t.Errorf("GetTime got %d want 100000", now)
+	}
+}
+
+// TestTimekeeperHostAlignedMonotonicRestore tests that a host-aligned
+// monotonic clock realigns with the backing clock source after restore.
+func TestTimekeeperHostAlignedMonotonicRestore(t *testing.T) {
+	c := &mockClocks{
+		monotonic: 900000,
+		realtime:  600000,
+	}
+
+	tk, params := stateTestClocklessTimekeeper(t)
+	tk.restored = make(chan struct{})
+	tk.saveMonotonic = 100000
+	tk.saveRealtime = 400000
+	tk.SetHostAlignedMonotonic(true)
+	tk.SetClocks(c, params)
+	defer tk.Destroy()
+
+	// Alignment (900000) wins over saveMonotonic + elapsed realtime (300000)
+	// since the clock only jumps further forward.
+	now, err := tk.GetTime(sentrytime.Monotonic)
+	if err != nil {
+		t.Errorf("GetTime err got %v want nil", err)
+	}
+	if now != 900000 {
+		t.Errorf("GetTime got %d want 900000", now)
+	}
+}
+
+// TestTimekeeperHostAlignedMonotonicRestoreBackwards tests that host
+// alignment never moves a restored monotonic clock backwards.
+func TestTimekeeperHostAlignedMonotonicRestoreBackwards(t *testing.T) {
+	c := &mockClocks{
+		monotonic: 200000,
+		realtime:  600000,
+	}
+
+	tk, params := stateTestClocklessTimekeeper(t)
+	tk.restored = make(chan struct{})
+	tk.saveMonotonic = 100000
+	tk.saveRealtime = 400000
+	tk.SetHostAlignedMonotonic(true)
+	tk.SetClocks(c, params)
+	defer tk.Destroy()
+
+	// saveMonotonic + elapsed realtime (300000) is ahead of the backing clock
+	// source (200000), so monotonicity wins over alignment.
+	now, err := tk.GetTime(sentrytime.Monotonic)
+	if err != nil {
+		t.Errorf("GetTime err got %v want nil", err)
+	}
+	if now != 300000 {
+		t.Errorf("GetTime got %d want 300000", now)
+	}
+}

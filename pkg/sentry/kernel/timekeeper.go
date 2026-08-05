@@ -69,6 +69,18 @@ type Timekeeper struct {
 	// It is set only once, by SetClocks.
 	monotonicOffset int64 `state:"nosave"`
 
+	// hostAlignedMonotonic, if true, causes the monotonic clock to expose the
+	// backing clock source's time directly (monotonicOffset == 0) rather than
+	// starting at zero. It is set by SetHostAlignedMonotonic before SetClocks,
+	// and is saved so that restore preserves the behavior.
+	//
+	// This supports GPU profiling (nvproxy CapProfiling): profilers correlate
+	// GPU timestamps, which are anchored in the host's CLOCK_MONOTONIC_RAW
+	// domain, against the sandbox's monotonic clock, so the latter must be in
+	// the same domain. It is paired with a clock source that tracks host
+	// CLOCK_MONOTONIC_RAW (see sentrytime.NewProfilingCalibratedClocks).
+	hostAlignedMonotonic bool
+
 	// monotonicLowerBound is the lowerBound for monotonic time.
 	monotonicLowerBound atomicbitops.Int64 `state:"nosave"`
 
@@ -134,6 +146,14 @@ func NewTimekeeper() *Timekeeper {
 	return &t
 }
 
+// SetHostAlignedMonotonic configures whether the monotonic clock is aligned
+// with the host's monotonic clock source rather than starting at zero on
+// boot, as required by GPU profiling tools. It must be called before
+// SetClocks. See Timekeeper.hostAlignedMonotonic.
+func (t *Timekeeper) SetHostAlignedMonotonic(v bool) {
+	t.hostAlignedMonotonic = v
+}
+
 // SetClocks the backing clock source.
 //
 // SetClocks must be called before the Timekeeper is used, and it may not be
@@ -187,6 +207,13 @@ func (t *Timekeeper) SetClocks(c sentrytime.Clocks, params *VDSOParamPage) {
 		if elapsed > 0 {
 			wantMonotonic += elapsed
 		}
+	}
+
+	if t.hostAlignedMonotonic && nowMonotonic > wantMonotonic {
+		// Use the backing clock source's time directly (monotonicOffset == 0),
+		// unless that would move a restored monotonic clock backwards. See
+		// Timekeeper.hostAlignedMonotonic.
+		wantMonotonic = nowMonotonic
 	}
 
 	t.monotonicOffset = wantMonotonic - nowMonotonic
