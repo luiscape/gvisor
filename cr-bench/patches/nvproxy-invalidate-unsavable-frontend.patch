@@ -1,0 +1,76 @@
+diff --git a/pkg/sentry/devices/nvproxy/frontend.go b/pkg/sentry/devices/nvproxy/frontend.go
+index 83a28a557..6db4f3a95 100644
+--- a/pkg/sentry/devices/nvproxy/frontend.go
++++ b/pkg/sentry/devices/nvproxy/frontend.go
+@@ -96,13 +96,28 @@ type frontendFD struct {
+ 	vfs.FileDescriptionDefaultImpl
+ 	vfs.DentryMetadataFileDescriptionImpl
+ 	vfs.NoLockFD
+-	memmap.MappableNoTrackMappings
+ 
+ 	dev           *frontendDevice
+ 	containerName string
+ 	hostFD        int32
+ 	memmapFile    frontendFDMemmapFile
+ 
++	// mapsMu protects mappings.
++	mapsMu mapsMutex `state:"nosave"`
++
++	// mappings tracks application mappings of this FD, so that they can be
++	// invalidated by InvalidateUnsavable before saving. Device pmas are not
++	// savable, and a process may hold device mappings that were not removed
++	// by cuda-checkpoint, e.g. mappings inherited across fork(2) by children
++	// that never initialized CUDA (compare CRIU's cuda_plugin, which fails to
++	// dump such processes). Dropping the pmas allows the mappings themselves
++	// to be saved; post-restore accesses fault and re-translate against the
++	// restored host FD (and typically fail, as with fsimpl/host), but this is
++	// only reachable for mappings that cuda-checkpoint did not manage.
++	//
++	// +checklocks:mapsMu
++	mappings memmap.MappingSet
++
+ 	// The driver's implementation of poll() for these files,
+ 	// kernel-open/nvidia/nv.c:nvidia_poll(), unsets
+ 	// nv_linux_file_private_t::dataless_event_pending if it's set. This makes
+diff --git a/pkg/sentry/devices/nvproxy/frontend_mmap.go b/pkg/sentry/devices/nvproxy/frontend_mmap.go
+index d149fd6a9..2067864ce 100644
+--- a/pkg/sentry/devices/nvproxy/frontend_mmap.go
++++ b/pkg/sentry/devices/nvproxy/frontend_mmap.go
+@@ -36,6 +36,37 @@ func (fd *frontendFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts)
+ 	return vfs.GenericProxyDeviceConfigureMMap(&fd.vfsfd, fd, opts)
+ }
+ 
++// AddMapping implements memmap.Mappable.AddMapping.
++func (fd *frontendFD) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
++	fd.mapsMu.Lock()
++	defer fd.mapsMu.Unlock()
++	fd.mappings.AddMapping(ms, ar, offset, writable)
++	return nil
++}
++
++// RemoveMapping implements memmap.Mappable.RemoveMapping.
++func (fd *frontendFD) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
++	fd.mapsMu.Lock()
++	defer fd.mapsMu.Unlock()
++	fd.mappings.RemoveMapping(ms, ar, offset, writable)
++}
++
++// CopyMapping implements memmap.Mappable.CopyMapping.
++func (fd *frontendFD) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
++	return fd.AddMapping(ctx, ms, dstAR, offset, writable)
++}
++
++// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
++//
++// Pmas backed by frontendFDMemmapFile cannot be saved, and are dropped here.
++// See frontendFD.mappings.
++func (fd *frontendFD) InvalidateUnsavable(ctx context.Context) error {
++	fd.mapsMu.Lock()
++	defer fd.mapsMu.Unlock()
++	fd.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
++	return nil
++}
++
+ // Translate implements memmap.Mappable.Translate.
+ func (fd *frontendFD) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+ 	return []memmap.Translation{

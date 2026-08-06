@@ -1,0 +1,77 @@
+# --------------------------------------------------------------------------
+#  Dockerfile.vllm — vLLM server image for checkpoint/restore benchmarks
+#
+#  vLLM + pre-downloaded models + the /sleep + /wake_up lifecycle wrapper
+#  + NVIDIA's cuda-checkpoint utility.
+#
+#  Differences from gcr/test/Dockerfile.vllm:
+#    - NO libgcr.so / LD_PRELOAD: GPU state is checkpointed by gVisor's
+#      native cuda-checkpoint integration (runsc checkpoint
+#      --cuda-checkpoint-path=/usr/local/bin/cuda-checkpoint).
+#    - cuda-checkpoint binary baked in (the sentry execs it in-container).
+#    - Pre-downloads a 1.5B model as well, for multi-GPU tensor-parallel
+#      benchmarks (0.5B has 14 attention heads → only divisible by TP=2;
+#      1.5B has 12 heads → works with TP=2 and TP=4).
+#
+#  Build context: cr-bench/
+#  Build:  docker build -t cr-bench-vllm -f images/Dockerfile.vllm .
+# --------------------------------------------------------------------------
+FROM nvidia/cuda:12.6.3-base-ubuntu22.04
+
+# Python + pip + curl + gcc/g++ (needed by Triton and torch.compile/inductor
+# for JIT kernel compilation)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-dev python3-venv \
+        curl ca-certificates gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir --upgrade pip
+
+# PyTorch (CUDA 12.6 wheels)
+RUN pip3 install --no-cache-dir \
+        torch --index-url https://download.pytorch.org/whl/cu126
+
+# vLLM — install after PyTorch to use the already-installed torch
+RUN pip3 install --no-cache-dir vllm
+
+# Pre-download models so no network is needed at runtime.
+# Override with: --build-arg MODELS="Org/Model1 Org/Model2"
+ARG MODELS="Qwen/Qwen2.5-0.5B-Instruct Qwen/Qwen2.5-1.5B-Instruct"
+ENV HF_HOME=/app/hf_cache
+RUN MODELS_TO_FETCH="$MODELS" python3 -c "\
+import os; \
+from huggingface_hub import snapshot_download; \
+[print(snapshot_download(m), flush=True) for m in os.environ['MODELS_TO_FETCH'].split()]"
+
+# NVIDIA cuda-checkpoint utility (thin CLI over cuCheckpoint* driver APIs).
+# (No build-time smoke test: the binary links libcuda.so.1, which is only
+#  injected at runtime with the rest of the driver userspace.)
+RUN curl -fSL -o /usr/local/bin/cuda-checkpoint \
+        https://github.com/NVIDIA/cuda-checkpoint/raw/main/bin/x86_64_Linux/cuda-checkpoint \
+    && chmod 0755 /usr/local/bin/cuda-checkpoint
+
+RUN mkdir -p /app
+
+# Sleep/wake lifecycle wrapper (adds /sleep, /wake_up, /is_sleeping)
+COPY apps/vllm_sleep_server.py /app/vllm_sleep_server.py
+
+# vLLM settings
+ENV VLLM_USAGE_SOURCE=production
+ENV HF_HUB_OFFLINE=1
+# The FlashInfer sampler JIT-compiles kernels at warmup (needs ninja +
+# libnvrtc, not installed) — use the built-in torch sampler instead.
+ENV VLLM_USE_FLASHINFER_SAMPLER=0
+
+WORKDIR /app
+EXPOSE 8000
+
+# CUDA graphs + torch.compile enabled (vLLM default); --enable-sleep-mode
+# allows sleep level 1/2 (weights → CPU / discard) for small checkpoints.
+ENTRYPOINT ["python3", "/app/vllm_sleep_server.py"]
+CMD ["--model", "Qwen/Qwen2.5-0.5B-Instruct", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--enable-sleep-mode", \
+     "--gpu-memory-utilization", "0.7", \
+     "--max-model-len", "2048", \
+     "--dtype", "float16"]

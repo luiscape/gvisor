@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -63,6 +64,9 @@ func (dev *uvmDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry
 	}
 	fd.memmapFile.SetFD(int(fd.hostFD))
 	fd.memmapFile.RequireAddrEqualsFileOffset()
+	dev.nvp.fdsMu.Lock()
+	dev.nvp.uvmFDs[fd] = struct{}{}
+	dev.nvp.fdsMu.Unlock()
 	return &fd.vfsfd, nil
 }
 
@@ -80,6 +84,13 @@ type uvmFD struct {
 	containerName string
 	hostFD        int32
 	memmapFile    uvmFDMemmapFile
+
+	// extRangesMu protects extRanges. extRanges records the base->length of
+	// UVM external ranges (UVM_CREATE_EXTERNAL_RANGE) mapped through this FD.
+	// It is used to drain CUDA fabric/multicast memory that cuda-checkpoint
+	// cannot serialize; see fabric.go.
+	extRangesMu sync.Mutex        `state:"nosave"`
+	extRanges   map[uint64]uint64 `state:"nosave"`
 
 	queue waiter.Queue
 }
@@ -179,6 +190,34 @@ func uvmIoctlSimple[Params any, PtrParams hasStatusPtr[Params]](ui *uvmIoctlStat
 	n, err := uvmIoctlInvoke(ui, ioctlParams)
 	if err != nil {
 		return n, err
+	}
+	if _, err := ioctlParams.CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+// uvmCreateExternalRange forwards UVM_CREATE_EXTERNAL_RANGE and records the
+// resulting VA range on the uvmFD. CUDA fabric/multicast memory is mapped into
+// these ranges (UVM_MAP_EXTERNAL_ALLOCATION); recording them lets nvproxy drain
+// that memory before checkpoint, since cuda-checkpoint cannot serialize it.
+// See fabric.go.
+func uvmCreateExternalRange(ui *uvmIoctlState) (uintptr, error) {
+	var ioctlParams nvgpu.UVM_CREATE_EXTERNAL_RANGE_PARAMS
+	if _, err := ioctlParams.CopyIn(ui.t, ui.ioctlParamsAddr); err != nil {
+		return 0, err
+	}
+	n, err := uvmIoctlInvoke(ui, &ioctlParams)
+	if err != nil {
+		return n, err
+	}
+	if ioctlParams.RMStatus == nvgpu.NV_OK {
+		ui.fd.extRangesMu.Lock()
+		if ui.fd.extRanges == nil {
+			ui.fd.extRanges = make(map[uint64]uint64)
+		}
+		ui.fd.extRanges[ioctlParams.Base] = ioctlParams.Length
+		ui.fd.extRangesMu.Unlock()
 	}
 	if _, err := ioctlParams.CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
 		return n, err

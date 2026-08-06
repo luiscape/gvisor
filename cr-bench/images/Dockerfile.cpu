@@ -1,0 +1,25 @@
+# --------------------------------------------------------------------------
+#  Dockerfile.cpu — CPU memory checkpoint/restore benchmark image
+#
+#  Minimal: python + curl + the stdlib-only memory test server.
+#
+#  Build context: cr-bench/
+#  Build:  docker build -t cr-bench-cpu -f images/Dockerfile.cpu .
+# --------------------------------------------------------------------------
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /app
+COPY apps/cpu_mem_server.py /app/cpu_mem_server.py
+
+ENV MEM_MB=1024
+ENV NUM_BUFFERS=8
+ENV PORT=8199
+
+WORKDIR /app
+EXPOSE 8199
+
+ENTRYPOINT ["python3", "/app/cpu_mem_server.py"]

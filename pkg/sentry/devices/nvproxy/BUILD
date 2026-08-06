@@ -42,6 +42,8 @@ go_template_instance(
 go_library(
     name = "nvproxy",
     srcs = [
+        "fabric.go",
+        "fabric_unsafe.go",
         "fds_mutex.go",
         "frontend.go",
         "frontend_mmap.go",

@@ -1,0 +1,70 @@
+diff --git a/pkg/sentry/devices/nvproxy/uvm.go b/pkg/sentry/devices/nvproxy/uvm.go
+index 82a73eacc..b777b0737 100644
+--- a/pkg/sentry/devices/nvproxy/uvm.go
++++ b/pkg/sentry/devices/nvproxy/uvm.go
+@@ -74,13 +74,22 @@ type uvmFD struct {
+ 	vfs.FileDescriptionDefaultImpl
+ 	vfs.DentryMetadataFileDescriptionImpl
+ 	vfs.NoLockFD
+-	memmap.MappableNoTrackMappings
+ 
+ 	dev           *uvmDevice
+ 	containerName string
+ 	hostFD        int32
+ 	memmapFile    uvmFDMemmapFile
+ 
++	// mapsMu protects mappings.
++	mapsMu mapsMutex `state:"nosave"`
++
++	// mappings tracks application mappings of this FD, so that they can be
++	// invalidated by InvalidateUnsavable before saving. See
++	// frontendFD.mappings.
++	//
++	// +checklocks:mapsMu
++	mappings memmap.MappingSet
++
+ 	queue waiter.Queue
+ }
+ 
+diff --git a/pkg/sentry/devices/nvproxy/uvm_mmap.go b/pkg/sentry/devices/nvproxy/uvm_mmap.go
+index 666b1955c..1a511820a 100644
+--- a/pkg/sentry/devices/nvproxy/uvm_mmap.go
++++ b/pkg/sentry/devices/nvproxy/uvm_mmap.go
+@@ -32,6 +32,37 @@ func (fd *uvmFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error
+ 	return vfs.GenericProxyDeviceConfigureMMap(&fd.vfsfd, fd, opts)
+ }
+ 
++// AddMapping implements memmap.Mappable.AddMapping.
++func (fd *uvmFD) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
++	fd.mapsMu.Lock()
++	defer fd.mapsMu.Unlock()
++	fd.mappings.AddMapping(ms, ar, offset, writable)
++	return nil
++}
++
++// RemoveMapping implements memmap.Mappable.RemoveMapping.
++func (fd *uvmFD) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
++	fd.mapsMu.Lock()
++	defer fd.mapsMu.Unlock()
++	fd.mappings.RemoveMapping(ms, ar, offset, writable)
++}
++
++// CopyMapping implements memmap.Mappable.CopyMapping.
++func (fd *uvmFD) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
++	return fd.AddMapping(ctx, ms, dstAR, offset, writable)
++}
++
++// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
++//
++// Pmas backed by uvmFDMemmapFile cannot be saved, and are dropped here. See
++// frontendFD.mappings.
++func (fd *uvmFD) InvalidateUnsavable(ctx context.Context) error {
++	fd.mapsMu.Lock()
++	defer fd.mapsMu.Unlock()
++	fd.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
++	return nil
++}
++
+ // Translate implements memmap.Mappable.Translate.
+ func (fd *uvmFD) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+ 	return []memmap.Translation{

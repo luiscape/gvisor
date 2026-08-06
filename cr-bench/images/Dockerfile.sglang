@@ -1,0 +1,66 @@
+# --------------------------------------------------------------------------
+#  Dockerfile.sglang — SGLang server image for checkpoint/restore benchmarks
+#
+#  SGLang + pre-downloaded models (same Qwen models as the vLLM image)
+#  + NVIDIA's cuda-checkpoint utility.
+#
+#  Unlike vLLM, SGLang needs no lifecycle wrapper: it ships native
+#  /pause_generation and /continue_generation endpoints which the
+#  benchmarks use to quiesce the engine around the snapshot.
+#
+#  Build context: cr-bench/
+#  Build:  docker build -t cr-bench-sglang -f images/Dockerfile.sglang .
+# --------------------------------------------------------------------------
+# devel (not base) image: SGLang JIT-compiles kernels at startup (fused
+# RoPE etc. via tvm-ffi/sgl-kernel-jit), which requires nvcc.
+FROM nvidia/cuda:12.6.3-devel-ubuntu22.04
+
+# Python + pip + curl + gcc (needed by Triton for JIT kernel compilation;
+# we run SGLang with --attention-backend triton) + libnuma (sgl-kernel).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-dev python3-venv \
+        curl ca-certificates gcc g++ libnuma1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir --upgrade pip
+
+# SGLang (pulls its own pinned torch + sgl-kernel + flashinfer wheels)
+RUN pip3 install --no-cache-dir "sglang[all]"
+
+# Pre-download models so no network is needed at runtime.
+# Same models as the vLLM image:
+#   Qwen2.5-0.5B-Instruct (14 heads): single GPU / TP=2
+#   Qwen2.5-1.5B-Instruct (12 heads): TP=2 and TP=4
+ARG MODELS="Qwen/Qwen2.5-0.5B-Instruct Qwen/Qwen2.5-1.5B-Instruct"
+ENV HF_HOME=/app/hf_cache
+RUN MODELS_TO_FETCH="$MODELS" python3 -c "\
+import os; \
+from huggingface_hub import snapshot_download; \
+[print(snapshot_download(m), flush=True) for m in os.environ['MODELS_TO_FETCH'].split()]"
+
+# NVIDIA cuda-checkpoint utility (thin CLI over cuCheckpoint* driver APIs).
+# (No build-time smoke test: the binary links libcuda.so.1, which is only
+#  injected at runtime with the rest of the driver userspace.)
+RUN curl -fSL -o /usr/local/bin/cuda-checkpoint \
+        https://github.com/NVIDIA/cuda-checkpoint/raw/main/bin/x86_64_Linux/cuda-checkpoint \
+    && chmod 0755 /usr/local/bin/cuda-checkpoint
+
+RUN mkdir -p /app
+
+ENV HF_HUB_OFFLINE=1
+
+WORKDIR /app
+EXPOSE 8000
+
+# --disable-cuda-graph: eager mode, simpler GPU state for C/R (analogous
+# to vLLM's --enforce-eager).
+ENTRYPOINT ["python3", "-m", "sglang.launch_server"]
+CMD ["--model-path", "Qwen/Qwen2.5-0.5B-Instruct", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--mem-fraction-static", "0.7", \
+     "--context-length", "2048", \
+     "--dtype", "float16", \
+     "--attention-backend", "triton", \
+     "--sampling-backend", "pytorch", \
+     "--disable-cuda-graph"]

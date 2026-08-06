@@ -215,7 +215,7 @@ func Init() {
 					nvgpu.UVM_ALLOC_SEMAPHORE_POOL:           uvmHandler(uvmIoctlSimple[nvgpu.UVM_ALLOC_SEMAPHORE_POOL_PARAMS], compUtil),
 					nvgpu.UVM_PAGEABLE_MEM_ACCESS_ON_GPU:     uvmHandler(uvmIoctlSimple[nvgpu.UVM_PAGEABLE_MEM_ACCESS_ON_GPU_PARAMS], nvconf.CapVideo),
 					nvgpu.UVM_VALIDATE_VA_RANGE:              uvmHandler(uvmIoctlSimple[nvgpu.UVM_VALIDATE_VA_RANGE_PARAMS], compUtil),
-					nvgpu.UVM_CREATE_EXTERNAL_RANGE:          uvmHandler(uvmIoctlSimple[nvgpu.UVM_CREATE_EXTERNAL_RANGE_PARAMS], compUtil),
+					nvgpu.UVM_CREATE_EXTERNAL_RANGE:          uvmHandler(uvmCreateExternalRange, compUtil),
 					nvgpu.UVM_MM_INITIALIZE:                  uvmHandler(uvmMMInitialize, compUtil),
 				},
 				controlCmd: map[uint32]controlCmdHandler{
