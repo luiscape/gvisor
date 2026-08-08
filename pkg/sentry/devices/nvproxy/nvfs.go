@@ -229,7 +229,6 @@ func nvfsIoctlMap(ni *nvfsIoctlState) (uintptr, error) {
 		return 0, linuxerr.EINVAL
 	}
 	appCPUVAddr := mapArgs.CPUVAddr
-	appEndFence := mapArgs.EndFenceAddr
 	shadowAddr, shadowCleanup, err := nvfsMapOwnShadowBuffer(ni, shadowLen)
 	if err != nil {
 		return 0, err
@@ -244,8 +243,8 @@ func nvfsIoctlMap(ni *nvfsIoctlState) (uintptr, error) {
 	}()
 	mapArgs.CPUVAddr = uint64(shadowAddr)
 
-	if appEndFence != 0 {
-		fenceAddr, fenceCleanup, err := nvfsPinAndMap(ni, appEndFence, hostarch.PageSize, true /* write */)
+	if mapArgs.EndFenceAddr != 0 {
+		fenceAddr, fenceCleanup, err := nvfsPinAndMap(ni, mapArgs.EndFenceAddr, hostarch.PageSize, true /* write */)
 		if err != nil {
 			return 0, err
 		}
@@ -258,16 +257,10 @@ func nvfsIoctlMap(ni *nvfsIoctlState) (uintptr, error) {
 	if err != nil {
 		return n, err
 	}
-	// Restore the guest-observable addresses before copying back, so the
-	// application never sees sentry VAs (nvfs_map() does not modify these
-	// fields on success).
-	mapArgs.CPUVAddr = appCPUVAddr
-	mapArgs.EndFenceAddr = appEndFence
-	mapArgs.MarshalBytes(param.Data[:])
-	if _, err := param.CopyOut(ni.t, ni.ioctlParamsAddr); err != nil {
-		return n, err
-	}
-	ni.fd.dev.nvp.storeGDSShadow(ni.fd, ni.t.MemoryManager(), appCPUVAddr, shadowAddr, shadowLen, shadowCleanup)
+	// nvfs_map() does not write the parameter struct back, so there is no
+	// copy-out; leaving the application's buffer untouched also keeps the sentry
+	// VAs substituted above from ever being exposed.
+	ni.fd.dev.nvp.storeGDSShadow(ni.fd, ni.t.MemoryManager(), appCPUVAddr, shadowAddr, shadowCleanup)
 	persisted = true
 	return n, nil
 }
@@ -376,24 +369,22 @@ type gdsShadowKey struct {
 	addr uint64
 }
 
-// gdsShadowMapping is a persistent sentry mapping of a shadow buffer's host
-// nvidia-fs pages, established at NVFS_IOCTL_MAP and reused by every
+// gdsShadowMapping is a persistent sentry-owned shadow buffer (a host mmap of
+// /dev/nvidia-fs), established at NVFS_IOCTL_MAP and reused by every
 // NVFS_IOCTL_READ/WRITE against that buffer until the owning nvfsFD is released.
 type gdsShadowMapping struct {
 	// owner is the nvfsFD whose MAP established this mapping; it owns cleanup.
 	owner *nvfsFD
 	// sentryAddr is the stable sentry VA passed to the host as cpuvaddr.
 	sentryAddr uintptr
-	// length is the shadow-buffer length in bytes.
-	length uint64
-	// release unmaps sentryAddr and unpins the underlying application pages.
+	// release unmaps the sentry-owned shadow buffer.
 	release func()
 }
 
 // storeGDSShadow records a shadow-buffer mapping, taking ownership of release.
 // A pre-existing registration at the same (mm, addr) is released first (the
 // application re-registered a buffer at the same VA).
-func (nvp *nvproxy) storeGDSShadow(owner *nvfsFD, appMM *mm.MemoryManager, addr uint64, sentryAddr uintptr, length uint64, release func()) {
+func (nvp *nvproxy) storeGDSShadow(owner *nvfsFD, appMM *mm.MemoryManager, addr uint64, sentryAddr uintptr, release func()) {
 	key := gdsShadowKey{mm: appMM, addr: addr}
 	nvp.gdsShadowsMu.Lock()
 	defer nvp.gdsShadowsMu.Unlock()
@@ -403,7 +394,6 @@ func (nvp *nvproxy) storeGDSShadow(owner *nvfsFD, appMM *mm.MemoryManager, addr 
 	nvp.gdsShadows[key] = &gdsShadowMapping{
 		owner:      owner,
 		sentryAddr: sentryAddr,
-		length:     length,
 		release:    release,
 	}
 }
@@ -465,7 +455,11 @@ func nvfsIoctlReadWrite(ni *nvfsIoctlState) (uintptr, error) {
 	// address, so fail early.
 	sentryAddr, ok := ni.fd.dev.nvp.lookupGDSShadow(ni.t.MemoryManager(), ioctlParams.CPUVAddr)
 	if !ok {
-		ni.ctx.Warningf("nvproxy: nvidia-fs %s on unregistered shadow buffer %#x", nvfsRWName(write), ioctlParams.CPUVAddr)
+		op := "READ"
+		if write {
+			op = "WRITE"
+		}
+		ni.ctx.Warningf("nvproxy: nvidia-fs %s on unregistered shadow buffer %#x", op, ioctlParams.CPUVAddr)
 		return 0, linuxerr.EINVAL
 	}
 
@@ -513,14 +507,6 @@ func nvfsIoctlReadWrite(ni *nvfsIoctlState) (uintptr, error) {
 		return n, err
 	}
 	return n, nil
-}
-
-// nvfsRWName returns a human-readable name for the READ/WRITE op, for logging.
-func nvfsRWName(write bool) string {
-	if write {
-		return "WRITE"
-	}
-	return "READ"
 }
 
 // nvfsOpenDirectHostFD re-opens the data file identified by hostFD with O_DIRECT
