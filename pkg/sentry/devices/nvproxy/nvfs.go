@@ -192,18 +192,30 @@ func nvfsIoctlRemove(ni *nvfsIoctlState) (uintptr, error) {
 
 // nvfsIoctlMap handles NVFS_IOCTL_MAP (cuFileBufRegister). The GPU buffer
 // (NvfsIoctlMap.GPUVAddr) is resolved by the GPU driver via nvidia_p2p and needs
-// no translation, but nvidia-fs also pin_user_pages_fast()es the shadow buffer
-// (CPUVAddr) and the end-fence page (EndFenceAddr) in the *calling* process.
-// Since nvproxy forwards from the sentry, those application VAs are translated
-// to sentry-host VAs backed by the same pages (pin + MapInternal + mremap into
-// a fresh reservation, mirroring rmAllocOSDescriptor).
+// no translation, but nvidia-fs pin_user_pages_fast()es the shadow buffer
+// (CPUVAddr) and the end-fence page (EndFenceAddr) in the *calling* process,
+// which for nvproxy is the sentry. The two are handled differently:
+//
+//   - CPUVAddr (shadow buffer): the sentry creates and owns its OWN shadow
+//     buffer by mmap()ing the host /dev/nvidia-fs FD, and passes that address.
+//     The application's own mapping is ignored. This is required because
+//     nvidia-fs allocates driver-private pages for each mmap and then asserts
+//     (via BUG_ON) that the pinned pages are exactly those; its vm_ops also
+//     reject mremap/VMA duplication, so the sentry cannot mirror the
+//     application's mapping. This is sound because the shadow buffer is a
+//     kernel-side handle, not a data buffer: nvfs_get_dma() substitutes GPU BAR
+//     addresses during DMA, so payload never lands in the shadow pages and the
+//     application never reads them. It also gives each registered buffer its own
+//     distinct shadow pages, which is what the driver expects.
+//   - EndFenceAddr: ordinary anonymous application memory, so the usual
+//     pin + MapInternal + mremap translation works (see nvfsPinAndMap).
 //
 // The shadow mapping is retained past MAP in a per-nvproxy registry: the host
-// records cpu_base_vaddr == the translated CPUVAddr and re-pins it in the
+// records cpu_base_vaddr == the address passed here and re-pins it in the
 // sentry on every READ/WRITE (nvfs-core.c:nvfs_get_mgroup_from_vaddr), so it
 // must stay mapped at the SAME sentry VA. The end-fence page does not need to
 // persist: the host holds its own pin_user_pages_fast() reference and kmaps the
-// page directly, so the sentry mapping is released once MAP returns.
+// page directly, so its sentry mapping is released once MAP returns.
 func nvfsIoctlMap(ni *nvfsIoctlState) (uintptr, error) {
 	var param nvgpu.NvfsIoctlParamUnion
 	if _, err := param.CopyIn(ni.t, ni.ioctlParamsAddr); err != nil {
@@ -218,7 +230,7 @@ func nvfsIoctlMap(ni *nvfsIoctlState) (uintptr, error) {
 	}
 	appCPUVAddr := mapArgs.CPUVAddr
 	appEndFence := mapArgs.EndFenceAddr
-	shadowAddr, shadowCleanup, err := nvfsPinAndMap(ni, appCPUVAddr, shadowLen, true /* write */)
+	shadowAddr, shadowCleanup, err := nvfsMapOwnShadowBuffer(ni, shadowLen)
 	if err != nil {
 		return 0, err
 	}
@@ -260,11 +272,36 @@ func nvfsIoctlMap(ni *nvfsIoctlState) (uintptr, error) {
 	return n, nil
 }
 
+// nvfsMapOwnShadowBuffer creates a sentry-owned GPUDirect Storage shadow buffer
+// by mmap()ing the host /dev/nvidia-fs FD directly, returning the sentry
+// virtual address and a cleanup function that unmaps it.
+//
+// nvidia-fs allocates driver-private pages per mmap (nvfs-mmap.c:
+// nvfs_mgroup_mmap_internal), tags them with an encoded page->index, and later
+// asserts via BUG_ON that the pages pinned at NVFS_IOCTL_MAP are exactly those.
+// The sentry therefore cannot mirror the application's mapping of the device
+// (its vm_ops also reject mremap and VMA duplication outright); it must own a
+// shadow buffer of its own. The offset must be 0: nvfs_mgroup_mmap() returns
+// -EIO for any non-zero vm_pgoff.
+func nvfsMapOwnShadowBuffer(ni *nvfsIoctlState, length uint64) (uintptr, func(), error) {
+	m, _, errno := unix.RawSyscall6(unix.SYS_MMAP, 0 /* addr */, uintptr(length), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED, uintptr(ni.fd.hostFD), 0 /* offset */)
+	if errno != 0 {
+		ni.ctx.Warningf("nvproxy: nvidia-fs failed to mmap host shadow buffer (len=%d): %v", length, errno)
+		return 0, nil, errno
+	}
+	return m, func() { unix.RawSyscall(unix.SYS_MUNMAP, m, uintptr(length), 0) }, nil
+}
+
 // nvfsPinAndMap pins the application memory range [addr, addr+length) and
 // mirrors it into a fresh reservation in the sentry's address space, returning
 // the sentry virtual address and a cleanup function that unmaps it and unpins
 // the application pages. The host nvidia-fs driver pin_user_pages_fast()es the
 // returned address in the sentry process.
+//
+// This works only for ordinary (anonymous) application memory, whose pages are
+// backed by the sentry's MemoryFile and can be duplicated; it is used for the
+// end-fence page. It must NOT be used for the shadow buffer -- see
+// nvfsMapOwnShadowBuffer.
 func nvfsPinAndMap(ni *nvfsIoctlState, addr uint64, length uint64, write bool) (uintptr, func(), error) {
 	appAR, ok := hostarch.Addr(addr).ToRange(length)
 	if !ok {
@@ -299,11 +336,6 @@ func nvfsPinAndMap(ni *nvfsIoctlState, addr uint64, length uint64, write bool) (
 		}
 		for !ims.IsEmpty() {
 			im := ims.Head()
-			// KNOWN LIMITATION: this fails (EFAULT) for nvidia-fs shadow
-			// buffers. See the "shadow-buffer mirroring is a dead end" section
-			// of GDS_PROGRESS.md: the sentry cannot mirror the application's
-			// mapping of /dev/nvidia-fs, and must instead own the shadow buffer
-			// (mmap the host device itself) and pass that address as cpuvaddr.
 			if _, _, errno := unix.RawSyscall6(unix.SYS_MREMAP, im.Addr(), 0 /* old_size */, uintptr(im.Len()), linux.MREMAP_MAYMOVE|linux.MREMAP_FIXED, sentryAddr, 0); errno != 0 {
 				ni.ctx.Warningf("nvproxy: nvidia-fs pin-and-map: mremap(src=%#x len=%d dst=%#x) failed: %v", im.Addr(), im.Len(), sentryAddr, errno)
 				return 0, nil, errno

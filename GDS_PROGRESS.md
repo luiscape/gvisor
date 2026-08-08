@@ -1,13 +1,15 @@
 # GPUDirect Storage (GDS) in nvproxy — Design & Handoff
 
-**Status:** the full proxy is implemented and compiles. `REMOVE` and `mmap` are
-hardware-validated. **`MAP` is BLOCKED**: with the real GDS stack installed, a
-real `cuFileBufRegister`-equivalent `MAP` succeeds on bare metal but fails with
-`EFAULT` inside the sandbox, because the sentry cannot mirror the application's
-mapping of `/dev/nvidia-fs`. This is a design-level blocker with a known fix —
-see [section 6a](#6a-blocker-shadow-buffer-mirroring-is-a-dead-end), which is
-**the next thing to work on**. `READ`/`WRITE` is implemented but unreachable
-until `MAP` works.
+**Status:** the full proxy is implemented. `REMOVE`, `mmap` and **`MAP` are
+hardware-validated**: a real `cuFileBufRegister`-equivalent `MAP` (real
+`cuMemAlloc` GPU buffer + real `mmap(/dev/nvidia-fs)` shadow buffer) now returns
+**0 inside the sandbox, matching bare metal**, including with 4 concurrently
+registered buffers. This required a design change — the sentry now **owns** the
+shadow buffer; see [section 6a](#6a-resolved-the-sentry-owns-the-shadow-buffer).
+
+`READ`/`WRITE` is implemented but **still never executed**, because it needs a
+GDS-capable backend (this box has neither `CONFIG_PCI_P2PDMA` nor an RDMA NIC,
+so cuFile stays in compat mode and never issues those ioctls).
 
 Branch: `luis/gds-capability`.
 
@@ -150,34 +152,36 @@ metal and the sandbox:
 | `open /dev/nvidia-fs0..15` | ok | ok |
 | `REMOVE` ×16 | `0` | `0` |
 | `mmap` (4 KiB) | ok | ok (host-backed) |
-| `MAP` (`gpuvaddr=0`) | `-1 EPERM` | `-1 EPERM` |
+| **real `MAP`** (real GPU buf + real shadow buf) | **`0`** | **`0`** ✅ |
+| **real `MAP` ×4 concurrent buffers** | 4/4 | **4/4** ✅ |
 
 This proves: device-node creation, dev-gofer/directfs FD donation into the
-handler, seccomp, ioctl dispatch, `REMOVE`, and the `mmap` proxy.
-
-**Executed and FAILING:** `MAP` against a *real* registered shadow buffer —
-see [section 6a](#6a-blocker-shadow-buffer-mirroring-is-a-dead-end). This is now
-the top blocker.
+handler, seccomp, ioctl dispatch, `REMOVE`, the `mmap` proxy, the sentry-owned
+shadow buffer, the end-fence translation, GPU-buffer resolution through nvproxy,
+and shadow-registry population — with multiple concurrent registrations.
 
 **Never executed** (compile- and source-verified only):
-- The shadow registry (`MAP` fails before reaching `storeGDSShadow`).
-- The entire `nvfsIoctlReadWrite` body.
+- The entire `nvfsIoctlReadWrite` body (`READ`/`WRITE`), and therefore the
+  registry *lookup* path (`storeGDSShadow` is exercised, `lookupGDSShadow` is
+  not).
 
-**Why it can't be validated here:** the test host has
-`# CONFIG_PCI_P2PDMA is not set`, so cuFile refuses GDS and falls back to compat
-mode (POSIX + `cudaMemcpy`), never opening `/dev/nvidia-fs`. A `gdsio` run here
-measures compat-mode bandwidth that bypasses the proxy entirely.
+**Why `READ`/`WRITE` can't be validated here:** `gdscheck -p` reports every
+backend as `compat`, `use_pci_p2pdma: false` (the kernel is built without
+`CONFIG_PCI_P2PDMA`) and `Userspace RDMA: Unsupported` with no RDMA devices — so
+neither the local-NVMe nor the DFS route to true GDS is available. cuFile stays
+in compat mode and never issues `READ`/`WRITE`.
 
-## 6a. BLOCKER: shadow-buffer mirroring is a dead end
+## 6a. RESOLVED: the sentry owns the shadow buffer
 
 **Hardware-proven on 2026-08-08.** With the full GDS stack installed (nvidia-fs
 2.29.4, libcufile/gds-tools 1.17.1.22), a purpose-built harness
 (`cuMemAlloc` + `mmap(/dev/nvidia-fs0)` + `NVFS_IOCTL_MAP`, i.e. exactly what
-`cuFileBufRegister` does) gives:
+`cuFileBufRegister` does) gave:
 
-| | bare metal | through `runsc-gds` |
-|---|---|---|
-| real `MAP` (real GPU buf + real shadow buf) | **0 (success)** | **-1 `EFAULT`** |
+| | bare metal | sandbox (before) | sandbox (after fix) |
+|---|---|---|---|
+| real `MAP` | **0** | **-1 `EFAULT`** | **0** ✅ |
+| 4 concurrent buffers | 4/4 | — | **4/4** ✅ |
 
 Sentry diagnostics localise it precisely:
 
@@ -225,28 +229,24 @@ aliasing problem** (risk #1 below): one sentry-side host `mmap` per registered
 buffer naturally yields distinct shadow pages, which is exactly what the driver
 expects.
 
-Until this is done, `MAP` (and therefore all of `READ`/`WRITE`) fails inside a
-sandbox on any host, GDS-capable or not.
+**This is now implemented** (`nvfsMapOwnShadowBuffer`). `nvfsPinAndMap` is
+retained only for the end-fence page, which is ordinary anonymous application
+memory and duplicates fine. Verified: `MAP` returns 0 in the sandbox with no
+warnings, and 4 concurrent registrations all succeed — which also closes the
+multi-buffer aliasing risk, since each registration now gets its own host mmap
+with distinct driver-allocated pages.
 
 ## 7. Known gaps & risks (ranked)
 
-1. **Multiple concurrent registered buffers will almost certainly break.**
-   *Architectural, not a small bug.* `nvfs_mgroup_mmap()` allocates distinct
-   shadow pages per mmap and rejects non-zero `vm_pgoff`. But gVisor's
-   `Translate` maps by file offset: two app mmaps of the device, both at offset
-   0, yield the same `MappableRange{0,…}` and therefore **alias the same host
-   pages**. The registry fixes *cpuvaddr→sentryVA*; it does **not** give each
-   buffer its own host mmap. Expect single-buffer to have a chance and
-   multi-buffer (e.g. multi-threaded `gdsio`) to collide. **Fixing this needs
-   work in the mmap layer: one host mmap per registered buffer, tracked
-   per-VA-range instead of per-offset.**
+1. ~~**Multiple concurrent registered buffers.**~~ **RESOLVED** by the
+   sentry-owned shadow buffer (section 6a): each registration performs its own
+   host `mmap`, so the driver allocates distinct shadow pages per buffer.
+   Verified 4/4 concurrent registrations succeed in the sandbox.
 
-2. **Shadow-page identity may not survive the pin+`mremap`, and the failure
-   mode can be a host kernel panic.** `nvfs_mgroup_pin_shadow_pages()` uses
-   `BUG_ON` (not error returns) to assert the pinned pages are the driver's
-   exact `struct page`s and in the right order. Most likely a mismatch fails
-   earlier and benignly (`base_index` lookup → `NULL` → `EINVAL`), but a
-   partial match panics the host. **Test on a machine you can afford to crash.**
+2. ~~**Shadow-page identity may not survive the pin+`mremap`.**~~ **RESOLVED** —
+   the `mremap` is gone for shadow buffers. The driver now pins pages it
+   allocated itself, so the `BUG_ON` identity assertions pass (empirically: MAP
+   returns 0, no `WARN`/oops in `dmesg`).
 
 3. **`file_args` major/minor semantics are inferred.** We map the driver's
    `get_major(inode)`/`get_minor(inode)` to `st_dev`. Reasonable but
