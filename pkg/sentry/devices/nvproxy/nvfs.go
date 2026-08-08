@@ -99,6 +99,8 @@ type nvfsFD struct {
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *nvfsFD) Release(context.Context) {
+	// Drop any GPUDirect Storage shadow-buffer mappings registered through this
+	fd.dev.nvp.releaseGDSShadows(fd)
 	fdnotifier.RemoveFD(fd.hostFD)
 	fd.queue.Notify(waiter.EventHUp)
 	fd.memmapFile.MappableRelease() // eventually closes fd.hostFD
@@ -196,11 +198,12 @@ func nvfsIoctlRemove(ni *nvfsIoctlState) (uintptr, error) {
 // to sentry-host VAs backed by the same pages (pin + MapInternal + mremap into
 // a fresh reservation, mirroring rmAllocOSDescriptor).
 //
-// TODO(GDS): the sentry mappings are released once MAP returns, which suffices
-// for buffer registration (the host pins the pages itself). The READ/WRITE path
-// additionally requires CPUVAddr to stay mapped at the SAME sentry VA, since the
-// host stores it as cpu_base_vaddr and re-pins it; that needs a per-mapping
-// registry (see nvfsIoctlReadWrite).
+// The shadow mapping is retained past MAP in a per-nvproxy registry: the host
+// records cpu_base_vaddr == the translated CPUVAddr and re-pins it in the
+// sentry on every READ/WRITE (nvfs-core.c:nvfs_get_mgroup_from_vaddr), so it
+// must stay mapped at the SAME sentry VA. The end-fence page does not need to
+// persist: the host holds its own pin_user_pages_fast() reference and kmaps the
+// page directly, so the sentry mapping is released once MAP returns.
 func nvfsIoctlMap(ni *nvfsIoctlState) (uintptr, error) {
 	var param nvgpu.NvfsIoctlParamUnion
 	if _, err := param.CopyIn(ni.t, ni.ioctlParamsAddr); err != nil {
@@ -213,15 +216,24 @@ func nvfsIoctlMap(ni *nvfsIoctlState) (uintptr, error) {
 	if shadowLen == 0 {
 		return 0, linuxerr.EINVAL
 	}
-	shadowAddr, shadowCleanup, err := nvfsPinAndMap(ni, mapArgs.CPUVAddr, shadowLen, true /* write */)
+	appCPUVAddr := mapArgs.CPUVAddr
+	appEndFence := mapArgs.EndFenceAddr
+	shadowAddr, shadowCleanup, err := nvfsPinAndMap(ni, appCPUVAddr, shadowLen, true /* write */)
 	if err != nil {
 		return 0, err
 	}
-	defer shadowCleanup()
+	// On any failure the shadow mapping is released; on success its ownership is
+	// transferred to the registry (persisted == true).
+	persisted := false
+	defer func() {
+		if !persisted {
+			shadowCleanup()
+		}
+	}()
 	mapArgs.CPUVAddr = uint64(shadowAddr)
 
-	if mapArgs.EndFenceAddr != 0 {
-		fenceAddr, fenceCleanup, err := nvfsPinAndMap(ni, mapArgs.EndFenceAddr, hostarch.PageSize, true /* write */)
+	if appEndFence != 0 {
+		fenceAddr, fenceCleanup, err := nvfsPinAndMap(ni, appEndFence, hostarch.PageSize, true /* write */)
 		if err != nil {
 			return 0, err
 		}
@@ -234,9 +246,17 @@ func nvfsIoctlMap(ni *nvfsIoctlState) (uintptr, error) {
 	if err != nil {
 		return n, err
 	}
+	// Restore the guest-observable addresses before copying back, so the
+	// application never sees sentry VAs (nvfs_map() does not modify these
+	// fields on success).
+	mapArgs.CPUVAddr = appCPUVAddr
+	mapArgs.EndFenceAddr = appEndFence
+	mapArgs.MarshalBytes(param.Data[:])
 	if _, err := param.CopyOut(ni.t, ni.ioctlParamsAddr); err != nil {
 		return n, err
 	}
+	ni.fd.dev.nvp.storeGDSShadow(ni.fd, ni.t.MemoryManager(), appCPUVAddr, shadowAddr, shadowLen, shadowCleanup)
+	persisted = true
 	return n, nil
 }
 
@@ -289,42 +309,126 @@ func nvfsPinAndMap(ni *nvfsIoctlState, addr uint64, length uint64, write bool) (
 // hostFDForGDSer is implemented by vfs.FileDescriptionImpls that can expose a
 // host file descriptor for use as the data-file FD in nvidia-fs (GPUDirect
 // Storage) ioctls. The gofer's directfs regular-file FD implements it.
+//
+// This mirrors how GPUDirect RDMA hands a host FD between proxies (nvproxy's
+// dmaBufFDWrapper implements vfs.HostFDProvider, recovered by rdmaproxy). The
+// gofer regular-file FD implements the vfs.HostFDProvider convention too, but
+// GDS uses this richer interface because it needs a superset of HostFD() int:
+// write-vs-read selection, O_DIRECT reconciliation, and an error return. See
+// regularFileFD.HostFDForGPUDirectStorage.
 type hostFDForGDSer interface {
 	HostFDForGPUDirectStorage(write bool) (int32, error)
 }
 
-// nvfsIoctlReadWrite handles NVFS_IOCTL_READ and NVFS_IOCTL_WRITE. nvidia-fs
-// performs direct I/O (and NVMe-to-GPU DMA) on the file descriptor carried in
-// NvfsIoctlIoargs.FD via fget() in the calling (sentry) process, so the
-// application's data-file FD must be translated to its host FD before
-// forwarding. The host FD is only reachable when directfs donated it to the
-// sentry, which CapGPUDirectStorage requires.
+// gdsShadowKey identifies a registered GPUDirect Storage shadow buffer by the
+// registering application's address space and the buffer's application VA. This
+// mirrors how the host driver resolves a shadow buffer: pin_user_pages_fast()
+// of cpuvaddr in current->mm (here, the app's MemoryManager).
 //
-// Confirmed against nvfs-core.c:nvfs_io_init(), three more translations are
-// required before READ/WRITE can succeed (none are exercisable on a
-// compat-mode host, which never issues these ioctls):
+// The MemoryManager pointer is used only as an opaque key; no reference is
+// held. This is safe because a registered buffer keeps its process alive, and
+// the process's death closes its nvfsFDs (releasing the registrations, see
+// releaseGDSShadows), so a live entry's MemoryManager pointer cannot be reused
+// by a different address space.
+type gdsShadowKey struct {
+	mm   *mm.MemoryManager
+	addr uint64
+}
+
+// gdsShadowMapping is a persistent sentry mapping of a shadow buffer's host
+// nvidia-fs pages, established at NVFS_IOCTL_MAP and reused by every
+// NVFS_IOCTL_READ/WRITE against that buffer until the owning nvfsFD is released.
+type gdsShadowMapping struct {
+	// owner is the nvfsFD whose MAP established this mapping; it owns cleanup.
+	owner *nvfsFD
+	// sentryAddr is the stable sentry VA passed to the host as cpuvaddr.
+	sentryAddr uintptr
+	// length is the shadow-buffer length in bytes.
+	length uint64
+	// release unmaps sentryAddr and unpins the underlying application pages.
+	release func()
+}
+
+// storeGDSShadow records a shadow-buffer mapping, taking ownership of release.
+// A pre-existing registration at the same (mm, addr) is released first (the
+// application re-registered a buffer at the same VA).
+func (nvp *nvproxy) storeGDSShadow(owner *nvfsFD, appMM *mm.MemoryManager, addr uint64, sentryAddr uintptr, length uint64, release func()) {
+	key := gdsShadowKey{mm: appMM, addr: addr}
+	nvp.gdsShadowsMu.Lock()
+	defer nvp.gdsShadowsMu.Unlock()
+	if old, ok := nvp.gdsShadows[key]; ok {
+		old.release()
+	}
+	nvp.gdsShadows[key] = &gdsShadowMapping{
+		owner:      owner,
+		sentryAddr: sentryAddr,
+		length:     length,
+		release:    release,
+	}
+}
+
+// lookupGDSShadow returns the stable sentry VA registered for the shadow buffer
+// at (appMM, addr), or ok == false if none is registered.
+func (nvp *nvproxy) lookupGDSShadow(appMM *mm.MemoryManager, addr uint64) (uintptr, bool) {
+	nvp.gdsShadowsMu.Lock()
+	defer nvp.gdsShadowsMu.Unlock()
+	m, ok := nvp.gdsShadows[gdsShadowKey{mm: appMM, addr: addr}]
+	if !ok {
+		return 0, false
+	}
+	return m.sentryAddr, true
+}
+
+// releaseGDSShadows releases every shadow mapping owned by fd. Called from
+// nvfsFD.Release.
+func (nvp *nvproxy) releaseGDSShadows(fd *nvfsFD) {
+	nvp.gdsShadowsMu.Lock()
+	defer nvp.gdsShadowsMu.Unlock()
+	for key, m := range nvp.gdsShadows {
+		if m.owner == fd {
+			m.release()
+			delete(nvp.gdsShadows, key)
+		}
+	}
+}
+
+// nvfsIoctlReadWrite handles NVFS_IOCTL_READ and NVFS_IOCTL_WRITE, the actual
+// NVMe->GPU (READ) and GPU->NVMe (WRITE) DMA path. nvfs_io_init() runs in the
+// ioctl-issuing (sentry) process and dereferences three request fields that
+// are all sandbox-relative and must be rewritten to host-relative before
+// forwarding (verified against nvfs-core.c):
 //
-//   - CPUVAddr: nvfs_get_mgroup_from_vaddr() pins it via pin_user_pages_fast()
-//     in current->mm and requires it to equal the cpu_base_vaddr recorded at
-//     MAP. It must be translated to a STABLE sentry VA backing the shadow
-//     buffer (the same value used at MAP), via a per-fd registry of shadow
-//     mappings (pin app range + MapInternal + mremap into a reserved range).
+//   - CPUVAddr: re-pinned via pin_user_pages_fast() in the sentry and required
+//     to equal the cpu_base_vaddr recorded at MAP
+//     (nvfs-mmap.c:nvfs_get_mgroup_from_vaddr). Translated to the persistent
+//     sentry VA established for this shadow buffer at NVFS_IOCTL_MAP.
+//   - FD: the data-file FD, fget()'d and subjected to direct I/O. Translated to
+//     the gofer's donated host FD (directfs, which CapGPUDirectStorage
+//     requires), then re-opened O_DIRECT with a matching access mode
+//     (nvfs_io_init() rejects the file unless O_DIRECT and FMODE_READ/WRITE are
+//     set).
 //   - FileArgs.{Inum,MajDev,MinDev,Generation}: validated against the HOST
-//     inode (inum == inode->i_ino, etc.). cuFile fills these from the sandbox
-//     (gVisor) stat, so nvproxy must fstat the host FD and overwrite them with
-//     host values, else nvfs returns ESTALE.
-//   - O_DIRECT: nvfs_io_init() rejects the data-file FD unless O_DIRECT is set;
-//     the directfs host FD may not have it, so it must be reconciled (e.g. a
-//     per-op O_DIRECT host FD).
+//     inode; rewritten from an fstat of the host FD, else nvfs returns ESTALE.
+//
+// The guest-observable inputs are restored before copy-out; only the
+// driver-written IoctlReturn is surfaced back to the application.
 func nvfsIoctlReadWrite(ni *nvfsIoctlState) (uintptr, error) {
 	var ioctlParams nvgpu.NvfsIoctlIoargs
 	if _, err := ioctlParams.CopyIn(ni.t, ni.ioctlParamsAddr); err != nil {
 		return 0, err
 	}
-
 	write := ni.cmd == nvgpu.NVFS_IOCTL_WRITE
 
-	// Translate the application's data-file FD to its host FD.
+	// Translate the shadow-buffer VA to the persistent sentry mapping recorded
+	// at MAP. Without a matching registration the host would fault or reject the
+	// address, so fail early.
+	sentryAddr, ok := ni.fd.dev.nvp.lookupGDSShadow(ni.t.MemoryManager(), ioctlParams.CPUVAddr)
+	if !ok {
+		ni.ctx.Warningf("nvproxy: nvidia-fs %s on unregistered shadow buffer %#x", nvfsRWName(write), ioctlParams.CPUVAddr)
+		return 0, linuxerr.EINVAL
+	}
+
+	// Translate the application's data-file FD to a host FD opened O_DIRECT.
 	dataFile, _ := ni.t.FDTable().Get(ioctlParams.FD)
 	if dataFile == nil {
 		return 0, linuxerr.EINVAL
@@ -335,15 +439,32 @@ func nvfsIoctlReadWrite(ni *nvfsIoctlState) (uintptr, error) {
 		ni.ctx.Warningf("nvproxy: nvidia-fs I/O on FD %d that is not backed by a host FD (directfs is required for GPUDirect Storage)", ioctlParams.FD)
 		return 0, linuxerr.EINVAL
 	}
-	hostFD, err := hostFDer.HostFDForGPUDirectStorage(write)
+	baseHostFD, err := hostFDer.HostFDForGPUDirectStorage(write)
 	if err != nil {
+		return 0, err
+	}
+	directFD, err := nvfsOpenDirectHostFD(baseHostFD, write)
+	if err != nil {
+		ni.ctx.Warningf("nvproxy: nvidia-fs failed to open data file O_DIRECT (GPUDirect Storage requires O_DIRECT-capable storage): %v", err)
+		return 0, err
+	}
+	defer unix.Close(directFD)
+
+	// Rewrite the file-identity fields to the host inode.
+	if err := nvfsRewriteFileArgs(&ioctlParams.FileArgs, directFD); err != nil {
 		return 0, err
 	}
 
 	origFD := ioctlParams.FD
-	ioctlParams.FD = hostFD
+	origCPUVAddr := ioctlParams.CPUVAddr
+	origFileArgs := ioctlParams.FileArgs
+	ioctlParams.FD = int32(directFD)
+	ioctlParams.CPUVAddr = uint64(sentryAddr)
 	n, err := nvfsIoctlInvoke(ni, &ioctlParams)
+	// Restore guest-observable inputs; keep driver outputs (IoctlReturn).
 	ioctlParams.FD = origFD
+	ioctlParams.CPUVAddr = origCPUVAddr
+	ioctlParams.FileArgs = origFileArgs
 	if err != nil {
 		return n, err
 	}
@@ -351,4 +472,46 @@ func nvfsIoctlReadWrite(ni *nvfsIoctlState) (uintptr, error) {
 		return n, err
 	}
 	return n, nil
+}
+
+// nvfsRWName returns a human-readable name for the READ/WRITE op, for logging.
+func nvfsRWName(write bool) string {
+	if write {
+		return "WRITE"
+	}
+	return "READ"
+}
+
+// nvfsOpenDirectHostFD re-opens the data file identified by hostFD with O_DIRECT
+// and an access mode matching the operation. nvfs_io_init() rejects the data
+// file unless O_DIRECT is set and FMODE_READ/FMODE_WRITE match the op; the host
+// FD donated by the gofer carries neither guarantee, so a fresh open of
+// /proc/self/fd/<hostFD> (which resolves to the same host inode) is used. The
+// caller owns the returned FD and must close it.
+func nvfsOpenDirectHostFD(hostFD int32, write bool) (int, error) {
+	flags := unix.O_DIRECT | unix.O_CLOEXEC
+	if write {
+		flags |= unix.O_WRONLY
+	} else {
+		flags |= unix.O_RDONLY
+	}
+	return unix.Open(fmt.Sprintf("/proc/self/fd/%d", hostFD), flags, 0)
+}
+
+// nvfsRewriteFileArgs overwrites the file-identity fields of file_args with the
+// HOST inode's values. cuFile fills these from the sandbox (gVisor) stat, but
+// nvfs_io_init() validates them against the host inode (inum == i_ino, majdev/
+// mindev == the device the inode resides on) and returns ESTALE on mismatch.
+// Generation is zeroed because nvfs only checks it when non-zero and it is not
+// recoverable via fstat. DevPtrOff (the GPU-buffer offset) is left untouched.
+func nvfsRewriteFileArgs(fa *nvgpu.NvfsFileArgs, hostFD int) error {
+	var st unix.Stat_t
+	if err := unix.Fstat(hostFD, &st); err != nil {
+		return err
+	}
+	fa.Inum = st.Ino
+	fa.MajDev = unix.Major(st.Dev)
+	fa.MinDev = unix.Minor(st.Dev)
+	fa.Generation = 0
+	return nil
 }

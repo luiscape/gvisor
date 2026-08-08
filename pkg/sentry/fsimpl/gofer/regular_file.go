@@ -50,6 +50,20 @@ type regularFileFD struct {
 	off int64
 }
 
+// Compile-time assertions that regularFileFD exposes its host FD in the two
+// ways external packages recover it:
+//   - the vfs.HostFDProvider convention (used by rdmaproxy/fuse), and
+//   - the GPUDirect Storage accessor consumed by pkg/sentry/devices/nvproxy's
+//     unexported hostFDForGDSer interface, which can only be type-asserted at
+//     runtime; the anonymous-interface assertion here guards the
+//     HostFDForGPUDirectStorage signature against drifting out of sync with it.
+var (
+	_ vfs.HostFDProvider = (*regularFileFD)(nil)
+	_ interface {
+		HostFDForGPUDirectStorage(write bool) (int32, error)
+	} = (*regularFileFD)(nil)
+)
+
 func newRegularFileFD(mnt *vfs.Mount, d *dentry, flags uint32, creds *auth.Credentials) (*regularFileFD, error) {
 	fd := &regularFileFD{}
 	fd.LockFD.Init(&d.inode.locks)
@@ -84,9 +98,10 @@ func (fd *regularFileFD) Release(context.Context) {
 // (enforced at configuration time for CapGPUDirectStorage), which guarantees a
 // host FD here for files on directfs mounts.
 //
-// This is intentionally single-purpose: it is the only way an external package
-// can obtain a gofer file's host FD, so its blast radius is limited to GPUDirect
-// Storage rather than exposing a general host-FD accessor.
+// This is the richer GDS-specific counterpart to the vfs.HostFDProvider.HostFD()
+// convention (implemented below): GDS needs read-vs-write selection, an error
+// return, and (in the READ/WRITE path) O_DIRECT reconciliation, none of which
+// the plain HostFD() int accessor can express.
 func (fd *regularFileFD) HostFDForGPUDirectStorage(write bool) (int32, error) {
 	i := fd.dentry().inode
 	i.handleMu.RLock()
@@ -102,6 +117,32 @@ func (fd *regularFileFD) HostFDForGPUDirectStorage(write bool) (int32, error) {
 		return hostFD, nil
 	}
 	return -1, linuxerr.EINVAL
+}
+
+// HostFD implements vfs.HostFDProvider.HostFD.
+//
+// It returns a host file descriptor backing this file, preferring one that
+// matches the file description's access mode, or -1 if the file is not backed
+// by a host FD (e.g. directfs is disabled and the file is served over the
+// lisafs RPC connection). Callers that need a specific access mode, an error
+// signal, or O_DIRECT should use HostFDForGPUDirectStorage instead.
+func (fd *regularFileFD) HostFD() int {
+	i := fd.dentry().inode
+	i.handleMu.RLock()
+	defer i.handleMu.RUnlock()
+	// RacyLoad is safe because handleMu is held.
+	if fd.vfsfd.IsWritable() {
+		if hostFD := i.writeFD.RacyLoad(); hostFD >= 0 {
+			return int(hostFD)
+		}
+	}
+	if hostFD := i.readFD.RacyLoad(); hostFD >= 0 {
+		return int(hostFD)
+	}
+	if hostFD := i.writeFD.RacyLoad(); hostFD >= 0 {
+		return int(hostFD)
+	}
+	return -1
 }
 
 // OnClose implements vfs.FileDescriptionImpl.OnClose.

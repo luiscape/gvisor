@@ -88,6 +88,7 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		procDriverNvidiaParams: opts.HostSettings.ProcDriverNvidiaParams,
 		frontendFDs:            make(map[*frontendFD]struct{}),
 		clients:                make(map[nvgpu.Handle]*rootClient),
+		gdsShadows:             make(map[gdsShadowKey]*gdsShadowMapping),
 	}
 	// Force ModifyDeviceFiles in /proc/driver/nvidia/params to 0. This is
 	// consistent with libnvidia-container's src/nvc_mount.c:mount_procfs().
@@ -243,6 +244,14 @@ type nvproxy struct {
 
 	clientsMu sync.RWMutex `state:"nosave"`
 	clients   map[nvgpu.Handle]*rootClient
+
+	// gdsShadowsMu protects gdsShadows.
+	gdsShadowsMu sync.Mutex `state:"nosave"`
+	// gdsShadows holds persistent sentry mappings of GPUDirect Storage shadow
+	// buffers registered via NVFS_IOCTL_MAP and reused by NVFS_IOCTL_READ/WRITE,
+	// keyed by the registering application's address space and shadow-buffer VA.
+	// See nvfs.go. GDS state is not saveable (nvfsFD.beforeSave panics).
+	gdsShadows map[gdsShadowKey]*gdsShadowMapping `state:"nosave"`
 }
 
 func nvproxyFromVFS(vfsObj *vfs.VirtualFilesystem) *nvproxy {
