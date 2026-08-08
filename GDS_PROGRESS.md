@@ -1,10 +1,13 @@
 # GPUDirect Storage (GDS) in nvproxy — Design & Handoff
 
-**Status (be calibrated):** the full proxy is implemented and compiles; the
-driver-init path (`REMOVE`/`MAP`-forwarding/`mmap`) is **hardware-validated**;
-the `READ`/`WRITE` data path is **implemented but has never executed once**.
-Do **not** expect it to work first try. See [Validation status](#validation-status)
-and [Known gaps & risks](#known-gaps--risks-ranked).
+**Status:** the full proxy is implemented and compiles. `REMOVE` and `mmap` are
+hardware-validated. **`MAP` is BLOCKED**: with the real GDS stack installed, a
+real `cuFileBufRegister`-equivalent `MAP` succeeds on bare metal but fails with
+`EFAULT` inside the sandbox, because the sentry cannot mirror the application's
+mapping of `/dev/nvidia-fs`. This is a design-level blocker with a known fix —
+see [section 6a](#6a-blocker-shadow-buffer-mirroring-is-a-dead-end), which is
+**the next thing to work on**. `READ`/`WRITE` is implemented but unreachable
+until `MAP` works.
 
 Branch: `luis/gds-capability`.
 
@@ -152,17 +155,78 @@ metal and the sandbox:
 This proves: device-node creation, dev-gofer/directfs FD donation into the
 handler, seccomp, ioctl dispatch, `REMOVE`, and the `mmap` proxy.
 
+**Executed and FAILING:** `MAP` against a *real* registered shadow buffer —
+see [section 6a](#6a-blocker-shadow-buffer-mirroring-is-a-dead-end). This is now
+the top blocker.
+
 **Never executed** (compile- and source-verified only):
-- `MAP` against a *real* registered shadow buffer. The harness used a `malloc`'d
-  `cpuvaddr`, so the shadow-page-identity path was **not** exercised; the
-  `EPERM` came from the bogus `gpuvaddr` on an early path.
-- The entire shadow registry.
+- The shadow registry (`MAP` fails before reaching `storeGDSShadow`).
 - The entire `nvfsIoctlReadWrite` body.
 
 **Why it can't be validated here:** the test host has
 `# CONFIG_PCI_P2PDMA is not set`, so cuFile refuses GDS and falls back to compat
 mode (POSIX + `cudaMemcpy`), never opening `/dev/nvidia-fs`. A `gdsio` run here
 measures compat-mode bandwidth that bypasses the proxy entirely.
+
+## 6a. BLOCKER: shadow-buffer mirroring is a dead end
+
+**Hardware-proven on 2026-08-08.** With the full GDS stack installed (nvidia-fs
+2.29.4, libcufile/gds-tools 1.17.1.22), a purpose-built harness
+(`cuMemAlloc` + `mmap(/dev/nvidia-fs0)` + `NVFS_IOCTL_MAP`, i.e. exactly what
+`cuFileBufRegister` does) gives:
+
+| | bare metal | through `runsc-gds` |
+|---|---|---|
+| real `MAP` (real GPU buf + real shadow buf) | **0 (success)** | **-1 `EFAULT`** |
+
+Sentry diagnostics localise it precisely:
+
+```
+pin-and-map: pinned range src=0x… len=65536 File=*nvproxy.nvfsFDMemmapFile off=0x0
+pin-and-map: MapInternal ok, numBlocks=1
+pin-and-map: mremap(src=… len=65536 dst=…) failed: bad address
+```
+
+So `Pin` ✓, reservation `mmap` ✓, `MapInternal` ✓ (correct File, offset 0) — and
+then **`mremap` fails with `EFAULT`**. The host driver logged nothing in
+`dmesg`, so the call never reached nvfs's `vm_ops`; the kernel rejected the
+duplication first.
+
+**Conclusion: `nvfsPinAndMap`'s "mirror the application's mapping into the
+sentry" strategy cannot work for nvidia-fs shadow buffers.** The pattern is
+borrowed from `rmAllocOSDescriptor`, which mirrors *anonymous application
+memory* (`pr.File` is the sentry's `MemoryFile`, freely duplicable). Here
+`pr.File` is a mapping of the nvidia-fs character device, and nvidia-fs is
+actively hostile to VMA duplication — its `vm_operations_struct` defines
+`.mremap = nvfs_vma_mremap` (returns `-ENOMEM`, `WARN_ON_ONCE`), `.open =
+nvfs_vma_open` (`WARN_ON_ONCE`, clears `vm_private_data`), and `.split` /
+`.fault` as hard errors.
+
+### Recommended redesign: the sentry should OWN the shadow buffer
+
+The shadow buffer is **not** a data buffer the application reads. It is a
+kernel-side handle: `nvfs_io_start_op()` passes `cpuvaddr` as the O_DIRECT
+buffer, the block layer builds a bio from those pages, and nvfs's DMA ops
+(`nvfs_get_dma`) substitute **GPU BAR** addresses — the data never lands in the
+shadow pages. So its contents need not be visible to the application.
+
+Therefore, instead of mirroring the app's mapping:
+
+1. At `MAP` (or at the app's `mmap` of the device), have the **sentry** call
+   `mmap(hostFD, offset 0, MAP_SHARED)` itself, creating its own shadow buffer
+   with its own driver-allocated pages and `base_index`.
+2. Pass **that** sentry address as `cpuvaddr` for `MAP` and every
+   `READ`/`WRITE`; store it in the existing `gdsShadows` registry keyed by the
+   application's shadow VA.
+3. Leave the application's own mapping as-is; its contents are irrelevant.
+
+This removes the `mremap` entirely and, as a bonus, **fixes the multi-buffer
+aliasing problem** (risk #1 below): one sentry-side host `mmap` per registered
+buffer naturally yields distinct shadow pages, which is exactly what the driver
+expects.
+
+Until this is done, `MAP` (and therefore all of `READ`/`WRITE`) fails inside a
+sandbox on any host, GDS-capable or not.
 
 ## 7. Known gaps & risks (ranked)
 
@@ -211,9 +275,29 @@ measures compat-mode bandwidth that bypasses the proxy entirely.
 
 ## 8. How to validate on a capable host
 
-**Backend** (need one): FSx for Lustre or WekaFS (neither requires
-`CONFIG_PCI_P2PDMA`), or a kernel built with `CONFIG_PCI_P2PDMA` for local
-NVMe→GPU DMA. The data file must be on an `O_DIRECT`-capable mount (not `/tmp`).
+**Prerequisite: fix the `MAP` blocker in [section 6a](#6a-blocker-shadow-buffer-mirroring-is-a-dead-end) first.**
+Until the sentry owns the shadow buffer, `MAP` fails with `EFAULT` in the
+sandbox on *every* host, so none of the steps below can pass.
+
+**Backend** (need one): a kernel built with `CONFIG_PCI_P2PDMA` for local
+NVMe→GPU DMA, or an RDMA-capable DFS (FSx for Lustre, WekaFS). Note the DFS
+route additionally needs an **RDMA NIC** — on the g5 test box `gdscheck -p`
+reported `Userspace RDMA: Unsupported` and `rdma devices: Not configured`, so
+every backend showed `compat`. The data file must be on an `O_DIRECT`-capable
+mount (not `/tmp`).
+
+**Reproducing the current blocker** (works on any box with the GDS stack, no
+P2PDMA needed): build a harness that does `cuMemAlloc` + `mmap(/dev/nvidia-fs0)`
++ `NVFS_IOCTL_MAP`. It returns 0 on bare metal and `EFAULT` through `runsc`.
+This is the fastest signal that the redesign works.
+
+**Note on cuFile in a sandbox:** cuFile probes `/proc/driver/nvidia-fs/*` and
+`/proc/modules`. gVisor serves neither; the former can be bind-mounted
+(`-v /proc/driver/nvidia-fs:/proc/driver/nvidia-fs:ro`) which gets cuFile to
+open the 16 devices, but `/proc/modules` cannot be (procfs refuses the
+mountpoint) and cuFile then stalls. Driving the ioctls from a harness avoids
+this entirely; serving those files from nvproxy's `procfs.go` would fix it
+properly.
 
 **Start minimal:** single thread, **one** registered buffer, one `cuFileRead` of
 a few MB, with `--strace --debug --debug-log=...`. Then walk the boot log in

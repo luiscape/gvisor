@@ -278,6 +278,7 @@ func nvfsPinAndMap(ni *nvfsIoctlState, addr uint64, length uint64, write bool) (
 	cu := cleanup.Make(func() { mm.Unpin(prs) })
 	defer cu.Clean()
 	if err != nil {
+		ni.ctx.Warningf("nvproxy: nvidia-fs pin-and-map: Pin(%#x, %d) failed: %v", addr, length, err)
 		return 0, nil, err
 	}
 	// Reserve a range in our address space, then mirror the pinned pages into
@@ -285,6 +286,7 @@ func nvfsPinAndMap(ni *nvfsIoctlState, addr uint64, length uint64, write bool) (
 	// than moving it, leaving the original MapInternal mapping intact.
 	m, _, errno := unix.RawSyscall6(unix.SYS_MMAP, 0 /* addr */, uintptr(length), unix.PROT_NONE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS, ^uintptr(0) /* fd */, 0 /* offset */)
 	if errno != 0 {
+		ni.ctx.Warningf("nvproxy: nvidia-fs pin-and-map: reservation mmap(%d) failed: %v", length, errno)
 		return 0, nil, errno
 	}
 	cu.Add(func() { unix.RawSyscall(unix.SYS_MUNMAP, m, uintptr(length), 0) })
@@ -292,11 +294,18 @@ func nvfsPinAndMap(ni *nvfsIoctlState, addr uint64, length uint64, write bool) (
 	for _, pr := range prs {
 		ims, err := pr.File.MapInternal(memmap.FileRange{pr.Offset, pr.Offset + uint64(pr.Source.Length())}, at)
 		if err != nil {
+			ni.ctx.Warningf("nvproxy: nvidia-fs pin-and-map: MapInternal(off=%#x len=%d) failed: %v", pr.Offset, pr.Source.Length(), err)
 			return 0, nil, err
 		}
 		for !ims.IsEmpty() {
 			im := ims.Head()
+			// KNOWN LIMITATION: this fails (EFAULT) for nvidia-fs shadow
+			// buffers. See the "shadow-buffer mirroring is a dead end" section
+			// of GDS_PROGRESS.md: the sentry cannot mirror the application's
+			// mapping of /dev/nvidia-fs, and must instead own the shadow buffer
+			// (mmap the host device itself) and pass that address as cpuvaddr.
 			if _, _, errno := unix.RawSyscall6(unix.SYS_MREMAP, im.Addr(), 0 /* old_size */, uintptr(im.Len()), linux.MREMAP_MAYMOVE|linux.MREMAP_FIXED, sentryAddr, 0); errno != 0 {
+				ni.ctx.Warningf("nvproxy: nvidia-fs pin-and-map: mremap(src=%#x len=%d dst=%#x) failed: %v", im.Addr(), im.Len(), sentryAddr, errno)
 				return 0, nil, errno
 			}
 			sentryAddr += uintptr(im.Len())
