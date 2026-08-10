@@ -63,12 +63,11 @@ func (mf *nvfsFDMemmapFile) MapInternal(fr memmap.FileRange, at hostarch.AccessT
 	return bs, nil
 }
 
-// NOTE: This establishes the host-device-backed shadow-buffer mapping. The
-// cpuvaddr translation and per-buffer tracking that NVFS_IOCTL_MAP/READ/WRITE
-// require are handled by the persistent shadow-buffer registry in nvfs.go
-// (nvproxy.gdsShadows, populated by nvfsIoctlMap and consumed by
-// nvfsIoctlReadWrite): each application shadow-buffer VA is mapped to a stable
-// sentry VA of the same host nvidia-fs pages, which the host driver re-pins in
-// the sentry on every I/O. The whole path is unvalidated against GPU hardware
-// and requires a GDS-capable backend (CONFIG_PCI_P2PDMA local NVMe, or an FSx
-// Lustre / WekaFS mount) to exercise the READ/WRITE ioctls end-to-end.
+// NOTE: This host-backs the application's own mmap of /dev/nvidia-fs so cuFile
+// sees a real device mapping. It is NOT the shadow buffer used for the ioctls:
+// nvfsIoctlMap gives the sentry its own shadow buffer (nvfsMapOwnShadowBuffer)
+// and records it in nvproxy.gdsShadows, keyed by the application's shadow VA, so
+// NVFS_IOCTL_READ/WRITE can present the same stable sentry VA the host pinned at
+// MAP. MAP is hardware-validated; READ/WRITE requires a GDS-capable backend
+// (CONFIG_PCI_P2PDMA local NVMe, or an RDMA-capable Lustre/WekaFS mount) and is
+// not yet exercised.

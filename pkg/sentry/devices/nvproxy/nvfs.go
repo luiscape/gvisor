@@ -71,10 +71,11 @@ func (dev *nvfsDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentr
 		unix.Close(int(fd.hostFD))
 		return nil, err
 	}
-	// Back application mmaps of /dev/nvidia-fs with mmaps of the host device,
-	// so that the shadow buffer's pages and fault handler are real. Unlike
-	// nvidia-uvm, nvidia-fs does not require addr == file offset, so
-	// RequireAddrEqualsFileOffset is not set.
+	// Back application mmaps of /dev/nvidia-fs with mmaps of the host device so
+	// the application sees a real shadow-buffer mapping. (The buffer used for the
+	// ioctls is the sentry's own; see nvfsIoctlMap.) Unlike nvidia-uvm, nvidia-fs
+	// does not require addr == file offset, so RequireAddrEqualsFileOffset is not
+	// set.
 	fd.memmapFile.SetFD(int(fd.hostFD))
 	return &fd.vfsfd, nil
 }
@@ -99,7 +100,7 @@ type nvfsFD struct {
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *nvfsFD) Release(context.Context) {
-	// Drop any GPUDirect Storage shadow-buffer mappings registered through this
+	// Drop any GPUDirect Storage shadow buffers registered through this FD.
 	fd.dev.nvp.releaseGDSShadows(fd)
 	fdnotifier.RemoveFD(fd.hostFD)
 	fd.queue.Notify(waiter.EventHUp)
