@@ -1934,7 +1934,15 @@ static void *control_thread(void *arg) {
 				marker_write(ack_r, "ok");
 			}
 		}
-		struct timespec ts = {0, 100 * 1000 * 1000}; /* 100ms */
+		/* Poll fast. The orchestrator arms the gate on every rank by
+		 * creating one marker, so the spread in when the ranks observe
+		 * it bounds how likely a peer is to enter a collective after
+		 * another rank has already gated -- a straddled collective that
+		 * neither the gate nor the lock can then quiesce. At 100ms the
+		 * spread was wide enough that a workload with no idle gap
+		 * exhausted the orchestrator's lock retries; a few ms of skew
+		 * makes it rare. Two stat()s per interval is negligible. */
+		struct timespec ts = {0, 5 * 1000 * 1000}; /* 5ms */
 		nanosleep(&ts, NULL);
 	}
 	return NULL;

@@ -31,6 +31,11 @@ RUNSC="${RUNSC:-/usr/local/bin/runsc-crbench}"
 COMPRESSION="${COMPRESSION:-none}"
 EXCLUDE_ZERO="${EXCLUDE_ZERO:-1}"
 REBUILD_ROOTFS="${REBUILD_ROOTFS:-0}"
+
+# Where cb_prepare_rootfs stages the multicast interposer inside the container,
+# and where it is built from on the host.
+CUDA_MULTICAST_SHIM_PATH="${CUDA_MULTICAST_SHIM_PATH:-/usr/local/lib/mcshim.so}"
+CUDA_MULTICAST_SHIM_SRC="${CUDA_MULTICAST_SHIM_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/gpu_mem_snapshots/phase0/mcshim/mcshim.so}"
 DATA_ROOT="${DATA_ROOT:-/data/cr-bench}"
 CUDA_CHECKPOINT_PATH="${CUDA_CHECKPOINT_PATH:-/usr/local/bin/cuda-checkpoint}"
 CUDA_CKPT_SEQUENTIAL="${CUDA_CKPT_SEQUENTIAL:-0}"
@@ -237,6 +242,14 @@ cb_runsc_flags() {
         if [[ "${CUDA_CKPT_JOB_FILE:-0}" = "1" ]]; then
             RUNSC_FLAGS+=(--cuda-checkpoint-path="$CUDA_CHECKPOINT_PATH")
         fi
+        # Opt-in: LD_PRELOAD the multicast suspend/resume interposer, which is
+        # what makes a process holding NVLS / symmetric-memory multicast
+        # objects checkpointable at all. gVisor drives its suspend and rebuild
+        # around the cuda-checkpoint phases; the application is untouched.
+        # Set CUDA_MULTICAST_SHIM=1 (cb_prepare_rootfs stages the library).
+        if [[ "${CUDA_MULTICAST_SHIM:-0}" = "1" ]]; then
+            RUNSC_FLAGS+=(--cuda-multicast-shim-path="$CUDA_MULTICAST_SHIM_PATH")
+        fi
     fi
 }
 
@@ -256,6 +269,12 @@ cb_prepare_rootfs() {
     fi
 
     [[ "$REBUILD_ROOTFS" = "1" ]] && rm -rf "$ROOTFS_DIR"
+
+    if [[ "${CUDA_MULTICAST_SHIM:-0}" = "1" ]]; then
+        if [[ ! -f "$CUDA_MULTICAST_SHIM_SRC" ]]; then
+            die "CUDA_MULTICAST_SHIM=1 but $CUDA_MULTICAST_SHIM_SRC is missing (build it: bash gpu_mem_snapshots/phase0/mcshim/build.sh)"
+        fi
+    fi
 
     if [[ -f "$ROOTFS_DIR/.ready" ]]; then
         ok "Rootfs cached at $ROOTFS_DIR"
@@ -278,6 +297,13 @@ cb_prepare_rootfs() {
     fi
 
     info "  Mounting per-run rootfs overlay …"
+    if [[ "${CUDA_MULTICAST_SHIM:-0}" = "1" ]]; then
+        install -D -m 0755 "$CUDA_MULTICAST_SHIM_SRC" \
+            "${ROOTFS_DIR}${CUDA_MULTICAST_SHIM_PATH}" \
+            && ok "Staged multicast interposer at ${CUDA_MULTICAST_SHIM_PATH}" \
+            || die "failed to stage $CUDA_MULTICAST_SHIM_SRC"
+    fi
+
     mount -t overlay overlay \
         -o "lowerdir=${ROOTFS_DIR},upperdir=${ROOTFS_UPPER},workdir=${ROOTFS_WORK}" \
         "$ROOTFS_MERGED" && ok "Overlay mounted at $ROOTFS_MERGED" || {

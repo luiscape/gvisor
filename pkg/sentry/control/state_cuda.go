@@ -65,7 +65,7 @@ const (
 	// retried when the lock cannot quiesce every rank. Only meaningful with
 	// the multicast interposer, whose gate is what gets released between
 	// attempts to let a deadlocked collective drain.
-	cudaLockGateAttempts = 5
+	cudaLockGateAttempts = 8
 
 	// cudaLockGateRetryDelay is how long the gate stays released between
 	// attempts, giving in-flight collectives time to complete.
