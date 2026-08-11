@@ -1,8 +1,199 @@
 # mcshim — generic libcuda-level multicast checkpoint interposer (Idea D)
 
-**PASS native + PASS under gVisor**, single-process (2 GPUs) **and**
-multi-process — one process per GPU, the vLLM/SGLang TP topology — at
-WORLD=2 and WORLD=4 (driver 610.57.04, H100 NVSwitch).
+**PASS native + PASS under gVisor** for raw-multicast workloads, single- and
+multi-process (WORLD=2/4, driver 610.57.04, H100 NVSwitch), **and for stock
+NCCL NVLS + CUDA graphs end-to-end under a full `runsc checkpoint`/`restore`**
+(WORLD=4) — see the resolution below.
+
+---
+
+## RESOLVED (2026-08-10, later) — supersedes both sections below
+
+The stock-NCCL `719` was **not** a shim limitation, not IPC taint, and not
+cuda-checkpoint. It was an **orchestration race in the harness**, and the
+transparent shim is sufficient for NCCL after all.
+
+### Root cause
+
+`runsc restore -detach` returns as soon as tasks are runnable, but
+`postRestoreCuda`'s `cuda-checkpoint --toggle` keeps rebuilding GPU state for
+**~8.5 s longer**, and the application's non-CUDA threads — including the
+shim's marker-polling control thread — run concurrently with it. The harness
+removed the `suspend` marker ~2 s after restore returned, so whichever rank
+happened *not* to be frozen by the toggle at that instant resumed and rebuilt
+multicast on a context whose device state had not been restored yet. That
+rank's context latched an unrecoverable fault (sticky `719`); every other rank
+resumed after the toggle and was fine.
+
+This exactly matches every previously-confusing symptom: one rank, a
+*different* rank each run, NCCL silent, resume reporting full success
+(`served=48 rebound=1 remapped=49` — VMM control-plane calls succeed on a
+faulted context because they never touch the device), and sensitivity to
+machine state (which only shifted the timing of the race).
+
+### Evidence
+
+A `CTXPROBE` (a `cuCtxSynchronize` whose result is logged) at suspend entry,
+suspend exit, and resume entry localises the fault precisely:
+
+| Probe | faulting rank | other ranks |
+| --- | --- | --- |
+| `suspend-entry` | 0 | 0 |
+| `suspend-exit` | 0 | 0 |
+| `resume-entry` | **719** | 0 |
+
+So the shim's teardown is innocent — every context is healthy after suspend.
+Two further controls close it out:
+
+- `TOGGLE_ONLY=1` (the same `cuda-checkpoint` lock/checkpoint/restore/unlock
+  sequence, driven in place, with **no** gVisor save/restore): **2/2 PASS**,
+  16/16 clean probes. Exonerates cuda-checkpoint.
+- In the failing runs the single `status=0x57` frontend-ioctl failure in the
+  restore sandbox is on the faulting tgid at the exact microsecond of its
+  `719` probe, ~6.4 s *before* `cuda-checkpoint --toggle for PID N succeeded`
+  was logged for it. The resume provably ran mid-toggle.
+
+### Fix and result
+
+Wait for the toggle to finish on every rank before signalling resume (the
+harness now polls the boot log for `cuda-checkpoint --toggle for PID .*
+succeeded` × WORLD). With that ordering:
+
+| Flow | Before | After |
+| --- | --- | --- |
+| full `runsc checkpoint` + `restore`, stock NCCL NVLS + CUDA graph, WORLD=4 | 4/4 FAIL | **3/3 PASS**, 0 context faults |
+
+**Conclusion: a purely transparent, fork-free shim IS sufficient for stock
+NCCL NVLS.** There is no "stale NCCL device descriptor" ceiling — consistent
+with the NCCL patch itself, whose `nvlsResumeOne` rebuilds *no* NCCL
+descriptors and relies solely on VAs being identical.
+
+The real requirement is **staging**: the resume must not begin until
+cuda-checkpoint has finished restoring GPU state. In production this ordering
+should be owned by gVisor (drive the shim from `postResumeCuda` *after* the
+toggle) rather than by an external poller racing `runsc restore`.
+
+### Disproven along the way
+
+`MCSHIM_UC_REBUILD` (1 = re-create IPC-exported unicast allocations fresh at
+resume, 2 = all; default 0) was added to test the hypothesis that
+cuda-checkpoint-restored allocations are "IPC-tainted" and cannot be cleanly
+re-exported — mirroring NCCL's policy of never carrying IPC-exported memory
+through a checkpoint. **It did not help** (mode 1 failed *worse*: the faulting
+rank aborted resume at its first `HtoD`, starving peers into `700`). The knob
+is retained only as a documented negative result; the default path is correct.
+
+---
+
+## gVisor-DRIVEN integration (2026-08-10, later still)
+
+The interposer is now driven by gVisor itself rather than by an external
+poller. `runsc --cuda-multicast-shim-path=<mcshim.so>` makes the sentry
+LD_PRELOAD it into a GPU container and export `MCSHIM_DIR`
+(`runsc/boot/loader.go`); `pkg/sentry/control/state_cuda_shim.go` then drives
+the two transitions around the cuda-checkpoint phases.
+
+Harness: `run_nccl_shim_gvisor_driven.sh` (stock NCCL NVLS + CUDA graph,
+WORLD=4). Result: **3/3 PASS, 0 context faults.**
+
+### Ordering constraints, all established empirically
+
+1. **Suspend must run before `cuda-checkpoint --action lock`.** The interposer
+   tears down through libcuda, and a locked process cannot submit that work
+   (observed: no rank acknowledges, suspend times out).
+2. **Verify, do not trust.** After the suspend, the blocker gate is re-run with
+   nothing exempt, so anything left unreleased fails the checkpoint loudly
+   instead of producing a snapshot that only misbehaves after restore.
+3. **Resume must run after the restore toggle has completed on every rank**
+   *and* after the restore RPC itself has returned. This is the one that cost
+   the most to pin down; see below.
+
+### The resume-placement result (open)
+
+Two distinct failure modes, with different signatures:
+
+| Placement | Signature |
+| --- | --- |
+| during the toggle | **one** arbitrary rank, sticky `719` |
+| inline in `postResumeCuda` | **every** rank, `700` (illegal address) |
+| after the restore RPC returns | clean |
+
+The second was **not** explained by any of: the `SigsegvLock` window (moving
+the rebuild after `SigsegvUnlock` did not help), waiting for
+`cuda-checkpoint --get-state` to report every process `running`, an added
+settle delay, or running the rebuild asynchronously. Yet the *identical*
+rebuild driven from outside once `runsc restore` has returned is reliably
+clean, with contexts probing healthy and collectives verifying.
+
+The bisect that isolates it: gVisor performs the suspend, an external driver
+performs the resume (`GVISOR_CUDA_MULTICAST_SHIM_EXTERNAL_RESUME=1`, harness
+knob `EXTERNAL_RESUME=1`). That configuration is what passes today, and it
+proves the save side of the gVisor integration is correct — only the resume
+trigger point is unresolved.
+
+**Next step:** find what the restore RPC completes *after* `PostRestore`
+returns that the rebuild depends on (candidate: lazily re-established
+nvproxy/device mappings for the app's VMAs), then move the resume to a hook
+that runs at that point so gVisor can own the transition end to end without
+the external driver.
+
+---
+
+## Earlier correction (2026-08-10) — superseded by the RESOLVED section above
+
+The earlier conclusion that a cuda-checkpoint-dropped `ncclCommInitRank`
+`/dev/nvidiactl` page was the root cause of the stock-NCCL `719` was **WRONG**
+(correlation, not causation). Decisive evidence: a run with `pre=5 post=4`
+(page dropped) **PASSED**. The page is a benign transient init mapping that
+drops in passing runs too. (The `nccl_commninit_page_probe.py` observation is
+real but irrelevant to the fault; the reverted nvproxy replay fix was aimed at
+a red herring — correctly reverted.)
+
+The real picture: the transparent stock-NCCL path has **two** failure modes.
+
+- **Mode 1 — re-export race (FIXED).** During resume phase-1,
+  `cuMemExportToShareableHandle` on a freshly-restored UC buffer transiently
+  returns `INVALID_VALUE`; the rank aborts resume, peers time out fetching its
+  buffers → one-rank failure (~10%). Fixed by a bounded retry in
+  `reexport_serve` (mirrors the import-side `304` retry). With it, stock NCCL
+  reached **15/15 PASS** in one environment state.
+- **Mode 2 — stale NCCL device state (OPEN, likely intrinsic).** Resume
+  completes fully on all ranks (`served=48 rebound=1 remapped=49`), NCCL logs
+  nothing (`NCCL_DEBUG=WARN` silent), yet one rank's collective kernel faults
+  `719`. It is **device-state-sensitive**: 15/15 PASS in a "warmed" box,
+  reliably FAIL (4/4) right after a clean `nvidia-smi -r` + fabric reinit. The
+  **patched-NCCL flow is robust across all these states**, so mode 2 is
+  specific to the transparent approach, not the environment.
+
+Interpretation (the answer to "can a purely transparent shim be universal for
+NCCL?"): **no, there is a ceiling.** The shim restores *memory* — every VA
+and mapping byte-identical, proven sound to 256 buffers with real NVLink
+read+write kernels by `p2p_reexport_probe.py` — but it cannot rebuild NCCL's
+*internal device-side bookkeeping* (channel/connection descriptors, FIFO
+state) that references those buffers and that `ncclCommSuspend`/`Resume`
+re-derives. When the shim silently releases + re-imports underneath NCCL, VAs
+match (steady-state kernels work) but any descriptor encoding more than a VA
+can be stale → the intermittent, state-dependent `719`. This is exactly why
+the NCCL-cooperative path exists and is robust.
+
+**Consequences for the roadmap:**
+1. **Robust solution today = the NCCL patch** (`NCCL_PATCH.md`): reliable
+   across every environment state tested. It is the path to a working vLLM
+   e2e now.
+2. **Transparent shim** remains the right generic mechanism for owners that
+   rely only on VAs (raw `cuMulticast`, and — to be checked — torch
+   `_symmetric_memory`), and its memory-replay core (identity oracle,
+   VA-stable multicast/import rebuild) is validated. For NCCL specifically it
+   needs to stop being *purely* transparent: a **hybrid** — the shim (or
+   gVisor) additionally drives NCCL's own `ncclCommSuspend`/`Resume` around
+   the checkpoint so NCCL rebuilds its descriptors, while the shim handles
+   any non-NCCL multicast owners. That removes the mode-2 ceiling without
+   forking NCCL's internals.
+3. Everything below this line predates the correction; the memory-mechanism
+   findings stand, but the "cuda-checkpoint page = root cause" attribution
+   does not.
+
+---
 
 ## What this is
 
@@ -176,9 +367,17 @@ unicast + MC VAs; zero suspend logic in the workload.
   `CONTROL=1` for the hang control leg).
 - `../run_mcshim_mp_gvisor.sh` — multi-process gVisor e2e (`WORLD=N`).
 - `../fd_identity_probe.py` / `../run_fd_identity_gvisor.sh` — step-0
-  measurement: are exported-object fd identities distinct? (Answer: no,
-  neither natively nor under gVisor — they are all opens of
-  `/dev/nvidiactl`.)
+  measurement: are exported-object fd identities distinct? (Answer: no via
+  fstat — all opens of `/dev/nvidiactl` — yes via the nvproxy fdinfo oracle.)
+- `../reexport_probe.py` — single-alloc: does a VMM POSIX-FD allocation
+  survive re-export after cuda-checkpoint? (Yes.)
+- `../p2p_reexport_probe.py` / `../run_p2p_reexport_gvisor.sh` — the
+  peer-access oracle: bidirectional N-buffer VMM P2P import with real SM
+  NVLink read/write kernels, release+re-import across checkpoint. Proves the
+  mechanism sound (all configs PASS), bounding the mcshim `719` to shim
+  replay fidelity. Knobs: `P2P_NBUF`, `P2P_THREADED`.
+- `../run_nccl_mcshim_gvisor.sh` — stock-NCCL acceptance under gVisor
+  (`NCCL_NVLS_ENABLE`, `GRAPH` bisection knobs).
 
 ## Stock-NCCL NVLS validation (`run_nccl_mcshim_native.sh`) — boundary found
 
@@ -238,12 +437,233 @@ Also added `cuMulticastBindAddr` tracking/replay (stock NCCL's NVLS
 user-buffer registration path; not exercised by this workload but required
 for engine workloads that register buffers during graph capture).
 
+## Stock-NCCL under gVisor with the identity oracle + UC-import replay
+
+With the fdinfo oracle (above) and UC-import suspend/replay implemented
+(`do_suspend`/`do_resume` now handle `KIND_IMP` alongside `KIND_MC`;
+`run_nccl_mcshim_gvisor.sh` is the acceptance runner, with `NCCL_NVLS_ENABLE`
+and `GRAPH` bisection knobs), stock 4-rank NCCL under gVisor now gets **much
+further** but is **not yet passing**:
+
+| stage | result |
+|-------|--------|
+| boot, NVLS engaged, stock NCCL 2.30.7 | ok |
+| shim suspend (all ranks) | ok: `groups=1 imports=48 unmapped=49 unbound=1 released=49` |
+| `runsc checkpoint` | **rc=0** |
+| `runsc restore` | **rc=0** |
+| shim resume (all ranks) | ok: `groups=1 imports=48 served=48 rebound=1 remapped=49`, every rank |
+| post-restore collective | **FAIL: one (varying) rank faults `CUDA_ERROR_LAUNCH_FAILED` (719)** |
+
+This is a large step past the prior wall (checkpoint hung / restore refused):
+the **entire mechanical pipeline works** for stock NCCL — suspend, checkpoint,
+restore, and a fully-successful resume that re-establishes every multicast
+group and all 48 P2P imports/exports per rank at identical VAs.
+
+Three bugs were found and fixed getting here, each verified by the run
+advancing past it:
+1. **ABI-aware `cuGetProcAddress` redirection** (`gpa_redirect`): stock NCCL
+   resolves `cuGetProcAddress` *through* `cuGetProcAddress_v2`; returning the
+   4-arg v1 wrapper for a v2 request left `symbolStatus` unwritten and
+   crashed `ncclCommInitRank` (ip=0 SIGSEGV).
+2. **UC exporters must record the rendezvous key too** (not just multicast):
+   `cuMemExportToShareableHandle` now records for `KIND_UC` as well, so P2P
+   peer buffers are re-exported+served on resume (else importers time out).
+3. **Fresh-context warmup** (resume phase 0): the first VMM/IPC call from the
+   shim's control thread on a freshly cuda-checkpoint-restored context returns
+   `CUDA_ERROR_UNKNOWN` (999); a per-context `cuCtxSynchronize` first clears
+   it. (Rank 0 was masked because its first op is `cuMulticastCreate`.)
+
+### The remaining fault (open)
+
+Symptom: after a fully-successful resume, exactly one rank (which rank varies
+run-to-run) faults `719` on its first post-restore collective; NCCL itself
+logs no error (`NCCL_DEBUG=WARN` is silent), so from NCCL's view all VAs and
+structs are consistent — the GPU access itself faults.
+
+Ruled out by bisection (`run_nccl_mcshim_gvisor.sh`):
+- **Not multicast/NVLS**: reproduces with `NCCL_NVLS_ENABLE=0` (`groups=0`,
+  pure P2P UC imports).
+- **Not CUDA graphs**: reproduces with `GRAPH=0` (plain eager allreduce).
+- **Not the 304 import-retry path**: reproduces with zero retries logged.
+- **Not VA/reservation overlap**: all 192 imports re-map on
+  `retained-reservation` (gVisor preserves the empty reservations exactly);
+  none fall back to fixed re-reserve.
+- **Not access grants** (as first guessed): always re-granting RW for the
+  mapping's device on remap did not help, and no `count>1`
+  `cuMemSetAccess` was observed.
+
+### The mechanism is sound — proven by a bare probe (`p2p_reexport_probe.py`)
+
+To decide whether `719` is a driver/gVisor limitation or a shim bug, a
+minimal probe reproduces the *mechanism* with **no NCCL and no shim**: two
+processes (one GPU each) create VMM POSIX-FD buffers, export/import them over
+a socketpair, and read/write every peer buffer with a **real PTX SM kernel
+over NVLink** (loaded via `cuModuleLoadData`, no nvcc). Then it mirrors the
+shim flow: release each import (unmap keeping the reservation + `cuMemRelease`)
+→ checkpoint/restore → re-export → re-import → re-map at the IDENTICAL VA →
+re-run the peer kernel.
+
+**Every configuration PASSES** (`baseline=OK`, `post=OK`):
+
+| dimension | native | gVisor |
+|-----------|--------|--------|
+| 1 buffer, unidirectional, read | PASS | PASS |
+| 48 buffers, **bidirectional** (each rank exporter+importer) | PASS | PASS |
+| suspend/resume on a **background control thread** (`P2P_THREADED=1`, exactly like the shim) | PASS | PASS |
+| kernel **writes** to peer memory (not just reads) | PASS | PASS |
+
+So peer NVLink access to a re-imported allocation **does** survive
+cuda-checkpoint and gVisor C/R, bidirectionally, at NCCL's buffer count, from
+a control thread, for reads and writes. The `719` is therefore **not** a
+driver, gVisor, cuda-checkpoint, threading, or fundamental-mechanism
+limitation.
+
+### So the remaining fault is shim replay fidelity vs real NCCL
+
+Ruled out further: the shim's per-import layout matches the probe exactly —
+`IMPORT-LAYOUT` diagnostics show **every NCCL import is a single mapping at
+offset 0** (no shared-reservation offsets, no multi-mapping). So the tracked
+set is structurally simple and correct-looking, yet one random rank still
+faults.
+
+### Root cause localized: one NCCL RM control page is not restored
+
+Dumping `/proc/self/maps` (GPU/UVM ranges) in each rank immediately before the
+shim suspend and again after resume gives a clean, decisive signal:
+
+| run | GPU maps pre → post | `r--s /dev/nvidiactl` pages | collective |
+|-----|--------------------|----------------------------|-----------|
+| passing probe, 48 buffers | 39 → 39 | 2 → 2 | OK |
+| passing probe, **256** buffers | 39 → 39 | 2 → 2 | OK |
+| **stock NCCL, WORLD=4** | **46 → 45** | **5 → 4** | **719 (one rank)** |
+
+Across the shim's suspend/checkpoint/restore/resume, stock NCCL loses exactly
+**one 4 KiB read-only-shared `/dev/nvidiactl` control page** on every rank
+(the first page of a contiguous 4-page block) — and the passing probe loses
+none, even at 256 buffers. So:
+
+- It is **not** a cuda-checkpoint scaling issue (256-buffer probe is stable).
+- It is **not** the shim's VMM replay: that page is **not** device memory the
+  shim manages (not a `cuMemCreate`/import/multicast VA). All of the shim's
+  tracked ranges (`-w-s /dev/nvidia0` device memory + import VAs) round-trip
+  intact; every import re-maps at its identical VA.
+- It **is** an NCCL-specific RM control object: NCCL has 5 such `r--s` control
+  pages (from objects the probe never creates — events, proxy/FIFO, semaphores,
+  notifiers, …); one is not re-established after restore, and its loss
+  correlates 1:1 with the `719`.
+
+This strongly implies a **cuda-checkpoint (or nvproxy replay) limitation for a
+specific NCCL RM control object**, surfaced only now that the shim cleared the
+import blocker — the same class of cuda-checkpoint gap the original native A/B
+hit (`PROGRESS.md`), one layer deeper. It is *not* a defect in the shim's
+suspend/replay logic.
+
+### ATTRIBUTED (2026-08-10): a cuda-checkpoint gap in `ncclCommInitRank`
+
+Phase-tagged maps snapshots pin the page's origin, and a minimal repro pins
+the layer:
+
+- **Origin — `ncclCommInitRank`.** The `r--s /dev/nvidiactl` page count per
+  rank goes 4 (after ctx+stream+alloc) → **5 after `ncclCommInitRank`** → 5
+  through warmup → **4 after restore**. The exact page added by
+  `ncclCommInitRank` is byte-for-byte the one lost on restore, identical on
+  all 4 ranks.
+- **Layer — cuda-checkpoint, not gVisor/nvproxy, not the shim.** Two
+  controls:
+  - Native (no gVisor): reading `/proc/<rank>/maps` from the host around a
+    bare `cuda-checkpoint` lock/checkpoint/restore/unlock cycle shows the
+    same drop (9 → 8 per rank; native /proc shows more host mappings, hence
+    9 not 5, but the delta is the same −1).
+  - **Minimal shim-free, gVisor-free, single-GPU repro**
+    (`nccl_commninit_page_probe.py`): one process, WORLD=1 NCCL comm (no
+    peers, no imports, no multicast, no mcshim), bare `cuda-checkpoint`
+    cycle → **9 → 8**. `VERDICT: cuda-checkpoint DROPS the ncclCommInitRank
+    control page`.
+
+So the post-restore `719` is rooted in **cuda-checkpoint failing to
+re-establish an RM control mapping that `ncclCommInitRank` creates** —
+entirely upstream of gVisor, nvproxy, and this project's shim. It is the same
+*class* of cuda-checkpoint limitation the original native A/B hit
+(`PROGRESS.md`), now precisely localized to a single control page. (The page
+drops even for a single-GPU comm, where it is harmless because no collective
+kernel dereferences the state behind it; in multi-GPU it manifests as the
+one-rank `719`.)
+
+### The page is an `NV_ESC_RM_MAP_MEMORY` mapping nvproxy can replay
+
+A temporary debug log in nvproxy `rmMapMemory` (reverted after use) named the
+mappings created during `ncclCommInitRank`: they are `NV_ESC_RM_MAP_MEMORY`
+calls on RM memory objects (classes `0x3e` `NV01_MEMORY_SYSTEM`, `0x40`,
+`0xde`, `0xc661`), and **every one reports `found=true`** — i.e. the mapped
+object is in nvproxy's live object graph. The lost `r--s` page is one of the
+small (`len=0x1000`) read-only control mappings among these.
+
+Crucially, gVisor's own `frontend_mmap.go` documents the gap directly:
+
+> `mmapLength ... state:"nosave"` — "we do not automatically reinvoke
+> `NV_ESC_RM_MAP_MEMORY` after restore, so restored FDs have no
+> mmap_context."
+
+So under gVisor, after restore the guest VA exists but its nvproxy
+mmap_context is gone, and nothing re-issues the map — matching the observed
+page loss.
+
+### The nvproxy workaround was attempted and does NOT apply (measured)
+
+An nvproxy-side fix was implemented and tested: record `NV_ESC_RM_MAP_MEMORY`
+params (savable) and replay the ioctl in `afterLoad` to re-establish the
+mmap_context. **It is a no-op for this flow**, for a decisive reason:
+
+> At restore, `nvproxy.afterLoad` logged **`0/0 frontend FDs`** and **0
+> restored objects**.
+
+With the cuda-checkpoint **job** integration, `control/state_cuda.go`
+`preSaveCuda` runs `cuda-checkpoint` *before* the gVisor save. That releases
+the process's GPU FDs and RM objects, so at gVisor-save time nvproxy holds
+**zero** GPU state; on restore, `cuda-checkpoint` (running in-sandbox)
+re-creates 100% of the GPU state itself — the FDs and mappings are re-opened
+*after* `afterLoad` runs. nvproxy's save/restore machinery (object graph,
+mmap replay) is therefore entirely **out of the GPU-state restore path** when
+cuda-checkpoint job mode is used, and it cannot re-establish a mapping
+cuda-checkpoint dropped (the app VMA itself is gone — the workload's own
+`/proc/self/maps` shows the page absent post-restore). The nvproxy change was
+reverted; the `nosave` mmap_context gap it targets is real but only matters
+for a pure-nvproxy restore path that GPU C/R does not use (cuda-checkpoint is
+always in the loop for live CUDA).
+
+### The fix must come from NVIDIA (cuda-checkpoint)
+
+This is now conclusive: **cuda-checkpoint fails to re-establish, on restore,
+an RM control mapping created by `ncclCommInitRank`**, and no gVisor/nvproxy
+layer can compensate because cuda-checkpoint owns the entire GPU-state
+teardown/rebuild in job mode. `nccl_commninit_page_probe.py` is the clean,
+~90-line, dependency-light repro to file (stock NCCL + cuda-checkpoint only —
+no gVisor, no fork, no shim: a bare cuda-checkpoint cycle drops the page
+9→8).
+
+The only conceivable in-sandbox workaround would be for gVisor to *observe*
+cuda-checkpoint's restore ioctls and inject the missing `NV_ESC_RM_MAP_MEMORY`
+— but it would also have to synthesize the app-side `mmap(2)`/VMA that
+cuda-checkpoint dropped, which is above nvproxy's layer and fragile. Not
+recommended; escalate to NVIDIA.
+
+Diagnostic aid (reverted, re-add if needed): a one-line `fi.ctx.Debugf` in
+`rmMapMemory` logging `hClient/hMemory/class/found/len/flags` names every
+mapped object at init; `restoreMmap`'s `%d/%d frontend FDs` log revealed the
+0/0 above.
+
+The probes remain the reusable oracles: `p2p_reexport_probe.py` proves the
+shim's memory mechanism sound (all configs PASS to 256 buffers, read+write
+over NVLink, control-thread); `nccl_commninit_page_probe.py` isolates the
+cuda-checkpoint control-page gap with no shim in the picture.
+
 ## Scope and next steps
 
 Done: single-process suspend/replay core; multi-rank rendezvous +
 export/import replay for multicast (WORLD=2/4, native + gVisor, PASS);
-stock-NCCL multicast suspend verified; UC-import gap isolated to a minimal
-repro with a proven-sufficient remediation shape.
+fdinfo identity oracle (sentry, PASS); UC-import suspend/replay implemented
+and mechanically complete for stock NCCL under gVisor (checkpoint+restore+
+resume all succeed); one open post-restore peer-access fault (above).
 
 Remaining, in de-risking order:
 

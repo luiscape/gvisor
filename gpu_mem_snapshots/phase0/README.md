@@ -12,11 +12,21 @@ question. **No replay code gets written until these are answered.**
 >   single-process (`run_mcshim_native.py` / `run_mcshim_gvisor.sh`) **and**
 >   multi-process, one rank per GPU at WORLD=2/4 (`run_mcshim_mp_native.py` /
 >   `run_mcshim_mp_gvisor.sh`) — the shim brokers the cross-rank fd
->   rendezvous itself. Stock-NCCL NVLS validation
->   (`run_nccl_mcshim_native.sh`): multicast suspend works, but restore hits
->   cuda-checkpoint's live-UC-import limitation (minimal proof:
->   `ipc_taint.py --mode hold` under `--launch-job`) — see
->   `mcshim/README.md` for the isolated gap + remediation shape.
+>   rendezvous itself. Identity oracle (`nvproxy_exported_object` fdinfo line,
+>   `fabric.go` + `task_fds.go`) verified by `fd_identity_probe.py`.
+>   Stock-NCCL NVLS under gVisor (`run_nccl_mcshim_gvisor.sh`): the full
+>   pipeline — suspend, checkpoint (rc=0), restore (rc=0), and resume — now
+>   works with UC-import replay. One open post-restore per-rank `719` fault
+>   remains. **CORRECTION (2026-08-10):** the earlier "cuda-checkpoint drops
+>   an `ncclCommInitRank` page = root cause" was disproven (a `pre=5 post=4`
+>   run PASSED — the page is benign). Real picture: two failure modes — a
+>   re-export `INVALID_VALUE` race (FIXED via retry; reached 15/15 PASS) and a
+>   deeper mode where resume completes yet one rank 719s because the
+>   transparent shim can't rebuild NCCL's device-side descriptors (the
+>   patched-NCCL flow is robust; the shim's memory replay is sound to 256
+>   buffers per `p2p_reexport_probe.py`). Robust path today = the NCCL patch;
+>   transparent NCCL needs a hybrid that drives `ncclCommSuspend/Resume`. See
+>   `mcshim/README.md` §"CORRECTION & FINAL UNDERSTANDING".
 
 All of this runs **natively** (no gVisor) except measurement 3, which is
 gVisor instrumentation.

@@ -1424,6 +1424,86 @@ func (l *Loader) setupCudaCheckpointJob(info *containerInfo) error {
 	return nil
 }
 
+// setupCudaMulticastShim LD_PRELOADs the multicast suspend/resume interposer
+// into a GPU container (when --cuda-multicast-shim-path is set, nvproxy is
+// enabled, and the driver is R610+).
+//
+// cuda-checkpoint cannot checkpoint a process holding live multicast (0x00fd)
+// objects, which NCCL NVLS and torch _symmetric_memory both create. The
+// interposer releases them before the checkpoint and rebuilds them at
+// byte-identical VAs afterwards; control/state_cuda.go drives both transitions
+// around the cuda-checkpoint phases via the marker directory exported here.
+func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
+	if info.conf.CUDAMulticastShimPath == "" || !specutils.NVProxyEnabled(info.spec, info.conf) {
+		return nil
+	}
+	if major := l.k.NvidiaDriverVersion.Major(); major < 610 {
+		log.Warningf("--cuda-multicast-shim-path is set but driver R%d is older than R610; not preloading the multicast interposer into container %q", major, info.containerName)
+		return nil
+	}
+	// Append to any LD_PRELOAD the container already sets rather than
+	// clobbering it.
+	env := info.procArgs.Envv
+	const preloadKey = "LD_PRELOAD="
+	preloaded := false
+	for i, e := range env {
+		if strings.HasPrefix(e, preloadKey) {
+			if existing := e[len(preloadKey):]; existing != "" {
+				env[i] = preloadKey + info.conf.CUDAMulticastShimPath + ":" + existing
+			} else {
+				env[i] = preloadKey + info.conf.CUDAMulticastShimPath
+			}
+			preloaded = true
+			break
+		}
+	}
+	if !preloaded {
+		env = append(env, preloadKey+info.conf.CUDAMulticastShimPath)
+	}
+	// The interposer and the sentry rendezvous through this directory. Only
+	// set it if the container has not chosen one itself.
+	hasDir := false
+	for _, e := range env {
+		if strings.HasPrefix(e, control.CudaMulticastShimDirEnv+"=") {
+			hasDir = true
+			break
+		}
+	}
+	shimDir := control.DefaultCudaMulticastShimDir
+	if hasDir {
+		for _, e := range env {
+			if v, ok := strings.CutPrefix(e, control.CudaMulticastShimDirEnv+"="); ok {
+				shimDir = v
+				break
+			}
+		}
+	} else {
+		env = append(env, control.CudaMulticastShimDirEnv+"="+shimDir)
+	}
+	info.procArgs.Envv = env
+
+	// Record the rendezvous directory in the container spec, which is how
+	// control/state_cuda_shim.go discovers that gVisor owns an interposer
+	// here (it reads SpecEnviron). Note what is deliberately NOT put in the
+	// spec: LD_PRELOAD, because the sentry passes SpecEnviron to the
+	// cuda-checkpoint processes it execs and preloading the interposer into
+	// those would be wrong.
+	if info.spec != nil && info.spec.Process != nil {
+		found := false
+		for _, e := range info.spec.Process.Env {
+			if strings.HasPrefix(e, control.CudaMulticastShimMarkerEnv+"=") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			info.spec.Process.Env = append(info.spec.Process.Env, control.CudaMulticastShimMarkerEnv+"="+shimDir)
+		}
+	}
+	log.Infof("Preloaded multicast interposer %q into container %q (rendezvous dir %q)", info.conf.CUDAMulticastShimPath, info.containerName, shimDir)
+	return nil
+}
+
 // +checklocks:l.mu
 func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGroup, *host.TTYFileDescription, error) {
 	// Create the FD map, which will set stdin, stdout, and stderr.
@@ -1513,6 +1593,9 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	// may not work.
 	if err := l.setupCudaCheckpointJob(info); err != nil {
 		log.Warningf("Failed to set up cuda-checkpoint job for container %q: %v", info.containerName, err)
+	}
+	if err := l.setupCudaMulticastShim(info); err != nil {
+		log.Warningf("Failed to set up multicast interposer for container %q: %v", info.containerName, err)
 	}
 
 	// Create and start the new process.

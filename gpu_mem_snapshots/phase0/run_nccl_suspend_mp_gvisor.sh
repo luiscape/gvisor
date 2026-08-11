@@ -171,6 +171,16 @@ for ((r=0; r<WORLD; r++)); do grep -q "\[rank$r\].*failures=0" <<<"$FINAL" || FA
 log "==== SUSPEND/RESUME (NVLS) log lines ===="
 grep -h 'NVLS Suspend\|NVLS Resume' "$WORK"/logs/*boot* 2>/dev/null | sed 's/^.*\] //' | awk '!seen[$0]++' | head -6
 
+# Experiment: snapshot GPU/UVM maps at each lifecycle point (written by
+# _dump_maps in nccl_suspend_mp.py) to compare against the mcshim flow's
+# lost r--s /dev/nvidiactl page.
+for ((r=0; r<WORLD; r++)); do
+  for tag in phase0_preinit phase1_comminit phase2_warmup presuspend suspended postresume; do
+    runsc exec "$CID_R" /bin/sh -c "cat /tmp/maps.$tag.$r" > "$WORK/maps.$tag.$r" 2>/dev/null || true
+  done
+done
+log "maps snapshots saved to $WORK/maps.<tag>.<rank>"
+
 runsc kill "$CID_R" KILL >/dev/null 2>&1 || true
 echo ""
 log "==== RESULT: $([[ $FAIL -eq 0 ]] && echo PASS || echo FAIL) ===="

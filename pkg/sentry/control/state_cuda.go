@@ -102,22 +102,53 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	}
 	sctx := k.SupervisorContext()
 
+	cudaProcs := cudaProcs(sctx, k, o.CudaCheckpointPath, k.NvidiaDriverVersion.Major())
+
 	// Gate: cuda-checkpoint cannot serialize multicast/fabric memory or live
 	// CUDA IPC exports; attempting to checkpoint with such resources live
 	// hangs or corrupts the snapshot. Poll (the app may be tearing them down)
 	// and fail loudly with a per-client attribution if they persist.
 	//
-	// When multicast suspend is enabled, multicast objects are not treated as
-	// blockers here (nvproxy suspends/replays them in checkpointCudaProcs /
-	// postResumeCuda); all other fabric/exported-fd blockers still gate.
-	if err := waitForCudaCheckpointBlockers(k, o.CudaBlockerTimeout, o.CudaMulticastSuspend); err != nil {
+	// Multicast objects are exempt when something is going to release them
+	// later in the sequence, between the cuda-checkpoint lock and checkpoint
+	// phases: either nvproxy's own suspend/replay, or the LD_PRELOADed
+	// interposer that checkpointCudaProcs drives (see state_cuda_shim.go).
+	// All other fabric/exported-fd blockers always gate.
+	multicastWillBeReleased := o.CudaMulticastSuspend || cudaShimDir(k, cudaProcs) != ""
+	if err := waitForCudaCheckpointBlockers(k, o.CudaBlockerTimeout, multicastWillBeReleased); err != nil {
+		if wasPaused {
+			k.Pause()
+		}
+		return err
+	}
+	// Have the multicast interposer release its multicast objects and CUDA
+	// IPC imports before the cuda-checkpoint sequence begins. It performs the
+	// teardown through libcuda (cuMemUnmap / cuMulticastUnbind /
+	// cuMemRelease), so it needs the processes in their ordinary running
+	// state: neither locked by cuda-checkpoint nor holding the SIGSEGV lock
+	// taken below. See state_cuda_shim.go.
+	if err := suspendCudaMulticastShim(sctx, k, cudaProcs); err != nil {
 		if wasPaused {
 			k.Pause()
 		}
 		return err
 	}
 
-	cudaProcs := cudaProcs(sctx, k, o.CudaCheckpointPath, k.NvidiaDriverVersion.Major())
+	// Verify rather than trust: the interposer acknowledging its suspend does
+	// not by itself prove the process is now serializable. Re-run the gate
+	// with nothing exempt, so anything the interposer failed to release is a
+	// loud failure here instead of a corrupt snapshot that only manifests as
+	// a GPU fault after restore.
+	if err := waitForCudaCheckpointBlockers(k, o.CudaBlockerTimeout, false /* multicastWillBeReleased */); err != nil {
+		if rerr := resumeCudaMulticastShim(sctx, k, o.CudaCheckpointPath, cudaProcs); rerr != nil {
+			log.Warningf("multicast interposer resume after post-suspend blocker check failed: %v", rerr)
+		}
+		if wasPaused {
+			k.Pause()
+		}
+		return fmt.Errorf("multicast interposer suspended but resources remain: %w", err)
+	}
+
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {
 		tg.SigsegvLock()
@@ -130,6 +161,10 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		// FIXME: b/456299722
 		for _, tg := range cudaProcs {
 			tg.SigsegvUnlock()
+		}
+		// Bring multicast back so the application keeps running.
+		if rerr := resumeCudaMulticastShim(sctx, k, o.CudaCheckpointPath, cudaProcs); rerr != nil {
+			log.Warningf("multicast interposer resume after failed checkpoint also failed: %v", rerr)
 		}
 		return err
 	}
@@ -144,16 +179,17 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 // elapses, in which case it returns an error attributing the blockers to
 // their owning clients/tasks.
 //
-// Blockers of kind "multicast" are NOT waited for: nvproxy suspends multicast
-// objects itself between the cuda-checkpoint lock and checkpoint phases
-// (checkpointCudaProcs) and replays them after the post-restore toggle, so
-// they do not need to be released by the application.
-func waitForCudaCheckpointBlockers(k *kernel.Kernel, timeout time.Duration, multicastSuspend bool) error {
+// When multicastWillBeReleased is true, blockers of kind "multicast" are NOT
+// waited for: they are released between the cuda-checkpoint lock and
+// checkpoint phases (by nvproxy's suspend/replay or by the interposer) and
+// rebuilt after the post-restore toggle, so the application need not release
+// them itself.
+func waitForCudaCheckpointBlockers(k *kernel.Kernel, timeout time.Duration, multicastWillBeReleased bool) error {
 	if timeout <= 0 {
 		timeout = DefaultCudaBlockerTimeout
 	}
 	deadline := time.Now().Add(timeout)
-	blockers := gatedBlockers(nvproxy.CheckpointBlockers(k.VFS()), multicastSuspend)
+	blockers := gatedBlockers(nvproxy.CheckpointBlockers(k.VFS()), multicastWillBeReleased)
 	for len(blockers) != 0 {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("cuda-checkpoint cannot proceed: %d resource(s) it cannot serialize are still live after %s: %s",
@@ -161,16 +197,16 @@ func waitForCudaCheckpointBlockers(k *kernel.Kernel, timeout time.Duration, mult
 		}
 		log.Infof("Waiting for CUDA checkpoint blockers to be released: %s", nvproxy.FormatBlockersByClient(blockers))
 		time.Sleep(cudaBlockerPollInterval)
-		blockers = gatedBlockers(nvproxy.CheckpointBlockers(k.VFS()), multicastSuspend)
+		blockers = gatedBlockers(nvproxy.CheckpointBlockers(k.VFS()), multicastWillBeReleased)
 	}
 	return nil
 }
 
 // gatedBlockers returns the blockers that must gate the checkpoint. When
-// multicastSuspend is enabled, multicast objects are handled by nvproxy's
-// suspend/replay and are not gated; all other blockers always gate.
-func gatedBlockers(blockers []nvproxy.CheckpointBlocker, multicastSuspend bool) []nvproxy.CheckpointBlocker {
-	if !multicastSuspend {
+// multicastWillBeReleased is true, multicast objects are released later in the
+// checkpoint sequence and are not gated; all other blockers always gate.
+func gatedBlockers(blockers []nvproxy.CheckpointBlocker, multicastWillBeReleased bool) []nvproxy.CheckpointBlocker {
+	if !multicastWillBeReleased {
 		return blockers
 	}
 	var out []nvproxy.CheckpointBlocker
@@ -273,6 +309,23 @@ func postResumeCuda(k *kernel.Kernel, timeline *timing.Timeline) error {
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {
 		tg.SigsegvUnlock()
+	}
+
+	// Rebuild the interposer's multicast objects and CUDA IPC imports.
+	//
+	// Ordering here is doubly constrained. It must run after the restore
+	// toggle has finished on EVERY process, or a rank rebuilds on a context
+	// whose device state is not restored yet and latches a sticky 719. It
+	// must also run after SigsegvUnlock above: the rebuild touches GPU
+	// memory, and while the SIGSEGV lock is held the resulting page faults
+	// cannot be serviced, which faults every rank's context with
+	// CUDA_ERROR_ILLEGAL_ADDRESS (700). Both were observed.
+	if err == nil {
+		if rerr := resumeCudaMulticastShim(k.SupervisorContext(), k, cudaCheckpointPath, cudaProcs); rerr != nil {
+			err = fmt.Errorf("failed to resume multicast interposer: %w", rerr)
+		} else {
+			timeline.Reached("multicast interposer resumed")
+		}
 	}
 	return err
 }
@@ -549,6 +602,8 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 		}
 	}
 
+
+
 	// Phase 1: lock every process, in parallel, so coupled ranks quiesce
 	// together. --timeout bounds how long each lock waits for its process to
 	// become lockable (rather than hanging forever).
@@ -560,6 +615,7 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 				log.Warningf("multicast replay after lock-phase failure also failed: %v", rerr)
 			}
 		}
+
 		// Best-effort: unlock whatever we locked so the application keeps running.
 		if _, uerr := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "unlock"}, true, nullFD); uerr != nil {
 			log.Warningf("cuda-checkpoint unlock after lock-phase failure also failed: %v", uerr)
@@ -589,10 +645,12 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 			log.Warningf("cuda-checkpoint restore after checkpoint-phase failure also failed: %v", rerr)
 		}
 		// Multicast objects suspended above must also be brought back for the
-		// app to keep working.
+		// app to keep working. The interposer rebuild is safe here because the
+		// restore action above has already put GPU state back.
 		if rerr := nvproxy.ReplayMulticastObjects(sctx, k.VFS()); rerr != nil {
 			log.Warningf("multicast replay after checkpoint-phase failure also failed: %v", rerr)
 		}
+
 		if _, uerr := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "unlock"}, true, nullFD); uerr != nil {
 			log.Warningf("cuda-checkpoint unlock after checkpoint-phase failure also failed: %v", uerr)
 		}

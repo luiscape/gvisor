@@ -131,6 +131,14 @@ touch "$DIR/suspend"
 wait_acks suspended 120 || { log "FAIL: shim suspend"; stop; exit 1; }
 log "all $WORLD shims SUSPENDED: $(grep -c 'SUSPEND done' "$DIR/mcshim.log") teardowns"
 
+# Layer-attribution probe: snapshot each rank's r--s /dev/nvidiactl control
+# pages (the one ncclCommInitRank creates and the gVisor run loses) directly
+# from the host /proc BEFORE and AFTER a bare cuda-checkpoint cycle -- no
+# gVisor in the loop. If the count drops here too, the gap is cuda-checkpoint
+# (NVIDIA bug); if it is preserved, the gap is gVisor/nvproxy mmap restore.
+maps_ctl(){ grep -c 'r--s.*nvidiactl' "/proc/$1/maps" 2>/dev/null || echo 0; }
+for p in $(rank_pids); do log "MAPS pre-cc  pid=$p r--s-nvidiactl=$(maps_ctl $p)"; done
+
 log "(c) cuda-checkpoint lock/checkpoint/restore/unlock on all rank pids"
 cc_all lock 60 --timeout 30000 || { log "FAIL: lock"; FAIL=1; }
 cc_all checkpoint 180         || { log "FAIL: checkpoint (with shim suspend!)"; FAIL=1; }
@@ -138,6 +146,7 @@ if [[ $FAIL -eq 0 ]]; then
   cc_all restore 180 || { log "FAIL: restore"; FAIL=1; }
   cc_all unlock 30   || { log "FAIL: unlock"; FAIL=1; }
 fi
+for p in $(rank_pids); do log "MAPS post-cc pid=$p r--s-nvidiactl=$(maps_ctl $p)"; done
 
 if [[ $FAIL -eq 0 ]]; then
   log "shim resume on all ranks"

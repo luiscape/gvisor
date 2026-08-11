@@ -122,6 +122,16 @@ _protos = {
     "cuGraphLaunch": (ctypes.c_void_p, ctypes.c_void_p),
     "cuGraphDestroy": (ctypes.c_void_p,),
     "cuMemsetD32Async": (_c_ull, ctypes.c_uint, ctypes.c_size_t, ctypes.c_void_p),
+    # Module + kernel launch (for a real SM peer-read over NVLink, loaded
+    # from PTX so no nvcc is required).
+    "cuModuleLoadData": (ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p),
+    "cuModuleGetFunction": (
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_char_p),
+    "cuLaunchKernel": (
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+        ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p)),
 }
 
 # CUstreamCaptureMode

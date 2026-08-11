@@ -385,6 +385,22 @@ type Config struct {
 	// https://github.com/NVIDIA/cuda-checkpoint#610-features.
 	CUDACheckpointPath string `flag:"cuda-checkpoint-path"`
 
+	// CUDAMulticastShimPath is the path, inside the container filesystem, to
+	// the multicast suspend/resume interposer (mcshim.so). When it is set for
+	// a GPU container (nvproxy enabled) on driver R610+, the container's
+	// command is run with the interposer LD_PRELOADed.
+	//
+	// cuda-checkpoint cannot checkpoint a process holding live multicast
+	// (NV_MEMORY_MULTICAST_FABRIC, 0x00fd) objects, which NCCL NVLS and
+	// torch _symmetric_memory both create. The interposer tracks every
+	// multicast group and CUDA IPC import at the libcuda layer and, when
+	// gVisor tells it to, releases them before the checkpoint and rebuilds
+	// them at byte-identical virtual addresses afterwards -- so application
+	// pointers and captured CUDA graphs stay valid. gVisor drives those two
+	// transitions around the cuda-checkpoint phases; see
+	// pkg/sentry/control/state_cuda.go.
+	CUDAMulticastShimPath string `flag:"cuda-multicast-shim-path"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 

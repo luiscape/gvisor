@@ -245,6 +245,8 @@ static CUresult (*r_cuMemImportFromShareableHandle)(
 static CUresult (*r_cuCtxGetCurrent)(CUcontext *);
 static CUresult (*r_cuCtxSetCurrent)(CUcontext);
 static CUresult (*r_cuCtxSynchronize)(void);
+static CUresult (*r_cuMemcpyDtoH)(void *, CUdeviceptr, size_t);
+static CUresult (*r_cuMemcpyHtoD)(CUdeviceptr, const void *, size_t);
 
 #define CU_MEM_HANDLE_TYPE_POSIX_FD 0x1
 
@@ -267,6 +269,8 @@ static void resolve_reals(void) {
 	REAL(r_cuCtxGetCurrent, "cuCtxGetCurrent");
 	REAL(r_cuCtxSetCurrent, "cuCtxSetCurrent");
 	REAL(r_cuCtxSynchronize, "cuCtxSynchronize");
+	REAL(r_cuMemcpyDtoH, "cuMemcpyDtoH_v2");
+	REAL(r_cuMemcpyHtoD, "cuMemcpyHtoD_v2");
 }
 
 /* ------------------------------------------------------------------ */
@@ -305,6 +309,10 @@ typedef struct {
 	int has_key;
 	unsigned long key_dev, key_ino;
 	int key_ord;
+	/* KIND_UC under MCSHIM_UC_REBUILD: host copy of the allocation's
+	 * contents, held only between suspend and resume (see backup_uc). */
+	void *backup;
+	size_t backup_size;
 	/* Creator-side, post-resume: the re-exported fd being served to
 	 * importers over a unix socket until the next suspend. */
 	int serve_fd;
@@ -358,12 +366,15 @@ static int alloc_find(CUmemGenericAllocationHandle h) {
 	return -1;
 }
 
-/* Translate a possibly-stale MC handle to the group's current handle. The app
- * (or NCCL) may retain the original handle in its structs; after a resume the
- * group has a new handle, so rewrite calls that reference an old value. */
+/* Translate a possibly-stale handle to its object's current handle. The app
+ * (or NCCL) may retain the original handle in its structs; after a resume a
+ * multicast group, an imported allocation, or (under MCSHIM_UC_REBUILD) a
+ * re-created unicast allocation has a new handle, so rewrite calls that
+ * reference an old value. For objects whose handle did not rotate this is the
+ * identity, so it is safe to apply to every kind. */
 static CUmemGenericAllocationHandle xlate_mc(CUmemGenericAllocationHandle h) {
 	for (int i = 0; i < MAXN; i++) {
-		if (g_alloc[i].kind != KIND_MC)
+		if (g_alloc[i].kind == KIND_FREE)
 			continue;
 		for (int a = 0; a < g_alloc[i].naka; a++)
 			if (g_alloc[i].aka[a] == h)
@@ -530,11 +541,16 @@ CUresult cuMemExportToShareableHandle(void *shHandle,
 	if (rc == CUDA_SUCCESS && type == CU_MEM_HANDLE_TYPE_POSIX_FD && shHandle) {
 		pthread_mutex_lock(&g_lock);
 		int i = alloc_find(real_h);
-		if (i >= 0 && g_alloc[i].kind == KIND_MC) {
+		/* Record the rendezvous identity for BOTH multicast groups and
+		 * unicast allocations: a UC export is a P2P peer buffer whose
+		 * importers must re-fetch it after restore, so its exporter
+		 * must re-export + serve on resume (has_key drives that). */
+		if (i >= 0 &&
+		    (g_alloc[i].kind == KIND_MC || g_alloc[i].kind == KIND_UC)) {
 			record_key(i, *(int *)shHandle);
-			mclog("track EXPORT group=%d key=%lx:%lx ord=%d", i,
-			      g_alloc[i].key_dev, g_alloc[i].key_ino,
-			      g_alloc[i].key_ord);
+			mclog("track EXPORT idx=%d kind=%d key=%lx:%lx ord=%d", i,
+			      g_alloc[i].kind, g_alloc[i].key_dev,
+			      g_alloc[i].key_ino, g_alloc[i].key_ord);
 		}
 		pthread_mutex_unlock(&g_lock);
 	}
@@ -738,6 +754,10 @@ CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size,
 	resolve_reals();
 	CUresult rc = r_cuMemSetAccess(ptr, size, desc, count);
 	if (rc == CUDA_SUCCESS && desc && count >= 1) {
+		if (count > 1)
+			mclog("NOTE: cuMemSetAccess va=0x%llx count=%zu "
+			      "(only desc[0] recorded!)",
+			      (unsigned long long)ptr, count);
 		pthread_mutex_lock(&g_lock);
 		for (int m = 0; m < MAXN; m++)
 			if (g_map[m].used && g_map[m].va == ptr) {
@@ -958,44 +978,332 @@ static int fetch_group_fd(const Alloc *a, int timeout_ms) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Suspend / resume of the multicast layer                            */
+/* Suspend / resume shared helpers                                    */
+/* ------------------------------------------------------------------ */
+
+/* Must hold g_lock. Unmap every VA that maps alloc gi, KEEPING the VA
+ * reservations (cuMemUnmap only -- never cuMemAddressFree). */
+static int unmap_alloc(int gi, const char *what, int *unmapped) {
+	for (int m = 0; m < MAXN; m++) {
+		if (!g_map[m].used || g_map[m].allocIdx != gi)
+			continue;
+		if (g_map[m].ctx)
+			r_cuCtxSetCurrent(g_map[m].ctx);
+		CUresult rc = r_cuMemUnmap(g_map[m].va, g_map[m].size);
+		if (rc != CUDA_SUCCESS) {
+			mclog("SUSPEND: cuMemUnmap(%s 0x%llx) rc=%d", what,
+			      (unsigned long long)g_map[m].va, rc);
+			return -1;
+		}
+		(*unmapped)++;
+	}
+	return 0;
+}
+
+/* Must hold g_lock. Re-map every VA of alloc gi at its IDENTICAL address,
+ * backed by handle h. Prefers the retained reservation; re-reserves at the
+ * fixed address if it did not survive restore. */
+static int remap_alloc(int gi, CUmemGenericAllocationHandle h,
+                       const char *what, int *remapped) {
+	for (int m = 0; m < MAXN; m++) {
+		if (!g_map[m].used || g_map[m].allocIdx != gi)
+			continue;
+		if (g_map[m].ctx)
+			r_cuCtxSetCurrent(g_map[m].ctx);
+		const char *path = "retained-reservation";
+		CUresult rc = r_cuMemMap(g_map[m].va, g_map[m].size,
+		                         g_map[m].offset, h, 0);
+		if (rc != CUDA_SUCCESS) {
+			CUdeviceptr got = 0;
+			CUresult rr = r_cuMemAddressReserve(
+			    &got, g_map[m].size, 0, g_map[m].va, 0);
+			if (rr != CUDA_SUCCESS || got != g_map[m].va) {
+				if (rr == CUDA_SUCCESS)
+					r_cuMemAddressFree(got, g_map[m].size);
+				mclog("RESUME: %s re-map at identical VA 0x%llx "
+				      "failed (got 0x%llx rr=%d)",
+				      what, (unsigned long long)g_map[m].va,
+				      (unsigned long long)got, rr);
+				return -1;
+			}
+			rc = r_cuMemMap(g_map[m].va, g_map[m].size,
+			                g_map[m].offset, h, 0);
+			if (rc != CUDA_SUCCESS) {
+				mclog("RESUME: %s cuMemMap after re-reserve "
+				      "rc=%d", what, rc);
+				return -1;
+			}
+			path = "re-reserved-fixed";
+		}
+		/* Grant access. NCCL frequently sets access once over a whole
+		 * reservation range rather than per sub-map, so a per-map
+		 * capture (has_access) misses it and the re-mapped view ends up
+		 * inaccessible -> the collective kernel faults (719) on the rank
+		 * whose import lost access. Always (re)grant RW for the mapping's
+		 * owning device, which is what NCCL's P2P imports and NVLS VAs
+		 * need; fall back to any captured descriptor. */
+		CUmemAccessDesc acc;
+		if (g_map[m].has_access) {
+			acc = g_map[m].access;
+		} else {
+			CUdevice d = -1;
+			r_cuCtxGetDevice(&d);
+			memset(&acc, 0, sizeof(acc));
+			acc.location.type = 1 /* CU_MEM_LOCATION_TYPE_DEVICE */;
+			acc.location.id = d;
+			acc.flags = 3 /* CU_MEM_ACCESS_FLAGS_PROT_READWRITE */;
+		}
+		CUresult ac = r_cuMemSetAccess(g_map[m].va, g_map[m].size, &acc, 1);
+		if (ac != CUDA_SUCCESS) {
+			mclog("RESUME: %s cuMemSetAccess(0x%llx) rc=%d", what,
+			      (unsigned long long)g_map[m].va, ac);
+			return -1;
+		}
+		(*remapped)++;
+		mclog("RESUME: %s VA 0x%llx re-mapped IDENTICAL (%s)", what,
+		      (unsigned long long)g_map[m].va, path);
+	}
+	return 0;
+}
+
+/* MCSHIM_UC_REBUILD -- how local unicast (cuMemCreate) allocations are carried
+ * across the checkpoint.
+ *
+ *   0 (default) they stay resident; cuda-checkpoint saves/restores them and the
+ *               exporter re-exports the RESTORED handle to its peers.
+ *   1           IPC-exported UC allocations are released at suspend (contents
+ *               copied to host) and re-created FRESH at resume, mapped at the
+ *               identical VAs, then exported. Peers therefore never import a
+ *               handle that went through cuda-checkpoint.
+ *   2           as 1, but for every tracked UC allocation.
+ *
+ * Mode >=1 mirrors NCCL's ncclCommMemSuspend policy (mem_manager.cc): it closes
+ * every shareable fd and releases every dynamic allocation *before* the
+ * checkpoint, and ncclNvlsResume then cuMemCreate()s fresh unicast memory at
+ * the original VAs. The NCCL flow never asks cuda-checkpoint to carry
+ * IPC-exported memory -- which is the one structural difference from this
+ * shim's default, and the suspected cause of the re-export INVALID_VALUE
+ * (mode 1) and the intermittent collective fault 719 (mode 2). */
+static int uc_rebuild_mode(void) {
+	static int mode = -1;
+	if (mode < 0) {
+		const char *p = getenv("MCSHIM_UC_REBUILD");
+		mode = p ? atoi(p) : 0;
+	}
+	return mode;
+}
+
+/* Must hold g_lock. True if alloc gi is released at suspend and re-created at
+ * resume rather than left for cuda-checkpoint. */
+static int uc_rebuilt(int gi) {
+	if (g_alloc[gi].kind != KIND_UC)
+		return 0;
+	int m = uc_rebuild_mode();
+	return m >= 2 || (m == 1 && g_alloc[gi].has_key);
+}
+
+/* Must hold g_lock. Synchronize every distinct tracked context and log the
+ * result. CUDA latches an unrecoverable fault into the context, so the first
+ * probe that reports non-zero brackets exactly when the context died. Purely
+ * diagnostic: never fatal, and every context is probed so all ranks report. */
+static void ctx_probe(const char *tag) {
+	CUcontext saved = NULL;
+	r_cuCtxGetCurrent(&saved);
+	for (int i = 0; i < MAXN; i++) {
+		if (g_alloc[i].kind == KIND_FREE || !g_alloc[i].ctx)
+			continue;
+		int seen = 0;
+		for (int j = 0; j < i; j++)
+			if (g_alloc[j].kind != KIND_FREE &&
+			    g_alloc[j].ctx == g_alloc[i].ctx) {
+				seen = 1;
+				break;
+			}
+		if (seen)
+			continue;
+		r_cuCtxSetCurrent(g_alloc[i].ctx);
+		CUresult sy = r_cuCtxSynchronize ? r_cuCtxSynchronize() : 0;
+		mclog("CTXPROBE[%s] ctx=%p sync=%d%s", tag, g_alloc[i].ctx, sy,
+		      sy ? "  <-- FAULTED" : "");
+	}
+	if (saved)
+		r_cuCtxSetCurrent(saved);
+}
+
+/* Must hold g_lock. Copy alloc gi's contents into a host buffer, keyed by each
+ * mapping's offset into the allocation, so they can be written back into a
+ * freshly created allocation at resume. */
+static int backup_uc(int gi) {
+	Alloc *a = &g_alloc[gi];
+	if (a->size == 0)
+		return 0;
+	a->backup = malloc(a->size);
+	if (!a->backup) {
+		mclog("SUSPEND: UC idx=%d backup malloc(%zu) failed", gi, a->size);
+		return -1;
+	}
+	a->backup_size = a->size;
+	int n = 0;
+	for (int m = 0; m < MAXN; m++) {
+		if (!g_map[m].used || g_map[m].allocIdx != gi)
+			continue;
+		if (g_map[m].offset + g_map[m].size > a->size) {
+			mclog("SUSPEND: UC idx=%d mapping va=0x%llx off=0x%zx "
+			      "size=0x%zx exceeds alloc size 0x%zx",
+			      gi, (unsigned long long)g_map[m].va,
+			      g_map[m].offset, g_map[m].size, a->size);
+			goto fail;
+		}
+		if (g_map[m].ctx)
+			r_cuCtxSetCurrent(g_map[m].ctx);
+		CUresult rc = r_cuMemcpyDtoH((char *)a->backup + g_map[m].offset,
+		                             g_map[m].va, g_map[m].size);
+		if (rc != CUDA_SUCCESS) {
+			mclog("SUSPEND: UC idx=%d DtoH(0x%llx, 0x%zx) rc=%d", gi,
+			      (unsigned long long)g_map[m].va, g_map[m].size, rc);
+			goto fail;
+		}
+		n++;
+	}
+	if (n == 0)
+		mclog("SUSPEND: UC idx=%d has no mapping; backup is zero-filled", gi);
+	return 0;
+fail:
+	free(a->backup);
+	a->backup = NULL;
+	a->backup_size = 0;
+	return -1;
+}
+
+/* Must hold g_lock. Write alloc gi's host backup back through its (already
+ * re-mapped, identical) VAs and drop the backup. */
+static int restore_uc(int gi) {
+	Alloc *a = &g_alloc[gi];
+	if (!a->backup)
+		return 0;
+	int rv = 0;
+	for (int m = 0; m < MAXN; m++) {
+		if (!g_map[m].used || g_map[m].allocIdx != gi)
+			continue;
+		if (g_map[m].offset + g_map[m].size > a->backup_size)
+			continue;
+		if (g_map[m].ctx)
+			r_cuCtxSetCurrent(g_map[m].ctx);
+		CUresult rc = r_cuMemcpyHtoD(g_map[m].va,
+		                             (char *)a->backup + g_map[m].offset,
+		                             g_map[m].size);
+		if (rc != CUDA_SUCCESS) {
+			mclog("RESUME: UC idx=%d HtoD(0x%llx, 0x%zx) rc=%d", gi,
+			      (unsigned long long)g_map[m].va, g_map[m].size, rc);
+			rv = -1;
+			break;
+		}
+	}
+	free(a->backup);
+	a->backup = NULL;
+	a->backup_size = 0;
+	return rv;
+}
+
+/* Must hold g_lock. Re-export alloc gi's handle h and start serving it on the
+ * rendezvous socket, so importers can fetch it. */
+static int reexport_serve(int gi, CUmemGenericAllocationHandle h) {
+	/* cuMemExportToShareableHandle can transiently return INVALID_VALUE (1)
+	 * on a freshly cuda-checkpoint-restored allocation: the handle is valid
+	 * (it survived restore) but the driver's export path is briefly not
+	 * ready. Left unretried this aborts the rank's resume, so peers time out
+	 * fetching the buffers it should serve -> ~10% one-rank 719. Retry with a
+	 * short backoff, bounded so a genuine failure stays loud. Mirrors the
+	 * re-import 304 retry. */
+	int fd = -1;
+	CUresult rc = 0;
+	for (int attempt = 0; attempt < 100; attempt++) {
+		rc = r_cuMemExportToShareableHandle(
+		    &fd, h, CU_MEM_HANDLE_TYPE_POSIX_FD, 0);
+		if (rc == CUDA_SUCCESS && fd >= 0)
+			break;
+		if (attempt == 0) {
+			CUcontext cur = NULL;
+			r_cuCtxGetCurrent(&cur);
+			mclog("RESUME: re-export idx=%d kind=%d handle=0x%llx "
+			      "ctx=%p cur=%p rc=%d fd=%d, retrying",
+			      gi, g_alloc[gi].kind, (unsigned long long)h,
+			      g_alloc[gi].ctx, cur, rc, fd);
+		}
+		struct timespec ts = {0, 100 * 1000 * 1000}; /* 100ms */
+		nanosleep(&ts, NULL);
+	}
+	if (rc != CUDA_SUCCESS || fd < 0) {
+		mclog("RESUME: re-export idx=%d gave up rc=%d fd=%d", gi, rc, fd);
+		return -1;
+	}
+	if (start_serving(&g_alloc[gi], fd) != 0) {
+		close(fd);
+		return -1;
+	}
+	return 0;
+}
+
+/* Must hold g_lock. Fetch alloc gi's re-exported fd from its exporter and
+ * re-import it into *out. Concurrent imports of the same object can
+ * transiently fail (CUDA_ERROR_OPERATING_SYSTEM=304 when several ranks import
+ * within ~1ms), so retry with a fresh fd, bounded so a real failure is loud. */
+static int reimport(int gi, CUmemGenericAllocationHandle *out) {
+	if (!g_alloc[gi].has_key) {
+		mclog("RESUME: imported idx=%d has no rendezvous key", gi);
+		return -1;
+	}
+	for (int attempt = 0;; attempt++) {
+		int fd = fetch_group_fd(&g_alloc[gi], 60 * 1000);
+		if (fd < 0)
+			return -1;
+		CUresult rc = r_cuMemImportFromShareableHandle(
+		    out, (void *)(intptr_t)fd, CU_MEM_HANDLE_TYPE_POSIX_FD);
+		close(fd);
+		if (rc == CUDA_SUCCESS) {
+			if (attempt > 0)
+				mclog("RESUME: re-import idx=%d key=%lx:%lx ok "
+				      "after %d retries",
+				      gi, g_alloc[gi].key_dev,
+				      g_alloc[gi].key_ino, attempt);
+			return 0;
+		}
+		if (attempt >= 100) {
+			mclog("RESUME: re-import idx=%d rc=%d after %d attempts",
+			      gi, rc, attempt);
+			return -1;
+		}
+		struct timespec ts = {0, 200 * 1000 * 1000};
+		nanosleep(&ts, NULL);
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* Suspend                                                            */
 /* ------------------------------------------------------------------ */
 
 /* Must hold g_lock. */
 static int do_suspend(void) {
-	int groups = 0, unmapped = 0, unbound = 0, released = 0;
+	int groups = 0, imports = 0, unmapped = 0, unbound = 0, released = 0;
 	CUcontext saved = NULL;
 	r_cuCtxGetCurrent(&saved);
 
+	ctx_probe("suspend-entry");
+
+	/* Stop serving any previous resume's re-exported fds first: a held
+	 * export fd is itself a checkpoint blocker. */
+	for (int i = 0; i < MAXN; i++)
+		if (g_alloc[i].serving)
+			stop_serving(&g_alloc[i]);
+
+	/* Multicast groups: unmap MC VAs, unbind each device, release the
+	 * 0x00fd handle. */
 	for (int gi = 0; gi < MAXN; gi++) {
 		if (g_alloc[gi].kind != KIND_MC)
 			continue;
 		groups++;
-
-		/* 0. Stop serving a previous resume's re-exported fd; a held
-		 *    export fd is itself a checkpoint blocker. */
-		stop_serving(&g_alloc[gi]);
-
-		/* 1. Unmap every MC VA that maps this group; KEEP the VA
-		 *    reservation (cuMemUnmap only -- never cuMemAddressFree). */
-		for (int m = 0; m < MAXN; m++) {
-			if (!g_map[m].used || g_map[m].allocIdx != gi)
-				continue;
-			if (g_map[m].ctx)
-				r_cuCtxSetCurrent(g_map[m].ctx);
-			CUresult rc = r_cuMemUnmap(g_map[m].va, g_map[m].size);
-			if (rc != CUDA_SUCCESS) {
-				mclog("SUSPEND: cuMemUnmap(0x%llx) failed rc=%d",
-				      (unsigned long long)g_map[m].va, rc);
-				return -1;
-			}
-			unmapped++;
-			mclog("SUSPEND: unmapped MC VA 0x%llx (reservation kept)",
-			      (unsigned long long)g_map[m].va);
-		}
-
-		/* 2. Unbind each recorded bind once, on the device hosting
-		 *    its memory. */
+		if (unmap_alloc(gi, "MC", &unmapped) != 0)
+			return -1;
 		for (int b = 0; b < MAXN; b++) {
 			if (!g_bind[b].used || g_bind[b].groupIdx != gi)
 				continue;
@@ -1003,25 +1311,21 @@ static int do_suspend(void) {
 				mclog("SUSPEND: bind %d has unknown device", b);
 				return -1;
 			}
-			CUresult crc = 0;
 			if (g_bind[b].ctx)
-				crc = r_cuCtxSetCurrent(g_bind[b].ctx);
+				r_cuCtxSetCurrent(g_bind[b].ctx);
 			CUresult rc = r_cuMulticastUnbind(
 			    g_alloc[gi].handle, g_bind[b].dev,
 			    g_bind[b].mcOffset, g_bind[b].size);
 			if (rc != CUDA_SUCCESS) {
 				mclog("SUSPEND: cuMulticastUnbind(mc=0x%llx, "
-				      "dev=%d, mcOff=0x%zx, size=0x%zx) rc=%d "
-				      "(setctx=%p rc=%d)",
+				      "dev=%d, mcOff=0x%zx, size=0x%zx) rc=%d",
 				      (unsigned long long)g_alloc[gi].handle,
 				      g_bind[b].dev, g_bind[b].mcOffset,
-				      g_bind[b].size, rc, g_bind[b].ctx, crc);
+				      g_bind[b].size, rc);
 				return -1;
 			}
 			unbound++;
 		}
-
-		/* 3. Release the 0x00fd multicast handle. */
 		CUresult rc = r_cuMemRelease(g_alloc[gi].handle);
 		if (rc != CUDA_SUCCESS) {
 			mclog("SUSPEND: cuMemRelease(MC 0x%llx) rc=%d",
@@ -1033,176 +1337,247 @@ static int do_suspend(void) {
 		      (unsigned long long)g_alloc[gi].handle);
 	}
 
+	/* UC imports (P2P peer buffers): unmap the views and release the
+	 * imported handle. The backing physical memory is the EXPORTER's
+	 * resident allocation, saved by cuda-checkpoint, so no content backup
+	 * is needed here -- only the local import must be released so this
+	 * process holds no live VMM import across the checkpoint (which R610
+	 * cuda-checkpoint cannot restore). */
+	for (int ii = 0; ii < MAXN; ii++) {
+		if (g_alloc[ii].kind != KIND_IMP)
+			continue;
+		imports++;
+		/* Layout diagnostics: how many mappings back this import, and
+		 * their (va, size, offset). NCCL mapping imports at nonzero
+		 * offsets or an import with != 1 mapping would mean the shim's
+		 * replay must reproduce that exactly. */
+		int nmap = 0;
+		for (int m = 0; m < MAXN; m++) {
+			if (!g_map[m].used || g_map[m].allocIdx != ii)
+				continue;
+			nmap++;
+			if (g_map[m].offset != 0 || nmap > 1)
+				mclog("IMPORT-LAYOUT idx=%d map#%d va=0x%llx "
+				      "size=0x%zx offset=0x%zx",
+				      ii, nmap,
+				      (unsigned long long)g_map[m].va,
+				      g_map[m].size, g_map[m].offset);
+		}
+		if (nmap != 1)
+			mclog("IMPORT-LAYOUT idx=%d has %d mappings", ii, nmap);
+		if (unmap_alloc(ii, "UC-import", &unmapped) != 0)
+			return -1;
+		CUresult rc = r_cuMemRelease(g_alloc[ii].handle);
+		if (rc != CUDA_SUCCESS) {
+			mclog("SUSPEND: cuMemRelease(import 0x%llx) rc=%d",
+			      (unsigned long long)g_alloc[ii].handle, rc);
+			return -1;
+		}
+		released++;
+	}
+
+	/* Local UC allocations. By default these stay resident and are carried
+	 * through the checkpoint by cuda-checkpoint. Under MCSHIM_UC_REBUILD
+	 * they are instead backed up to host memory and released here, so the
+	 * process holds no IPC-exportable device allocation across the
+	 * checkpoint -- the policy NCCL's ncclCommMemSuspend uses. Runs after
+	 * the loops above so every multicast unbind and peer import release has
+	 * already dropped its reference to this memory. */
+	int ucrebuilt = 0;
+	for (int gi = 0; gi < MAXN; gi++) {
+		if (!uc_rebuilt(gi))
+			continue;
+		if (g_alloc[gi].ctx)
+			r_cuCtxSetCurrent(g_alloc[gi].ctx);
+		if (backup_uc(gi) != 0)
+			return -1;
+		if (unmap_alloc(gi, "UC", &unmapped) != 0)
+			return -1;
+		CUresult rc = r_cuMemRelease(g_alloc[gi].handle);
+		if (rc != CUDA_SUCCESS) {
+			mclog("SUSPEND: cuMemRelease(UC 0x%llx) rc=%d",
+			      (unsigned long long)g_alloc[gi].handle, rc);
+			return -1;
+		}
+		released++;
+		ucrebuilt++;
+		mclog("SUSPEND: released UC idx=%d handle=0x%llx size=0x%zx "
+		      "(backed up, VA reservations retained)",
+		      gi, (unsigned long long)g_alloc[gi].handle,
+		      g_alloc[gi].size);
+	}
+
+	ctx_probe("suspend-exit");
+
 	if (saved)
 		r_cuCtxSetCurrent(saved);
 	if (r_cuCtxSynchronize)
 		r_cuCtxSynchronize();
-	mclog("SUSPEND done: groups=%d unmapped=%d unbound=%d released=%d",
-	      groups, unmapped, unbound, released);
+	mclog("SUSPEND done: groups=%d imports=%d unmapped=%d unbound=%d "
+	      "released=%d uc_rebuilt=%d (mode=%d)",
+	      groups, imports, unmapped, unbound, released, ucrebuilt,
+	      uc_rebuild_mode());
 	return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Resume (three phases)                                              */
+/*                                                                    */
+/* A rank is simultaneously an EXPORTER (of its multicast groups and its    */
+/* P2P peer buffers) and an IMPORTER (of its peers'). If it fetched before  */
+/* it served, two ranks could deadlock waiting on each other. So every      */
+/* exporter starts serving (phase 1) before anyone fetches (phase 2), and   */
+/* bindings/mappings that need all handles resolved come last (phase 3).    */
+/* ------------------------------------------------------------------ */
+
 /* Must hold g_lock. */
 static int do_resume(void) {
-	int groups = 0, remapped = 0, rebound = 0;
+	int groups = 0, imports = 0, remapped = 0, rebound = 0, served = 0;
 	CUcontext saved = NULL;
 	r_cuCtxGetCurrent(&saved);
 
-	for (int gi = 0; gi < MAXN; gi++) {
-		if (g_alloc[gi].kind != KIND_MC)
-			continue;
-		groups++;
+	/* Phase 0: warm each context. The first VMM/IPC call issued from this
+	 * (control) thread on a freshly cuda-checkpoint-restored context can
+	 * return CUDA_ERROR_UNKNOWN; a synchronize first clears it. (Rank 0
+	 * was masked because its first op is cuMulticastCreate; importer ranks,
+	 * whose first op was a re-export, hit the stale-context error.)
+	 *
+	 * The synchronize result is also the earliest possible health probe:
+	 * it runs before the shim has issued any rebuild work, so a sticky
+	 * error here means cuda-checkpoint's restore itself left the context
+	 * faulted, and no rebuild policy can be responsible. Logged, not
+	 * fatal, so every rank reports. */
+	ctx_probe("resume-entry");
+	ctx_probe("resume-warm");
 
-		/* 1. Re-establish the multicast object (new handle is fine).
-		 *    Creator: cuMulticastCreate, then re-export + serve the fd
-		 *    BEFORE AddDevice/Bind, so importers are never starved
-		 *    while our own bind blocks waiting for them to join.
-		 *    Importer: fetch the creator's new fd and re-import. */
+	/* Phase 1: every exporter re-establishes its object and starts
+	 * serving the re-exported fd. */
+	int p1_mc = 0, p1_uc = 0, p1_ucnew = 0;
+	for (int gi = 0; gi < MAXN; gi++) {
 		if (g_alloc[gi].ctx)
 			r_cuCtxSetCurrent(g_alloc[gi].ctx);
-		CUmemGenericAllocationHandle newmc = 0;
-		CUresult rc;
-		if (!g_alloc[gi].imported) {
-			rc = r_cuMulticastCreate(&newmc, &g_alloc[gi].mprop);
-			if (rc != CUDA_SUCCESS) {
-				mclog("RESUME: cuMulticastCreate rc=%d", rc);
-				return -1;
-			}
-			if (g_alloc[gi].has_key) {
-				int fd = -1;
-				rc = r_cuMemExportToShareableHandle(
-				    &fd, newmc, CU_MEM_HANDLE_TYPE_POSIX_FD, 0);
-				if (rc != CUDA_SUCCESS || fd < 0) {
-					mclog("RESUME: re-export rc=%d fd=%d",
-					      rc, fd);
-					return -1;
-				}
-				if (start_serving(&g_alloc[gi], fd) != 0) {
-					close(fd);
-					return -1;
-				}
-			}
-		} else {
-			if (!g_alloc[gi].has_key) {
-				mclog("RESUME: imported group idx=%d has no "
-				      "rendezvous key; cannot re-import",
+		if (g_alloc[gi].kind == KIND_MC && !g_alloc[gi].imported) {
+			/* Multicast creator: new group handle, then serve it. */
+			CUmemGenericAllocationHandle newmc = 0;
+			if (r_cuMulticastCreate(&newmc, &g_alloc[gi].mprop) !=
+			    CUDA_SUCCESS) {
+				mclog("RESUME: cuMulticastCreate idx=%d failed",
 				      gi);
 				return -1;
 			}
-			/* Concurrent imports of the same group can transiently
-			 * fail (observed: CUDA_ERROR_OPERATING_SYSTEM=304 when
-			 * several ranks import within ~1ms). Retry with a fresh
-			 * fd, bounded so a real failure stays loud. */
-			int attempt = 0;
-			for (;;) {
-				int fd = fetch_group_fd(&g_alloc[gi], 60 * 1000);
-				if (fd < 0)
-					return -1;
-				rc = r_cuMemImportFromShareableHandle(
-				    &newmc, (void *)(intptr_t)fd,
-				    CU_MEM_HANDLE_TYPE_POSIX_FD);
-				close(fd);
-				if (rc == CUDA_SUCCESS)
-					break;
-				if (++attempt >= 100) {
-					mclog("RESUME: re-import rc=%d after "
-					      "%d attempts, giving up",
-					      rc, attempt);
-					return -1;
-				}
-				mclog("RESUME: re-import rc=%d (attempt %d), "
-				      "retrying",
-				      rc, attempt);
-				struct timespec ts = {0, 200 * 1000 * 1000};
-				nanosleep(&ts, NULL);
-			}
-		}
-		CUmemGenericAllocationHandle oldmc = g_alloc[gi].handle;
-		alloc_push_aka(&g_alloc[gi], newmc);
-		mclog("RESUME: re-established MC group idx=%d 0x%llx -> 0x%llx "
-		      "(%s)",
-		      gi, (unsigned long long)oldmc, (unsigned long long)newmc,
-		      g_alloc[gi].imported ? "re-imported" : "recreated+served");
-
-		/* 2. Re-add the participating devices. */
-		for (int d = 0; d < g_alloc[gi].ndev; d++) {
-			rc = r_cuMulticastAddDevice(newmc, g_alloc[gi].devs[d]);
-			if (rc != CUDA_SUCCESS) {
-				mclog("RESUME: cuMulticastAddDevice dev=%d rc=%d",
-				      g_alloc[gi].devs[d], rc);
+			alloc_push_aka(&g_alloc[gi], newmc);
+			if (g_alloc[gi].has_key &&
+			    reexport_serve(gi, newmc) != 0)
 				return -1;
-			}
-		}
-
-		/* 3. Re-bind the same memory (restored verbatim by
-		 *    cuda-checkpoint) into the group: by handle for BindMem
-		 *    entries, by (stable) VA for BindAddr entries. */
-		for (int b = 0; b < MAXN; b++) {
-			if (!g_bind[b].used || g_bind[b].groupIdx != gi)
-				continue;
-			if (g_bind[b].ctx)
-				r_cuCtxSetCurrent(g_bind[b].ctx);
-			if (g_bind[b].by_addr)
-				rc = r_cuMulticastBindAddr(newmc,
-				                           g_bind[b].mcOffset,
-				                           g_bind[b].va,
-				                           g_bind[b].size, 0);
-			else
-				rc = r_cuMulticastBindMem(newmc,
-				                          g_bind[b].mcOffset,
-				                          g_bind[b].mem,
-				                          g_bind[b].memOffset,
-				                          g_bind[b].size, 0);
-			if (rc != CUDA_SUCCESS) {
-				mclog("RESUME: re-bind (%s) rc=%d",
-				      g_bind[b].by_addr ? "addr" : "mem", rc);
-				return -1;
-			}
-			rebound++;
-		}
-
-		/* 4. Re-map every MC VA at its IDENTICAL address. Prefer the
-		 *    retained reservation; if it did not survive restore,
-		 *    re-reserve at the fixed address. */
-		for (int m = 0; m < MAXN; m++) {
-			if (!g_map[m].used || g_map[m].allocIdx != gi)
-				continue;
-			if (g_map[m].ctx)
-				r_cuCtxSetCurrent(g_map[m].ctx);
-			const char *path = "retained-reservation";
-			rc = r_cuMemMap(g_map[m].va, g_map[m].size,
-			                g_map[m].offset, newmc, 0);
-			if (rc != CUDA_SUCCESS) {
-				CUdeviceptr got = 0;
-				CUresult rr = r_cuMemAddressReserve(
-				    &got, g_map[m].size, 0, g_map[m].va, 0);
-				if (rr != CUDA_SUCCESS || got != g_map[m].va) {
-					if (rr == CUDA_SUCCESS)
-						r_cuMemAddressFree(got,
-						                   g_map[m].size);
-					mclog("RESUME: could not re-map at "
-					      "identical VA 0x%llx (got 0x%llx "
-					      "rr=%d)",
-					      (unsigned long long)g_map[m].va,
-					      (unsigned long long)got, rr);
-					return -1;
-				}
-				rc = r_cuMemMap(g_map[m].va, g_map[m].size,
-				                g_map[m].offset, newmc, 0);
+			groups++;
+			p1_mc++;
+		} else if (g_alloc[gi].kind == KIND_UC) {
+			CUmemGenericAllocationHandle h = g_alloc[gi].handle;
+			if (uc_rebuilt(gi)) {
+				/* Re-create the allocation instead of reusing the
+				 * cuda-checkpoint-restored one, then map it at the
+				 * identical VAs and write the contents back. A
+				 * restored allocation is not equivalent to a fresh
+				 * one for IPC export, so peers must only ever
+				 * import a handle that never went through the
+				 * checkpoint. */
+				CUmemGenericAllocationHandle newuc = 0;
+				CUresult rc = r_cuMemCreate(&newuc,
+				                            g_alloc[gi].size,
+				                            &g_alloc[gi].uprop, 0);
 				if (rc != CUDA_SUCCESS) {
-					mclog("RESUME: cuMemMap after re-reserve "
-					      "rc=%d",
+					mclog("RESUME: cuMemCreate(UC idx=%d "
+					      "size=0x%zx) rc=%d",
+					      gi, g_alloc[gi].size, rc);
+					return -1;
+				}
+				alloc_push_aka(&g_alloc[gi], newuc);
+				if (remap_alloc(gi, newuc, "UC", &remapped) != 0)
+					return -1;
+				if (restore_uc(gi) != 0)
+					return -1;
+				h = newuc;
+				p1_ucnew++;
+			}
+			if (g_alloc[gi].has_key) {
+				/* Exporter of a P2P peer buffer: serve the handle
+				 * importers must fetch. */
+				if (reexport_serve(gi, h) != 0)
+					return -1;
+				served++;
+				p1_uc++;
+			}
+		}
+	}
+	mclog("RESUME: phase1 done (%d MC creators, %d UC re-created, "
+	      "%d UC exporters served)",
+	      p1_mc, p1_ucnew, p1_uc);
+
+	/* Phase 2: importers fetch the re-exported fd and re-import (new
+	 * handle). Serving is already up for every exporter, so no deadlock. */
+	for (int gi = 0; gi < MAXN; gi++) {
+		if (g_alloc[gi].ctx)
+			r_cuCtxSetCurrent(g_alloc[gi].ctx);
+		if (g_alloc[gi].kind == KIND_MC && g_alloc[gi].imported) {
+			CUmemGenericAllocationHandle newmc = 0;
+			if (reimport(gi, &newmc) != 0)
+				return -1;
+			alloc_push_aka(&g_alloc[gi], newmc);
+			groups++;
+		} else if (g_alloc[gi].kind == KIND_IMP) {
+			CUmemGenericAllocationHandle newh = 0;
+			if (reimport(gi, &newh) != 0)
+				return -1;
+			alloc_push_aka(&g_alloc[gi], newh);
+			imports++;
+		}
+	}
+
+	/* Phase 3: rebuild bindings and re-map every VA at its IDENTICAL
+	 * address, now that all handles (local and imported) are resolved. */
+	for (int gi = 0; gi < MAXN; gi++) {
+		if (g_alloc[gi].ctx)
+			r_cuCtxSetCurrent(g_alloc[gi].ctx);
+		if (g_alloc[gi].kind == KIND_MC) {
+			CUmemGenericAllocationHandle mc = g_alloc[gi].handle;
+			for (int d = 0; d < g_alloc[gi].ndev; d++)
+				if (r_cuMulticastAddDevice(
+				        mc, g_alloc[gi].devs[d]) != CUDA_SUCCESS) {
+					mclog("RESUME: AddDevice dev=%d failed",
+					      g_alloc[gi].devs[d]);
+					return -1;
+				}
+			/* cuMulticastBindMem blocks until every device has
+			 * joined -- the binds are the cross-rank barrier. */
+			for (int b = 0; b < MAXN; b++) {
+				if (!g_bind[b].used || g_bind[b].groupIdx != gi)
+					continue;
+				if (g_bind[b].ctx)
+					r_cuCtxSetCurrent(g_bind[b].ctx);
+				CUresult rc =
+				    g_bind[b].by_addr
+				        ? r_cuMulticastBindAddr(
+				              mc, g_bind[b].mcOffset,
+				              g_bind[b].va, g_bind[b].size, 0)
+				        : r_cuMulticastBindMem(
+				              mc, g_bind[b].mcOffset,
+				              xlate_mc(g_bind[b].mem),
+				              g_bind[b].memOffset,
+				              g_bind[b].size, 0);
+				if (rc != CUDA_SUCCESS) {
+					mclog("RESUME: re-bind (%s) rc=%d",
+					      g_bind[b].by_addr ? "addr" : "mem",
 					      rc);
 					return -1;
 				}
-				path = "re-reserved-fixed";
+				rebound++;
 			}
-			if (g_map[m].has_access)
-				r_cuMemSetAccess(g_map[m].va, g_map[m].size,
-				                 &g_map[m].access, 1);
-			remapped++;
-			mclog("RESUME: MC VA 0x%llx re-mapped IDENTICAL (%s)",
-			      (unsigned long long)g_map[m].va, path);
+			if (remap_alloc(gi, mc, "MC", &remapped) != 0)
+				return -1;
+		} else if (g_alloc[gi].kind == KIND_IMP) {
+			if (remap_alloc(gi, g_alloc[gi].handle, "UC-import",
+			                &remapped) != 0)
+				return -1;
 		}
 	}
 
@@ -1210,8 +1585,9 @@ static int do_resume(void) {
 		r_cuCtxSetCurrent(saved);
 	if (r_cuCtxSynchronize)
 		r_cuCtxSynchronize();
-	mclog("RESUME done: groups=%d rebound=%d remapped=%d", groups, rebound,
-	      remapped);
+	mclog("RESUME done: groups=%d imports=%d served=%d rebound=%d "
+	      "remapped=%d",
+	      groups, imports, served, rebound, remapped);
 	return 0;
 }
 

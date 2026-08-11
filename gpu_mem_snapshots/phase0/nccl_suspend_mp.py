@@ -40,6 +40,31 @@ def f32bits(x):
     return struct.unpack("<I", struct.pack("<f", float(x)))[0]
 
 
+def _ctl_pages():
+    """Count r--s /dev/nvidiactl control pages currently mapped."""
+    try:
+        return sum(1 for ln in open("/proc/self/maps")
+                   if "r--s" in ln and "nvidiactl" in ln)
+    except OSError:
+        return -1
+
+
+def _dump_maps(d, rank, tag):
+    """Snapshot GPU/UVM address-space mappings (for diffing across the shim's
+    suspend/resume: a range present pre- but missing/changed post- is a
+    mapping the shim failed to replay -> the 719 culprit)."""
+    try:
+        lines = []
+        with open("/proc/self/maps") as f:
+            for ln in f:
+                if any(k in ln for k in ("nvidia", "uvm", "/dev/nvidia")):
+                    lines.append(ln.rstrip())
+        with open(os.path.join(d, f"maps.{tag}.{rank}"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default="/tmp/mp")
@@ -112,10 +137,12 @@ def main():
             raw = f.read(nc.NCCL_UNIQUE_ID_BYTES)
         ctypes.memmove(ctypes.byref(uid), raw, len(raw))
 
+    _dump_maps(args.dir, rank, "phase0_preinit")  # ctx + stream + cuMemAlloc
     comm = nc.ncclComm_t()
     print(f"[rank{rank}] NCCL {nc.version()} InitRank world={world} dev={rank}",
           flush=True)
     nc.call("ncclCommInitRank", ctypes.byref(comm), world, uid, rank)
+    _dump_maps(args.dir, rank, "phase1_comminit")  # after ncclCommInitRank
 
     # Each rank contributes a FIXED value (rank+1). Independent per-process
     # loops drift (ranks are not lock-step without a barrier), so the expected
@@ -151,6 +178,7 @@ def main():
     if errs:
         status("FATAL warmup: " + "; ".join(errs))
         return 1
+    _dump_maps(args.dir, rank, "phase2_warmup")  # after first allreduce (lazy conns)
     suspendable, susp, persist = nc.mem_stats(comm)
     status(f"WARMUP-OK expected={EXPECTED} suspendable={suspendable} "
            f"suspended={susp} persist={persist}")
@@ -188,20 +216,24 @@ def main():
             want = os.path.exists(os.path.join(args.dir, "pause"))
             if want and not paused:
                 paused = True
+                _dump_maps(args.dir, rank, "pre")
                 status(f"PAUSED iter={it} (quiesced; shim may suspend)")
             elif not want and paused:
                 paused = False
                 restored = True
+                _dump_maps(args.dir, rank, "post")
                 status(f"UNPAUSED iter={it}")
             if paused:
                 time.sleep(args.interval)
                 continue
         elif not suspended and os.path.exists(os.path.join(args.dir, "suspend")):
             try:
+                _dump_maps(args.dir, rank, "presuspend")
                 t0 = time.monotonic()
                 nc.call("ncclCommSuspend", comm, nc.NCCL_SUSPEND_MEM)
                 dt = time.monotonic() - t0
                 suspended = True
+                _dump_maps(args.dir, rank, "suspended")
                 status(f"SUSPENDED iter={it} ({dt:.2f}s) memstats={nc.mem_stats(comm)}")
             except nc.NcclError as e:
                 failures += 1
@@ -213,6 +245,7 @@ def main():
                 nc.call("ncclCommResume", comm)
                 dt = time.monotonic() - t0
                 suspended = False
+                _dump_maps(args.dir, rank, "postresume")
                 status(f"RESUMED iter={it} ({dt:.2f}s) memstats={nc.mem_stats(comm)}")
             except nc.NcclError as e:
                 failures += 1
@@ -241,7 +274,7 @@ def main():
             failures += 1
             status(f"iter={it} {tag} FAIL: {'; '.join(errs)} failures={failures}")
         else:
-            status(f"iter={it} {tag} pass failures={failures}")
+            status(f"iter={it} {tag} pass failures={failures} ctlpages={_ctl_pages()}")
         time.sleep(args.interval)
 
 
