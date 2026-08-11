@@ -37,10 +37,15 @@ for ((i = 1; i <= TRIALS; i++)); do
     log=$(mktemp /tmp/vllmtrial.XXXXXX.log)
     printf 'trial %d/%d (TP=%s eager=%s): ' "$i" "$TRIALS" "$TP" "$EAGER"
     timeout 1500 bash ./bench_4_vllm_multi.sh --gpus "$GPUS" --tp "$TP" >"$log" 2>&1
+    # cuda-checkpoint reports a failed restore toggle in the sentry log, not on
+    # the benchmark's stdout, so classify against the run's artifacts too.
+    art=$(grep -ohE '==> Artifacts at .*' "$log" | tail -1 | awk '{print $NF}')
+    toggle_err=""
+    [[ -n "$art" ]] && toggle_err=$(grep -lE 'restore toggle failed|Error toggling CUDA' "$art"/logs/*boot* 2>/dev/null | head -1)
     if grep -q "RESULT: PASS" "$log"; then
         pass=$((pass + 1))
         echo "PASS"
-    elif grep -qE 'restore toggle failed|Error toggling CUDA' "$log"; then
+    elif [[ -n "$toggle_err" ]] || grep -qE 'restore toggle failed|Error toggling CUDA' "$log"; then
         toggle=$((toggle + 1))
         echo "FAIL (cuda-checkpoint restore toggle -- pre-existing, not multicast)"
     else

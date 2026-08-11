@@ -28,6 +28,34 @@ glibc 2.38+ redirects `sscanf` to `__isoc23_sscanf`, so the library then fails
 to load in older images — which shows up only as the container exiting
 immediately with an empty log.
 
+## Rebuilding the environment from scratch
+
+Nothing here depends on a warm machine, but four artifacts are not in git and
+have to be recreated. Recorded because doing it blind costs an hour.
+
+1. **Driver + fabric manager.** `instal_nvidia.sh` installs 610.57.04. On a
+   fresh Ubuntu 26.04 image it needs two things it does not do itself:
+   `build-essential` plus `linux-headers-$(uname -r)` (the runfile aborts with
+   "Unable to find the development tool `cc`"), and correct apt version pins --
+   NVIDIA publishes `nvidia-fabricmanager=610.57.04-1ubuntu1`, not the
+   `610.57.04-1` the script asks for, and the container toolkit pin has moved
+   too. Fabric manager **must** match the driver exactly or NVSwitch never
+   initialises and there is no NVLS to test.
+2. **Persistence.** The runfile ships no systemd unit, so `nvidia-smi -pm 1`
+   alone is lost on reboot. Install a `nvidia-persistenced.service` and enable
+   it.
+3. **Stock NCCL** at `/opt/phase0/nccl-stock/libnccl.so.2`: extract
+   `libnccl.so.2` from the `nvidia-nccl-cu13` wheel. A wheel build is exactly
+   what "stock" means here, and it avoids a source build.
+4. **cuda-checkpoint** at `/usr/local/bin/cuda-checkpoint`, from the NVIDIA
+   cuda-checkpoint repo.
+
+Then `make build TARGETS=//runsc` (containerised, needs Docker),
+`mcshim/build.sh`, and `run_matrix.sh` to confirm.
+
+Sanity checks before trusting any result: `nvidia-smi -q | grep -A3 Fabric`
+must say `Completed` / `Success`, and every GPU must read 0 MiB.
+
 ## The sequence, and why each step is where it is
 
     gate ──► lock ──► unlock ──► tear down ──► lock ──► checkpoint ──► save
