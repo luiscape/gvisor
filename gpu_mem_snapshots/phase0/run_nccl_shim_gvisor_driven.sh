@@ -164,17 +164,6 @@ log "(a) pause the workload (application-level quiesce only)"
 touch_m "$CID" pause
 wait_all "$CID" "PAUSED" 60 || { log "FAIL: pause"; exit 1; }
 
-# Bisect knob: perform the SUSPEND externally (exactly as the
-# externally-driven control harness does) while still letting gVisor own the
-# RESUME. gVisor's suspend step then finds the acks already present and
-# returns immediately, so this isolates suspend placement from resume
-# placement.
-if [[ "${EXTERNAL_SUSPEND:-0}" = 1 ]]; then
-  log "(a2) EXTERNAL_SUSPEND=1: suspending interposer before runsc checkpoint"
-  touch_m "$CID" suspend
-  wait_acks "$CID" suspended 120 || { log "FAIL: external shim suspend"; exit 1; }
-fi
-
 log "(b) runsc checkpoint -- gVisor suspends the interposer itself"
 t0=$SECONDS
 runsc checkpoint -image-path "$WORK/img" \
@@ -193,10 +182,7 @@ runsc delete -force "$CID" >/dev/null 2>&1 || true
 
 log "(c) runsc restore -- gVisor resumes the interposer after the toggle"
 t0=$SECONDS
-GVISOR_CUDA_MULTICAST_SHIM_EXTERNAL_RESUME="${EXTERNAL_RESUME:-0}" \
-  GVISOR_CUDA_MULTICAST_SHIM_RESUME_DELAY="${RESUME_DELAY:-0}" \
-  GVISOR_CUDA_MULTICAST_SHIM_RESUME_VIA_EXEC="${RESUME_VIA_EXEC:-0}" \
-  runsc restore -detach -image-path "$WORK/img" -bundle "$WORK/bundle" \
+runsc restore -detach -image-path "$WORK/img" -bundle "$WORK/bundle" \
   -pid-file "$WORK/pid-r" "$CID_R"
 REST_RC=$?
 log "restore rc=$REST_RC ($((SECONDS-t0))s)"
@@ -205,18 +191,17 @@ TOGGLE_ERR=$(grep -h 'Killing the sandbox after post restore' "$WORK"/logs/*boot
 [[ -z "$TOGGLE_ERR" && $REST_RC -eq 0 ]] || { log "FAIL: restore: ${TOGGLE_ERR#*restore work failed: }"; exit 1; }
 grep -h "Multicast interposer resumed" "$WORK"/logs/*boot* | tail -1
 
-if [[ "${EXTERNAL_RESUME:-0}" = 1 ]]; then
-  log "(c2) EXTERNAL_RESUME=1: waiting for toggle, then resuming externally"
-  for ((i=0; i<180; i++)); do
-    n=$(grep -h 'cuda-checkpoint --toggle for PID .* succeeded' "$WORK"/logs/*boot* 2>/dev/null | wc -l)
-    [[ "${n:-0}" -ge "$WORLD" ]] && { log "toggle complete on $n/$WORLD ranks"; break; }
-    sleep 1
-  done
-  rm_m "$CID_R" suspend
-  wait_acks "$CID_R" resumed 120 || { log "FAIL: external shim resume"; FAIL=1; }
-fi
+# The workload must not run again until gVisor has finished rebuilding the
+# multicast layer. gVisor does that from postResumeCuda, which completes after
+# `runsc restore` has already returned, so wait for the interposer's own
+# per-rank "resumed" acknowledgements before unpausing. Unpausing early lets
+# the ranks touch multicast VAs that are still unmapped, which faults every
+# rank's context with CUDA_ERROR_ILLEGAL_ADDRESS (700).
+log "(d) waiting for gVisor's interposer rebuild to finish on all $WORLD ranks"
+wait_acks "$CID_R" resumed 180 || { log "FAIL: interposer rebuild did not complete"; FAIL=1; }
+grep -h "Multicast interposer resumed" "$WORK"/logs/*boot* | tail -1
 
-log "(d) unpause + post-restore verification (eager allreduce + CUDA graph)"
+log "(e) unpause + post-restore verification (eager allreduce + CUDA graph)"
 rm_m "$CID_R" pause
 wait_all "$CID_R" "post-restore pass" 60 || { log "FAIL: post-restore verify"; FAIL=1; }
 sleep 3

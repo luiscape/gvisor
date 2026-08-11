@@ -85,57 +85,79 @@ is retained only as a documented negative result; the default path is correct.
 
 ---
 
-## gVisor-DRIVEN integration (2026-08-10, later still)
+## gVisor-DRIVEN integration (2026-08-11) -- WORKING
 
-The interposer is now driven by gVisor itself rather than by an external
-poller. `runsc --cuda-multicast-shim-path=<mcshim.so>` makes the sentry
-LD_PRELOAD it into a GPU container and export `MCSHIM_DIR`
-(`runsc/boot/loader.go`); `pkg/sentry/control/state_cuda_shim.go` then drives
-the two transitions around the cuda-checkpoint phases.
+The interposer is driven by gVisor itself; nothing outside gVisor touches it.
+`runsc --cuda-multicast-shim-path=<mcshim.so>` makes the sentry LD_PRELOAD it
+into a GPU container and export `MCSHIM_DIR` (`runsc/boot/loader.go`), and
+`pkg/sentry/control/state_cuda_shim.go` drives both transitions around the
+cuda-checkpoint phases.
 
 Harness: `run_nccl_shim_gvisor_driven.sh` (stock NCCL NVLS + CUDA graph,
-WORLD=4). Result: **3/3 PASS, 0 context faults.**
+WORLD=4). Result: **PASS, 0 context faults, reproducible.**
 
-### Ordering constraints, all established empirically
+### Ordering rules, all established empirically
 
-1. **Suspend must run before `cuda-checkpoint --action lock`.** The interposer
-   tears down through libcuda, and a locked process cannot submit that work
-   (observed: no rank acknowledges, suspend times out).
+1. **Suspend before `cuda-checkpoint --action lock`.** The interposer tears
+   down through libcuda, and a locked process cannot submit that work
+   (observed: no rank acknowledges and the suspend times out).
 2. **Verify, do not trust.** After the suspend, the blocker gate is re-run with
    nothing exempt, so anything left unreleased fails the checkpoint loudly
    instead of producing a snapshot that only misbehaves after restore.
-3. **Resume must run after the restore toggle has completed on every rank**
-   *and* after the restore RPC itself has returned. This is the one that cost
-   the most to pin down; see below.
+3. **Rebuild after the restore toggle has completed on every rank**, which is
+   where `postResumeCuda` already sits.
+4. **The application must not run GPU work until the rebuild completes.**
 
-### The resume-placement result (open)
+### Rule 4, and a warning about how easy it is to misdiagnose
 
-Two distinct failure modes, with different signatures:
+Rule 4 cost the most to find, and produced a long chain of wrong conclusions
+worth recording so they are not repeated.
 
-| Placement | Signature |
-| --- | --- |
-| during the toggle | **one** arbitrary rank, sticky `719` |
-| inline in `postResumeCuda` | **every** rank, `700` (illegal address) |
-| after the restore RPC returns | clean |
+The symptom was that a gVisor-driven rebuild faulted **every** rank with
+`CUDA_ERROR_ILLEGAL_ADDRESS` (700), while an externally-driven rebuild was
+clean. Ruled out, each by direct experiment: the `SigsegvLock` window (moving
+the rebuild after `SigsegvUnlock` changed nothing); waiting for
+`cuda-checkpoint --get-state` to report every process `running`; a settle
+delay; running the rebuild asynchronously; the interposer's unicast policy
+(`MCSHIM_UC_REBUILD`); async MemoryFile page loading (the log shows
+`MFs loaded` completing ~10 s *before* the rebuild); and the injection method
+(spec env vs `procArgs.Envv`, i.e. whether the cuda-checkpoint helpers are
+themselves preloaded).
 
-The second was **not** explained by any of: the `SigsegvLock` window (moving
-the rebuild after `SigsegvUnlock` did not help), waiting for
-`cuda-checkpoint --get-state` to report every process `running`, an added
-settle delay, or running the rebuild asynchronously. Yet the *identical*
-rebuild driven from outside once `runsc restore` has returned is reliably
-clean, with contexts probing healthy and collectives verifying.
+The actual cause was in the **harness**: it removed the workload's `pause`
+marker about two seconds after `runsc restore` returned, but gVisor's rebuild
+runs in `postResumeCuda`, which finishes *later* than the restore RPC. The
+ranks therefore resumed collectives against multicast VAs that were still
+unmapped. Every rank faulting, and the fault being immune to every delay added
+*inside* gVisor, are both explained by this -- a longer internal delay makes it
+strictly worse, because the application is unpaused even earlier relative to
+the rebuild.
 
-The bisect that isolates it: gVisor performs the suspend, an external driver
-performs the resume (`GVISOR_CUDA_MULTICAST_SHIM_EXTERNAL_RESUME=1`, harness
-knob `EXTERNAL_RESUME=1`). That configuration is what passes today, and it
-proves the save side of the gVisor integration is correct — only the resume
-trigger point is unresolved.
+Two traps made this hard to see:
 
-**Next step:** find what the restore RPC completes *after* `PostRestore`
-returns that the rebuild depends on (candidate: lazily re-established
-nvproxy/device mappings for the app's VMAs), then move the resume to a hook
-that runs at that point so gVisor can own the transition end to end without
-the external driver.
+* An `EXTERNAL_RESUME=1` bisect appeared to prove the sentry-side rebuild was
+  at fault. It proved nothing: **`runsc` clears the sandbox environment**
+  (`cmd.Env = []string{}` in `runsc/sandbox/sandbox.go`), so that knob -- and
+  every other env-based knob -- never reached the sentry. gVisor rebuilt
+  inline in *all* of those runs. What the flag actually changed was that the
+  harness waited for the toggle before unpausing.
+* `CTXPROBE` at resume entry reports the context already faulted, which looks
+  like "something before the rebuild broke it". It was the *application*,
+  running ahead of the rebuild.
+
+Fix: wait for the interposer's per-rank `resumed` acknowledgements before
+letting the workload run.
+
+### Production implication (not yet addressed)
+
+The harness satisfies rule 4 with an application-level pause, which a real
+workload will not have. `cuda-checkpoint --toggle` restores *and unlocks* each
+process, so in production the application becomes runnable while gVisor is
+still rebuilding -- the same race. The robust fix belongs in the interposer:
+while suspended, block in the interposed libcuda entry points (kernel launch,
+memset, memcpy, graph launch, stream/context sync) until the rebuild finishes.
+That makes the guarantee app-transparent instead of relying on the workload
+being idle.
 
 ---
 
