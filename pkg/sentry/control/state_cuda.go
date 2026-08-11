@@ -60,6 +60,16 @@ const (
 	// cudaBlockerPollInterval is how often the checkpoint-blocker gate
 	// re-polls nvproxy for live blockers before giving up.
 	cudaBlockerPollInterval = 500 * time.Millisecond
+
+	// cudaLockGateAttempts bounds how many times the (gate, lock) pair is
+	// retried when the lock cannot quiesce every rank. Only meaningful with
+	// the multicast interposer, whose gate is what gets released between
+	// attempts to let a deadlocked collective drain.
+	cudaLockGateAttempts = 5
+
+	// cudaLockGateRetryDelay is how long the gate stays released between
+	// attempts, giving in-flight collectives time to complete.
+	cudaLockGateRetryDelay = 500 * time.Millisecond
 )
 
 // cudaSuspendBeforeLock controls whether multicast suspend runs before the
@@ -121,39 +131,11 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		}
 		return err
 	}
-	// Have the multicast interposer release its multicast objects and CUDA
-	// IPC imports before the cuda-checkpoint sequence begins. It performs the
-	// teardown through libcuda (cuMemUnmap / cuMulticastUnbind /
-	// cuMemRelease), so it needs the processes in their ordinary running
-	// state: neither locked by cuda-checkpoint nor holding the SIGSEGV lock
-	// taken below. See state_cuda_shim.go.
-	if err := suspendCudaMulticastShim(sctx, k, cudaProcs); err != nil {
-		if wasPaused {
-			k.Pause()
-		}
-		return err
-	}
-
-	// Verify rather than trust: the interposer acknowledging its suspend does
-	// not by itself prove the process is now serializable. Re-run the gate
-	// with nothing exempt, so anything the interposer failed to release is a
-	// loud failure here instead of a corrupt snapshot that only manifests as
-	// a GPU fault after restore.
-	if err := waitForCudaCheckpointBlockers(k, o.CudaBlockerTimeout, false /* multicastWillBeReleased */); err != nil {
-		if rerr := resumeCudaMulticastShim(sctx, k, o.CudaCheckpointPath, cudaProcs); rerr != nil {
-			log.Warningf("multicast interposer resume after post-suspend blocker check failed: %v", rerr)
-		}
-		if wasPaused {
-			k.Pause()
-		}
-		return fmt.Errorf("multicast interposer suspended but resources remain: %w", err)
-	}
-
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {
 		tg.SigsegvLock()
 	}
-	err := checkpointCudaProcs(sctx, k, o.CudaCheckpointPath, cudaProcs, o.CudaCheckpointSequential, o.CudaMulticastSuspend)
+	err := checkpointCudaProcs(sctx, k, o.CudaCheckpointPath, cudaProcs, o.CudaCheckpointSequential, o.CudaMulticastSuspend, o.CudaBlockerTimeout)
 	if wasPaused {
 		k.Pause()
 	}
@@ -557,7 +539,7 @@ func runCudaAction(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath st
 //     checkpointing while its peer keeps spinning waiting for it, deadlocking
 //     the snapshot.
 //  2. Checkpoint all locked processes, releasing their GPU state.
-func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, sequential, multicastSuspend bool) error {
+func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, sequential, multicastSuspend bool, blockerTimeout time.Duration) error {
 	start := time.Now()
 	nullFD, cleanup := openCudaCheckpointNullFD(sctx, k)
 	defer cleanup()
@@ -603,12 +585,52 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 	}
 
 
-
-	// Phase 1: lock every process, in parallel, so coupled ranks quiesce
-	// together. --timeout bounds how long each lock waits for its process to
-	// become lockable (rather than hanging forever).
+	// Phase 1: bar the application from the GPU, then lock every process in
+	// parallel so coupled ranks quiesce together. --timeout bounds how long
+	// each lock waits for its process to become lockable.
+	//
+	// The gate and the lock cover different halves of the problem, and neither
+	// suffices alone. The gate stops *new* submissions but cannot drain work
+	// already in flight. The lock drains and preempts in-flight work but
+	// cannot keep up with a workload that never idles, and then reports
+	// "device not ready". So gate first, leaving the lock only the in-flight
+	// work to deal with.
+	//
+	// Gating can however deadlock a collective: a rank gated just before
+	// submitting collective N starves peers already spinning in N, and the
+	// lock cannot quiesce those peers either. Releasing the gate lets that
+	// collective complete, so retry the pair a bounded number of times -- each
+	// attempt is a fresh chance to catch every rank between collectives. If it
+	// never converges, fail cleanly with the application still running.
+	shimDir := cudaShimDir(k, cudaProcs)
 	lockArgs := []string{"--action", "lock", "--timeout", strconv.Itoa(cudaLockTimeoutMS)}
-	locked, err := runCudaAction(sctx, k, cudaCheckpointPath, cudaProcs, lockArgs, true /* parallel */, nullFD)
+	var locked []*kernel.ThreadGroup
+	var err error
+	for attempt := 1; ; attempt++ {
+		if shimDir != "" {
+			if err = armCudaMulticastShimGate(sctx, k, cudaProcs, shimDir); err != nil {
+				return err
+			}
+		}
+		locked, err = runCudaAction(sctx, k, cudaCheckpointPath, cudaProcs, lockArgs, true /* parallel */, nullFD)
+		if err == nil {
+			break
+		}
+		// Unlock whatever did lock, so ranks holding peers back can make
+		// progress before the next attempt.
+		if _, uerr := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "unlock"}, true, nullFD); uerr != nil {
+			log.Warningf("cuda-checkpoint unlock between lock attempts failed: %v", uerr)
+		}
+		if shimDir == "" || attempt >= cudaLockGateAttempts {
+			break
+		}
+		log.Infof("cuda-checkpoint lock attempt %d/%d did not quiesce all ranks; releasing the interposer gate to let in-flight collectives drain, then retrying: %v",
+			attempt, cudaLockGateAttempts, err)
+		if rerr := releaseCudaMulticastShimGate(sctx, k, cudaProcs, shimDir); rerr != nil {
+			log.Warningf("failed to release multicast interposer gate between lock attempts: %v", rerr)
+		}
+		time.Sleep(cudaLockGateRetryDelay)
+	}
 	if err != nil {
 		if multicastSuspend && cudaSuspendBeforeLock {
 			if rerr := nvproxy.ReplayMulticastObjects(sctx, k.VFS()); rerr != nil {
@@ -616,9 +638,10 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 			}
 		}
 
-		// Best-effort: unlock whatever we locked so the application keeps running.
-		if _, uerr := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "unlock"}, true, nullFD); uerr != nil {
-			log.Warningf("cuda-checkpoint unlock after lock-phase failure also failed: %v", uerr)
+		if shimDir != "" {
+			if rerr := releaseCudaMulticastShimGate(sctx, k, cudaProcs, shimDir); rerr != nil {
+				log.Warningf("failed to release multicast interposer gate after lock-phase failure: %v", rerr)
+			}
 		}
 		return fmt.Errorf("cuda-checkpoint lock phase failed: %w", err)
 	}
@@ -634,6 +657,53 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 				log.Warningf("cuda-checkpoint unlock after multicast suspend failure also failed: %v", uerr)
 			}
 			return err
+		}
+	}
+
+	// Interposer teardown, sandwiched inside the lock.
+	//
+	// Two constraints collide. The interposer must issue libcuda calls
+	// (cuMemUnmap / cuMulticastUnbind / cuMemRelease), which a locked process
+	// cannot do. But it must not tear multicast down while the application is
+	// still using it, and the application cannot simply be gated first: a rank
+	// gated before submitting its next collective starves peers already
+	// spinning in that collective, so the gate alone deadlocks the drain
+	// (observed with NVLS disabled and a workload with no idle gap).
+	//
+	// cuda-checkpoint's parallel lock is precisely the thing that can quiesce
+	// coupled ranks. So: arm the gate while still locked -- the interposer only
+	// flips a flag and issues no CUDA calls, so this is safe -- then unlock, so
+	// the teardown runs against an already-drained GPU that the application is
+	// barred from touching. Then re-lock for the checkpoint.
+	if shimDir != "" {
+		undo := func() {
+			if rerr := resumeCudaMulticastShim(sctx, k, cudaCheckpointPath, locked); rerr != nil {
+				log.Warningf("multicast interposer resume during checkpoint unwind failed: %v", rerr)
+			}
+			if _, uerr := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "unlock"}, true, nullFD); uerr != nil {
+				log.Warningf("cuda-checkpoint unlock during checkpoint unwind failed: %v", uerr)
+			}
+		}
+		if _, err := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "unlock"}, true, nullFD); err != nil {
+			undo()
+			return fmt.Errorf("cuda-checkpoint unlock before multicast teardown failed: %w", err)
+		}
+		if err := suspendCudaMulticastShim(sctx, k, locked); err != nil {
+			undo()
+			return err
+		}
+		// Verify rather than trust: the interposer acknowledging its suspend
+		// does not by itself prove the process is serializable. Re-run the
+		// gate with nothing exempt, so anything left unreleased fails here
+		// instead of becoming a snapshot that only misbehaves after restore.
+		if err := waitForCudaCheckpointBlockers(k, blockerTimeout, false /* multicastWillBeReleased */); err != nil {
+			undo()
+			return fmt.Errorf("multicast interposer suspended but resources remain: %w", err)
+		}
+		var err error
+		if locked, err = runCudaAction(sctx, k, cudaCheckpointPath, cudaProcs, lockArgs, true /* parallel */, nullFD); err != nil {
+			undo()
+			return fmt.Errorf("cuda-checkpoint re-lock after multicast teardown failed: %w", err)
 		}
 	}
 

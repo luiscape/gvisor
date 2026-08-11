@@ -85,9 +85,14 @@ const (
 	// container does not set CudaMulticastShimDirEnv itself.
 	DefaultCudaMulticastShimDir = "/tmp/mcshim"
 
-	// cudaShimSuspendMarker is created to request suspend and removed to
-	// request resume.
+	// cudaShimSuspendMarker is created to request the teardown and removed to
+	// request the rebuild.
 	cudaShimSuspendMarker = "suspend"
+
+	// cudaShimGateMarker is created to bar the application from submitting
+	// GPU work. Handling it involves no CUDA calls, so it can be created
+	// while the processes are locked by cuda-checkpoint.
+	cudaShimGateMarker = "gate"
 
 	// cudaShimAckTimeout bounds how long to wait for every process to
 	// acknowledge a transition. Rebuilding multicast is collective (each
@@ -169,9 +174,9 @@ func cudaShimCreds(k *kernel.Kernel) *auth.Credentials {
 // cudaShimSetMarker creates (set) or removes (clear) the suspend marker in
 // every distinct mount namespace among cudaProcs. Ranks of a job usually share
 // one namespace, in which case this touches the file once.
-func cudaShimSetMarker(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, dir string, set bool) error {
+func cudaShimSetMarker(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, dir, marker string, set bool) error {
 	creds := cudaShimCreds(k)
-	path := dir + "/" + cudaShimSuspendMarker
+	path := dir + "/" + marker
 	seen := make(map[*vfs.MountNamespace]bool)
 	var done bool
 	for _, tg := range cudaProcs {
@@ -288,6 +293,36 @@ func waitCudaProcsRunning(sctx context.Context, k *kernel.Kernel, cudaCheckpoint
 }
 
 
+
+// armCudaMulticastShimGate bars the application from submitting GPU work, and
+// waits until every process confirms it.
+//
+// This makes no CUDA calls in the target processes -- the interposer only flips
+// a flag -- so it is safe to call while they are locked by cuda-checkpoint.
+// That matters: the lock is what quiesces coupled ranks, and gating before the
+// lock would deadlock the drain (a gated rank starves peers already spinning in
+// a collective it has not submitted yet).
+func armCudaMulticastShimGate(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, dir string) error {
+	start := time.Now()
+	if err := cudaShimSetMarker(sctx, k, cudaProcs, dir, cudaShimGateMarker, true /* set */); err != nil {
+		return err
+	}
+	if err := cudaShimWaitAcks(sctx, k, cudaProcs, dir, "gated"); err != nil {
+		if rerr := cudaShimSetMarker(sctx, k, cudaProcs, dir, cudaShimGateMarker, false /* set */); rerr != nil {
+			log.Warningf("Failed to clear multicast interposer gate after arm failure: %v", rerr)
+		}
+		return err
+	}
+	log.Infof("Multicast interposer gated %d process(es) in %s", len(cudaProcs), time.Since(start))
+	return nil
+}
+
+// releaseCudaMulticastShimGate lets the application submit GPU work again. Used
+// to unwind when the checkpoint fails before the teardown.
+func releaseCudaMulticastShimGate(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, dir string) error {
+	return cudaShimSetMarker(sctx, k, cudaProcs, dir, cudaShimGateMarker, false /* set */)
+}
+
 // suspendCudaMulticastShim asks the interposer to release multicast objects and
 // CUDA IPC imports on every process, and waits for all of them to finish.
 //
@@ -299,12 +334,12 @@ func suspendCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaProcs 
 		return nil
 	}
 	start := time.Now()
-	if err := cudaShimSetMarker(sctx, k, cudaProcs, dir, true /* set */); err != nil {
+	if err := cudaShimSetMarker(sctx, k, cudaProcs, dir, cudaShimSuspendMarker, true /* set */); err != nil {
 		return err
 	}
 	if err := cudaShimWaitAcks(sctx, k, cudaProcs, dir, "suspended"); err != nil {
 		// Undo, so a failed checkpoint leaves the application running.
-		if rerr := cudaShimSetMarker(sctx, k, cudaProcs, dir, false /* set */); rerr != nil {
+		if rerr := cudaShimSetMarker(sctx, k, cudaProcs, dir, cudaShimSuspendMarker, false /* set */); rerr != nil {
 			log.Warningf("Failed to clear multicast interposer marker after suspend failure: %v", rerr)
 		}
 		return err
@@ -332,11 +367,16 @@ func resumeCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaCheckpo
 	if err := waitCudaProcsRunning(sctx, k, cudaCheckpointPath, cudaProcs); err != nil {
 		return err
 	}
-	if err := cudaShimSetMarker(sctx, k, cudaProcs, dir, false /* set */); err != nil {
+	if err := cudaShimSetMarker(sctx, k, cudaProcs, dir, cudaShimSuspendMarker, false /* set */); err != nil {
 		return err
 	}
 	if err := cudaShimWaitAcks(sctx, k, cudaProcs, dir, "resumed"); err != nil {
 		return err
+	}
+	// The interposer releases the application itself once the rebuild
+	// succeeds; clear the marker too so a later checkpoint starts clean.
+	if err := cudaShimSetMarker(sctx, k, cudaProcs, dir, cudaShimGateMarker, false /* set */); err != nil {
+		log.Warningf("Failed to clear multicast interposer gate marker: %v", err)
 	}
 	log.Infof("Multicast interposer resumed on %d process(es) in %s", len(cudaProcs), time.Since(start))
 	return nil

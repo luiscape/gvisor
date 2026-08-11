@@ -1879,9 +1879,31 @@ static void *control_thread(void *arg) {
 	snprintf(ack_s, sizeof(ack_s), "suspended.%d", (int)getpid());
 	snprintf(ack_r, sizeof(ack_r), "resumed.%d", (int)getpid());
 	snprintf(ack_e, sizeof(ack_e), "error.%d", (int)getpid());
+	char ack_g[64], ack_ug[64];
+	snprintf(ack_g, sizeof(ack_g), "gated.%d", (int)getpid());
+	snprintf(ack_ug, sizeof(ack_ug), "ungated.%d", (int)getpid());
 	mclog("control thread started (dir=%s)", g_dir);
-	int prev = 0; /* treat startup as not-suspended */
+	int prev = 0;      /* treat startup as not-suspended */
+	int prev_gate = 0; /* and not-gated */
 	for (;;) {
+		/* "gate" bars the application from the GPU. Handled first and
+		 * separately from "suspend" because it issues no CUDA calls, so
+		 * the orchestrator can arm it while this process is locked by
+		 * cuda-checkpoint -- which is what lets the lock, rather than
+		 * the gate, be the thing that quiesces coupled ranks. */
+		int wgate = marker_exists("gate");
+		if (wgate != prev_gate) {
+			prev_gate = wgate;
+			if (wgate) {
+				gate_arm();
+				marker_rm(ack_ug);
+				marker_write(ack_g, "ok");
+			} else {
+				gate_disarm();
+				marker_rm(ack_g);
+				marker_write(ack_ug, "ok");
+			}
+		}
 		int want = marker_exists("suspend");
 		if (want != prev) {
 			prev = want;
