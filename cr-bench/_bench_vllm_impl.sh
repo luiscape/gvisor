@@ -192,9 +192,13 @@ VLLM_WORKER_MULTIPROC_METHOD=spawn
 VLLM_USE_FLASHINFER_SAMPLER=0
 TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=$TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
 NCCL_CUMEM_ENABLE=$NCCL_CUMEM_ENABLE
-LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cu13/lib"
+LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cu13/lib"
     [[ -n "$NCCL_NVLS_ENABLE" ]] && CB_ENV+=$'\n'"NCCL_NVLS_ENABLE=$NCCL_NVLS_ENABLE"
     [[ -n "$VLLM_ALLREDUCE_USE_SYMM_MEM" ]] && CB_ENV+=$'\n'"VLLM_ALLREDUCE_USE_SYMM_MEM=$VLLM_ALLREDUCE_USE_SYMM_MEM"
+    # Diagnostics passthrough: NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NVLS is
+    # how to confirm which algorithm NCCL actually selected.
+    [[ -n "${NCCL_DEBUG:-}" ]] && CB_ENV+=$'\n'"NCCL_DEBUG=$NCCL_DEBUG"
+    [[ -n "${NCCL_DEBUG_SUBSYS:-}" ]] && CB_ENV+=$'\n'"NCCL_DEBUG_SUBSYS=$NCCL_DEBUG_SUBSYS"
     cb_write_bundle
 
     # ── cold boot ─────────────────────────────────────────────────────────

@@ -273,6 +273,24 @@ static void resolve_reals(void) {
 	REAL(r_cuMemcpyHtoD, "cuMemcpyHtoD_v2");
 }
 
+
+/* Symbol-resolution tracing is only useful when debugging interposition itself.
+ * It is per-symbol and per-process, so left on it floods the application's
+ * stderr (thousands of lines interleaved across ranks, which is what made a
+ * failing vLLM run hard to read). Opt in with MCSHIM_VERBOSE=1. */
+static int mcverbose(void) {
+	static int v = -1;
+	if (v < 0)
+		v = getenv("MCSHIM_VERBOSE") != NULL;
+	return v;
+}
+
+#define mcvlog(...)                                                            \
+	do {                                                                   \
+		if (mcverbose())                                               \
+			mclog(__VA_ARGS__);                                    \
+	} while (0)
+
 /* ------------------------------------------------------------------ */
 /* Tracked state (the live object graph, at the libcuda layer).       */
 /*                                                                    */
@@ -1809,7 +1827,7 @@ void *dlsym(void *handle, const char *symbol) {
 		 * (so feature probes against old drivers still behave). */
 		void *r = real_dlsym(handle, symbol);
 		if (r) {
-			mclog("dlsym(%s) -> shim wrapper", symbol);
+			mcvlog("dlsym(%s) -> shim wrapper", symbol);
 			return w;
 		}
 		return r;
@@ -1841,7 +1859,7 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion,
 	void *w;
 	if (rc == CUDA_SUCCESS && pfn && *pfn &&
 	    (w = gpa_redirect(symbol, cudaVersion))) {
-		mclog("cuGetProcAddress(%s, ver=%d) -> shim wrapper", symbol,
+		mcvlog("cuGetProcAddress(%s, ver=%d) -> shim wrapper", symbol,
 		      cudaVersion);
 		*pfn = w;
 	}
@@ -1859,7 +1877,7 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
 	void *w;
 	if (rc == CUDA_SUCCESS && pfn && *pfn &&
 	    (w = gpa_redirect(symbol, cudaVersion))) {
-		mclog("cuGetProcAddress_v2(%s, ver=%d) -> shim wrapper", symbol,
+		mcvlog("cuGetProcAddress_v2(%s, ver=%d) -> shim wrapper", symbol,
 		      cudaVersion);
 		*pfn = w;
 	}
