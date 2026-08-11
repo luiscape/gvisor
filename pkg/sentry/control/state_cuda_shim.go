@@ -17,6 +17,7 @@ package control
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -84,6 +85,14 @@ const (
 	// own environment, makes gVisor suspend the interposer but leave the
 	// post-restore rebuild to an external orchestrator.
 	CudaMulticastShimExternalResumeEnv = "GVISOR_CUDA_MULTICAST_SHIM_EXTERNAL_RESUME"
+
+	// Experiment knobs (temporary, for root-causing resume placement).
+	//   ..._RESUME_DELAY=<seconds>  sleep before triggering the rebuild.
+	//   ..._RESUME_VIA_EXEC=1       trigger it by running /bin/rm as a task
+	//                               in the container instead of unlinking
+	//                               the marker from the sentry.
+	cudaShimResumeDelayEnv   = "GVISOR_CUDA_MULTICAST_SHIM_RESUME_DELAY"
+	cudaShimResumeViaExecEnv = "GVISOR_CUDA_MULTICAST_SHIM_RESUME_VIA_EXEC"
 
 	// DefaultCudaMulticastShimDir is the rendezvous directory used when the
 	// container does not set CudaMulticastShimDirEnv itself.
@@ -296,6 +305,54 @@ func waitCudaProcsRunning(sctx context.Context, k *kernel.Kernel, cudaCheckpoint
 	}
 }
 
+
+// cudaShimClearMarkerViaExec removes the suspend marker by running /bin/rm as a
+// task inside the container, rather than unlinking it from the sentry.
+// Experiment: isolates whether the trigger mechanism (a container task vs a
+// sentry VFS operation) is what makes an inline rebuild succeed or fail.
+func cudaShimClearMarkerViaExec(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, dir string) error {
+	if len(cudaProcs) == 0 {
+		return fmt.Errorf("multicast interposer: no process to exec in")
+	}
+	tg := cudaProcs[0]
+	leader := tg.Leader()
+	if leader == nil {
+		return fmt.Errorf("multicast interposer: process has no leader")
+	}
+	mntns := leader.MountNamespace()
+	if mntns == nil || !mntns.TryIncRef() {
+		return fmt.Errorf("multicast interposer: process has exited")
+	}
+	root := mntns.Root(sctx)
+	ctx := vfs.WithRoot(sctx, root)
+	defer func() {
+		root.DecRef(ctx)
+		mntns.DecRef(ctx)
+	}()
+	contID := leader.ContainerID()
+	path := dir + "/" + cudaShimSuspendMarker
+	args := &ExecArgs{
+		Filename:       "/bin/rm",
+		Argv:           []string{"rm", "-f", path},
+		ContainerID:    contID,
+		MountNamespace: mntns,
+		PIDNamespace:   leader.PIDNamespace(),
+		Envv:           k.Saver().SpecEnviron(k.ContainerName(contID)),
+		FDTable:        k.NewFDTable(),
+	}
+	defer args.FDTable.DecRef(ctx)
+	proc := &Proc{Kernel: k}
+	newTG, _, _, err := ExecAsync(proc, args)
+	if err != nil {
+		return fmt.Errorf("multicast interposer: exec rm: %w", err)
+	}
+	newTG.WaitExited()
+	if st := newTG.ExitStatus(); st != 0 {
+		return fmt.Errorf("multicast interposer: rm %q exited %d", path, st)
+	}
+	return nil
+}
+
 // suspendCudaMulticastShim asks the interposer to release multicast objects and
 // CUDA IPC imports on every process, and waits for all of them to finish.
 //
@@ -359,6 +416,23 @@ func resumeCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaCheckpo
 	}
 	if cudaShimResumeSettle > 0 {
 		time.Sleep(cudaShimResumeSettle)
+	}
+	if v := os.Getenv(cudaShimResumeDelayEnv); v != "" {
+		if secs, perr := strconv.Atoi(v); perr == nil && secs > 0 {
+			log.Infof("Multicast interposer: delaying rebuild by %ds (%s)", secs, cudaShimResumeDelayEnv)
+			time.Sleep(time.Duration(secs) * time.Second)
+		}
+	}
+	if os.Getenv(cudaShimResumeViaExecEnv) == "1" {
+		log.Infof("Multicast interposer: triggering rebuild via a container task (%s)", cudaShimResumeViaExecEnv)
+		if err := cudaShimClearMarkerViaExec(sctx, k, cudaProcs, dir); err != nil {
+			return err
+		}
+		if err := cudaShimWaitAcks(sctx, k, cudaProcs, dir, "resumed"); err != nil {
+			return err
+		}
+		log.Infof("Multicast interposer resumed on %d process(es) in %s", len(cudaProcs), time.Since(start))
+		return nil
 	}
 	if err := cudaShimSetMarker(sctx, k, cudaProcs, dir, false /* set */); err != nil {
 		return err

@@ -194,6 +194,8 @@ runsc delete -force "$CID" >/dev/null 2>&1 || true
 log "(c) runsc restore -- gVisor resumes the interposer after the toggle"
 t0=$SECONDS
 GVISOR_CUDA_MULTICAST_SHIM_EXTERNAL_RESUME="${EXTERNAL_RESUME:-0}" \
+  GVISOR_CUDA_MULTICAST_SHIM_RESUME_DELAY="${RESUME_DELAY:-0}" \
+  GVISOR_CUDA_MULTICAST_SHIM_RESUME_VIA_EXEC="${RESUME_VIA_EXEC:-0}" \
   runsc restore -detach -image-path "$WORK/img" -bundle "$WORK/bundle" \
   -pid-file "$WORK/pid-r" "$CID_R"
 REST_RC=$?
