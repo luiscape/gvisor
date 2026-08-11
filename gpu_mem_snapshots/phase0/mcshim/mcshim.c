@@ -393,7 +393,31 @@ static CUmemGenericAllocationHandle xlate_mc(CUmemGenericAllocationHandle h) {
 	return h;
 }
 
+/* Record h as a's current handle, remembering the previous values so that a
+ * later call still referring to one of them can be rewritten (see xlate_mc).
+ *
+ * Must hold g_lock. Before recording, drop h from every other object's alias
+ * list: the driver reuses handle values, so if the value now being issued still
+ * appears elsewhere, that alias is stale. Leaving it would make xlate_mc rewrite
+ * a legitimate reference to this new object into a reference to an unrelated
+ * one. Application churn makes such collisions routine -- vLLM's sleep/wake
+ * releases and re-creates every weight allocation -- and the symptom is some
+ * later, unrelated cuMem* call failing ("operation not supported" out of vLLM's
+ * own allocator), intermittently and only after a rebuild has created aliases. */
 static void alloc_push_aka(Alloc *a, CUmemGenericAllocationHandle h) {
+	for (int i = 0; i < MAXN; i++) {
+		Alloc *o = &g_alloc[i];
+		if (o == a || o->kind == KIND_FREE)
+			continue;
+		for (int k = 0; k < o->naka; k++) {
+			if (o->aka[k] != h)
+				continue;
+			for (int j = k; j + 1 < o->naka; j++)
+				o->aka[j] = o->aka[j + 1];
+			o->naka--;
+			k--;
+		}
+	}
 	a->handle = h;
 	if (a->naka < MAX_AKA)
 		a->aka[a->naka++] = h;
@@ -794,6 +818,7 @@ static void alloc_forget(int i) {
 		if (g_map[m].used && g_map[m].allocIdx == i)
 			g_map[m].used = 0;
 	stop_serving(&g_alloc[i]);
+	g_alloc[i].naka = 0;
 	g_alloc[i].kind = KIND_FREE;
 }
 

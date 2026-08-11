@@ -144,9 +144,9 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		for _, tg := range cudaProcs {
 			tg.SigsegvUnlock()
 		}
-		// Bring multicast back so the application keeps running.
-		if rerr := resumeCudaMulticastShim(sctx, k, o.CudaCheckpointPath, cudaProcs); rerr != nil {
-			log.Warningf("multicast interposer resume after failed checkpoint also failed: %v", rerr)
+		// Bring multicast back and let the application run again.
+		if dir := cudaShimDir(k, cudaProcs); dir != "" {
+			unwindCudaMulticastShim(sctx, k, cudaProcs, dir)
 		}
 		return err
 	}
@@ -626,7 +626,7 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 		}
 		log.Infof("cuda-checkpoint lock attempt %d/%d did not quiesce all ranks; releasing the interposer gate to let in-flight collectives drain, then retrying: %v",
 			attempt, cudaLockGateAttempts, err)
-		if rerr := releaseCudaMulticastShimGate(sctx, k, cudaProcs, shimDir); rerr != nil {
+		if rerr := cudaShimSetMarker(sctx, k, cudaProcs, shimDir, cudaShimGateMarker, false /* set */); rerr != nil {
 			log.Warningf("failed to release multicast interposer gate between lock attempts: %v", rerr)
 		}
 		time.Sleep(cudaLockGateRetryDelay)
@@ -639,9 +639,7 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 		}
 
 		if shimDir != "" {
-			if rerr := releaseCudaMulticastShimGate(sctx, k, cudaProcs, shimDir); rerr != nil {
-				log.Warningf("failed to release multicast interposer gate after lock-phase failure: %v", rerr)
-			}
+			unwindCudaMulticastShim(sctx, k, cudaProcs, shimDir)
 		}
 		return fmt.Errorf("cuda-checkpoint lock phase failed: %w", err)
 	}
@@ -677,9 +675,7 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 	// barred from touching. Then re-lock for the checkpoint.
 	if shimDir != "" {
 		undo := func() {
-			if rerr := resumeCudaMulticastShim(sctx, k, cudaCheckpointPath, locked); rerr != nil {
-				log.Warningf("multicast interposer resume during checkpoint unwind failed: %v", rerr)
-			}
+			unwindCudaMulticastShim(sctx, k, locked, shimDir)
 			if _, uerr := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "unlock"}, true, nullFD); uerr != nil {
 				log.Warningf("cuda-checkpoint unlock during checkpoint unwind failed: %v", uerr)
 			}

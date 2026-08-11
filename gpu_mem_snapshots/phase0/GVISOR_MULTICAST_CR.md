@@ -83,9 +83,13 @@ Stock vLLM 0.27, stock NCCL, `cr-bench/bench_4_vllm_multi.sh` with
 
 | Case | Result |
 | --- | --- |
-| TP=2, multicast live, torch.compile + CUDA graphs | PASS — ckpt 12.6s, restore 4.1s, answer EXACT MATCH |
-| TP=4, NCCL NVLS on, `--enforce-eager` | PASS — ckpt 24.3s, restore 5.7s, answer EXACT MATCH |
+| TP=2, multicast live, torch.compile + CUDA graphs | **4/4 PASS** — ckpt 12.6s, restore 4.1s, answer EXACT MATCH |
+| TP=4, NCCL NVLS on, `--enforce-eager` | **2/3 PASS** — ckpt 24.3s, restore 5.7s, answer EXACT MATCH |
 | TP=4, NCCL NVLS on, torch.compile + CUDA graphs | FAIL, not ours — see below |
+
+Repeat with `cr-bench/vllm_trials.sh`, which reports a pass rate and classifies
+each failure (in particular it separates cuda-checkpoint's own restore-toggle
+failure from anything attributable to the interposer).
 
 The TP=4 row is the new capability: it previously required NVLS off, because
 live multicast made the process un-checkpointable outright.
@@ -102,6 +106,26 @@ It was bisected here to confirm it is not multicast related: with vLLM's own
 custom all-reduce and symmetric memory disabled, the interposer has only NCCL's
 two NVLS groups to handle and suspends them cleanly (`groups=2 imports=0`), and
 the toggle still fails identically.
+
+## A bug worth remembering: handle aliases
+
+After a rebuild, an object's handle changes, so the interposer keeps the previous
+values as aliases and rewrites later calls that still use one (`xlate_mc`). The
+driver, however, **reuses handle values**. If a value being issued for a new
+allocation still appears in some other object's alias list, that alias is stale,
+and rewriting through it silently redirects a legitimate reference to an
+unrelated object.
+
+The symptom was nothing like the cause: an unrelated `cuMem*` call failing with
+`operation not supported` inside vLLM's own sleep/wake allocator, intermittently
+(1/4 runs passed) and only after a rebuild had created aliases. vLLM's
+`/sleep` releases and re-creates every weight allocation, which makes value
+collisions routine; the NCCL harness barely churns allocations and never showed
+it.
+
+Aliases are now dropped from every other object whenever the driver reissues
+that value, and cleared when an object is forgotten. That took vLLM TP=2 from
+1/4 to 4/4.
 
 ## Debugging
 
