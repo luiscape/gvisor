@@ -111,29 +111,49 @@ Stock vLLM 0.27, stock NCCL, `cr-bench/bench_4_vllm_multi.sh` with
 
 | Case | Result |
 | --- | --- |
-| TP=2, multicast live, torch.compile + CUDA graphs | **4/4 PASS** — ckpt 12.6s, restore 4.1s, answer EXACT MATCH |
-| TP=4, NCCL NVLS on, `--enforce-eager` | **2/3 PASS** — ckpt 24.3s, restore 5.7s, answer EXACT MATCH |
-| TP=4, NCCL NVLS on, torch.compile + CUDA graphs | FAIL, not ours — see below |
+| TP=2, multicast live, torch.compile + CUDA graphs | **8/8 PASS** — ckpt 12.6s, restore 4.1s, answer EXACT MATCH |
+| TP=4, NCCL NVLS on, `--enforce-eager` | **3/4 PASS** — ckpt 24.3s, restore 5.7s, answer EXACT MATCH |
+| TP=4, NCCL NVLS on, torch.compile + CUDA graphs | **5/8 PASS** — answer EXACT MATCH |
 
-Repeat with `cr-bench/vllm_trials.sh`, which reports a pass rate and classifies
-each failure (in particular it separates cuda-checkpoint's own restore-toggle
-failure from anything attributable to the interposer).
+Every failure in those runs was cuda-checkpoint's own restore toggle (below).
+**None was attributable to the interposer**, which is the distinction
+`cr-bench/vllm_trials.sh` exists to make: it reports a pass rate and classifies
+each failure, reading the sentry log rather than the benchmark's stdout, because
+that is where the toggle failure is reported.
+
+The last row is worth stating plainly, because earlier notes in this tree
+(including an earlier version of this file) call it impossible. It is the
+configuration PROGRESS.md's TL;DR marks ❌ "cuda-checkpoint cannot restore it".
+It now succeeds most of the time. Two separate things had to be fixed to get
+there, and the second was found only by repeating the run: multicast had to stop
+being a checkpoint blocker at all, and the interposer had to stop mistranslating
+handle aliases (see below). Before the alias fix this configuration failed every
+time, which is why it was written off.
 
 The TP=4 row is the new capability: it previously required NVLS off, because
 live multicast made the process un-checkpointable outright.
 
 ## Known limitation, outside this work
 
-vLLM TP=4 with torch.compile + piecewise CUDA graphs still fails, in
-`cuda-checkpoint --toggle`, which returns `unknown error` restoring three of
-four workers — before gVisor reaches the rebuild. This is PROGRESS.md finding
-\#3/\#4, reproduced natively under `runc` with no gVisor in the loop
+At TP=4, roughly a third of runs fail inside `cuda-checkpoint --toggle`, which
+returns `unknown error` restoring some of the workers — before gVisor reaches
+the rebuild, and regardless of whether CUDA graphs are enabled. This is the
+error signature of PROGRESS.md finding \#3, and that finding was reproduced
+natively under `runc` with no gVisor in the loop
 (`gpu_mem_snapshots/native_ab.sh`).
 
-It was bisected here to confirm it is not multicast related: with vLLM's own
-custom all-reduce and symmetric memory disabled, the interposer has only NCCL's
-two NVLS groups to handle and suspends them cleanly (`groups=2 imports=0`), and
-the toggle still fails identically.
+It is not multicast related. Bisected: with vLLM's own custom all-reduce and
+symmetric memory disabled, the interposer has only NCCL's two NVLS groups to
+handle and suspends them cleanly (`groups=2 imports=0`), and the toggle still
+fails the same way. It is also independent of the interposer's own health — the
+suspend, the blocker check and the rebuild all report success in the runs that
+hit it.
+
+Note this is weaker than PROGRESS.md's conclusion, which treats the
+compile + CUDA-graph case as a hard restore failure. Under this path it is
+intermittent rather than deterministic, plausibly because the workers now carry
+much less live IPC and fabric state into the checkpoint. Retrying the checkpoint
+is a viable mitigation today; a fix belongs in cuda-checkpoint.
 
 ## A bug worth remembering: handle aliases
 

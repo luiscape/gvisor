@@ -51,6 +51,15 @@ Harness knobs: `CUDA_CKPT_JOB_FILE=1` (adds the flag), `CUDA_CKPT_SEQUENTIAL=1`.
 
 ## TL;DR
 
+> **Superseded for the multicast rows.** The table below describes the state
+> *before* the gVisor-driven multicast interposer
+> (`gpu_mem_snapshots/phase0/GVISOR_MULTICAST_CR.md`). Multicast/NVLS is no
+> longer a checkpoint blocker, so "fabric-free" is no longer a precondition
+> anywhere, and multi-GPU vLLM with torch.compile + CUDA graphs now succeeds
+> most of the time (measured 5/8 at TP=4, 8/8 at TP=2). What remains is an
+> intermittent `cuda-checkpoint --toggle` failure at TP=4, unrelated to
+> multicast.
+
 | Workload | Checkpointable? | Condition |
 | --- | --- | --- |
 | Single-GPU (all classes A/B/C/inductor) | ✅ | works as-is |
