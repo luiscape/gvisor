@@ -1633,6 +1633,109 @@ static void marker_write(const char *name, const char *body) {
 
 /* All wrappers above are already defined; only the cuGetProcAddress pair is
  * defined below the table and needs declarations. */
+
+/* ------------------------------------------------------------------ */
+/* Suspend gate.                                                      */
+/*                                                                    */
+/* Between suspend and resume the multicast groups and peer imports    */
+/* are released and their VAs are unmapped. Any application thread     */
+/* that reaches the GPU in that window touches an unmapped VA and      */
+/* faults its context (CUDA_ERROR_ILLEGAL_ADDRESS, 700) -- and because */
+/* the ranks share a multicast group, one rank doing so can fault      */
+/* every rank. The acceptance harness avoids this by pausing the       */
+/* workload, but a real workload (vLLM, SGLang) has no such pause:     */
+/* `cuda-checkpoint --toggle` restores AND unlocks each process, so the */
+/* application becomes runnable while the rebuild is still in flight.  */
+/*                                                                    */
+/* So the shim makes the guarantee itself: while suspended, the        */
+/* interposed entry points through which GPU work is submitted block   */
+/* until the rebuild completes. The application observes a pause, not  */
+/* a fault, and needs no cooperation. The shim's own suspend/resume    */
+/* work calls the real entry points (r_*) directly and is never gated. */
+/* ------------------------------------------------------------------ */
+
+static pthread_mutex_t g_gate_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_gate_cv = PTHREAD_COND_INITIALIZER;
+
+/* Arm before the teardown begins, so no app thread can slip between the
+ * decision to suspend and the first unmap. */
+static void gate_arm(void) {
+	pthread_mutex_lock(&g_gate_lock);
+	g_suspended = 1;
+	pthread_mutex_unlock(&g_gate_lock);
+}
+
+static void gate_disarm(void) {
+	pthread_mutex_lock(&g_gate_lock);
+	g_suspended = 0;
+	pthread_cond_broadcast(&g_gate_cv);
+	pthread_mutex_unlock(&g_gate_lock);
+}
+
+static void gate_wait(void) {
+	if (!g_suspended) /* fast path: one load on every GPU submission */
+		return;
+	static __thread int logged;
+	pthread_mutex_lock(&g_gate_lock);
+	if (g_suspended && !logged) {
+		logged = 1;
+		mclog("GATE: app thread blocked until resume");
+	}
+	while (g_suspended)
+		pthread_cond_wait(&g_gate_cv, &g_gate_lock);
+	pthread_mutex_unlock(&g_gate_lock);
+}
+
+/* Entry points through which the application submits GPU work or waits on
+ * it. Each one blocks while suspended, then forwards unchanged. */
+#define GATED(name, proto, args)                                               \
+	static CUresult (*r_##name) proto;                                     \
+	CUresult name proto;                                                   \
+	CUresult name proto {                                                  \
+		REAL(r_##name, #name);                                         \
+		if (!r_##name)                                                 \
+			return 1 /* CUDA_ERROR_INVALID_VALUE */;               \
+		gate_wait();                                                   \
+		return r_##name args;                                          \
+	}
+
+typedef void *CUstream_t;
+typedef void *CUfunction_t;
+typedef void *CUgraphExec_t;
+
+GATED(cuLaunchKernel,
+      (CUfunction_t f, unsigned gx, unsigned gy, unsigned gz, unsigned bx,
+       unsigned by, unsigned bz, unsigned shmem, CUstream_t st, void **kp,
+       void **extra),
+      (f, gx, gy, gz, bx, by, bz, shmem, st, kp, extra))
+GATED(cuLaunchKernelEx,
+      (const void *cfg, CUfunction_t f, void **kp, void **extra),
+      (cfg, f, kp, extra))
+GATED(cuLaunchCooperativeKernel,
+      (CUfunction_t f, unsigned gx, unsigned gy, unsigned gz, unsigned bx,
+       unsigned by, unsigned bz, unsigned shmem, CUstream_t st, void **kp),
+      (f, gx, gy, gz, bx, by, bz, shmem, st, kp))
+GATED(cuGraphLaunch, (CUgraphExec_t g, CUstream_t st), (g, st))
+GATED(cuMemsetD32_v2, (CUdeviceptr d, unsigned ui, size_t n), (d, ui, n))
+GATED(cuMemsetD32Async,
+      (CUdeviceptr d, unsigned ui, size_t n, CUstream_t st), (d, ui, n, st))
+GATED(cuMemsetD8_v2, (CUdeviceptr d, unsigned char uc, size_t n), (d, uc, n))
+GATED(cuMemsetD8Async,
+      (CUdeviceptr d, unsigned char uc, size_t n, CUstream_t st),
+      (d, uc, n, st))
+GATED(cuMemcpyAsync,
+      (CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream_t st),
+      (dst, src, n, st))
+GATED(cuMemcpyHtoD_v2, (CUdeviceptr dst, const void *src, size_t n),
+      (dst, src, n))
+GATED(cuMemcpyDtoH_v2, (void *dst, CUdeviceptr src, size_t n), (dst, src, n))
+GATED(cuMemcpyHtoDAsync_v2,
+      (CUdeviceptr dst, const void *src, size_t n, CUstream_t st),
+      (dst, src, n, st))
+GATED(cuMemcpyDtoHAsync_v2,
+      (void *dst, CUdeviceptr src, size_t n, CUstream_t st), (dst, src, n, st))
+GATED(cuStreamSynchronize, (CUstream_t st), (st))
+
 CUresult cuGetProcAddress(const char *, void **, int, unsigned long long);
 CUresult cuGetProcAddress_v2(const char *, void **, int, unsigned long long,
                              int *);
@@ -1659,6 +1762,26 @@ static const WrapEntry *wrap_table(void) {
 	     (void *)cuMemExportToShareableHandle},
 	    {"cuMemImportFromShareableHandle",
 	     (void *)cuMemImportFromShareableHandle},
+	    {"cuLaunchKernel", (void *)cuLaunchKernel},
+	    {"cuLaunchKernelEx", (void *)cuLaunchKernelEx},
+	    {"cuLaunchCooperativeKernel", (void *)cuLaunchCooperativeKernel},
+	    {"cuGraphLaunch", (void *)cuGraphLaunch},
+	    {"cuMemsetD32", (void *)cuMemsetD32_v2},
+	    {"cuMemsetD32_v2", (void *)cuMemsetD32_v2},
+	    {"cuMemsetD32Async", (void *)cuMemsetD32Async},
+	    {"cuMemsetD8", (void *)cuMemsetD8_v2},
+	    {"cuMemsetD8_v2", (void *)cuMemsetD8_v2},
+	    {"cuMemsetD8Async", (void *)cuMemsetD8Async},
+	    {"cuMemcpyAsync", (void *)cuMemcpyAsync},
+	    {"cuMemcpyHtoD", (void *)cuMemcpyHtoD_v2},
+	    {"cuMemcpyHtoD_v2", (void *)cuMemcpyHtoD_v2},
+	    {"cuMemcpyDtoH", (void *)cuMemcpyDtoH_v2},
+	    {"cuMemcpyDtoH_v2", (void *)cuMemcpyDtoH_v2},
+	    {"cuMemcpyHtoDAsync", (void *)cuMemcpyHtoDAsync_v2},
+	    {"cuMemcpyHtoDAsync_v2", (void *)cuMemcpyHtoDAsync_v2},
+	    {"cuMemcpyDtoHAsync", (void *)cuMemcpyDtoHAsync_v2},
+	    {"cuMemcpyDtoHAsync_v2", (void *)cuMemcpyDtoHAsync_v2},
+	    {"cuStreamSynchronize", (void *)cuStreamSynchronize},
 	    {"cuGetProcAddress", (void *)cuGetProcAddress},
 	    {"cuGetProcAddress_v2", (void *)cuGetProcAddress_v2},
 	    {NULL, NULL},
@@ -1766,13 +1889,16 @@ static void *control_thread(void *arg) {
 			resolve_reals();
 			int rc;
 			if (want) {
+				/* Arm first: an app thread must not reach the
+				 * GPU between here and the last unmap. */
+				gate_arm();
 				rc = do_suspend();
-				if (rc == 0)
-					g_suspended = 1;
+				if (rc != 0)
+					gate_disarm();
 			} else {
 				rc = do_resume();
 				if (rc == 0)
-					g_suspended = 0;
+					gate_disarm();
 			}
 			pthread_mutex_unlock(&g_lock);
 			if (rc != 0) {

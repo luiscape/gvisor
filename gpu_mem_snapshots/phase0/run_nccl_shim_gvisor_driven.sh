@@ -32,6 +32,9 @@ NCCL_STOCK="${NCCL_STOCK:-/opt/phase0/nccl-stock/libnccl.so.2}"
 NVLS="${NCCL_NVLS_ENABLE:-1}"
 GRAPH="${GRAPH:-1}"
 WORLD="${WORLD:-4}"
+# INTERVAL=0 makes the ranks collective back-to-back with no idle gap, which
+# is what actually exercises the suspend gate.
+INTERVAL="${INTERVAL:-1}"
 WORK=/tmp/nccl-shim-driven
 STAGE=/opt/phase0
 MCDIR=/tmp/mcshim
@@ -88,7 +91,7 @@ cat > "$WORK/bundle/config.json" <<EOF
     "args": [
       "/usr/bin/python3", "$STAGE/nccl_mp_launcher.py",
       "--dir", "$MCDIR", "--world", "$WORLD", $([ "$GRAPH" = 1 ] && echo '"--graph",') "--pause-only",
-      "--interval", "1"
+      "--interval", "$INTERVAL"
     ],
     "env": [
       "PATH=/usr/local/bin:/usr/bin:/bin",
@@ -160,9 +163,19 @@ runsc run -detach -bundle "$WORK/bundle" -pid-file "$WORK/pid" "$CID" \
 wait_all "$CID" "pre-checkpoint pass" 300 || { tail -40 "$WORK"/logs/*boot*; exit 1; }
 grep -h "Preloaded multicast interposer" "$WORK"/logs/*boot* | tail -1
 
-log "(a) pause the workload (application-level quiesce only)"
-touch_m "$CID" pause
-wait_all "$CID" "PAUSED" 60 || { log "FAIL: pause"; exit 1; }
+# NO_PAUSE=1 exercises the production shape: the workload never stops. It keeps
+# issuing NVLS collectives across the whole checkpoint/restore, and the only
+# thing preventing it from touching torn-down multicast VAs is the interposer's
+# suspend gate. A real engine (vLLM/SGLang) has no pause hook, and
+# `cuda-checkpoint --toggle` unlocks each process before gVisor's rebuild
+# finishes, so this is the case that has to work.
+if [[ "${NO_PAUSE:-0}" = 1 ]]; then
+  log "(a) NO_PAUSE=1: leaving the workload running; the suspend gate must hold it"
+else
+  log "(a) pause the workload (application-level quiesce only)"
+  touch_m "$CID" pause
+  wait_all "$CID" "PAUSED" 60 || { log "FAIL: pause"; exit 1; }
+fi
 
 log "(b) runsc checkpoint -- gVisor suspends the interposer itself"
 t0=$SECONDS
@@ -201,8 +214,14 @@ log "(d) waiting for gVisor's interposer rebuild to finish on all $WORLD ranks"
 wait_acks "$CID_R" resumed 180 || { log "FAIL: interposer rebuild did not complete"; FAIL=1; }
 grep -h "Multicast interposer resumed" "$WORK"/logs/*boot* | tail -1
 
-log "(e) unpause + post-restore verification (eager allreduce + CUDA graph)"
-rm_m "$CID_R" pause
+log "(e) post-restore verification (eager allreduce + CUDA graph)"
+if [[ "${NO_PAUSE:-0}" = 1 ]]; then
+  # Nothing to unpause; flip the workload's own tag so post-restore
+  # iterations are distinguishable from pre-checkpoint ones.
+  touch_m "$CID_R" restored
+else
+  rm_m "$CID_R" pause
+fi
 wait_all "$CID_R" "post-restore pass" 60 || { log "FAIL: post-restore verify"; FAIL=1; }
 sleep 3
 runsc exec "$CID_R" /bin/sh -c "cat $MCDIR/mcshim.log" > "$WORK/mcshim.log" 2>/dev/null || true
