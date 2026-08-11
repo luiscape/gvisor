@@ -17,7 +17,12 @@ TP="${TP:-2}"
 GPUS="${GPUS:-0,1}"
 export EAGER="${EAGER:-0}"
 export RUNSC="${RUNSC:-/usr/local/bin/runsc-phase0}"
-export CUDA_CKPT_JOB_FILE=1 CUDA_CKPT_SEQUENTIAL=1 CUDA_MULTICAST_SHIM=1
+export CUDA_CKPT_JOB_FILE=1 CUDA_MULTICAST_SHIM=1
+# Job members have historically had to be toggled one at a time so that an
+# importer restores after its exporter. Overridable, because once the interposer
+# has released the multicast objects and peer imports before the checkpoint,
+# that dependency may no longer exist.
+export CUDA_CKPT_SEQUENTIAL="${CUDA_CKPT_SEQUENTIAL:-1}"
 
 # Reap a sandbox left behind by a failed run; otherwise it holds tens of GB and
 # starves the next trial.
@@ -35,7 +40,7 @@ reap() {
 pass=0 toggle=0 other=0
 for ((i = 1; i <= TRIALS; i++)); do
     log=$(mktemp /tmp/vllmtrial.XXXXXX.log)
-    printf 'trial %d/%d (TP=%s eager=%s): ' "$i" "$TRIALS" "$TP" "$EAGER"
+    printf 'trial %d/%d (TP=%s eager=%s seq=%s): ' "$i" "$TRIALS" "$TP" "$EAGER" "$CUDA_CKPT_SEQUENTIAL"
     timeout 1500 bash ./bench_4_vllm_multi.sh --gpus "$GPUS" --tp "$TP" >"$log" 2>&1
     # cuda-checkpoint reports a failed restore toggle in the sentry log, not on
     # the benchmark's stdout, so classify against the run's artifacts too.

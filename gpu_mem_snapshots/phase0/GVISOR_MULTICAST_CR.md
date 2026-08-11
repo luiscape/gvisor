@@ -155,6 +155,21 @@ intermittent rather than deterministic, plausibly because the workers now carry
 much less live IPC and fabric state into the checkpoint. Retrying the checkpoint
 is a viable mitigation today; a fix belongs in cuda-checkpoint.
 
+What it looks like, and two things that do **not** fix it, so they are not
+retried:
+
+* The shape is always the same: some number of workers toggle successfully and
+  then every remaining one fails, i.e. the first failure cascades. That looks
+  like a restore-order dependency — a member that imported CUDA IPC memory can
+  only come back once its exporter has, and the interposer releases the
+  VMM-based imports but not the legacy `cuIpcGetMemHandle` ones, which is what
+  job mode exists to carry.
+* **Toggling members in parallel: 0/4.** The sequential requirement is real and
+  still holds even with multicast and peer imports released beforehand.
+* **Sorting members by PID to approximate exporter-before-importer: 6/9,
+  against 5/8 unsorted.** No effect, and the ordering is not even stable enough
+  to make the outcome reproducible, so the code deliberately does not sort.
+
 ## A bug worth remembering: handle aliases
 
 After a rebuild, an object's handle changes, so the interposer keeps the previous
