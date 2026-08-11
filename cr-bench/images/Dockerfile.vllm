@@ -16,23 +16,36 @@
 #  Build context: cr-bench/
 #  Build:  docker build -t cr-bench-vllm -f images/Dockerfile.vllm .
 # --------------------------------------------------------------------------
-FROM nvidia/cuda:12.6.3-base-ubuntu22.04
+# Ubuntu 24.04 for Python 3.12: current vLLM uses builtin-generic subscripts at
+# runtime, which raises "TypeError: 'type' object is not subscriptable" on the
+# 3.10 that 22.04 ships, killing every TP worker at startup.
+FROM nvidia/cuda:12.6.3-base-ubuntu24.04
 
-# Python + pip + curl + gcc/g++ (needed by Triton and torch.compile/inductor
-# for JIT kernel compilation)
+# Python + curl + gcc/g++ (needed by Triton and torch.compile/inductor for JIT
+# kernel compilation)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip python3-dev python3-venv \
+        python3 python3-pip python3-dev \
         curl ca-certificates gcc g++ \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir --upgrade pip
+# Install into the system interpreter rather than a venv. 24.04 marks it
+# externally managed (PEP 668), hence --break-system-packages. A venv would be
+# tidier, but it only works if whatever launches the image puts it on PATH, and
+# the OCI bundle these benchmarks generate sets its own PATH -- so a bare
+# `python3` would miss vLLM entirely.
+# (Not upgrading pip: the distro-installed pip has no RECORD file, so pip
+# cannot uninstall it and --upgrade fails.)
 
-# PyTorch (CUDA 12.6 wheels)
-RUN pip3 install --no-cache-dir \
-        torch --index-url https://download.pytorch.org/whl/cu126
-
-# vLLM — install after PyTorch to use the already-installed torch
-RUN pip3 install --no-cache-dir vllm
+# vLLM, and let it resolve its own torch/torchvision.
+#
+# Do NOT pre-install torch from a specific CUDA index and then add vLLM on top:
+# pip then satisfies vLLM's torchvision dependency from PyPI, which can be built
+# against a different CUDA major version than the pinned torch. That mismatch is
+# only detected at import time, as
+#   "PyTorch and torchvision were compiled with different CUDA major versions"
+# and it kills the server during startup. Installing vLLM alone yields a
+# self-consistent set.
+RUN pip3 install --no-cache-dir --break-system-packages vllm
 
 # Pre-download models so no network is needed at runtime.
 # Override with: --build-arg MODELS="Org/Model1 Org/Model2"

@@ -1882,6 +1882,16 @@ static void *control_thread(void *arg) {
 	char ack_g[64], ack_ug[64];
 	snprintf(ack_g, sizeof(ack_g), "gated.%d", (int)getpid());
 	snprintf(ack_ug, sizeof(ack_ug), "ungated.%d", (int)getpid());
+	/* Announce that this process is interposer-managed. Only processes that
+	 * resolved a tracked CUDA entry point get a control thread, so only they
+	 * can ever acknowledge a transition. The orchestrator selects CUDA
+	 * processes by looking for open NVIDIA device FDs, which is a broader set
+	 * (a vLLM API server or engine-core process holds them without ever
+	 * touching multicast). Without this file the orchestrator would wait
+	 * forever for acknowledgements from processes that have no interposer. */
+	char present[64];
+	snprintf(present, sizeof(present), "present.%d", (int)getpid());
+	marker_write(present, "ok");
 	mclog("control thread started (dir=%s)", g_dir);
 	int prev = 0;      /* treat startup as not-suspended */
 	int prev_gate = 0; /* and not-gated */
