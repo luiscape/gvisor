@@ -22,11 +22,6 @@ NCCL_STOCK="${NCCL_STOCK:-/opt/phase0/nccl-stock/libnccl.so.2}"
 NVLS="${NCCL_NVLS_ENABLE:-1}"   # set 0 to bisect: P2P UC imports only, no multicast
 GRAPH="${GRAPH:-1}"             # set 0 to bisect: eager collective only, no CUDA graph
 WORLD="${WORLD:-4}"
-# MCSHIM_UC_REBUILD: 0 = carry unicast allocations through cuda-checkpoint
-# (default), 1 = re-create IPC-exported ones fresh at resume, 2 = re-create all.
-# Modes >=1 mirror NCCL's ncclCommMemSuspend policy of never asking
-# cuda-checkpoint to carry IPC-exported device memory.
-UC_REBUILD="${MCSHIM_UC_REBUILD:-0}"
 # TOGGLE_ONLY=1 replaces `runsc checkpoint`+`runsc restore` with the bare
 # cuda-checkpoint lock/checkpoint/restore/unlock sequence that state_cuda.go
 # drives, run in place via `runsc exec`. Same GPU-side operations, but no
@@ -92,7 +87,6 @@ cat > "$WORK/bundle/config.json" <<EOF
       "LD_PRELOAD=$STAGE/mcshim.so",
       "MCSHIM_DIR=$MCDIR",
       "MCSHIM_LOG=$MCDIR/mcshim.log",
-      "MCSHIM_UC_REBUILD=$UC_REBUILD",
       "NCCL_LIB=$NCCL_STOCK",
       "NCCL_NVLS_ENABLE=$NVLS",
       "NCCL_SOCKET_IFNAME=lo",

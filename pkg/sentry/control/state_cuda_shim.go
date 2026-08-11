@@ -104,13 +104,13 @@ const (
 	// cudaShimPollInterval is how often to re-check for acknowledgements.
 	cudaShimPollInterval = 100 * time.Millisecond
 
+	// cudaShimDirKey records, in the checkpoint, the rendezvous directory of
+	// an interposer that was suspended. Its presence is what tells
+	// postResumeCuda that a rebuild is owed, and carrying the directory
+	// itself keeps the rebuild independent of how the container's
+	// environment is reconstructed.
+	cudaShimDirKey = "cuda-multicast-shim-dir"
 )
-
-// cudaShimDirKey records the rendezvous directory of an interposer that was
-// suspended before the checkpoint. Its presence tells postResumeCuda that it
-// must resume the interposer, and carrying the directory itself keeps the
-// resume independent of how the container's environment is reconstructed.
-const cudaShimDirKey = "cuda-multicast-shim-dir"
 
 // cudaShimDir returns the rendezvous directory for cudaProcs, or "" if the
 // interposer is not in use. It is read from the environment gVisor injected at
