@@ -34,6 +34,14 @@ PHASE0_DIR=$(pwd)
 #   mcshim           the libcuda-level interposer, driven by gVisor. Sits below
 #                    every multicast owner, so it should cover BOTH NCCL's NVLS
 #                    and torch symmetric memory.
+#   both             belt and braces: NCCL releases its own groups first (the
+#                    harness drives that, before the checkpoint), then gVisor's
+#                    interposer teardown runs and should find only whatever
+#                    NCCL does not own. Tests that the interposer's live object
+#                    graph tolerates entries having already been freed.
+#
+# The two use separate rendezvous directories (CTRL_DIR vs the interposer's own
+# /tmp/mcshim), so their marker protocols cannot collide.
 MECH="${MECH:-nccl}"
 RUNSC="${RUNSC:-/usr/local/bin/runsc-phase0}"
 CUDA_CHECKPOINT="${CUDA_CHECKPOINT:-/usr/local/bin/cuda-checkpoint}"
@@ -55,7 +63,7 @@ log(){ echo "[torch-gvisor $(date +%H:%M:%S)] $*"; }
 UVM_MAJOR=$(awk '$2=="nvidia-uvm"{print $1}' /proc/devices)
 
 SHIM_FLAG=()
-if [[ "$MECH" == "mcshim" ]]; then
+if [[ "$MECH" == "mcshim" || "$MECH" == "both" ]]; then
   [[ -f "$MCSHIM_SO" ]] || { log "mcshim not built at $MCSHIM_SO (run mcshim/build.sh)"; exit 1; }
   SHIM_FLAG=(--cuda-multicast-shim-path "$MCSHIM_IN_CTR")
 fi
@@ -71,7 +79,7 @@ rm -rf "$WORK" 2>/dev/null; mkdir -p "$WORK"/{root,logs,img,bundle}
 mkdir -p "$STAGE"
 cp "$PHASE0_DIR"/{torch_nccl_launcher.py,torch_nccl_ckpt.py} "$STAGE/"
 mkdir -p "$STAGE/nccl" && cp "$NCCL_LIB" "$STAGE/nccl/libnccl.so.2"
-[[ "$MECH" == "mcshim" ]] && cp "$MCSHIM_SO" "$STAGE/mcshim.so"
+[[ "$MECH" == "mcshim" || "$MECH" == "both" ]] && cp "$MCSHIM_SO" "$STAGE/mcshim.so"
 for m in nvidia nvidia_uvm; do
   mkdir -p "$STAGE/sys_module_$m"; echo live > "$STAGE/sys_module_$m/initstate"
 done
@@ -80,7 +88,7 @@ chmod -R a+rX "$STAGE"
 # The NCCL control thread is enabled only for MECH=nccl. Under MECH=mcshim the
 # interposer is the sole mechanism, so NCCL must not also be tearing its own
 # multicast down underneath it.
-if [[ "$MECH" == "nccl" ]]; then
+if [[ "$MECH" == "nccl" || "$MECH" == "both" ]]; then
   CTRL_ENV_LINE="      \"NCCL_CKPT_CTRL_DIR=$CTRL_DIR\","
 else
   CTRL_ENV_LINE=""
@@ -168,12 +176,13 @@ log "(b) pause the app"
 runsc exec "$CID" /bin/touch "$CTRL_DIR/pause"
 wait_count "$CID" status PAUSED 120 || FAIL=1
 
-if [[ "$MECH" == "nccl" ]]; then
+if [[ "$MECH" == "nccl" || "$MECH" == "both" ]]; then
   log "    ask NCCL to release its NVLS multicast layer"
   runsc exec "$CID" /bin/touch "$CTRL_DIR/suspend"
   wait_count "$CID" files 'suspended.*' 300 || { log "suspend not acknowledged"; FAIL=1; }
-else
-  log "    (mcshim: gVisor drives the teardown inside the checkpoint)"
+fi
+if [[ "$MECH" == "mcshim" || "$MECH" == "both" ]]; then
+  log "    (mcshim: gVisor drives its teardown inside the checkpoint)"
 fi
 
 log "(c) runsc checkpoint"
@@ -213,11 +222,14 @@ RC=$?
 log "  restore rc=$RC ($((SECONDS-t0))s)"
 [[ $RC -eq 0 ]] || { log "FAIL: restore"; tail -30 "$WORK"/logs/*restore* 2>/dev/null; exit 1; }
 runsc exec "$CID_R" /bin/touch "$CTRL_DIR/restored" 2>/dev/null || true
-if [[ "$MECH" == "nccl" ]]; then
+# Reverse order on the way back: gVisor has already rebuilt the interposer's
+# objects by the time the restore RPC returns, so NCCL resumes on top of that.
+if [[ "$MECH" == "mcshim" || "$MECH" == "both" ]]; then
+  log "    (mcshim: gVisor rebuilt after the restore toggle)"
+fi
+if [[ "$MECH" == "nccl" || "$MECH" == "both" ]]; then
   runsc exec "$CID_R" /bin/rm -f "$CTRL_DIR/suspend"
   wait_count "$CID_R" files 'resumed.*' 300 || { log "resume not acknowledged"; FAIL=1; }
-else
-  log "    (mcshim: gVisor rebuilt after the restore toggle)"
 fi
 
 log "(e) unpause; the captured graph must keep producing correct results"
