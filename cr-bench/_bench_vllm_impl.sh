@@ -198,7 +198,18 @@ LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:/usr/loc
     # vLLM 0.27 has a fourth potential multicast owner besides NCCL NVLS,
     # custom all-reduce and symmetric memory: the FlashInfer all-reduce
     # backend. Passed through so the interposer can be tested against it.
-    [[ -n "${VLLM_ALLREDUCE_USE_FLASHINFER:-}" ]] && CB_ENV+=$'\n'"VLLM_ALLREDUCE_USE_FLASHINFER=$VLLM_ALLREDUCE_USE_FLASHINFER"
+    #
+    # FlashInfer JIT-compiles its kernels at startup and looks for nvcc under
+    # CUDA_HOME. The image has no /usr/local/cuda, but it does ship a complete
+    # toolchain in torch's pip tree (nvidia/cu13: bin/nvcc, include, nvvm), so
+    # point CUDA_HOME there rather than adding the CUDA toolkit to the image.
+    if [[ -n "${VLLM_ALLREDUCE_USE_FLASHINFER:-}" ]]; then
+        CB_ENV+=$'\n'"VLLM_ALLREDUCE_USE_FLASHINFER=$VLLM_ALLREDUCE_USE_FLASHINFER"
+        local cu_home=/usr/local/lib/python3.12/dist-packages/nvidia/cu13
+        CB_ENV+=$'\n'"CUDA_HOME=$cu_home"
+        CB_ENV+=$'\n'"CUDA_PATH=$cu_home"
+        CB_ENV+=$'\n'"PATH=$cu_home/bin:/usr/local/bin:/usr/bin:/bin"
+    fi
     # Diagnostics passthrough: NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NVLS is
     # how to confirm which algorithm NCCL actually selected.
     [[ -n "${NCCL_DEBUG:-}" ]] && CB_ENV+=$'\n'"NCCL_DEBUG=$NCCL_DEBUG"

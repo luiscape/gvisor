@@ -20,8 +20,10 @@ checkpoint/restore of multi-GPU (tensor-parallel) GPU containers under gVisor.
 >   suspends cleanly, with one isolated remaining gap (live VMM UC imports,
 >   R610 job mode doesn't restore them) and a documented, de-risked plan.
 >
-> Start at `phase0/mcshim/README.md` §"Scope and next steps" for the live
-> to-do list.
+> **Start at `phase0/TESTING.md`** -- it indexes every runner and document,
+> says which of the two mechanisms to use and why, and lists the canonical
+> commands. `phase0/mcshim/README.md` §"Scope and next steps" has the live
+> to-do list for the interposer itself.
 
 ## Goal
 

@@ -175,11 +175,24 @@ cheaper reproducer than a TP=4 engine run.
 engage at this model size (it is size-gated by `should_use_symm_mem`); torch
 symmetric memory is covered instead by the PyTorch tier, where enabling it
 demonstrably adds a group (`groups=1` -> `groups=2`, see NCCL_PATCH_TESTS.md).
-And `flashinfer` never reaches a checkpoint at all: the image has no
-`/usr/local/cuda/bin/nvcc`, so FlashInfer cannot JIT its kernels and the
-engine dies during cold boot. Covering it needs the CUDA toolkit in the image,
-and until then nothing is known about whether the interposer handles that
-owner.
+And `flashinfer` never reaches a checkpoint at all. It JIT-compiles its
+kernels at startup and the engine dies during cold boot. Two blockers, one
+fixed and one not:
+
+* It looks for `nvcc` under `CUDA_HOME` and the image has no
+  `/usr/local/cuda`. It does, however, ship a complete CUDA 13.3 toolchain in
+  torch's pip tree (`nvidia/cu13`: `bin/nvcc`, `include`, `nvvm`), so the
+  bench now points `CUDA_HOME` there -- no CUDA toolkit needs adding to the
+  image.
+* With that fixed it compiles and then fails on a version mismatch:
+  FlashInfer 0.6.16 bundles its own cccl/libcudacxx headers, which reject the
+  13.3 compiler with `"CUDA compiler and CUDA toolkit headers are
+  incompatible, please check your include paths"`.
+
+That second one is a packaging problem in the image, unrelated to
+checkpoint/restore, and it needs a matching flashinfer/CUDA pair to resolve.
+So **this multicast owner remains untested** -- the one real coverage gap
+left. Nothing is known about whether the interposer handles it.
 
 ## Known limitation, outside this work
 
