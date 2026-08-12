@@ -1,0 +1,1417 @@
+ 11-08-2026 21:15:33:453 [pid=1618602 tid=1618602] INFO   0:324 Lib being used for urcup concurrency : libcufile_ck 
+ 11-08-2026 21:15:33:453 [pid=1618602 tid=1618602] INFO   cufio_core:597 Loaded successfully  libcufile_ck.so
+ 11-08-2026 21:15:33:454 [pid=1618602 tid=1618602] INFO   cufio_core:597 Loaded successfully  libmount.so
+ 11-08-2026 21:15:33:454 [pid=1618602 tid=1618602] INFO   cufio_core:597 Loaded successfully  libudev.so
+ 11-08-2026 21:15:33:454 [pid=1618602 tid=1618602] INFO   cufio_core:601 Using CKIT static library
+ 11-08-2026 21:15:33:646 [pid=1618602 tid=1618602] TRACE  cufio-cuda:660 Allocated  65536  bytes on the GPU: 0  to check for P2PDMA Support
+ 11-08-2026 21:15:33:646 [pid=1618602 tid=1618602] INFO   cufio-cuda:666 Failed to get cuda p2p device address for ptr 0x7073b9e00000 length: 65536 errornum: 801
+ 11-08-2026 21:15:33:773 [pid=1618602 tid=1618602] DEBUG  cufio-drv:792 gpu attribute pci_p2pdma not supported errornum: 801 error:  CUDA_ERROR_NOT_SUPPORTED
+ 11-08-2026 21:15:33:977 [pid=1618602 tid=1618602] TRACE  cufio-cuda:660 Allocated  65536  bytes on the GPU: 0  to check for P2PDMA Support
+ 11-08-2026 21:15:33:977 [pid=1618602 tid=1618602] INFO   cufio-cuda:666 Failed to get cuda p2p device address for ptr 0x707379e00000 length: 65536 errornum: 801
+ 11-08-2026 21:15:34:66 [pid=1618602 tid=1618602] DEBUG  cufio-drv:792 gpu attribute pci_p2pdma not supported errornum: 801 error:  CUDA_ERROR_NOT_SUPPORTED
+ 11-08-2026 21:15:34:201 [pid=1618602 tid=1618602] TRACE  cufio-cuda:660 Allocated  65536  bytes on the GPU: 0  to check for P2PDMA Support
+ 11-08-2026 21:15:34:201 [pid=1618602 tid=1618602] INFO   cufio-cuda:666 Failed to get cuda p2p device address for ptr 0x707379e00000 length: 65536 errornum: 801
+ 11-08-2026 21:15:34:293 [pid=1618602 tid=1618602] DEBUG  cufio-drv:792 gpu attribute pci_p2pdma not supported errornum: 801 error:  CUDA_ERROR_NOT_SUPPORTED
+ 11-08-2026 21:15:34:296 [pid=1618602 tid=1618602] INFO   cufio-drv:838 Is PCIP2PDMA Supported: 1 kernel Support: 1 pci_p2pdma_supported_cuda: 1 checkIfAllGPUsSupportP2PDMA(): 0
+ 11-08-2026 21:15:34:296 [pid=1618602 tid=1618602] INFO   0:179 nvidia_fs driver open invoked
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:72 GDS release version: 1.15.1.6
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:455 nvidia_fs version:  2.29 libcufile version: 2.12
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:79 Platform: x86_64
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:378 WekaFS: driver support OK
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:586 nvidia_fs driver version check ok
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:378 WekaFS: driver support OK
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:234 ============
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:235 ENVIRONMENT:
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:236 ============
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:249 =====================
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:250 DRIVER CONFIGURATION:
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:251 =====================
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:253 NVMe P2PDMA        : Unsupported
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:254 NVMe               : Unsupported
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:255 NVMeOF             : Unsupported
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:256 SCSI               : Unsupported
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:257 ScaleFlux CSD      : Unsupported
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:258 NVMesh             : Unsupported
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:261 DDN EXAScaler      : Unsupported
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:265 IBM Spectrum Scale : Unsupported
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:269 NFS                : Unsupported
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:272 BeeGFS             : Unsupported
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-drv:275 ScaTeFS            : Unsupported
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] DEBUG  cufio-rdma:149 No valid ip addresses specified for RDMA devices. Disabling GDS userspace RDMA access
+
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-rdma:1131 WekaFS             : Unsupported
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-rdma:1133 Userspace RDMA     : Unsupported
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-rdma:1141 --Mellanox PeerDirect : Disabled
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-rdma:1149 --rdma library        : Not Loaded (libcufile_rdma.so)
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-rdma:1152 --rdma devices        : Not configured
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio-rdma:1155 --rdma_device_status  : Up: 0 Down: 0
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio_core:1001 =====================
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio_core:1002 CUFILE CONFIGURATION:
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   cufio_core:1003 =====================
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   0:1509 properties.use_pci_p2pdma : true
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   0:1511 properties.use_compat_mode : false
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   0:1513 properties.force_compat_mode : false
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   0:1515 properties.gds_rdma_write_support : true
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   0:1517 properties.use_poll_mode : false
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   0:1519 properties.poll_mode_max_size_kb : 4
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   0:1521 properties.max_batch_io_size : 128
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   0:1523 properties.max_batch_io_timeout_msecs : 5
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   0:1525 properties.max_direct_io_size_kb : 16384
+ 11-08-2026 21:15:34:298 [pid=1618602 tid=1618602] INFO   0:1527 properties.max_device_cache_size_kb : 131072
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1529 properties.per_buffer_cache_size_kb : 1024
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1531 properties.max_device_pinned_mem_size_kb : 33554432
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1533 properties.posix_pool_slab_size_kb : 4 1024 16384 
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1535 properties.posix_pool_slab_count : 128 64 64 
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1537 properties.rdma_peer_affinity_policy : RoundRobin
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1539 properties.rdma_dynamic_routing : 0
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1546 fs.generic.posix_unaligned_writes : false
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1549 fs.lustre.posix_gds_min_kb: 0
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1563 fs.beegfs.posix_gds_min_kb: 0
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1578 fs.scatefs.posix_gds_min_kb: 0
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1593 fs.weka.rdma_write_support: false
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1619 fs.gpfs.gds_write_support: false
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1621 fs.gpfs.gds_async_support: true
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1634 profile.nvtx : false
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1636 profile.cufile_stats : 0
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1638 miscellaneous.api_check_aggressive : false
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1648 execution.max_io_threads : 4
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1649 execution.max_io_queue_depth : 128
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1650 execution.parallel_io : true
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1651 execution.min_io_threshold_size_kb : 8192
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1652 execution.max_request_parallelism : 4
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1653 properties.force_odirect_mode : false
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   0:1655 properties.prefer_iouring : false
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   cufio-plat:900 =========
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   cufio-plat:901 GPU INFO:
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   cufio-plat:902 =========
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] TRACE  cufio-plat:304 gpu attribute read , cuDeviceGetAttribute GPU_DIRECT_RDMA_SUPPORTED value: 1
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] TRACE  cufio-plat:304 gpu attribute read , cuDeviceGetAttribute GPU_DIRECT_RDMA_SUPPORTED value: 1
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] TRACE  cufio-plat:304 gpu attribute read , cuDeviceGetAttribute GPU_DIRECT_RDMA_SUPPORTED value: 1
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] TRACE  cufio-plat:304 gpu attribute read , cuDeviceGetAttribute GPU_DIRECT_RDMA_SUPPORTED value: 1
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] TRACE  cufio-plat:304 gpu attribute read , cuDeviceGetAttribute GPU_DIRECT_RDMA_SUPPORTED value: 1
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] TRACE  cufio-plat:304 gpu attribute read , cuDeviceGetAttribute GPU_DIRECT_RDMA_SUPPORTED value: 1
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] TRACE  cufio-plat:304 gpu attribute read , cuDeviceGetAttribute GPU_DIRECT_RDMA_SUPPORTED value: 1
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] TRACE  cufio-plat:304 gpu attribute read , cuDeviceGetAttribute GPU_DIRECT_RDMA_SUPPORTED value: 1
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:403 GPU BDF: 0000:53:00.0
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:373 Searching IOMMU entries in /sys/bus/pci/devices/0000:53:00.0/iommu
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:412 cuda GPU device attributes:  gpu :0 model :NVIDIA H100 80GB HBM3 nvdirect :0 numa:-1 pcibridge: bar :1 barBase :3573412790284 barSize :137438953472 streamMemOps :0 dmaBufCapable:1 GDRBufCapable:1 PCIP2PDMACapable:0 bdf :0 : 83 : 0 : 0
+
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   cufio-plat:475 GPU index 0 NVIDIA H100 80GB HBM3 bar:1 bar size (MiB):131072 supports GDS, IOMMU State: Disabled
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:403 GPU BDF: 0000:64:00.0
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:373 Searching IOMMU entries in /sys/bus/pci/devices/0000:64:00.0/iommu
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:412 cuda GPU device attributes:  gpu :1 model :NVIDIA H100 80GB HBM3 nvdirect :0 numa:-1 pcibridge: bar :1 barBase :3161095929868 barSize :137438953472 streamMemOps :0 dmaBufCapable:1 GDRBufCapable:1 PCIP2PDMACapable:0 bdf :0 : 100 : 0 : 0
+
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   cufio-plat:475 GPU index 1 NVIDIA H100 80GB HBM3 bar:1 bar size (MiB):131072 supports GDS, IOMMU State: Disabled
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:403 GPU BDF: 0000:75:00.0
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:373 Searching IOMMU entries in /sys/bus/pci/devices/0000:75:00.0/iommu
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:412 cuda GPU device attributes:  gpu :2 model :NVIDIA H100 80GB HBM3 nvdirect :0 numa:-1 pcibridge: bar :1 barBase :2748779069452 barSize :137438953472 streamMemOps :0 dmaBufCapable:1 GDRBufCapable:1 PCIP2PDMACapable:0 bdf :0 : 117 : 0 : 0
+
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   cufio-plat:475 GPU index 2 NVIDIA H100 80GB HBM3 bar:1 bar size (MiB):131072 supports GDS, IOMMU State: Disabled
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:403 GPU BDF: 0000:86:00.0
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:373 Searching IOMMU entries in /sys/bus/pci/devices/0000:86:00.0/iommu
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:412 cuda GPU device attributes:  gpu :3 model :NVIDIA H100 80GB HBM3 nvdirect :0 numa:-1 pcibridge: bar :1 barBase :2336462209036 barSize :137438953472 streamMemOps :0 dmaBufCapable:1 GDRBufCapable:1 PCIP2PDMACapable:0 bdf :0 : 134 : 0 : 0
+
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   cufio-plat:475 GPU index 3 NVIDIA H100 80GB HBM3 bar:1 bar size (MiB):131072 supports GDS, IOMMU State: Disabled
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:403 GPU BDF: 0000:97:00.0
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:373 Searching IOMMU entries in /sys/bus/pci/devices/0000:97:00.0/iommu
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:412 cuda GPU device attributes:  gpu :4 model :NVIDIA H100 80GB HBM3 nvdirect :0 numa:-1 pcibridge: bar :1 barBase :4810363371532 barSize :137438953472 streamMemOps :0 dmaBufCapable:1 GDRBufCapable:1 PCIP2PDMACapable:0 bdf :0 : 151 : 0 : 0
+
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   cufio-plat:475 GPU index 4 NVIDIA H100 80GB HBM3 bar:1 bar size (MiB):131072 supports GDS, IOMMU State: Disabled
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:403 GPU BDF: 0000:a8:00.0
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:373 Searching IOMMU entries in /sys/bus/pci/devices/0000:a8:00.0/iommu
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:412 cuda GPU device attributes:  gpu :5 model :NVIDIA H100 80GB HBM3 nvdirect :0 numa:-1 pcibridge: bar :1 barBase :5222680231948 barSize :137438953472 streamMemOps :0 dmaBufCapable:1 GDRBufCapable:1 PCIP2PDMACapable:0 bdf :0 : 168 : 0 : 0
+
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   cufio-plat:475 GPU index 5 NVIDIA H100 80GB HBM3 bar:1 bar size (MiB):131072 supports GDS, IOMMU State: Disabled
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:403 GPU BDF: 0000:b9:00.0
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:373 Searching IOMMU entries in /sys/bus/pci/devices/0000:b9:00.0/iommu
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:412 cuda GPU device attributes:  gpu :6 model :NVIDIA H100 80GB HBM3 nvdirect :0 numa:-1 pcibridge: bar :1 barBase :3985729650700 barSize :137438953472 streamMemOps :0 dmaBufCapable:1 GDRBufCapable:1 PCIP2PDMACapable:0 bdf :0 : 185 : 0 : 0
+
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] INFO   cufio-plat:475 GPU index 6 NVIDIA H100 80GB HBM3 bar:1 bar size (MiB):131072 supports GDS, IOMMU State: Disabled
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:403 GPU BDF: 0000:ca:00.0
+ 11-08-2026 21:15:34:299 [pid=1618602 tid=1618602] DEBUG  cufio-plat:373 Searching IOMMU entries in /sys/bus/pci/devices/0000:ca:00.0/iommu
+ 11-08-2026 21:15:34:300 [pid=1618602 tid=1618602] DEBUG  cufio-plat:412 cuda GPU device attributes:  gpu :7 model :NVIDIA H100 80GB HBM3 nvdirect :0 numa:-1 pcibridge: bar :1 barBase :4398046511116 barSize :137438953472 streamMemOps :0 dmaBufCapable:1 GDRBufCapable:1 PCIP2PDMACapable:0 bdf :0 : 202 : 0 : 0
+
+ 11-08-2026 21:15:34:300 [pid=1618602 tid=1618602] INFO   cufio-plat:475 GPU index 7 NVIDIA H100 80GB HBM3 bar:1 bar size (MiB):131072 supports GDS, IOMMU State: Disabled
+ 11-08-2026 21:15:34:300 [pid=1618602 tid=1618602] INFO   cufio-plat:499 Total GPUS supported on this platform 8
+ 11-08-2026 21:15:34:300 [pid=1618602 tid=1618602] INFO   cufio-plat:913 ==============
+ 11-08-2026 21:15:34:300 [pid=1618602 tid=1618602] INFO   cufio-plat:914 PLATFORM INFO:
+ 11-08-2026 21:15:34:300 [pid=1618602 tid=1618602] INFO   cufio-plat:915 ==============
+ 11-08-2026 21:15:34:300 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 0
+ 11-08-2026 21:15:34:300 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 0
+ 11-08-2026 21:15:34:300 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 0
+ 11-08-2026 21:15:34:300 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 0
+ 11-08-2026 21:15:34:300 [pid=1618602 tid=1618602] DEBUG  cufio-udev:148 device pci path string : 0000:53:00.0->0000:46:01.4->0000:45:00.0->0000:44:00.0
+ 11-08-2026 21:15:34:300 [pid=1618602 tid=1618602] DEBUG  cufio-plat:716 GPU Dev: 0 numa_node: 0 PCI Group 0000:44:00.0
+ 11-08-2026 21:15:34:300 [pid=1618602 tid=1618602] INFO   cufio-plat:617 ACS not enabled in GPU paths
+ 11-08-2026 21:15:34:301 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 0
+ 11-08-2026 21:15:34:301 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 0
+ 11-08-2026 21:15:34:301 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 0
+ 11-08-2026 21:15:34:301 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 0
+ 11-08-2026 21:15:34:301 [pid=1618602 tid=1618602] DEBUG  cufio-udev:148 device pci path string : 0000:64:00.0->0000:57:01.4->0000:56:00.0->0000:55:00.0
+ 11-08-2026 21:15:34:301 [pid=1618602 tid=1618602] DEBUG  cufio-plat:716 GPU Dev: 1 numa_node: 0 PCI Group 0000:55:00.0
+ 11-08-2026 21:15:34:301 [pid=1618602 tid=1618602] INFO   cufio-plat:617 ACS not enabled in GPU paths
+ 11-08-2026 21:15:34:301 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 0
+ 11-08-2026 21:15:34:302 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 0
+ 11-08-2026 21:15:34:302 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 0
+ 11-08-2026 21:15:34:302 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 0
+ 11-08-2026 21:15:34:302 [pid=1618602 tid=1618602] DEBUG  cufio-udev:148 device pci path string : 0000:75:00.0->0000:68:01.4->0000:67:00.0->0000:66:00.0
+ 11-08-2026 21:15:34:302 [pid=1618602 tid=1618602] DEBUG  cufio-plat:716 GPU Dev: 2 numa_node: 0 PCI Group 0000:66:00.0
+ 11-08-2026 21:15:34:302 [pid=1618602 tid=1618602] INFO   cufio-plat:617 ACS not enabled in GPU paths
+ 11-08-2026 21:15:34:302 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 0
+ 11-08-2026 21:15:34:302 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 0
+ 11-08-2026 21:15:34:302 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 0
+ 11-08-2026 21:15:34:302 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 0
+ 11-08-2026 21:15:34:303 [pid=1618602 tid=1618602] DEBUG  cufio-udev:148 device pci path string : 0000:86:00.0->0000:79:01.4->0000:78:00.0->0000:77:00.0
+ 11-08-2026 21:15:34:303 [pid=1618602 tid=1618602] DEBUG  cufio-plat:716 GPU Dev: 3 numa_node: 0 PCI Group 0000:77:00.0
+ 11-08-2026 21:15:34:303 [pid=1618602 tid=1618602] INFO   cufio-plat:617 ACS not enabled in GPU paths
+ 11-08-2026 21:15:34:303 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 1
+ 11-08-2026 21:15:34:303 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 1
+ 11-08-2026 21:15:34:303 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 1
+ 11-08-2026 21:15:34:303 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 1
+ 11-08-2026 21:15:34:303 [pid=1618602 tid=1618602] DEBUG  cufio-udev:148 device pci path string : 0000:97:00.0->0000:8a:01.4->0000:89:00.0->0000:88:00.0
+ 11-08-2026 21:15:34:303 [pid=1618602 tid=1618602] DEBUG  cufio-plat:716 GPU Dev: 4 numa_node: 1 PCI Group 0000:88:00.0
+ 11-08-2026 21:15:34:303 [pid=1618602 tid=1618602] INFO   cufio-plat:617 ACS not enabled in GPU paths
+ 11-08-2026 21:15:34:304 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 1
+ 11-08-2026 21:15:34:304 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 1
+ 11-08-2026 21:15:34:304 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 1
+ 11-08-2026 21:15:34:304 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 1
+ 11-08-2026 21:15:34:304 [pid=1618602 tid=1618602] DEBUG  cufio-udev:148 device pci path string : 0000:a8:00.0->0000:9b:01.4->0000:9a:00.0->0000:99:00.0
+ 11-08-2026 21:15:34:304 [pid=1618602 tid=1618602] DEBUG  cufio-plat:716 GPU Dev: 5 numa_node: 1 PCI Group 0000:99:00.0
+ 11-08-2026 21:15:34:304 [pid=1618602 tid=1618602] INFO   cufio-plat:617 ACS not enabled in GPU paths
+ 11-08-2026 21:15:34:304 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 1
+ 11-08-2026 21:15:34:304 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 1
+ 11-08-2026 21:15:34:304 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 1
+ 11-08-2026 21:15:34:305 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 1
+ 11-08-2026 21:15:34:305 [pid=1618602 tid=1618602] DEBUG  cufio-udev:148 device pci path string : 0000:b9:00.0->0000:ac:01.4->0000:ab:00.0->0000:aa:00.0
+ 11-08-2026 21:15:34:305 [pid=1618602 tid=1618602] DEBUG  cufio-plat:716 GPU Dev: 6 numa_node: 1 PCI Group 0000:aa:00.0
+ 11-08-2026 21:15:34:305 [pid=1618602 tid=1618602] INFO   cufio-plat:617 ACS not enabled in GPU paths
+ 11-08-2026 21:15:34:305 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 1
+ 11-08-2026 21:15:34:305 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 1
+ 11-08-2026 21:15:34:305 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 1
+ 11-08-2026 21:15:34:305 [pid=1618602 tid=1618602] DEBUG  cufio-udev:131 numanode string 1
+ 11-08-2026 21:15:34:305 [pid=1618602 tid=1618602] DEBUG  cufio-udev:148 device pci path string : 0000:ca:00.0->0000:bd:01.4->0000:bc:00.0->0000:bb:00.0
+ 11-08-2026 21:15:34:305 [pid=1618602 tid=1618602] DEBUG  cufio-plat:716 GPU Dev: 7 numa_node: 1 PCI Group 0000:bb:00.0
+ 11-08-2026 21:15:34:305 [pid=1618602 tid=1618602] INFO   cufio-plat:617 ACS not enabled in GPU paths
+ 11-08-2026 21:15:34:306 [pid=1618602 tid=1618602] INFO   cufio-plat:833 cannot open scsi_mod path, skip scsi check
+ 11-08-2026 21:15:34:306 [pid=1618602 tid=1618602] INFO   cufio-plat:920 use_mq not detected in scsi configuration.cannot support SCSI disks!
+ 11-08-2026 21:15:34:306 [pid=1618602 tid=1618602] INFO   cufio-plat:804 IOMMU: disabled
+ 11-08-2026 21:15:34:306 [pid=1618602 tid=1618602] INFO   cufio-plat:754 Nvidia Driver Info Status: Supported(Nvidia Open Driver Installed)
+ 11-08-2026 21:15:34:326 [pid=1618602 tid=1618602] INFO   cufio-plat:760 Cuda Driver Version Installed:  13030
+ 11-08-2026 21:15:34:326 [pid=1618602 tid=1618602] INFO   cufio-plat:788 Platform: p5.48xlarge, Arch: x86_64(Linux 7.0.0-1006-aws)
+ 11-08-2026 21:15:34:326 [pid=1618602 tid=1618602] INFO   cufio-plat:957 Platform verification succeeded
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:b9:00.0  0000:00:04.0  0x01020080 0x0102 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:b9:00.0  0000:a9:00.0  0x00860080 0x0086 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:b9:00.0  0000:76:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:b9:00.0  0000:54:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:b9:00.0  0000:ba:00.0  0x00030080 0x0003 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:b9:00.0  0000:47:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 network
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:b9:00.0  0000:87:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:b9:00.0  0000:98:00.0  0x00860080 0x0086 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:b9:00.0  0000:cb:00.0  0x00860080 0x0086 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:b9:00.0  0000:65:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:ca:00.0  0000:00:04.0  0x01020080 0x0102 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:ca:00.0  0000:a9:00.0  0x00860080 0x0086 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:ca:00.0  0000:76:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:ca:00.0  0000:54:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:ca:00.0  0000:ba:00.0  0x00860080 0x0086 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:ca:00.0  0000:47:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 network
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:ca:00.0  0000:87:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:ca:00.0  0000:98:00.0  0x00860080 0x0086 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:ca:00.0  0000:cb:00.0  0x00030080 0x0003 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:ca:00.0  0000:65:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:64:00.0  0000:00:04.0  0x00830080 0x0083 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:64:00.0  0000:a9:00.0  0x01050080 0x0105 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:64:00.0  0000:76:00.0  0x00860080 0x0086 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:64:00.0  0000:54:00.0  0x00860080 0x0086 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:64:00.0  0000:ba:00.0  0x01050080 0x0105 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:64:00.0  0000:47:00.0  0x00860080 0x0086 0x08 0x04 0x00 0 network
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:64:00.0  0000:87:00.0  0x00860080 0x0086 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:64:00.0  0000:98:00.0  0x01050080 0x0105 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:64:00.0  0000:cb:00.0  0x01050080 0x0105 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:64:00.0  0000:65:00.0  0x00030080 0x0003 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:86:00.0  0000:00:04.0  0x00830080 0x0083 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:86:00.0  0000:a9:00.0  0x01050080 0x0105 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:86:00.0  0000:76:00.0  0x00860080 0x0086 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:86:00.0  0000:54:00.0  0x00860080 0x0086 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:86:00.0  0000:ba:00.0  0x01050080 0x0105 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:86:00.0  0000:47:00.0  0x00860080 0x0086 0x08 0x04 0x00 0 network
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:86:00.0  0000:87:00.0  0x00030080 0x0003 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:86:00.0  0000:98:00.0  0x01050080 0x0105 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:86:00.0  0000:cb:00.0  0x01050080 0x0105 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:86:00.0  0000:65:00.0  0x00860080 0x0086 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:53:00.0  0000:00:04.0  0x00830080 0x0083 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:331 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:53:00.0  0000:a9:00.0  0x01050080 0x0105 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:53:00.0  0000:76:00.0  0x00860080 0x0086 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:53:00.0  0000:54:00.0  0x00030080 0x0003 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:53:00.0  0000:ba:00.0  0x01050080 0x0105 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:53:00.0  0000:47:00.0  0x00030080 0x0003 0x08 0x04 0x00 0 network
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:53:00.0  0000:87:00.0  0x00860080 0x0086 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:53:00.0  0000:98:00.0  0x01050080 0x0105 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:53:00.0  0000:cb:00.0  0x01050080 0x0105 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:53:00.0  0000:65:00.0  0x00860080 0x0086 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:97:00.0  0000:00:04.0  0x01020080 0x0102 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:97:00.0  0000:a9:00.0  0x00860080 0x0086 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:97:00.0  0000:76:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:97:00.0  0000:54:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:97:00.0  0000:ba:00.0  0x00860080 0x0086 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:97:00.0  0000:47:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 network
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:97:00.0  0000:87:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:97:00.0  0000:98:00.0  0x00030080 0x0003 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:97:00.0  0000:cb:00.0  0x00860080 0x0086 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:97:00.0  0000:65:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:75:00.0  0000:00:04.0  0x00830080 0x0083 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:75:00.0  0000:a9:00.0  0x01050080 0x0105 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:75:00.0  0000:76:00.0  0x00030080 0x0003 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:75:00.0  0000:54:00.0  0x00860080 0x0086 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:75:00.0  0000:ba:00.0  0x01050080 0x0105 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:75:00.0  0000:47:00.0  0x00860080 0x0086 0x08 0x04 0x00 0 network
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:75:00.0  0000:87:00.0  0x00860080 0x0086 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:75:00.0  0000:98:00.0  0x01050080 0x0105 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:75:00.0  0000:cb:00.0  0x01050080 0x0105 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:75:00.0  0000:65:00.0  0x00860080 0x0086 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:a8:00.0  0000:00:04.0  0x01020080 0x0102 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:a8:00.0  0000:a9:00.0  0x00030080 0x0003 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:a8:00.0  0000:76:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:a8:00.0  0000:54:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:a8:00.0  0000:ba:00.0  0x00860080 0x0086 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:a8:00.0  0000:47:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 network
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:a8:00.0  0000:87:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:a8:00.0  0000:98:00.0  0x00860080 0x0086 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:a8:00.0  0000:cb:00.0  0x00860080 0x0086 0x08 0x04 0x01 0 nvme
+ 11-08-2026 21:15:34:332 [pid=1618602 tid=1618602] TRACE  cufio-drv:515 0000:a8:00.0  0000:65:00.0  0x01050080 0x0105 0x08 0x04 0x00 0 nvme
+ 11-08-2026 21:15:34:337 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: nvme path: /sys/devices/pci0000:00/0000:00:04.0/nvme/nvme0
+ 11-08-2026 21:15:34:337 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: nvme0
+ 11-08-2026 21:15:34:337 [pid=1618602 tid=1618602] DEBUG  cufio-udev:558 vendor id attribute for device found: 0x1d0f
+ 11-08-2026 21:15:34:338 [pid=1618602 tid=1618602] DEBUG  cufio-udev:584 sys attribute uevent for device found: 0000:00:04.0
+ 11-08-2026 21:15:34:338 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: nvme path: /sys/devices/pci0000:44/0000:44:00.0/0000:45:00.0/0000:46:01.5/0000:54:00.0/nvme/nvme1
+ 11-08-2026 21:15:34:338 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: nvme1
+ 11-08-2026 21:15:34:338 [pid=1618602 tid=1618602] DEBUG  cufio-udev:558 vendor id attribute for device found: 0x1d0f
+ 11-08-2026 21:15:34:338 [pid=1618602 tid=1618602] DEBUG  cufio-udev:584 sys attribute uevent for device found: 0000:54:00.0
+ 11-08-2026 21:15:34:338 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: nvme path: /sys/devices/pci0000:55/0000:55:00.0/0000:56:00.0/0000:57:01.5/0000:65:00.0/nvme/nvme5
+ 11-08-2026 21:15:34:338 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: nvme5
+ 11-08-2026 21:15:34:338 [pid=1618602 tid=1618602] DEBUG  cufio-udev:558 vendor id attribute for device found: 0x1d0f
+ 11-08-2026 21:15:34:338 [pid=1618602 tid=1618602] DEBUG  cufio-udev:584 sys attribute uevent for device found: 0000:65:00.0
+ 11-08-2026 21:15:34:338 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: nvme path: /sys/devices/pci0000:66/0000:66:00.0/0000:67:00.0/0000:68:01.5/0000:76:00.0/nvme/nvme6
+ 11-08-2026 21:15:34:338 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: nvme6
+ 11-08-2026 21:15:34:338 [pid=1618602 tid=1618602] DEBUG  cufio-udev:558 vendor id attribute for device found: 0x1d0f
+ 11-08-2026 21:15:34:338 [pid=1618602 tid=1618602] DEBUG  cufio-udev:584 sys attribute uevent for device found: 0000:76:00.0
+ 11-08-2026 21:15:34:338 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: nvme path: /sys/devices/pci0000:77/0000:77:00.0/0000:78:00.0/0000:79:01.5/0000:87:00.0/nvme/nvme8
+ 11-08-2026 21:15:34:338 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: nvme8
+ 11-08-2026 21:15:34:338 [pid=1618602 tid=1618602] DEBUG  cufio-udev:558 vendor id attribute for device found: 0x1d0f
+ 11-08-2026 21:15:34:339 [pid=1618602 tid=1618602] DEBUG  cufio-udev:584 sys attribute uevent for device found: 0000:87:00.0
+ 11-08-2026 21:15:34:339 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: nvme path: /sys/devices/pci0000:88/0000:88:00.0/0000:89:00.0/0000:8a:01.5/0000:98:00.0/nvme/nvme2
+ 11-08-2026 21:15:34:339 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: nvme2
+ 11-08-2026 21:15:34:339 [pid=1618602 tid=1618602] DEBUG  cufio-udev:558 vendor id attribute for device found: 0x1d0f
+ 11-08-2026 21:15:34:339 [pid=1618602 tid=1618602] DEBUG  cufio-udev:584 sys attribute uevent for device found: 0000:98:00.0
+ 11-08-2026 21:15:34:339 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: nvme path: /sys/devices/pci0000:99/0000:99:00.0/0000:9a:00.0/0000:9b:01.5/0000:a9:00.0/nvme/nvme3
+ 11-08-2026 21:15:34:339 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: nvme3
+ 11-08-2026 21:15:34:339 [pid=1618602 tid=1618602] DEBUG  cufio-udev:558 vendor id attribute for device found: 0x1d0f
+ 11-08-2026 21:15:34:339 [pid=1618602 tid=1618602] DEBUG  cufio-udev:584 sys attribute uevent for device found: 0000:a9:00.0
+ 11-08-2026 21:15:34:339 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: nvme path: /sys/devices/pci0000:aa/0000:aa:00.0/0000:ab:00.0/0000:ac:01.5/0000:ba:00.0/nvme/nvme4
+ 11-08-2026 21:15:34:339 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: nvme4
+ 11-08-2026 21:15:34:339 [pid=1618602 tid=1618602] DEBUG  cufio-udev:558 vendor id attribute for device found: 0x1d0f
+ 11-08-2026 21:15:34:339 [pid=1618602 tid=1618602] DEBUG  cufio-udev:584 sys attribute uevent for device found: 0000:ba:00.0
+ 11-08-2026 21:15:34:339 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: nvme path: /sys/devices/pci0000:bb/0000:bb:00.0/0000:bc:00.0/0000:bd:01.5/0000:cb:00.0/nvme/nvme7
+ 11-08-2026 21:15:34:339 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: nvme7
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-udev:558 vendor id attribute for device found: 0x1d0f
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-udev:584 sys attribute uevent for device found: 0000:cb:00.0
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme0 device link width: 8 device link speed: 4 ) numa node : 0
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme1 device link width: 8 device link speed: 4 ) numa node : 0
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme5 device link width: 8 device link speed: 4 ) numa node : 0
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme6 device link width: 8 device link speed: 4 ) numa node : 0
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme8 device link width: 8 device link speed: 4 ) numa node : 0
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme2 device link width: 8 device link speed: 4 ) numa node : 1
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme3 device link width: 8 device link speed: 4 ) numa node : 1
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme4 device link width: 8 device link speed: 4 ) numa node : 1
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme7 device link width: 8 device link speed: 4 ) numa node : 1
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] INFO   cufio-udev:516 no devices found by udev enumeration for pci class: infiniband
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:75 device name attribute already set nvme0
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme0 device link width: 8 device link speed: 4 ) numa node : 0
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:75 device name attribute already set nvme1
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme1 device link width: 8 device link speed: 4 ) numa node : 0
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:75 device name attribute already set nvme5
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme5 device link width: 8 device link speed: 4 ) numa node : 0
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:75 device name attribute already set nvme6
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme6 device link width: 8 device link speed: 4 ) numa node : 0
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:75 device name attribute already set nvme8
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme8 device link width: 8 device link speed: 4 ) numa node : 0
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:75 device name attribute already set nvme2
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme2 device link width: 8 device link speed: 4 ) numa node : 1
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:75 device name attribute already set nvme3
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme3 device link width: 8 device link speed: 4 ) numa node : 1
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:75 device name attribute already set nvme4
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme4 device link width: 8 device link speed: 4 ) numa node : 1
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:75 device name attribute already set nvme7
+ 11-08-2026 21:15:34:340 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device nvme7 device link width: 8 device link speed: 4 ) numa node : 1
+ 11-08-2026 21:15:34:341 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: net path: /sys/devices/pci0000:44/0000:44:00.0/0000:45:00.0/0000:46:00.0/0000:47:00.0/net/enp71s0
+ 11-08-2026 21:15:34:341 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: enp71s0
+ 11-08-2026 21:15:34:341 [pid=1618602 tid=1618602] DEBUG  cufio-udev:558 vendor id attribute for device found: 0x1d0f
+ 11-08-2026 21:15:34:341 [pid=1618602 tid=1618602] DEBUG  cufio-udev:584 sys attribute uevent for device found: 0000:47:00.0
+ 11-08-2026 21:15:34:341 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: net path: /sys/devices/virtual/net/docker0
+ 11-08-2026 21:15:34:341 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: docker0
+ 11-08-2026 21:15:34:342 [pid=1618602 tid=1618602] DEBUG  cufio-udev:556 vendor id attribute for device not found: docker0
+ 11-08-2026 21:15:34:342 [pid=1618602 tid=1618602] DEBUG  cufio-udev:579 sys attribute for device not found: docker0 class: net sysattr: device/uevent
+ 11-08-2026 21:15:34:342 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: net path: /sys/devices/virtual/net/lo
+ 11-08-2026 21:15:34:342 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: lo
+ 11-08-2026 21:15:34:342 [pid=1618602 tid=1618602] DEBUG  cufio-udev:556 vendor id attribute for device not found: lo
+ 11-08-2026 21:15:34:342 [pid=1618602 tid=1618602] DEBUG  cufio-udev:579 sys attribute for device not found: lo class: net sysattr: device/uevent
+ 11-08-2026 21:15:34:342 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: net path: /sys/devices/virtual/net/vethf5dbfbf
+ 11-08-2026 21:15:34:342 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: vethf5dbfbf
+ 11-08-2026 21:15:34:342 [pid=1618602 tid=1618602] DEBUG  cufio-udev:556 vendor id attribute for device not found: vethf5dbfbf
+ 11-08-2026 21:15:34:342 [pid=1618602 tid=1618602] DEBUG  cufio-udev:579 sys attribute for device not found: vethf5dbfbf class: net sysattr: device/uevent
+ 11-08-2026 21:15:34:342 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device enp71s0 device link width: 8 device link speed: 4 ) numa node : 0
+ 11-08-2026 21:15:34:342 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:51 bus-device-function not found in the device attribute : docker0
+ 11-08-2026 21:15:34:342 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:51 bus-device-function not found in the device attribute : lo
+ 11-08-2026 21:15:34:342 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:51 bus-device-function not found in the device attribute : vethf5dbfbf
+ 11-08-2026 21:15:34:342 [pid=1618602 tid=1618602] INFO   cufio-udev:516 no devices found by udev enumeration for pci class: infiniband
+ 11-08-2026 21:15:34:343 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: net path: /sys/devices/pci0000:44/0000:44:00.0/0000:45:00.0/0000:46:00.0/0000:47:00.0/net/enp71s0
+ 11-08-2026 21:15:34:343 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: enp71s0
+ 11-08-2026 21:15:34:343 [pid=1618602 tid=1618602] DEBUG  cufio-udev:558 vendor id attribute for device found: 0x1d0f
+ 11-08-2026 21:15:34:343 [pid=1618602 tid=1618602] DEBUG  cufio-udev:584 sys attribute uevent for device found: 0000:47:00.0
+ 11-08-2026 21:15:34:343 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: net path: /sys/devices/virtual/net/docker0
+ 11-08-2026 21:15:34:343 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: docker0
+ 11-08-2026 21:15:34:343 [pid=1618602 tid=1618602] DEBUG  cufio-udev:556 vendor id attribute for device not found: docker0
+ 11-08-2026 21:15:34:344 [pid=1618602 tid=1618602] DEBUG  cufio-udev:579 sys attribute for device not found: docker0 class: net sysattr: device/uevent
+ 11-08-2026 21:15:34:344 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: net path: /sys/devices/virtual/net/lo
+ 11-08-2026 21:15:34:344 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: lo
+ 11-08-2026 21:15:34:344 [pid=1618602 tid=1618602] DEBUG  cufio-udev:556 vendor id attribute for device not found: lo
+ 11-08-2026 21:15:34:344 [pid=1618602 tid=1618602] DEBUG  cufio-udev:579 sys attribute for device not found: lo class: net sysattr: device/uevent
+ 11-08-2026 21:15:34:344 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: net path: /sys/devices/virtual/net/vethf5dbfbf
+ 11-08-2026 21:15:34:344 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: vethf5dbfbf
+ 11-08-2026 21:15:34:344 [pid=1618602 tid=1618602] DEBUG  cufio-udev:556 vendor id attribute for device not found: vethf5dbfbf
+ 11-08-2026 21:15:34:344 [pid=1618602 tid=1618602] DEBUG  cufio-udev:579 sys attribute for device not found: vethf5dbfbf class: net sysattr: device/uevent
+ 11-08-2026 21:15:34:344 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:75 device name attribute already set enp71s0
+ 11-08-2026 21:15:34:344 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device enp71s0 device link width: 8 device link speed: 4 ) numa node : 0
+ 11-08-2026 21:15:34:344 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:51 bus-device-function not found in the device attribute : docker0
+ 11-08-2026 21:15:34:344 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:51 bus-device-function not found in the device attribute : lo
+ 11-08-2026 21:15:34:344 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:51 bus-device-function not found in the device attribute : vethf5dbfbf
+ 11-08-2026 21:15:34:344 [pid=1618602 tid=1618602] INFO   cufio-udev:516 no devices found by udev enumeration for pci class: infiniband
+ 11-08-2026 21:15:34:345 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: net path: /sys/devices/pci0000:44/0000:44:00.0/0000:45:00.0/0000:46:00.0/0000:47:00.0/net/enp71s0
+ 11-08-2026 21:15:34:345 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: enp71s0
+ 11-08-2026 21:15:34:345 [pid=1618602 tid=1618602] DEBUG  cufio-udev:558 vendor id attribute for device found: 0x1d0f
+ 11-08-2026 21:15:34:345 [pid=1618602 tid=1618602] DEBUG  cufio-udev:584 sys attribute uevent for device found: 0000:47:00.0
+ 11-08-2026 21:15:34:345 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: net path: /sys/devices/virtual/net/docker0
+ 11-08-2026 21:15:34:345 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: docker0
+ 11-08-2026 21:15:34:345 [pid=1618602 tid=1618602] DEBUG  cufio-udev:556 vendor id attribute for device not found: docker0
+ 11-08-2026 21:15:34:345 [pid=1618602 tid=1618602] DEBUG  cufio-udev:579 sys attribute for device not found: docker0 class: net sysattr: device/uevent
+ 11-08-2026 21:15:34:345 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: net path: /sys/devices/virtual/net/lo
+ 11-08-2026 21:15:34:345 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: lo
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-udev:556 vendor id attribute for device not found: lo
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-udev:579 sys attribute for device not found: lo class: net sysattr: device/uevent
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-udev:536 scanning sys CLASS: net path: /sys/devices/virtual/net/vethf5dbfbf
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-udev:551 sys attribute sysname for device found: vethf5dbfbf
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-udev:556 vendor id attribute for device not found: vethf5dbfbf
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-udev:579 sys attribute for device not found: vethf5dbfbf class: net sysattr: device/uevent
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:75 device name attribute already set enp71s0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:84 adding attributes for device enp71s0 device link width: 8 device link speed: 4 ) numa node : 0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:51 bus-device-function not found in the device attribute : docker0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:51 bus-device-function not found in the device attribute : lo
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:51 bus-device-function not found in the device attribute : vethf5dbfbf
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:273 printing cufile platform topology using nvfs probe:
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:283 gpu 0000:a8:00.0 peers : 0000:a9:00.0(196736) 0000:ba:00.0(8781952) 0000:98:00.0(8781952) 0000:cb:00.0(8781952) 0000:00:04.0(16908416) 0000:76:00.0(17105024) 0000:54:00.0(17105024) 0000:47:00.0(17105024) 0000:87:00.0(17105024) 0000:65:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:283 gpu 0000:75:00.0 peers : 0000:76:00.0(196736) 0000:00:04.0(8585344) 0000:54:00.0(8781952) 0000:47:00.0(8781952) 0000:87:00.0(8781952) 0000:65:00.0(8781952) 0000:a9:00.0(17105024) 0000:ba:00.0(17105024) 0000:98:00.0(17105024) 0000:cb:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:283 gpu 0000:97:00.0 peers : 0000:98:00.0(196736) 0000:a9:00.0(8781952) 0000:ba:00.0(8781952) 0000:cb:00.0(8781952) 0000:00:04.0(16908416) 0000:76:00.0(17105024) 0000:54:00.0(17105024) 0000:47:00.0(17105024) 0000:87:00.0(17105024) 0000:65:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:283 gpu 0000:53:00.0 peers : 0000:54:00.0(196736) 0000:47:00.0(196736) 0000:00:04.0(8585344) 0000:76:00.0(8781952) 0000:87:00.0(8781952) 0000:65:00.0(8781952) 0000:a9:00.0(17105024) 0000:ba:00.0(17105024) 0000:98:00.0(17105024) 0000:cb:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:283 gpu 0000:86:00.0 peers : 0000:87:00.0(196736) 0000:00:04.0(8585344) 0000:76:00.0(8781952) 0000:54:00.0(8781952) 0000:47:00.0(8781952) 0000:65:00.0(8781952) 0000:a9:00.0(17105024) 0000:ba:00.0(17105024) 0000:98:00.0(17105024) 0000:cb:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:283 gpu 0000:64:00.0 peers : 0000:65:00.0(196736) 0000:00:04.0(8585344) 0000:76:00.0(8781952) 0000:54:00.0(8781952) 0000:47:00.0(8781952) 0000:87:00.0(8781952) 0000:a9:00.0(17105024) 0000:ba:00.0(17105024) 0000:98:00.0(17105024) 0000:cb:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:283 gpu 0000:ca:00.0 peers : 0000:cb:00.0(196736) 0000:a9:00.0(8781952) 0000:ba:00.0(8781952) 0000:98:00.0(8781952) 0000:00:04.0(16908416) 0000:76:00.0(17105024) 0000:54:00.0(17105024) 0000:47:00.0(17105024) 0000:87:00.0(17105024) 0000:65:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:283 gpu 0000:b9:00.0 peers : 0000:ba:00.0(196736) 0000:a9:00.0(8781952) 0000:98:00.0(8781952) 0000:cb:00.0(8781952) 0000:00:04.0(16908416) 0000:76:00.0(17105024) 0000:54:00.0(17105024) 0000:47:00.0(17105024) 0000:87:00.0(17105024) 0000:65:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:291 peer 0000:65:00.0 gpus : 0000:64:00.0(196736) 0000:86:00.0(8781952) 0000:53:00.0(8781952) 0000:75:00.0(8781952) 0000:b9:00.0(17105024) 0000:ca:00.0(17105024) 0000:97:00.0(17105024) 0000:a8:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:291 peer 0000:cb:00.0 gpus : 0000:ca:00.0(196736) 0000:b9:00.0(8781952) 0000:97:00.0(8781952) 0000:a8:00.0(8781952) 0000:64:00.0(17105024) 0000:86:00.0(17105024) 0000:53:00.0(17105024) 0000:75:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:291 peer 0000:98:00.0 gpus : 0000:97:00.0(196736) 0000:b9:00.0(8781952) 0000:ca:00.0(8781952) 0000:a8:00.0(8781952) 0000:64:00.0(17105024) 0000:86:00.0(17105024) 0000:53:00.0(17105024) 0000:75:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:291 peer 0000:ba:00.0 gpus : 0000:b9:00.0(196736) 0000:ca:00.0(8781952) 0000:97:00.0(8781952) 0000:a8:00.0(8781952) 0000:64:00.0(17105024) 0000:86:00.0(17105024) 0000:53:00.0(17105024) 0000:75:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:291 peer 0000:47:00.0 gpus : 0000:53:00.0(196736) 0000:64:00.0(8781952) 0000:86:00.0(8781952) 0000:75:00.0(8781952) 0000:b9:00.0(17105024) 0000:ca:00.0(17105024) 0000:97:00.0(17105024) 0000:a8:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:291 peer 0000:54:00.0 gpus : 0000:53:00.0(196736) 0000:64:00.0(8781952) 0000:86:00.0(8781952) 0000:75:00.0(8781952) 0000:b9:00.0(17105024) 0000:ca:00.0(17105024) 0000:97:00.0(17105024) 0000:a8:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:291 peer 0000:76:00.0 gpus : 0000:75:00.0(196736) 0000:64:00.0(8781952) 0000:86:00.0(8781952) 0000:53:00.0(8781952) 0000:b9:00.0(17105024) 0000:ca:00.0(17105024) 0000:97:00.0(17105024) 0000:a8:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:291 peer 0000:a9:00.0 gpus : 0000:a8:00.0(196736) 0000:b9:00.0(8781952) 0000:ca:00.0(8781952) 0000:97:00.0(8781952) 0000:64:00.0(17105024) 0000:86:00.0(17105024) 0000:53:00.0(17105024) 0000:75:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:291 peer 0000:87:00.0 gpus : 0000:86:00.0(196736) 0000:64:00.0(8781952) 0000:53:00.0(8781952) 0000:75:00.0(8781952) 0000:b9:00.0(17105024) 0000:ca:00.0(17105024) 0000:97:00.0(17105024) 0000:a8:00.0(17105024) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-topo-nvfs:291 peer 0000:00:04.0 gpus : 0000:64:00.0(8585344) 0000:86:00.0(8585344) 0000:53:00.0(8585344) 0000:75:00.0(8585344) 0000:b9:00.0(16908416) 0000:ca:00.0(16908416) 0000:97:00.0(16908416) 0000:a8:00.0(16908416) 
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:617 checking GPU attributes 0000:44:00.0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] TRACE  cufio-drv:626 Assigning numanode :  0 to PCI Group
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] TRACE  cufio-drv:644 Added group : pgroup 0 0x28083ef0 to map
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:646 new group 0000:44:00.0 groupid 0 size 1
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:617 checking GPU attributes 0000:55:00.0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] TRACE  cufio-drv:626 Assigning numanode :  0 to PCI Group
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] TRACE  cufio-drv:644 Added group : pgroup 1 0x280840e0 to map
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:646 new group 0000:55:00.0 groupid 1 size 1
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:617 checking GPU attributes 0000:66:00.0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] TRACE  cufio-drv:626 Assigning numanode :  0 to PCI Group
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] TRACE  cufio-drv:644 Added group : pgroup 2 0x28083b50 to map
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:646 new group 0000:66:00.0 groupid 2 size 1
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:617 checking GPU attributes 0000:77:00.0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] TRACE  cufio-drv:626 Assigning numanode :  0 to PCI Group
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] TRACE  cufio-drv:644 Added group : pgroup 3 0x27afb680 to map
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:646 new group 0000:77:00.0 groupid 3 size 1
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:617 checking GPU attributes 0000:88:00.0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] TRACE  cufio-drv:626 Assigning numanode :  1 to PCI Group
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] TRACE  cufio-drv:644 Added group : pgroup 4 0x2741cc00 to map
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:646 new group 0000:88:00.0 groupid 4 size 1
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:617 checking GPU attributes 0000:99:00.0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] TRACE  cufio-drv:626 Assigning numanode :  1 to PCI Group
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] TRACE  cufio-drv:644 Added group : pgroup 5 0x27c82bb0 to map
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:646 new group 0000:99:00.0 groupid 5 size 1
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:617 checking GPU attributes 0000:aa:00.0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] TRACE  cufio-drv:626 Assigning numanode :  1 to PCI Group
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] TRACE  cufio-drv:644 Added group : pgroup 6 0x274da040 to map
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:646 new group 0000:aa:00.0 groupid 6 size 1
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:617 checking GPU attributes 0000:bb:00.0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] TRACE  cufio-drv:626 Assigning numanode :  1 to PCI Group
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] TRACE  cufio-drv:644 Added group : pgroup 7 0x27727920 to map
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:646 new group 0000:bb:00.0 groupid 7 size 1
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:698 ngpus 1 pos 0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:698 ngpus 1 pos 0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:698 ngpus 1 pos 0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:698 ngpus 1 pos 0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:698 ngpus 1 pos 0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:698 ngpus 1 pos 0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:698 ngpus 1 pos 0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  cufio-drv:698 ngpus 1 pos 0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  0:297 Bounce buffers initializing... PCI-Groups 8
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  0:308 Buffer pool initializing for GPU 0 PCI-Group 0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 128 slots and priority: default
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  0:318 Buffer pool setup for GPU 0 with 128 slots Caching enabled: 1 priority: default PCI-Group: 0
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  0:308 Buffer pool initializing for GPU 1 PCI-Group 1
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 128 slots and priority: default
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  0:318 Buffer pool setup for GPU 1 with 128 slots Caching enabled: 1 priority: default PCI-Group: 1
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  0:308 Buffer pool initializing for GPU 2 PCI-Group 2
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 128 slots and priority: default
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  0:318 Buffer pool setup for GPU 2 with 128 slots Caching enabled: 1 priority: default PCI-Group: 2
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  0:308 Buffer pool initializing for GPU 3 PCI-Group 3
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 128 slots and priority: default
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  0:318 Buffer pool setup for GPU 3 with 128 slots Caching enabled: 1 priority: default PCI-Group: 3
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  0:308 Buffer pool initializing for GPU 4 PCI-Group 4
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 128 slots and priority: default
+ 11-08-2026 21:15:34:346 [pid=1618602 tid=1618602] DEBUG  0:318 Buffer pool setup for GPU 4 with 128 slots Caching enabled: 1 priority: default PCI-Group: 4
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:308 Buffer pool initializing for GPU 5 PCI-Group 5
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 128 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:318 Buffer pool setup for GPU 5 with 128 slots Caching enabled: 1 priority: default PCI-Group: 5
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:308 Buffer pool initializing for GPU 6 PCI-Group 6
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 128 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:318 Buffer pool setup for GPU 6 with 128 slots Caching enabled: 1 priority: default PCI-Group: 6
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:308 Buffer pool initializing for GPU 7 PCI-Group 7
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 128 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:318 Buffer pool setup for GPU 7 with 128 slots Caching enabled: 1 priority: default PCI-Group: 7
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:348 Bounce buffers initialization complete
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-drv:735 PCI Groups initialized
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:382 Initializing cufile POSIX pool
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 128 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 0 slab size (KiB): 4 slots: 128
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 64 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 0 slab size (KiB): 1024 slots: 64
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 64 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 0 slab size (KiB): 16384 slots: 64
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 128 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 1 slab size (KiB): 4 slots: 128
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 64 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 1 slab size (KiB): 1024 slots: 64
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 64 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 1 slab size (KiB): 16384 slots: 64
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 128 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 2 slab size (KiB): 4 slots: 128
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 64 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 2 slab size (KiB): 1024 slots: 64
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 64 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 2 slab size (KiB): 16384 slots: 64
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 128 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 3 slab size (KiB): 4 slots: 128
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 64 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 3 slab size (KiB): 1024 slots: 64
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 64 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 3 slab size (KiB): 16384 slots: 64
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 128 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 4 slab size (KiB): 4 slots: 128
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 64 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 4 slab size (KiB): 1024 slots: 64
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 64 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 4 slab size (KiB): 16384 slots: 64
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 128 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 5 slab size (KiB): 4 slots: 128
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 64 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 5 slab size (KiB): 1024 slots: 64
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 64 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 5 slab size (KiB): 16384 slots: 64
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 128 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 6 slab size (KiB): 4 slots: 128
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 64 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 6 slab size (KiB): 1024 slots: 64
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 64 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 6 slab size (KiB): 16384 slots: 64
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 128 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 7 slab size (KiB): 4 slots: 128
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 64 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 7 slab size (KiB): 1024 slots: 64
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  0:230 Buffer pool initialized with 64 slots and priority: default
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:124 POSIX buffer pool initialized for GPU 7 slab size (KiB): 16384 slots: 64
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] INFO   cufio-px-pool:456 POSIX pool buffer initialization complete
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] INFO   curdma-ldbal:510 No RDMA devices configured,skipping RDMA load balancer initialization
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] TRACE  cufio_core:456 Threadpool Initialize Obtained pgroup 0x28083ef0 from map
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] TRACE  cufio_core:463 Threadpool Initialize Obtained pgroup : numa : numgpus 0x28083ef0 0 1
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] TRACE  cufio_core:456 Threadpool Initialize Obtained pgroup 0x280840e0 from map
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] TRACE  cufio_core:463 Threadpool Initialize Obtained pgroup : numa : numgpus 0x280840e0 0 1
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] TRACE  cufio_core:456 Threadpool Initialize Obtained pgroup 0x28083b50 from map
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] TRACE  cufio_core:463 Threadpool Initialize Obtained pgroup : numa : numgpus 0x28083b50 0 1
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] TRACE  cufio_core:456 Threadpool Initialize Obtained pgroup 0x27afb680 from map
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] TRACE  cufio_core:463 Threadpool Initialize Obtained pgroup : numa : numgpus 0x27afb680 0 1
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] TRACE  cufio_core:456 Threadpool Initialize Obtained pgroup 0x2741cc00 from map
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] TRACE  cufio_core:463 Threadpool Initialize Obtained pgroup : numa : numgpus 0x2741cc00 1 1
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] TRACE  cufio_core:456 Threadpool Initialize Obtained pgroup 0x27c82bb0 from map
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] TRACE  cufio_core:463 Threadpool Initialize Obtained pgroup : numa : numgpus 0x27c82bb0 1 1
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] TRACE  cufio_core:456 Threadpool Initialize Obtained pgroup 0x274da040 from map
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] TRACE  cufio_core:463 Threadpool Initialize Obtained pgroup : numa : numgpus 0x274da040 1 1
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] TRACE  cufio_core:456 Threadpool Initialize Obtained pgroup 0x27727920 from map
+ 11-08-2026 21:15:34:347 [pid=1618602 tid=1618602] TRACE  cufio_core:463 Threadpool Initialize Obtained pgroup : numa : numgpus 0x27727920 1 1
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  0:78 numa_num_configured_nodes obtained numNumaNodes :  2
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:37 Threadpool detected mismatch between library call and procfs for numa node num
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:41 Discovered 8 numa nodes and 8 gpus on this system
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  0:84 setting numa_set_bind_policy preferred policy
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:24 Threapool workqueue 0x274cdad0 for gpu node 7
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:65 create workqueue 0 7 0x274cdad0
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:24 Threapool workqueue 0x274d5050 for gpu node 6
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:65 create workqueue 1 6 0x274d5050
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:24 Threapool workqueue 0x27f69370 for gpu node 5
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:65 create workqueue 2 5 0x27f69370
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:24 Threapool workqueue 0x27d2eae0 for gpu node 4
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:65 create workqueue 3 4 0x27d2eae0
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:24 Threapool workqueue 0x27ad9bb0 for gpu node 3
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:65 create workqueue 4 3 0x27ad9bb0
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:24 Threapool workqueue 0x27aeadd0 for gpu node 2
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:65 create workqueue 5 2 0x27aeadd0
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:24 Threapool workqueue 0x274d85e0 for gpu node 1
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:65 create workqueue 6 1 0x274d85e0
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:24 Threapool workqueue 0x27ebf9d0 for gpu node 0
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:65 create workqueue 7 0 0x27ebf9d0
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123642551050240
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:50 Creating a thread pool with 32 threads
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1619020] TRACE  cufio_core:84 Started Thread: 0x27416370
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123641882726400
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1619021] TRACE  cufio_core:84 Started Thread: 0x27e2f000
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123642542657536
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1619022] TRACE  cufio_core:84 Started Thread: 0x27ec1770
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1619022] TRACE  cufio_core:41 Threadpool Thread ID:  123642542657536 obtained gpuId: 1
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123642534264832
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1619023] TRACE  cufio_core:84 Started Thread: 0x278bea90
+ 11-08-2026 21:15:34:348 [pid=1618602 tid=1619023] TRACE  cufio_core:41 Threadpool Thread ID:  123642534264832 obtained gpuId: 2
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123642525872128
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1619021] TRACE  cufio_core:41 Threadpool Thread ID:  123641882726400 obtained gpuId: 0
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123642310553600
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1619024] TRACE  cufio_core:84 Started Thread: 0x27d44230
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1619024] TRACE  cufio_core:41 Threadpool Thread ID:  123642525872128 obtained gpuId: 3
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123642302160896
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1619026] TRACE  cufio_core:84 Started Thread: 0x27ec0ca0
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1619026] TRACE  cufio_core:41 Threadpool Thread ID:  123642302160896 obtained gpuId: 5
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123642293768192
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1619027] TRACE  cufio_core:84 Started Thread: 0x280982f0
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1619027] TRACE  cufio_core:41 Threadpool Thread ID:  123642293768192 obtained gpuId: 6
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123642285375488
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1619028] TRACE  cufio_core:84 Started Thread: 0x27e26420
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1619028] TRACE  cufio_core:41 Threadpool Thread ID:  123642285375488 obtained gpuId: 7
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123642276982784
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1619029] TRACE  cufio_core:84 Started Thread: 0x2767f370
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123642268590080
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1619029] TRACE  cufio_core:41 Threadpool Thread ID:  123642276982784 obtained gpuId: 0
+ 11-08-2026 21:15:34:349 [pid=1618602 tid=1619025] TRACE  cufio_core:84 Started Thread: 0x2773bee0
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1619025] TRACE  cufio_core:41 Threadpool Thread ID:  123642310553600 obtained gpuId: 4
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123642260197376
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1619031] TRACE  cufio_core:84 Started Thread: 0x27c827f0
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1619031] TRACE  cufio_core:41 Threadpool Thread ID:  123642260197376 obtained gpuId: 2
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123641907900416
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1619030] TRACE  cufio_core:84 Started Thread: 0x274d9ae0
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1619030] TRACE  cufio_core:41 Threadpool Thread ID:  123642268590080 obtained gpuId: 1
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123641899507712
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1619033] TRACE  cufio_core:84 Started Thread: 0x27d7fa20
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1619033] TRACE  cufio_core:41 Threadpool Thread ID:  123641899507712 obtained gpuId: 4
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123641874333696
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1619034] TRACE  cufio_core:84 Started Thread: 0x27ebe7f0
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1619034] TRACE  cufio_core:41 Threadpool Thread ID:  123641874333696 obtained gpuId: 5
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123641865940992
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1619035] TRACE  cufio_core:84 Started Thread: 0x278bf270
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1619035] TRACE  cufio_core:41 Threadpool Thread ID:  123641865940992 obtained gpuId: 6
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1619032] TRACE  cufio_core:84 Started Thread: 0x27c7eba0
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1619032] TRACE  cufio_core:41 Threadpool Thread ID:  123641907900416 obtained gpuId: 3
+ 11-08-2026 21:15:34:350 [pid=1618602 tid=1619036] TRACE  cufio_core:84 Started Thread: 0x278be400
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1619036] TRACE  cufio_core:41 Threadpool Thread ID:  123641857548288 obtained gpuId: 7
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123641857548288
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123641236811776
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1619037] TRACE  cufio_core:84 Started Thread: 0x27eb9990
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1619037] TRACE  cufio_core:41 Threadpool Thread ID:  123641236811776 obtained gpuId: 0
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123641228419072
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1619038] TRACE  cufio_core:84 Started Thread: 0x2786a380
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1619039] TRACE  cufio_core:84 Started Thread: 0x27d2fa00
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1619039] TRACE  cufio_core:41 Threadpool Thread ID:  123641220026368 obtained gpuId: 2
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1619038] TRACE  cufio_core:41 Threadpool Thread ID:  123641228419072 obtained gpuId: 1
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123641220026368
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123641211633664
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1619040] TRACE  cufio_core:84 Started Thread: 0x274c78f0
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1619040] TRACE  cufio_core:41 Threadpool Thread ID:  123641211633664 obtained gpuId: 3
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1619041] TRACE  cufio_core:84 Started Thread: 0x278c5800
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1619041] TRACE  cufio_core:41 Threadpool Thread ID:  123641203240960 obtained gpuId: 4
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123641203240960
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123641194848256
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1619042] TRACE  cufio_core:84 Started Thread: 0x27744710
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1619042] TRACE  cufio_core:41 Threadpool Thread ID:  123641194848256 obtained gpuId: 5
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1619043] TRACE  cufio_core:84 Started Thread: 0x2773baa0
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1619043] TRACE  cufio_core:41 Threadpool Thread ID:  123641186455552 obtained gpuId: 6
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123641186455552
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123640699940864
+ 11-08-2026 21:15:34:351 [pid=1618602 tid=1619044] TRACE  cufio_core:84 Started Thread: 0x274d7e70
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619044] TRACE  cufio_core:41 Threadpool Thread ID:  123640699940864 obtained gpuId: 7
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123640691548160
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619045] TRACE  cufio_core:84 Started Thread: 0x274d27f0
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619045] TRACE  cufio_core:41 Threadpool Thread ID:  123640691548160 obtained gpuId: 0
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619046] TRACE  cufio_core:84 Started Thread: 0x273ed540
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619046] TRACE  cufio_core:41 Threadpool Thread ID:  123640683155456 obtained gpuId: 1
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123640683155456
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123640674762752
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619047] TRACE  cufio_core:84 Started Thread: 0x27522410
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619047] TRACE  cufio_core:41 Threadpool Thread ID:  123640674762752 obtained gpuId: 2
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123640666370048
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619048] TRACE  cufio_core:84 Started Thread: 0x2802a210
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619048] TRACE  cufio_core:41 Threadpool Thread ID:  123640666370048 obtained gpuId: 3
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619049] TRACE  cufio_core:84 Started Thread: 0x27ecfbe0
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619049] TRACE  cufio_core:41 Threadpool Thread ID:  123640657977344 obtained gpuId: 4
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123640657977344
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123640649584640
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619050] TRACE  cufio_core:84 Started Thread: 0x28026cd0
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619050] TRACE  cufio_core:41 Threadpool Thread ID:  123640649584640 obtained gpuId: 5
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123640297287680
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619051] TRACE  cufio_core:84 Started Thread: 0x27b1a140
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619051] TRACE  cufio_core:41 Threadpool Thread ID:  123640297287680 obtained gpuId: 6
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619052] TRACE  cufio_core:84 Started Thread: 0x27c7fa40
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1619052] TRACE  cufio_core:41 Threadpool Thread ID:  123640288894976 obtained gpuId: 7
+ 11-08-2026 21:15:34:352 [pid=1618602 tid=1618602] TRACE  cufio_core:38 Started tid:  123640288894976
+ 11-08-2026 21:15:35:486 [pid=1618602 tid=1619023] TRACE  cufio_core:60 Threadpool Thread ID:  123642534264832 pushing primary context: 0x27435c00
+ 11-08-2026 21:15:35:487 [pid=1618602 tid=1619023] TRACE  cufio_core:71 Threadpool Thread ID:  123642534264832 started running on workqueue  0x27aeadd0  corresponding to gpunode  2
+ 11-08-2026 21:15:35:487 [pid=1618602 tid=1619031] TRACE  cufio_core:60 Threadpool Thread ID:  123642260197376 pushing primary context: 0x27435c00
+ 11-08-2026 21:15:35:487 [pid=1618602 tid=1619031] TRACE  cufio_core:71 Threadpool Thread ID:  123642260197376 started running on workqueue  0x27aeadd0  corresponding to gpunode  2
+ 11-08-2026 21:15:35:487 [pid=1618602 tid=1619047] TRACE  cufio_core:60 Threadpool Thread ID:  123640674762752 pushing primary context: 0x27435c00
+ 11-08-2026 21:15:35:487 [pid=1618602 tid=1619047] TRACE  cufio_core:71 Threadpool Thread ID:  123640674762752 started running on workqueue  0x27aeadd0  corresponding to gpunode  2
+ 11-08-2026 21:15:35:487 [pid=1618602 tid=1619039] TRACE  cufio_core:60 Threadpool Thread ID:  123641220026368 pushing primary context: 0x27435c00
+ 11-08-2026 21:15:35:487 [pid=1618602 tid=1619039] TRACE  cufio_core:71 Threadpool Thread ID:  123641220026368 started running on workqueue  0x27aeadd0  corresponding to gpunode  2
+ 11-08-2026 21:15:35:563 [pid=1618602 tid=1619021] TRACE  cufio_core:60 Threadpool Thread ID:  123641882726400 pushing primary context: 0x27409530
+ 11-08-2026 21:15:35:563 [pid=1618602 tid=1619021] TRACE  cufio_core:71 Threadpool Thread ID:  123641882726400 started running on workqueue  0x27ebf9d0  corresponding to gpunode  0
+ 11-08-2026 21:15:35:563 [pid=1618602 tid=1619029] TRACE  cufio_core:60 Threadpool Thread ID:  123642276982784 pushing primary context: 0x27409530
+ 11-08-2026 21:15:35:563 [pid=1618602 tid=1619029] TRACE  cufio_core:71 Threadpool Thread ID:  123642276982784 started running on workqueue  0x27ebf9d0  corresponding to gpunode  0
+ 11-08-2026 21:15:35:563 [pid=1618602 tid=1619037] TRACE  cufio_core:60 Threadpool Thread ID:  123641236811776 pushing primary context: 0x27409530
+ 11-08-2026 21:15:35:563 [pid=1618602 tid=1619037] TRACE  cufio_core:71 Threadpool Thread ID:  123641236811776 started running on workqueue  0x27ebf9d0  corresponding to gpunode  0
+ 11-08-2026 21:15:35:563 [pid=1618602 tid=1619045] TRACE  cufio_core:60 Threadpool Thread ID:  123640691548160 pushing primary context: 0x27409530
+ 11-08-2026 21:15:35:563 [pid=1618602 tid=1619045] TRACE  cufio_core:71 Threadpool Thread ID:  123640691548160 started running on workqueue  0x27ebf9d0  corresponding to gpunode  0
+ 11-08-2026 21:15:35:570 [pid=1618602 tid=1619028] TRACE  cufio_core:60 Threadpool Thread ID:  123642285375488 pushing primary context: 0x274a7090
+ 11-08-2026 21:15:35:570 [pid=1618602 tid=1619044] TRACE  cufio_core:60 Threadpool Thread ID:  123640699940864 pushing primary context: 0x274a7090
+ 11-08-2026 21:15:35:570 [pid=1618602 tid=1619044] TRACE  cufio_core:71 Threadpool Thread ID:  123640699940864 started running on workqueue  0x274cdad0  corresponding to gpunode  7
+ 11-08-2026 21:15:35:570 [pid=1618602 tid=1619052] TRACE  cufio_core:60 Threadpool Thread ID:  123640288894976 pushing primary context: 0x274a7090
+ 11-08-2026 21:15:35:570 [pid=1618602 tid=1619052] TRACE  cufio_core:71 Threadpool Thread ID:  123640288894976 started running on workqueue  0x274cdad0  corresponding to gpunode  7
+ 11-08-2026 21:15:35:570 [pid=1618602 tid=1619036] TRACE  cufio_core:60 Threadpool Thread ID:  123641857548288 pushing primary context: 0x274a7090
+ 11-08-2026 21:15:35:570 [pid=1618602 tid=1619028] TRACE  cufio_core:71 Threadpool Thread ID:  123642285375488 started running on workqueue  0x274cdad0  corresponding to gpunode  7
+ 11-08-2026 21:15:35:570 [pid=1618602 tid=1619036] TRACE  cufio_core:71 Threadpool Thread ID:  123641857548288 started running on workqueue  0x274cdad0  corresponding to gpunode  7
+ 11-08-2026 21:15:35:600 [pid=1618602 tid=1619025] TRACE  cufio_core:60 Threadpool Thread ID:  123642310553600 pushing primary context: 0x27476dc0
+ 11-08-2026 21:15:35:600 [pid=1618602 tid=1619025] TRACE  cufio_core:71 Threadpool Thread ID:  123642310553600 started running on workqueue  0x27d2eae0  corresponding to gpunode  4
+ 11-08-2026 21:15:35:600 [pid=1618602 tid=1619033] TRACE  cufio_core:60 Threadpool Thread ID:  123641899507712 pushing primary context: 0x27476dc0
+ 11-08-2026 21:15:35:600 [pid=1618602 tid=1619049] TRACE  cufio_core:60 Threadpool Thread ID:  123640657977344 pushing primary context: 0x27476dc0
+ 11-08-2026 21:15:35:600 [pid=1618602 tid=1619049] TRACE  cufio_core:71 Threadpool Thread ID:  123640657977344 started running on workqueue  0x27d2eae0  corresponding to gpunode  4
+ 11-08-2026 21:15:35:600 [pid=1618602 tid=1619033] TRACE  cufio_core:71 Threadpool Thread ID:  123641899507712 started running on workqueue  0x27d2eae0  corresponding to gpunode  4
+ 11-08-2026 21:15:35:600 [pid=1618602 tid=1619041] TRACE  cufio_core:60 Threadpool Thread ID:  123641203240960 pushing primary context: 0x27476dc0
+ 11-08-2026 21:15:35:600 [pid=1618602 tid=1619041] TRACE  cufio_core:71 Threadpool Thread ID:  123641203240960 started running on workqueue  0x27d2eae0  corresponding to gpunode  4
+ 11-08-2026 21:15:35:615 [pid=1618602 tid=1619022] TRACE  cufio_core:60 Threadpool Thread ID:  123642542657536 pushing primary context: 0x27427120
+ 11-08-2026 21:15:35:615 [pid=1618602 tid=1619022] TRACE  cufio_core:71 Threadpool Thread ID:  123642542657536 started running on workqueue  0x274d85e0  corresponding to gpunode  1
+ 11-08-2026 21:15:35:615 [pid=1618602 tid=1619030] TRACE  cufio_core:60 Threadpool Thread ID:  123642268590080 pushing primary context: 0x27427120
+ 11-08-2026 21:15:35:615 [pid=1618602 tid=1619030] TRACE  cufio_core:71 Threadpool Thread ID:  123642268590080 started running on workqueue  0x274d85e0  corresponding to gpunode  1
+ 11-08-2026 21:15:35:615 [pid=1618602 tid=1619046] TRACE  cufio_core:60 Threadpool Thread ID:  123640683155456 pushing primary context: 0x27427120
+ 11-08-2026 21:15:35:615 [pid=1618602 tid=1619046] TRACE  cufio_core:71 Threadpool Thread ID:  123640683155456 started running on workqueue  0x274d85e0  corresponding to gpunode  1
+ 11-08-2026 21:15:35:615 [pid=1618602 tid=1619038] TRACE  cufio_core:60 Threadpool Thread ID:  123641228419072 pushing primary context: 0x27427120
+ 11-08-2026 21:15:35:615 [pid=1618602 tid=1619038] TRACE  cufio_core:71 Threadpool Thread ID:  123641228419072 started running on workqueue  0x274d85e0  corresponding to gpunode  1
+ 11-08-2026 21:15:35:617 [pid=1618602 tid=1619027] TRACE  cufio_core:60 Threadpool Thread ID:  123642293768192 pushing primary context: 0x27496fa0
+ 11-08-2026 21:15:35:617 [pid=1618602 tid=1619035] TRACE  cufio_core:60 Threadpool Thread ID:  123641865940992 pushing primary context: 0x27496fa0
+ 11-08-2026 21:15:35:617 [pid=1618602 tid=1619035] TRACE  cufio_core:71 Threadpool Thread ID:  123641865940992 started running on workqueue  0x274d5050  corresponding to gpunode  6
+ 11-08-2026 21:15:35:617 [pid=1618602 tid=1619027] TRACE  cufio_core:71 Threadpool Thread ID:  123642293768192 started running on workqueue  0x274d5050  corresponding to gpunode  6
+ 11-08-2026 21:15:35:617 [pid=1618602 tid=1619051] TRACE  cufio_core:60 Threadpool Thread ID:  123640297287680 pushing primary context: 0x27496fa0
+ 11-08-2026 21:15:35:617 [pid=1618602 tid=1619051] TRACE  cufio_core:71 Threadpool Thread ID:  123640297287680 started running on workqueue  0x274d5050  corresponding to gpunode  6
+ 11-08-2026 21:15:35:617 [pid=1618602 tid=1619043] TRACE  cufio_core:60 Threadpool Thread ID:  123641186455552 pushing primary context: 0x27496fa0
+ 11-08-2026 21:15:35:617 [pid=1618602 tid=1619043] TRACE  cufio_core:71 Threadpool Thread ID:  123641186455552 started running on workqueue  0x274d5050  corresponding to gpunode  6
+ 11-08-2026 21:15:35:679 [pid=1618602 tid=1619024] TRACE  cufio_core:60 Threadpool Thread ID:  123642525872128 pushing primary context: 0x27466cd0
+ 11-08-2026 21:15:35:679 [pid=1618602 tid=1619024] TRACE  cufio_core:71 Threadpool Thread ID:  123642525872128 started running on workqueue  0x27ad9bb0  corresponding to gpunode  3
+ 11-08-2026 21:15:35:679 [pid=1618602 tid=1619040] TRACE  cufio_core:60 Threadpool Thread ID:  123641211633664 pushing primary context: 0x27466cd0
+ 11-08-2026 21:15:35:679 [pid=1618602 tid=1619040] TRACE  cufio_core:71 Threadpool Thread ID:  123641211633664 started running on workqueue  0x27ad9bb0  corresponding to gpunode  3
+ 11-08-2026 21:15:35:679 [pid=1618602 tid=1619032] TRACE  cufio_core:60 Threadpool Thread ID:  123641907900416 pushing primary context: 0x27466cd0
+ 11-08-2026 21:15:35:679 [pid=1618602 tid=1619032] TRACE  cufio_core:71 Threadpool Thread ID:  123641907900416 started running on workqueue  0x27ad9bb0  corresponding to gpunode  3
+ 11-08-2026 21:15:35:680 [pid=1618602 tid=1619048] TRACE  cufio_core:60 Threadpool Thread ID:  123640666370048 pushing primary context: 0x27466cd0
+ 11-08-2026 21:15:35:680 [pid=1618602 tid=1619048] TRACE  cufio_core:71 Threadpool Thread ID:  123640666370048 started running on workqueue  0x27ad9bb0  corresponding to gpunode  3
+ 11-08-2026 21:15:35:694 [pid=1618602 tid=1619026] TRACE  cufio_core:60 Threadpool Thread ID:  123642302160896 pushing primary context: 0x27486eb0
+ 11-08-2026 21:15:35:694 [pid=1618602 tid=1619026] TRACE  cufio_core:71 Threadpool Thread ID:  123642302160896 started running on workqueue  0x27f69370  corresponding to gpunode  5
+ 11-08-2026 21:15:35:694 [pid=1618602 tid=1619042] TRACE  cufio_core:60 Threadpool Thread ID:  123641194848256 pushing primary context: 0x27486eb0
+ 11-08-2026 21:15:35:694 [pid=1618602 tid=1619050] TRACE  cufio_core:60 Threadpool Thread ID:  123640649584640 pushing primary context: 0x27486eb0
+ 11-08-2026 21:15:35:694 [pid=1618602 tid=1619050] TRACE  cufio_core:71 Threadpool Thread ID:  123640649584640 started running on workqueue  0x27f69370  corresponding to gpunode  5
+ 11-08-2026 21:15:35:694 [pid=1618602 tid=1619042] TRACE  cufio_core:71 Threadpool Thread ID:  123641194848256 started running on workqueue  0x27f69370  corresponding to gpunode  5
+ 11-08-2026 21:15:35:694 [pid=1618602 tid=1619034] TRACE  cufio_core:60 Threadpool Thread ID:  123641874333696 pushing primary context: 0x27486eb0
+ 11-08-2026 21:15:35:695 [pid=1618602 tid=1619034] TRACE  cufio_core:71 Threadpool Thread ID:  123641874333696 started running on workqueue  0x27f69370  corresponding to gpunode  5
+ 11-08-2026 21:15:35:754 [pid=1618602 tid=1618602] TRACE  cufio_core:1063 driver opened from implicit driver intitialization
+ 11-08-2026 21:15:35:754 [pid=1618602 tid=1618602] INFO   cufio_core:1070 CUFile initialization complete
+ 11-08-2026 21:15:35:754 [pid=1618602 tid=1618602] DEBUG  cufio:200 cuFileHandleRegister invoked
+ 11-08-2026 21:15:35:763 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found wwid nvme0n1
+ 11-08-2026 21:15:35:763 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found device/transport nvme0n1
+ 11-08-2026 21:15:35:763 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found model nvme0n1
+ 11-08-2026 21:15:35:763 [pid=1618602 tid=1618602] DEBUG  cufio-udev:312 detected nvme model: Amazon Elastic Block Store               wwid: uuid.674874e5-a5ae-583b-befc-3247e7122b0b xport: pcie /sys/devices/pci0000:00/0000:00:04.0/nvme/nvme0/nvme0n1
+ 11-08-2026 21:15:35:764 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found wwid nvme0n1p1
+ 11-08-2026 21:15:35:764 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found device/transport nvme0n1p1
+ 11-08-2026 21:15:35:764 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found model nvme0n1p1
+ 11-08-2026 21:15:35:764 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found wwid nvme0n1p13
+ 11-08-2026 21:15:35:764 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found device/transport nvme0n1p13
+ 11-08-2026 21:15:35:765 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found model nvme0n1p13
+ 11-08-2026 21:15:35:765 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found wwid nvme0n1p14
+ 11-08-2026 21:15:35:765 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found device/transport nvme0n1p14
+ 11-08-2026 21:15:35:765 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found model nvme0n1p14
+ 11-08-2026 21:15:35:766 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found wwid nvme0n1p15
+ 11-08-2026 21:15:35:766 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found device/transport nvme0n1p15
+ 11-08-2026 21:15:35:766 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found model nvme0n1p15
+ 11-08-2026 21:15:35:766 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found wwid nvme1n1
+ 11-08-2026 21:15:35:766 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found device/transport nvme1n1
+ 11-08-2026 21:15:35:766 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found model nvme1n1
+ 11-08-2026 21:15:35:766 [pid=1618602 tid=1618602] DEBUG  cufio-udev:312 detected nvme model: Amazon EC2 NVMe Instance Storage         wwid: eui.2db9b65461c122ef40b4cd0000000001 xport: pcie /sys/devices/pci0000:44/0000:44:00.0/0000:45:00.0/0000:46:01.5/0000:54:00.0/nvme/nvme1/nvme1n1
+ 11-08-2026 21:15:35:767 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found wwid nvme5n1
+ 11-08-2026 21:15:35:767 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found device/transport nvme5n1
+ 11-08-2026 21:15:35:767 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found model nvme5n1
+ 11-08-2026 21:15:35:767 [pid=1618602 tid=1618602] DEBUG  cufio-udev:312 detected nvme model: Amazon EC2 NVMe Instance Storage         wwid: eui.e2bfd52da54144b340b4cd0000000001 xport: pcie /sys/devices/pci0000:55/0000:55:00.0/0000:56:00.0/0000:57:01.5/0000:65:00.0/nvme/nvme5/nvme5n1
+ 11-08-2026 21:15:35:767 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found wwid nvme6n1
+ 11-08-2026 21:15:35:767 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found device/transport nvme6n1
+ 11-08-2026 21:15:35:768 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found model nvme6n1
+ 11-08-2026 21:15:35:768 [pid=1618602 tid=1618602] DEBUG  cufio-udev:312 detected nvme model: Amazon EC2 NVMe Instance Storage         wwid: eui.618627771693628740b4cd0000000001 xport: pcie /sys/devices/pci0000:66/0000:66:00.0/0000:67:00.0/0000:68:01.5/0000:76:00.0/nvme/nvme6/nvme6n1
+ 11-08-2026 21:15:35:768 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found wwid nvme8n1
+ 11-08-2026 21:15:35:768 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found device/transport nvme8n1
+ 11-08-2026 21:15:35:768 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found model nvme8n1
+ 11-08-2026 21:15:35:768 [pid=1618602 tid=1618602] DEBUG  cufio-udev:312 detected nvme model: Amazon EC2 NVMe Instance Storage         wwid: eui.59882ffa693ca45f40b4cd0000000001 xport: pcie /sys/devices/pci0000:77/0000:77:00.0/0000:78:00.0/0000:79:01.5/0000:87:00.0/nvme/nvme8/nvme8n1
+ 11-08-2026 21:15:35:768 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found wwid nvme2n1
+ 11-08-2026 21:15:35:769 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found device/transport nvme2n1
+ 11-08-2026 21:15:35:769 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found model nvme2n1
+ 11-08-2026 21:15:35:769 [pid=1618602 tid=1618602] DEBUG  cufio-udev:312 detected nvme model: Amazon EC2 NVMe Instance Storage         wwid: eui.a5ead96873b6383740b4cd0000000001 xport: pcie /sys/devices/pci0000:88/0000:88:00.0/0000:89:00.0/0000:8a:01.5/0000:98:00.0/nvme/nvme2/nvme2n1
+ 11-08-2026 21:15:35:769 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found wwid nvme3n1
+ 11-08-2026 21:15:35:769 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found device/transport nvme3n1
+ 11-08-2026 21:15:35:769 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found model nvme3n1
+ 11-08-2026 21:15:35:769 [pid=1618602 tid=1618602] DEBUG  cufio-udev:312 detected nvme model: Amazon EC2 NVMe Instance Storage         wwid: eui.6b048bb44de8e63340b4cd0000000001 xport: pcie /sys/devices/pci0000:99/0000:99:00.0/0000:9a:00.0/0000:9b:01.5/0000:a9:00.0/nvme/nvme3/nvme3n1
+ 11-08-2026 21:15:35:770 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found wwid nvme4n1
+ 11-08-2026 21:15:35:770 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found device/transport nvme4n1
+ 11-08-2026 21:15:35:770 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found model nvme4n1
+ 11-08-2026 21:15:35:770 [pid=1618602 tid=1618602] DEBUG  cufio-udev:312 detected nvme model: Amazon EC2 NVMe Instance Storage         wwid: eui.e34f299029aa6f9f40b4cd0000000001 xport: pcie /sys/devices/pci0000:aa/0000:aa:00.0/0000:ab:00.0/0000:ac:01.5/0000:ba:00.0/nvme/nvme4/nvme4n1
+ 11-08-2026 21:15:35:770 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found wwid nvme7n1
+ 11-08-2026 21:15:35:770 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found device/transport nvme7n1
+ 11-08-2026 21:15:35:770 [pid=1618602 tid=1618602] DEBUG  cufio-udev:94 sysfs attribute found model nvme7n1
+ 11-08-2026 21:15:35:770 [pid=1618602 tid=1618602] DEBUG  cufio-udev:312 detected nvme model: Amazon EC2 NVMe Instance Storage         wwid: eui.5e95917a0f7b862b40b4cd0000000001 xport: pcie /sys/devices/pci0000:bb/0000:bb:00.0/0000:bc:00.0/0000:bd:01.5/0000:cb:00.0/nvme/nvme7/nvme7n1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] ERROR  cufio-fs:328 error creating udev_device for block device dev_no: 0:36
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] ERROR  cufio-fs:777 error getting volume attributes error for device: dev_no: 0:36
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] DEBUG  cufio_core:1272 cuFile DIO status for file descriptor 3 DirectIO not supported
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] ERROR  cufio:289 cuFileHandleRegister error, file checks failed
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] ERROR  cufio:331 cuFileHandleRegister error: GPUDirect Storage not supported on current file
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] DEBUG  cufio:348 cuFileHandleDeregister invoked
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] ERROR  cufio-obj:56 cuFile error fetching fd, null CUfileHandle
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] ERROR  cufio:359 cuFile invalid file handle to destroy
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  cufio:884 cuFileDriver closing
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] DEBUG  cufio_core:1155 cuFile clearing stream information
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] DEBUG  cufio_core:1158 cuFile clearing active batch operations
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] DEBUG  cufio_core:1160 Destroying Batch Pool
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:772 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:773 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:774 [pid=1618602 tid=1618602] TRACE  0:399 Batch Ctx state 1
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  cufio_core:1163 cuFile clearing buffer hashtable
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  0:207 Bounce buffer io is not in-progress
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:99 Posix Bounce buffer io is not in-progress
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  cufio_core:1192 cuFile destroying posix buffer pool
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:468 Releasing POSIX pool buffers
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 4096 for GPU: 0
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 0 num objects: 128
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 0 num objects: 128
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 1048576 for GPU: 0
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 0 num objects: 64
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 0 num objects: 64
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 16777216 for GPU: 0
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 0 num objects: 64
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 0 num objects: 64
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 4096 for GPU: 1
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 1 num objects: 128
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 1 num objects: 128
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 1048576 for GPU: 1
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 1 num objects: 64
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 1 num objects: 64
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 16777216 for GPU: 1
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 1 num objects: 64
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 1 num objects: 64
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 4096 for GPU: 2
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 2 num objects: 128
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 2 num objects: 128
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 1048576 for GPU: 2
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 2 num objects: 64
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 2 num objects: 64
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 16777216 for GPU: 2
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 2 num objects: 64
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 2 num objects: 64
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 4096 for GPU: 3
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 3 num objects: 128
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 3 num objects: 128
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 1048576 for GPU: 3
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 3 num objects: 64
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 3 num objects: 64
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 16777216 for GPU: 3
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 3 num objects: 64
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 3 num objects: 64
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 4096 for GPU: 4
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 4 num objects: 128
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 4 num objects: 128
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 1048576 for GPU: 4
+ 11-08-2026 21:15:35:775 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 4 num objects: 64
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 4 num objects: 64
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 16777216 for GPU: 4
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 4 num objects: 64
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 4 num objects: 64
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 4096 for GPU: 5
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 5 num objects: 128
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 5 num objects: 128
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 1048576 for GPU: 5
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 5 num objects: 64
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 5 num objects: 64
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 16777216 for GPU: 5
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 5 num objects: 64
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 5 num objects: 64
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 4096 for GPU: 6
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 6 num objects: 128
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 6 num objects: 128
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 1048576 for GPU: 6
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 6 num objects: 64
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 6 num objects: 64
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 16777216 for GPU: 6
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 6 num objects: 64
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 6 num objects: 64
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 4096 for GPU: 7
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 7 num objects: 128
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 7 num objects: 128
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 1048576 for GPU: 7
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 7 num objects: 64
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 7 num objects: 64
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio-px-pool:476 Releasing POSIX pool size: 16777216 for GPU: 7
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:46 Tearing down POSIX pool slab for gpu 7 num objects: 64
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio-px-pool:65 Freed POSIX pool slab for gpu 7 num objects: 64
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] INFO   cufio-px-pool:487 POSIX pool buffer release complete
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio_core:1197 cuFile clearing file hashtable
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio_core:1200 cuFile clearing volumeAttributes
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio_core:1203 cuFile cleanring pciGroupMap
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio_core:1207 cuFile cleanring pci group number map
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio_core:1211 cuFile clearing Dynamic Routing info
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio_core:1214 cuFile clearing pci topology
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio_core:1217 cuFile clearing all gpu entries
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio_core:1220 cuFile closing Driver
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:182 Tearing down bounce buffers
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:106 Tearing down buffers from GPU 0
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:114 free buffers 128
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:106 Tearing down buffers from GPU 1
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:114 free buffers 128
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:106 Tearing down buffers from GPU 2
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:114 free buffers 128
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:106 Tearing down buffers from GPU 3
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:114 free buffers 128
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:106 Tearing down buffers from GPU 4
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:114 free buffers 128
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:106 Tearing down buffers from GPU 5
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:114 free buffers 128
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:106 Tearing down buffers from GPU 6
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:114 free buffers 128
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:148 Tearing down pci-info with 1 GPUs
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:106 Tearing down buffers from GPU 7
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  0:114 free buffers 128
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] INFO   0:152 nvidia_fs driver closed
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio_core:1228 cuFile clearing all hashtables
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] DEBUG  cufio_core:1231 cuFile shutting threadpool
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio_core:137 killing pollworker 0x27416370
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123642551050240 thread: 0x27416370
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1619020] TRACE  cufio_core:86 Thread func exited 0x27416370 tid: 123642551050240
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1618602] TRACE  cufio_core:144 killing cuFileWaitQueue 0x274cf7f0
+ 11-08-2026 21:15:35:776 [pid=1618602 tid=1619036] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619025] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619030] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619030] TRACE  cufio_core:86 Thread func exited 0x274d9ae0 tid: 123642268590080
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619028] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619040] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619040] TRACE  cufio_core:86 Thread func exited 0x274c78f0 tid: 123641211633664
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619024] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619024] TRACE  cufio_core:86 Thread func exited 0x27d44230 tid: 123642525872128
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619025] TRACE  cufio_core:86 Thread func exited 0x2773bee0 tid: 123642310553600
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619034] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619034] TRACE  cufio_core:86 Thread func exited 0x27ebe7f0 tid: 123641874333696
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619026] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619026] TRACE  cufio_core:86 Thread func exited 0x27ec0ca0 tid: 123642302160896
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619050] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619050] TRACE  cufio_core:86 Thread func exited 0x28026cd0 tid: 123640649584640
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619042] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619042] TRACE  cufio_core:86 Thread func exited 0x27744710 tid: 123641194848256
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619031] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619031] TRACE  cufio_core:86 Thread func exited 0x27c827f0 tid: 123642260197376
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619023] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619023] TRACE  cufio_core:86 Thread func exited 0x278bea90 tid: 123642534264832
+ 11-08-2026 21:15:35:777 [pid=1618602 tid=1619049] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619049] TRACE  cufio_core:86 Thread func exited 0x27ecfbe0 tid: 123640657977344
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619022] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619022] TRACE  cufio_core:86 Thread func exited 0x27ec1770 tid: 123642542657536
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619038] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619038] TRACE  cufio_core:86 Thread func exited 0x2786a380 tid: 123641228419072
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619027] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x27e2f000
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123641882726400 thread: 0x27e2f000
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619021] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619021] TRACE  cufio_core:86 Thread func exited 0x27e2f000 tid: 123641882726400
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619037] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619045] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619052] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619029] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619029] TRACE  cufio_core:86 Thread func exited 0x2767f370 tid: 123642276982784
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619032] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619032] TRACE  cufio_core:86 Thread func exited 0x27c7eba0 tid: 123641907900416
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619027] TRACE  cufio_core:86 Thread func exited 0x280982f0 tid: 123642293768192
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619047] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619047] TRACE  cufio_core:86 Thread func exited 0x27522410 tid: 123640674762752
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619039] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619039] TRACE  cufio_core:86 Thread func exited 0x27d2fa00 tid: 123641220026368
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619041] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 0
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x27ec1770
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123642542657536 thread: 0x27ec1770
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619045] TRACE  cufio_core:86 Thread func exited 0x274d27f0 tid: 123640691548160
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619046] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619046] TRACE  cufio_core:86 Thread func exited 0x273ed540 tid: 123640683155456
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619048] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619048] TRACE  cufio_core:86 Thread func exited 0x2802a210 tid: 123640666370048
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619035] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619035] TRACE  cufio_core:86 Thread func exited 0x278bf270 tid: 123641865940992
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619036] TRACE  cufio_core:86 Thread func exited 0x278be400 tid: 123641857548288
+ 11-08-2026 21:15:35:778 [pid=1618602 tid=1619037] TRACE  cufio_core:86 Thread func exited 0x27eb9990 tid: 123641236811776
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1619041] TRACE  cufio_core:86 Thread func exited 0x278c5800 tid: 123641203240960
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1619033] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1619033] TRACE  cufio_core:86 Thread func exited 0x27d7fa20 tid: 123641899507712
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 1
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x278bea90
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123642534264832 thread: 0x278bea90
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 2
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x27d44230
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123642525872128 thread: 0x27d44230
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1619044] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1619044] TRACE  cufio_core:86 Thread func exited 0x274d7e70 tid: 123640699940864
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1619043] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1619052] TRACE  cufio_core:86 Thread func exited 0x27c7fa40 tid: 123640288894976
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1619051] TRACE  0:14 threadpool cleanup triggered, thread woken up and returning
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1619051] TRACE  cufio_core:86 Thread func exited 0x27b1a140 tid: 123640297287680
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1619043] TRACE  cufio_core:86 Thread func exited 0x2773baa0 tid: 123641186455552
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 3
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x2773bee0
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123642310553600 thread: 0x2773bee0
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1619028] TRACE  cufio_core:86 Thread func exited 0x27e26420 tid: 123642285375488
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 4
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x27ec0ca0
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123642302160896 thread: 0x27ec0ca0
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 5
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x280982f0
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123642293768192 thread: 0x280982f0
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 6
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x27e26420
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123642285375488 thread: 0x27e26420
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 7
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x2767f370
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123642276982784 thread: 0x2767f370
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 8
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x274d9ae0
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123642268590080 thread: 0x274d9ae0
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 9
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x27c827f0
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123642260197376 thread: 0x27c827f0
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 10
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x27c7eba0
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123641907900416 thread: 0x27c7eba0
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 11
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x27d7fa20
+ 11-08-2026 21:15:35:779 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123641899507712 thread: 0x27d7fa20
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 12
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x27ebe7f0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123641874333696 thread: 0x27ebe7f0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 13
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x278bf270
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123641865940992 thread: 0x278bf270
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 14
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x278be400
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123641857548288 thread: 0x278be400
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 15
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x27eb9990
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123641236811776 thread: 0x27eb9990
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 16
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x2786a380
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123641228419072 thread: 0x2786a380
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 17
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x27d2fa00
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123641220026368 thread: 0x27d2fa00
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 18
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x274c78f0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123641211633664 thread: 0x274c78f0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 19
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x278c5800
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123641203240960 thread: 0x278c5800
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 20
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x27744710
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123641194848256 thread: 0x27744710
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 21
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x2773baa0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123641186455552 thread: 0x2773baa0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 22
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x274d7e70
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123640699940864 thread: 0x274d7e70
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 23
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x274d27f0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123640691548160 thread: 0x274d27f0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 24
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x273ed540
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123640683155456 thread: 0x273ed540
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 25
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x27522410
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123640674762752 thread: 0x27522410
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 26
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x2802a210
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123640666370048 thread: 0x2802a210
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 27
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x27ecfbe0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123640657977344 thread: 0x27ecfbe0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 28
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x28026cd0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123640649584640 thread: 0x28026cd0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 29
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x27b1a140
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123640297287680 thread: 0x27b1a140
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 30
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:154 Waiting for thread to join 0x27c7fa40
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:45 marking thread exit 123640288894976 thread: 0x27c7fa40
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:48 Thread exited
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:156 Thread Joined %d 31
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:72 delete workqueue 0x27ebf9d0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:33 Killing workQueue 0x27ebf9d0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:72 delete workqueue 0x274d85e0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:33 Killing workQueue 0x274d85e0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:72 delete workqueue 0x27aeadd0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:33 Killing workQueue 0x27aeadd0
+ 11-08-2026 21:15:35:780 [pid=1618602 tid=1618602] TRACE  cufio_core:72 delete workqueue 0x27ad9bb0
+ 11-08-2026 21:15:35:781 [pid=1618602 tid=1618602] TRACE  cufio_core:33 Killing workQueue 0x27ad9bb0
+ 11-08-2026 21:15:35:781 [pid=1618602 tid=1618602] TRACE  cufio_core:72 delete workqueue 0x27d2eae0
+ 11-08-2026 21:15:35:781 [pid=1618602 tid=1618602] TRACE  cufio_core:33 Killing workQueue 0x27d2eae0
+ 11-08-2026 21:15:35:781 [pid=1618602 tid=1618602] TRACE  cufio_core:72 delete workqueue 0x27f69370
+ 11-08-2026 21:15:35:781 [pid=1618602 tid=1618602] TRACE  cufio_core:33 Killing workQueue 0x27f69370
+ 11-08-2026 21:15:35:781 [pid=1618602 tid=1618602] TRACE  cufio_core:72 delete workqueue 0x274d5050
+ 11-08-2026 21:15:35:781 [pid=1618602 tid=1618602] TRACE  cufio_core:33 Killing workQueue 0x274d5050
+ 11-08-2026 21:15:35:781 [pid=1618602 tid=1618602] TRACE  cufio_core:72 delete workqueue 0x274cdad0
+ 11-08-2026 21:15:35:781 [pid=1618602 tid=1618602] TRACE  cufio_core:33 Killing workQueue 0x274cdad0
+ 11-08-2026 21:15:35:781 [pid=1618602 tid=1618602] INFO   cufio_core:1240 cuFile shutdown
+ 11-08-2026 21:15:35:781 [pid=1618602 tid=1618602] INFO   cufio_core:1242 Logger Shutdown

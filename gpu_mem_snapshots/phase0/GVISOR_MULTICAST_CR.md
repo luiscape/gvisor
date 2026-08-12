@@ -169,6 +169,16 @@ retried:
 * **Sorting members by PID to approximate exporter-before-importer: 6/9,
   against 5/8 unsorted.** No effect, and the ordering is not even stable enough
   to make the outcome reproducible, so the code deliberately does not sort.
+* **Retrying just the failed members, after every member that could be restored
+  has been: does not help.** The retry fired once across five runs and reported
+  `still failing after a retry`.
+
+That last one matters: if this were purely a restore-order problem, a second
+pass would find the missing exporter already running. It does not, so the first
+failure is corrupting shared job state rather than merely arriving too early —
+which is why none of the orchestration-level fixes above work, and why a fix has
+to come from cuda-checkpoint. The mitigation available today is to retry the
+whole checkpoint/restore.
 
 ## A bug worth remembering: handle aliases
 
