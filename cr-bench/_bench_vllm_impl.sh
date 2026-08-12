@@ -212,8 +212,22 @@ LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:/usr/loc
     # toggle -- with no change to gVisor itself.
     if [[ "${NCCL_CKPT_PATCH:-0}" = "1" ]]; then
         CB_ENV+=$'\n'"LD_PRELOAD=$NCCL_CKPT_PATCH_PATH"
-        CB_ENV+=$'\n'"NCCL_CKPT_CTRL_DIR=$NCCL_CKPT_CTRL_DIR"
-        CB_ENV+=$'\n'"GVISOR_CUDA_MULTICAST_SHIM_DIR=$NCCL_CKPT_CTRL_DIR"
+        # Point vLLM's pynccl at the patched library explicitly, so its
+        # ctypes.CDLL loads the one that has the NVLS suspend extension
+        # rather than the torch-bundled 2.29.7.
+        CB_ENV+=$'\n'"VLLM_NCCL_SO_PATH=$NCCL_CKPT_PATCH_PATH"
+        if [[ "${NCCL_ENGINE_HOOK:-0}" = "1" ]]; then
+            # Engine-driven: vLLM's sleep/wake_up call the API themselves.
+            # Deliberately no NCCL_CKPT_CTRL_DIR (NCCL's control thread stays
+            # inert) and no GVISOR_CUDA_MULTICAST_SHIM_DIR (the sentry drives
+            # nothing and waits for no acks), so this measures the engine hook
+            # alone. gVisor's blocker gate still runs and will name anything
+            # left live.
+            CB_ENV+=$'\n'"VLLM_NCCL_SUSPEND_HOOK=1"
+        else
+            CB_ENV+=$'\n'"NCCL_CKPT_CTRL_DIR=$NCCL_CKPT_CTRL_DIR"
+            CB_ENV+=$'\n'"GVISOR_CUDA_MULTICAST_SHIM_DIR=$NCCL_CKPT_CTRL_DIR"
+        fi
     fi
     cb_write_bundle
 

@@ -8,16 +8,40 @@
 # natively under runc with no gVisor in the loop. Classifying it separately keeps
 # it from being confused with an interposer problem.
 #
-# Usage: sudo [TRIALS=3] [TP=2] [GPUS=0,1] [EAGER=0] bash vllm_trials.sh
+# MECH selects which mechanism releases the multicast layer. Both are driven by
+# the same gVisor orchestration, so this is a like-for-like comparison:
+#   mcshim (default) -- generic libcuda interposer; covers every multicast
+#                       owner (NCCL NVLS, vLLM custom all-reduce, torch
+#                       symmetric memory)
+#   nccl             -- patched libnccl whose ncclCommSuspend/Resume also
+#                       release the NVLS layer, plus NCCL's control thread.
+#                       Covers only multicast NCCL owns, so the other owners
+#                       must be disabled (done automatically below).
+#
+# Usage: sudo [TRIALS=3] [TP=2] [GPUS=0,1] [EAGER=0] [MECH=mcshim|nccl] \
+#             bash vllm_trials.sh
 set -uo pipefail
 cd "$(dirname "$0")"
 
 TRIALS="${TRIALS:-3}"
 TP="${TP:-2}"
 GPUS="${GPUS:-0,1}"
+MECH="${MECH:-mcshim}"
 export EAGER="${EAGER:-0}"
 export RUNSC="${RUNSC:-/usr/local/bin/runsc-phase0}"
-export CUDA_CKPT_JOB_FILE=1 CUDA_MULTICAST_SHIM=1
+export CUDA_CKPT_JOB_FILE=1
+case "$MECH" in
+  mcshim) export CUDA_MULTICAST_SHIM=1 NCCL_CKPT_PATCH=0 ;;
+  nccl)
+    export CUDA_MULTICAST_SHIM=0 NCCL_CKPT_PATCH=1
+    # NCCL can only release multicast NCCL owns; leave any other owner live
+    # and the blocker gate refuses the checkpoint (by design).
+    export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-1}"
+    export DISABLE_CUSTOM_ALL_REDUCE="${DISABLE_CUSTOM_ALL_REDUCE:-1}"
+    export VLLM_ALLREDUCE_USE_SYMM_MEM="${VLLM_ALLREDUCE_USE_SYMM_MEM:-0}"
+    ;;
+  *) echo "unknown MECH=$MECH (want mcshim|nccl)" >&2; exit 2 ;;
+esac
 # Job members have historically had to be toggled one at a time so that an
 # importer restores after its exporter. Overridable, because once the interposer
 # has released the multicast objects and peer imports before the checkpoint,
@@ -40,7 +64,7 @@ reap() {
 pass=0 toggle=0 other=0
 for ((i = 1; i <= TRIALS; i++)); do
     log=$(mktemp /tmp/vllmtrial.XXXXXX.log)
-    printf 'trial %d/%d (TP=%s eager=%s seq=%s): ' "$i" "$TRIALS" "$TP" "$EAGER" "$CUDA_CKPT_SEQUENTIAL"
+    printf 'trial %d/%d (mech=%s TP=%s eager=%s seq=%s): ' "$i" "$TRIALS" "$MECH" "$TP" "$EAGER" "$CUDA_CKPT_SEQUENTIAL"
     timeout 1500 bash ./bench_4_vllm_multi.sh --gpus "$GPUS" --tp "$TP" >"$log" 2>&1
     # cuda-checkpoint reports a failed restore toggle in the sentry log, not on
     # the benchmark's stdout, so classify against the run's artifacts too.
@@ -62,7 +86,7 @@ for ((i = 1; i <= TRIALS; i++)); do
 done
 
 echo
-echo "pass $pass/$TRIALS, cuda-checkpoint toggle failures $toggle, other $other"
+echo "mech=$MECH TP=$TP: pass $pass/$TRIALS, cuda-checkpoint toggle failures $toggle, other $other"
 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ' '
 echo
 [[ $other -eq 0 ]]

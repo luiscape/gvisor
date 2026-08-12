@@ -319,6 +319,21 @@ cb_prepare_rootfs() {
             && ok "Staged patched NCCL at ${NCCL_CKPT_PATCH_PATH}" \
             || die "failed to stage $NCCL_CKPT_PATCH_SRC"
     fi
+    # NCCL_ENGINE_HOOK=1: engine-side suspend/resume. vLLM's own sleep/wake_up
+    # call the NCCL API, so nothing outside the engine drives the transition
+    # (no interposer, no control thread, no gVisor marker driving).
+    if [[ "${NCCL_ENGINE_HOOK:-0}" = "1" ]]; then
+        local pydir
+        for pydir in python3.12 python3.10 python3.11; do
+            [[ -d "${ROOTFS_DIR}/usr/local/lib/$pydir/dist-packages" ]] || continue
+            install -D -m 0644 "$CB_DIR/vllm_nccl_ckpt.py" \
+                "${ROOTFS_DIR}/usr/local/lib/$pydir/dist-packages/vllm_nccl_ckpt.py" \
+                || die "failed to stage vllm_nccl_ckpt.py"
+        done
+        python3 "$CB_DIR/patch_vllm_nccl_hook.py" "$ROOTFS_DIR" \
+            && ok "Patched vLLM worker sleep/wake_up to call ncclCommSuspend/Resume" \
+            || die "failed to patch vLLM for the NCCL engine hook"
+    fi
 
     mount -t overlay overlay \
         -o "lowerdir=${ROOTFS_DIR},upperdir=${ROOTFS_UPPER},workdir=${ROOTFS_WORK}" \
