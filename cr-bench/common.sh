@@ -267,6 +267,7 @@ cb_runsc_flags() {
 # mount a per-run overlay at ROOTFS_MERGED.
 cb_prepare_rootfs() {
     info "Prepare rootfs"
+    cb_require_disk
 
     if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
         info "  Building Docker image '$IMAGE' …"
@@ -319,27 +320,55 @@ cb_prepare_rootfs() {
             && ok "Staged patched NCCL at ${NCCL_CKPT_PATCH_PATH}" \
             || die "failed to stage $NCCL_CKPT_PATCH_SRC"
     fi
+
+
     # NCCL_ENGINE_HOOK=1: engine-side suspend/resume. vLLM's own sleep/wake_up
     # call the NCCL API, so nothing outside the engine drives the transition
     # (no interposer, no control thread, no gVisor marker driving).
-    if [[ "${NCCL_ENGINE_HOOK:-0}" = "1" ]]; then
-        local pydir
-        for pydir in python3.12 python3.10 python3.11; do
-            [[ -d "${ROOTFS_DIR}/usr/local/lib/$pydir/dist-packages" ]] || continue
-            install -D -m 0644 "$CB_DIR/vllm_nccl_ckpt.py" \
-                "${ROOTFS_DIR}/usr/local/lib/$pydir/dist-packages/vllm_nccl_ckpt.py" \
-                || die "failed to stage vllm_nccl_ckpt.py"
-        done
-        python3 "$CB_DIR/patch_vllm_nccl_hook.py" "$ROOTFS_DIR" \
-            && ok "Patched vLLM worker sleep/wake_up to call ncclCommSuspend/Resume" \
-            || die "failed to patch vLLM for the NCCL engine hook"
-    fi
+    #
+    # Applied to the per-run overlay below, never to ROOTFS_DIR: that is a
+    # cache shared by every bench, and an engine patch left behind there would
+    # silently affect unrelated runs.
+    _cb_stage_nccl_engine_hook_after_mount=0
+    [[ "${NCCL_ENGINE_HOOK:-0}" = "1" ]] && _cb_stage_nccl_engine_hook_after_mount=1
 
     mount -t overlay overlay \
         -o "lowerdir=${ROOTFS_DIR},upperdir=${ROOTFS_UPPER},workdir=${ROOTFS_WORK}" \
         "$ROOTFS_MERGED" && ok "Overlay mounted at $ROOTFS_MERGED" || {
         fail "Failed to mount rootfs overlay"; exit 1
     }
+
+    if [[ "$_cb_stage_nccl_engine_hook_after_mount" = "1" ]]; then
+        local pydir
+        for pydir in python3.12 python3.10 python3.11; do
+            [[ -d "${ROOTFS_MERGED}/usr/local/lib/$pydir/dist-packages" ]] || continue
+            install -D -m 0644 "$CB_DIR/vllm_nccl_ckpt.py" \
+                "${ROOTFS_MERGED}/usr/local/lib/$pydir/dist-packages/vllm_nccl_ckpt.py" \
+                || die "failed to stage vllm_nccl_ckpt.py"
+        done
+        python3 "$CB_DIR/patch_vllm_nccl_hook.py" "$ROOTFS_MERGED" \
+            && ok "Patched vLLM worker sleep/wake_up to call ncclCommSuspend/Resume (per-run overlay)" \
+            || die "failed to patch vLLM for the NCCL engine hook"
+    fi
+}
+
+# Checkpoint images are tens of GB. A full disk does not fail cleanly: it
+# surfaces as "failed to save MemoryFile pages: no space left on device",
+# which the trial harness files under "other" -- the bucket that is supposed to
+# mean "possibly ours". That silently depressed a measured pass rate here
+# (2/5 and 3/5 on a full disk, 4/5 once cleaned), so check up front.
+cb_require_disk() {
+    local need_gb="${CB_MIN_FREE_GB:-60}" avail_gb
+    avail_gb=$(df -BG --output=avail "$DATA_ROOT" 2>/dev/null | tail -1 | tr -dc '0-9')
+    [[ -n "$avail_gb" ]] || return 0
+    if (( avail_gb < need_gb )); then
+        fail "Only ${avail_gb}GB free under $DATA_ROOT; need ${need_gb}GB."
+        fail "Old run artifacts are the usual cause:"
+        fail "    sudo rm -rf $DATA_ROOT/${BENCH_NAME%-*}-*"
+        fail "(keep rootfs-* -- those are the image caches)"
+        exit 1
+    fi
+    ok "Disk: ${avail_gb}GB free under $DATA_ROOT"
 }
 
 # The image has the CUDA runtime but NOT the host driver userspace

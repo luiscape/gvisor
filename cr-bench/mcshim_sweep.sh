@@ -77,5 +77,9 @@ for cell in "${ORDER[@]}"; do
     fi
     printf '%-12s %-8s %-10s %-10s %s\n' "$cell" "$res" "${ck:-–}" "${rs:-–}" "$note"
     rm -f "$log"
+    # See vllm_trials.sh: checkpoint images are tens of GB and a full disk
+    # produces a save failure that masquerades as a bug of ours.
+    # reap first: the sandbox still holds mounts under the artifact dir.
     reap
+    [[ "${KEEP_ARTIFACTS:-0}" = "1" || -z "$art" ]] || rm -rf "$art" 2>/dev/null
 done

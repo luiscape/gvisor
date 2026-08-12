@@ -82,7 +82,13 @@ for ((i = 1; i <= TRIALS; i++)); do
         echo "FAIL (other): $(grep -ohE 'wake_up response: .*|FAIL: .*|Container exited.*' "$log" | tail -1 | cut -c1-120)"
     fi
     rm -f "$log"
+    # Each trial leaves a checkpoint image of tens of GB. Left to accumulate
+    # they fill the disk, and a full disk shows up as a save failure that lands
+    # in the "other" bucket -- i.e. it looks like our bug. Classification is
+    # already done by this point, so drop the artifacts.
+    # reap first: the sandbox still holds mounts under the artifact dir.
     reap
+    [[ "${KEEP_ARTIFACTS:-0}" = "1" || -z "$art" ]] || rm -rf "$art" 2>/dev/null
 done
 
 echo
