@@ -27,9 +27,19 @@ set -uo pipefail
 cd "$(dirname "$0")"
 PHASE0_DIR=$(pwd)
 
+# MECH selects what releases the multicast layer:
+#   nccl   (default) patched libnccl + NCCL's control thread. Covers multicast
+#                    NCCL owns; a torch symmetric-memory team is invisible to
+#                    it (SYMM_MEM=1 then fails, by design).
+#   mcshim           the libcuda-level interposer, driven by gVisor. Sits below
+#                    every multicast owner, so it should cover BOTH NCCL's NVLS
+#                    and torch symmetric memory.
+MECH="${MECH:-nccl}"
 RUNSC="${RUNSC:-/usr/local/bin/runsc-phase0}"
 CUDA_CHECKPOINT="${CUDA_CHECKPOINT:-/usr/local/bin/cuda-checkpoint}"
 NCCL_LIB="${NCCL_LIB:-/opt/phase0/nccl-patched/libnccl.so.2}"
+MCSHIM_SO="${MCSHIM_SO:-$PHASE0_DIR/mcshim/mcshim.so}"
+MCSHIM_IN_CTR=/opt/phase0/torchtier/mcshim.so
 ROOTFS="${ROOTFS:-/data/cr-bench/rootfs-cr-bench-vllm}"
 WORLD="${WORLD:-4}"
 WORK=/tmp/torch-nccl-gvisor
@@ -44,8 +54,13 @@ log(){ echo "[torch-gvisor $(date +%H:%M:%S)] $*"; }
 [[ -d "$ROOTFS" ]] || { log "rootfs not found at $ROOTFS (extract the benchmark image first)"; exit 1; }
 UVM_MAJOR=$(awk '$2=="nvidia-uvm"{print $1}' /proc/devices)
 
+SHIM_FLAG=()
+if [[ "$MECH" == "mcshim" ]]; then
+  [[ -f "$MCSHIM_SO" ]] || { log "mcshim not built at $MCSHIM_SO (run mcshim/build.sh)"; exit 1; }
+  SHIM_FLAG=(--cuda-multicast-shim-path "$MCSHIM_IN_CTR")
+fi
 runsc(){ "$RUNSC" --root "$WORK/root" --debug --debug-log="$WORK/logs/" \
-         --cuda-checkpoint-path "$CUDA_CHECKPOINT" --network=none "$@"; }
+         --cuda-checkpoint-path "$CUDA_CHECKPOINT" --network=none "${SHIM_FLAG[@]}" "$@"; }
 cleanup(){ runsc delete -force "$CID" >/dev/null 2>&1 || true
            runsc delete -force "$CID_R" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
@@ -56,10 +71,20 @@ rm -rf "$WORK" 2>/dev/null; mkdir -p "$WORK"/{root,logs,img,bundle}
 mkdir -p "$STAGE"
 cp "$PHASE0_DIR"/{torch_nccl_launcher.py,torch_nccl_ckpt.py} "$STAGE/"
 mkdir -p "$STAGE/nccl" && cp "$NCCL_LIB" "$STAGE/nccl/libnccl.so.2"
+[[ "$MECH" == "mcshim" ]] && cp "$MCSHIM_SO" "$STAGE/mcshim.so"
 for m in nvidia nvidia_uvm; do
   mkdir -p "$STAGE/sys_module_$m"; echo live > "$STAGE/sys_module_$m/initstate"
 done
 chmod -R a+rX "$STAGE"
+
+# The NCCL control thread is enabled only for MECH=nccl. Under MECH=mcshim the
+# interposer is the sole mechanism, so NCCL must not also be tearing its own
+# multicast down underneath it.
+if [[ "$MECH" == "nccl" ]]; then
+  CTRL_ENV_LINE="      \"NCCL_CKPT_CTRL_DIR=$CTRL_DIR\","
+else
+  CTRL_ENV_LINE=""
+fi
 
 WORKLOAD_ARGS='"--dir", "'"$CTRL_DIR"'"'
 [[ "${NO_GRAPH:-0}" = "1" ]] && WORKLOAD_ARGS+=', "--no-graph"'
@@ -83,7 +108,7 @@ cat > "$WORK/bundle/config.json" <<EOF
     "env": [
       "PATH=/usr/local/bin:/usr/bin:/bin",
       "LD_PRELOAD=$STAGE/nccl/libnccl.so.2",
-      "NCCL_CKPT_CTRL_DIR=$CTRL_DIR",
+$CTRL_ENV_LINE
       "NCCL_NVLS_ENABLE=1",
       "NCCL_SOCKET_IFNAME=lo",
       "NCCL_DEBUG=WARN",
@@ -137,11 +162,19 @@ runsc run -detach -bundle "$WORK/bundle" -pid-file "$WORK/pid" "$CID" \
 wait_count "$CID" status "iter=" 900 || { log "ranks never started"; status_all "$CID"; tail -40 "$WORK"/logs/*boot*; exit 1; }
 log "  ranks verifying: $(status_all "$CID" | head -1)"
 
-log "(b) pause the app, then ask NCCL to release its NVLS multicast layer"
+# The app pauses in both mechanisms: ncclCommSuspend cannot run under a live
+# collective, and a captured CUDA graph replay bypasses NCCL's own gate.
+log "(b) pause the app"
 runsc exec "$CID" /bin/touch "$CTRL_DIR/pause"
 wait_count "$CID" status PAUSED 120 || FAIL=1
-runsc exec "$CID" /bin/touch "$CTRL_DIR/suspend"
-wait_count "$CID" files 'suspended.*' 300 || { log "suspend not acknowledged"; FAIL=1; }
+
+if [[ "$MECH" == "nccl" ]]; then
+  log "    ask NCCL to release its NVLS multicast layer"
+  runsc exec "$CID" /bin/touch "$CTRL_DIR/suspend"
+  wait_count "$CID" files 'suspended.*' 300 || { log "suspend not acknowledged"; FAIL=1; }
+else
+  log "    (mcshim: gVisor drives the teardown inside the checkpoint)"
+fi
 
 log "(c) runsc checkpoint"
 t0=$SECONDS
@@ -156,7 +189,7 @@ log "  checkpoint rc=$CK ($((SECONDS-t0))s)"
 # With a torch symmetric-memory tensor there is a multicast owner NCCL does
 # not know about, so suspending NCCL is not enough. The correct outcome is a
 # refused checkpoint naming the rank, not a hang and not a broken snapshot.
-if [[ "${SYMM_MEM:-0}" = "1" ]]; then
+if [[ "${SYMM_MEM:-0}" = "1" && "$MECH" == "nccl" ]]; then
   BLOCKED=$(grep -h 'cannot proceed.*multicast' "$WORK"/logs/*boot* 2>/dev/null | tail -1)
   if [[ $CK -ne 0 && -n "$BLOCKED" ]]; then
     log "EXPECTED: NCCL released its own NVLS, but torch symmetric memory is a"
@@ -180,8 +213,12 @@ RC=$?
 log "  restore rc=$RC ($((SECONDS-t0))s)"
 [[ $RC -eq 0 ]] || { log "FAIL: restore"; tail -30 "$WORK"/logs/*restore* 2>/dev/null; exit 1; }
 runsc exec "$CID_R" /bin/touch "$CTRL_DIR/restored" 2>/dev/null || true
-runsc exec "$CID_R" /bin/rm -f "$CTRL_DIR/suspend"
-wait_count "$CID_R" files 'resumed.*' 300 || { log "resume not acknowledged"; FAIL=1; }
+if [[ "$MECH" == "nccl" ]]; then
+  runsc exec "$CID_R" /bin/rm -f "$CTRL_DIR/suspend"
+  wait_count "$CID_R" files 'resumed.*' 300 || { log "resume not acknowledged"; FAIL=1; }
+else
+  log "    (mcshim: gVisor rebuilt after the restore toggle)"
+fi
 
 log "(e) unpause; the captured graph must keep producing correct results"
 runsc exec "$CID_R" /bin/rm -f "$CTRL_DIR/pause"
