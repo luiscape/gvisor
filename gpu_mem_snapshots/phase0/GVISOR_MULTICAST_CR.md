@@ -139,6 +139,48 @@ time, which is why it was written off.
 The TP=4 row is the new capability: it previously required NVLS off, because
 live multicast made the process un-checkpointable outright.
 
+## Parameter sweep (2026-08-12): which vLLM configurations are covered
+
+vLLM 0.27 can create multicast from four places -- NCCL NVLS, custom
+all-reduce, torch symmetric memory, and the FlashInfer all-reduce backend --
+and the benchmark's defaults only exercise the first two. `mcshim_sweep.sh`
+runs one checkpoint/restore per cell at TP=2 to find breakage.
+
+| Cell | Result | Interposer saw |
+| --- | --- | --- |
+| baseline (custom all-reduce on, cuMem off) | PASS | `groups=4 imports=2` |
+| `VLLM_ALLREDUCE_USE_SYMM_MEM=1` | PASS | `groups=4 imports=2` |
+| `SLEEP_LEVEL=2` (discard all GPU memory) | PASS | `groups=4 imports=2` |
+| `NCCL_CUMEM_ENABLE=1 NCCL_NVLS_ENABLE=1` | 1/3 PASS | `groups=3 imports=50` |
+| all of the above together | PASS | `groups=3 imports=50` |
+| `VLLM_ALLREDUCE_USE_FLASHINFER=1` | n/a | never boots |
+
+Three things worth recording.
+
+**The interposer did not fail in any cell.** Every failure was
+cuda-checkpoint's restore toggle, and in each of those the suspend, the
+blocker check and the rebuild all reported success first.
+
+**`NCCL_CUMEM_ENABLE=1` reproduces the toggle bug at TP=2**, which is new and
+useful. The bug was previously only reachable at TP>=4, where a run costs four
+GPUs and several minutes. Turning on cuMem takes the interposer from 2 live
+peer imports to **50** -- NCCL switches to VMM allocations -- and the toggle
+starts failing (1/3) in a configuration that is otherwise 8/8. That is direct
+evidence for the standing theory that the toggle failure is about live CUDA
+IPC/VMM imports rather than about multicast, and it gives NVIDIA a much
+cheaper reproducer than a TP=4 engine run.
+
+**Two cells prove less than they appear to.** `symmmem` reports the same
+`groups=4` as the baseline, so vLLM's symmetric-memory path evidently did not
+engage at this model size (it is size-gated by `should_use_symm_mem`); torch
+symmetric memory is covered instead by the PyTorch tier, where enabling it
+demonstrably adds a group (`groups=1` -> `groups=2`, see NCCL_PATCH_TESTS.md).
+And `flashinfer` never reaches a checkpoint at all: the image has no
+`/usr/local/cuda/bin/nvcc`, so FlashInfer cannot JIT its kernels and the
+engine dies during cold boot. Covering it needs the CUDA toolkit in the image,
+and until then nothing is known about whether the interposer handles that
+owner.
+
 ## Known limitation, outside this work
 
 At TP=4, roughly a third of runs fail inside `cuda-checkpoint --toggle`, which
