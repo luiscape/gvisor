@@ -115,6 +115,12 @@ Stock vLLM 0.27, stock NCCL, `cr-bench/bench_4_vllm_multi.sh` with
 | TP=4, NCCL NVLS on, `--enforce-eager` | **3/4 PASS** — ckpt 24.3s, restore 5.7s, answer EXACT MATCH |
 | TP=4, NCCL NVLS on, torch.compile + CUDA graphs | **5/8 PASS** — answer EXACT MATCH |
 
+vLLM is not covered at TP=8: both models baked into the benchmark image have an
+attention-head count that is not divisible by 8 (Qwen2.5-1.5B has 12), so vLLM
+refuses at startup, before anything under test runs. Testing it needs a model
+with 8 | heads added to the image. The multicast machinery itself is covered at
+8 ranks by the synthetic matrix above.
+
 Every failure in those runs was cuda-checkpoint's own restore toggle (below).
 **None was attributable to the interposer**, which is the distinction
 `cr-bench/vllm_trials.sh` exists to make: it reports a pass rate and classifies
