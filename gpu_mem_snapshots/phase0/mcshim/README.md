@@ -148,16 +148,34 @@ Two traps made this hard to see:
 Fix: wait for the interposer's per-rank `resumed` acknowledgements before
 letting the workload run.
 
-### Production implication (not yet addressed)
+### Production implication -- ADDRESSED, and now verified
 
-The harness satisfies rule 4 with an application-level pause, which a real
-workload will not have. `cuda-checkpoint --toggle` restores *and unlocks* each
-process, so in production the application becomes runnable while gVisor is
-still rebuilding -- the same race. The robust fix belongs in the interposer:
-while suspended, block in the interposed libcuda entry points (kernel launch,
-memset, memcpy, graph launch, stream/context sync) until the rebuild finishes.
-That makes the guarantee app-transparent instead of relying on the workload
-being idle.
+This section previously read "not yet addressed". It is stale: the gate was
+implemented (`GATED(...)` wrappers around `cuLaunchKernel`,
+`cuLaunchKernelEx`, `cuLaunchCooperativeKernel`, `cuGraphLaunch`, the memset
+and memcpy families, and `cuStreamSynchronize`), so a suspended interposer
+blocks the application in libcuda rather than relying on it being idle.
+
+What was missing was a test: every harness still paused the application
+itself, so the gate was never the thing doing the quiescing. That gap is now
+closed by `run_torch_nccl_gvisor.sh NO_PAUSE=1 MECH=mcshim`, which runs the
+PyTorch tier with **no application-level pause at all** -- a workload
+continuously replaying a captured CUDA graph of an NCCL collective, which is
+the hardest case, since a graph replay does not re-enter NCCL and cannot be
+stopped by anything above libcuda.
+
+Result: **3/3 PASS**, with all four ranks logging
+`GATE: app thread blocked until resume` during the checkpoint and returning
+correct results afterwards at unchanged VAs. So the guarantee really is
+app-transparent, which is what a real engine needs -- `cuda-checkpoint
+--toggle` restores *and unlocks* each process, so the application becomes
+runnable while gVisor is still rebuilding.
+
+One harness note worth keeping, because it produced a spurious failure first:
+`runsc restore -detach` returns before `postRestore` has finished rebuilding,
+and under `NO_PAUSE` the ranks are still gated at that moment. A fixed sleep
+before checking their status is therefore a race; poll for the post-restore
+line instead.
 
 ---
 

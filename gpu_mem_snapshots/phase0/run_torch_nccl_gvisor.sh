@@ -172,9 +172,23 @@ log "  ranks verifying: $(status_all "$CID" | head -1)"
 
 # The app pauses in both mechanisms: ncclCommSuspend cannot run under a live
 # collective, and a captured CUDA graph replay bypasses NCCL's own gate.
-log "(b) pause the app"
-runsc exec "$CID" /bin/touch "$CTRL_DIR/pause"
-wait_count "$CID" status PAUSED 120 || FAIL=1
+#
+# NO_PAUSE=1 skips it, which is only meaningful for MECH=mcshim: the
+# interposer gates the libcuda entry points itself (kernel launch, graph
+# launch, memcpy/memset, stream sync), so it should be able to quiesce a
+# workload that never stops on its own. That is what a real engine looks like
+# -- an application-level pause is a property of this harness, not of
+# production -- so this is the case that proves app-transparency.
+if [[ "${NO_PAUSE:-0}" = "1" ]]; then
+  log "(b) NOT pausing the app (NO_PAUSE=1): the interposer's gate must quiesce it"
+  if [[ "$MECH" != "mcshim" ]]; then
+    log "    WARNING: NO_PAUSE is only expected to work with MECH=mcshim"
+  fi
+else
+  log "(b) pause the app"
+  runsc exec "$CID" /bin/touch "$CTRL_DIR/pause"
+  wait_count "$CID" status PAUSED 120 || FAIL=1
+fi
 
 if [[ "$MECH" == "nccl" || "$MECH" == "both" ]]; then
   log "    ask NCCL to release its NVLS multicast layer"
@@ -232,15 +246,20 @@ if [[ "$MECH" == "nccl" || "$MECH" == "both" ]]; then
   wait_count "$CID_R" files 'resumed.*' 300 || { log "resume not acknowledged"; FAIL=1; }
 fi
 
-log "(e) unpause; the captured graph must keep producing correct results"
-runsc exec "$CID_R" /bin/rm -f "$CTRL_DIR/pause"
-sleep 10
+log "(e) the captured graph must keep producing correct results"
+[[ "${NO_PAUSE:-0}" = "1" ]] || runsc exec "$CID_R" /bin/rm -f "$CTRL_DIR/pause"
+# Poll rather than sleep a fixed interval. `runsc restore -detach` returns
+# before postRestore has finished rebuilding, and under NO_PAUSE the ranks are
+# still blocked in the interposer's gate at that point, so how long they take
+# to notice the restore marker and write a post-restore line varies. A fixed
+# sleep turns that into a spurious failure.
+wait_count "$CID_R" status "post-restore pass" 180 \
+  || { log "no rank reported a post-restore pass in time"; FAIL=1; }
 log "final per-rank status:"
 S=$(status_all "$CID_R")
 echo "$S" | sed 's/^/    /'
 for ((r=0; r<WORLD; r++)); do :; done
 grep -q 'FAIL' <<<"$S" && FAIL=1
-grep -q 'post-restore pass' <<<"$S" || { log "no rank reported a post-restore pass"; FAIL=1; }
 awk '/failures=[1-9]/{bad=1} END{exit bad?1:0}' <<<"$S" || { log "a rank reported failures"; FAIL=1; }
 
 runsc kill "$CID_R" KILL >/dev/null 2>&1 || true
