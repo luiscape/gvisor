@@ -36,6 +36,14 @@ REBUILD_ROOTFS="${REBUILD_ROOTFS:-0}"
 # and where it is built from on the host.
 CUDA_MULTICAST_SHIM_PATH="${CUDA_MULTICAST_SHIM_PATH:-/usr/local/lib/mcshim.so}"
 CUDA_MULTICAST_SHIM_SRC="${CUDA_MULTICAST_SHIM_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/gpu_mem_snapshots/phase0/mcshim/mcshim.so}"
+
+# NCCL_CKPT_PATCH=1 selects the NCCL-native multicast path instead of the
+# interposer: a patched libnccl whose ncclCommSuspend/Resume also release and
+# rebuild the NVLS multicast layer, plus NCCL's own control thread so the
+# engine needs no code change. See gpu_mem_snapshots/phase0/NCCL_PATCH_TESTS.md.
+NCCL_CKPT_PATCH_PATH="${NCCL_CKPT_PATCH_PATH:-/usr/local/lib/libnccl-patched.so.2}"
+NCCL_CKPT_PATCH_SRC="${NCCL_CKPT_PATCH_SRC:-/opt/phase0/nccl-patched/libnccl.so.2}"
+NCCL_CKPT_CTRL_DIR="${NCCL_CKPT_CTRL_DIR:-/tmp/ncclckpt}"
 DATA_ROOT="${DATA_ROOT:-/data/cr-bench}"
 CUDA_CHECKPOINT_PATH="${CUDA_CHECKPOINT_PATH:-/usr/local/bin/cuda-checkpoint}"
 CUDA_CKPT_SEQUENTIAL="${CUDA_CKPT_SEQUENTIAL:-0}"
@@ -302,6 +310,14 @@ cb_prepare_rootfs() {
             "${ROOTFS_DIR}${CUDA_MULTICAST_SHIM_PATH}" \
             && ok "Staged multicast interposer at ${CUDA_MULTICAST_SHIM_PATH}" \
             || die "failed to stage $CUDA_MULTICAST_SHIM_SRC"
+    fi
+    if [[ "${NCCL_CKPT_PATCH:-0}" = "1" ]]; then
+        [[ -f "$NCCL_CKPT_PATCH_SRC" ]] || \
+            die "NCCL_CKPT_PATCH=1 but $NCCL_CKPT_PATCH_SRC is missing (build nccl/ and stage it; see NCCL_PATCH_TESTS.md)"
+        install -D -m 0755 "$NCCL_CKPT_PATCH_SRC" \
+            "${ROOTFS_DIR}${NCCL_CKPT_PATCH_PATH}" \
+            && ok "Staged patched NCCL at ${NCCL_CKPT_PATCH_PATH}" \
+            || die "failed to stage $NCCL_CKPT_PATCH_SRC"
     fi
 
     mount -t overlay overlay \

@@ -92,24 +92,62 @@ The CONTROL leg is what makes the MAIN result meaningful: it proves NVLS
 multicast was genuinely engaged, and that the patch is what makes the process
 checkpointable.
 
-### Tier 2 — inference engine, sleep workflow (next)
+### Tier 2 — inference engine, sleep workflow (vLLM) — WORKING
 
-vLLM already has the lifecycle hooks this needs: `/sleep` quiesces the engine
-and releases weights, `/wake_up` brings it back, and `cr-bench/bench_4_vllm_multi.sh`
-already drives them around a checkpoint. Two ways to wire the NCCL path in:
+Enabled with `NCCL_CKPT_PATCH=1` on the existing bench. The engine is **not
+modified**: `cr-bench/common.sh` stages the patched `libnccl.so.2` into the
+rootfs and `_bench_vllm_impl.sh` adds three environment variables.
 
-* **Transparent** — set `NCCL_CKPT_CTRL_DIR` and let gVisor drive the markers,
-  exactly as tier 1 does. The engine needs no change, but rule 2 above means
-  the engine must be idle: `/sleep` already provides that.
-* **Explicit** — have the engine's sleep/wake hooks call `ncclCommSuspend`/
-  `Resume`. vLLM's pynccl communicator is reachable from Python via ctypes
-  (torch's is not), so this is feasible for vLLM's own comms but does not
-  cover torch's `ProcessGroupNCCL` ones — which is precisely why the control
-  thread exists.
+The third of those is the interesting one. NCCL's control thread speaks the
+same marker protocol as the interposer, so setting
+`GVISOR_CUDA_MULTICAST_SHIM_DIR` to the same directory as
+`NCCL_CKPT_CTRL_DIR` makes **gVisor's existing orchestration drive NCCL** —
+gate and suspend before the checkpoint, rebuild after the restore toggle —
+with no change to gVisor at all. The two mechanisms are interchangeable behind
+one driver.
 
-Requires staging the patched `libnccl.so.2` into the image (LD_PRELOAD over
-the torch-bundled 2.29.7, which has upstream `ncclCommSuspend` but no NVLS
-extension — a useful built-in A/B).
+vLLM's `/sleep` provides the quiesce that rule 1 requires and, being an engine
+pause, also covers rule 2 (its CUDA graphs are not replaying).
+
+Results, stock vLLM 0.27 + torch.compile + CUDA graphs, NVLS on, TP=2,
+`--gpus 0,1`:
+
+| Leg | Result |
+| --- | --- |
+| `NCCL_CKPT_PATCH=0` (control, NVLS live) | checkpoint **refused**: `task 680 (client 0xc1d07081): 1 multicast` |
+| `NCCL_CKPT_PATCH=1` | **PASS** — checkpoint 13.8s, restore 4.0s, wake_up ok, answer **EXACT MATCH**, 14.9x faster than cold boot (215s) |
+
+Sentry log for the passing run, showing gVisor driving NCCL:
+
+    Multicast interposer gated     2 of 4 CUDA process(es) in 100ms
+    Multicast interposer suspended 2 of 4 CUDA process(es) in 2.11s
+    Multicast interposer resumed   2 of 4 CUDA process(es) in 1.06s
+
+"2 of 4" is correct and worth noting: only the two TP workers hold NCCL
+communicators. The API server and engine-core processes hold NVIDIA device FDs
+— so gVisor lists them as CUDA processes — but never register a communicator,
+never write `present.<pid>`, and are therefore not waited on. Waiting on them
+would hang every checkpoint.
+
+Run it with:
+
+    sudo RUNSC=/usr/local/bin/runsc-phase0 \
+         CUDA_CKPT_JOB_FILE=1 CUDA_CKPT_SEQUENTIAL=1 \
+         NCCL_CKPT_PATCH=1 NCCL_NVLS_ENABLE=1 NCCL_CUMEM_ENABLE=1 \
+         DISABLE_CUSTOM_ALL_REDUCE=1 VLLM_ALLREDUCE_USE_SYMM_MEM=0 \
+         bash cr-bench/bench_4_vllm_multi.sh --gpus 0,1 --tp 2
+
+`DISABLE_CUSTOM_ALL_REDUCE=1` and `VLLM_ALLREDUCE_USE_SYMM_MEM=0` are part of
+the scope, not incidental: both allocate multicast that NCCL does not own, and
+the `SYMM_MEM=1` result below shows what happens if such an owner is left live.
+Covering those needs `mcshim`; this path covers NCCL's NVLS.
+
+**Explicit alternative (not needed, recorded for completeness):** having
+`/sleep` and `/wake_up` call `ncclCommSuspend`/`Resume` directly. vLLM's pynccl
+communicator is reachable from Python via ctypes, but torch's
+`ProcessGroupNCCL` is not, so an engine hook cannot cover every communicator —
+which is exactly why the control thread exists. The transparent path above
+covers both and needs no engine change.
 
 ## Rejection paths (new in the reworked patch)
 

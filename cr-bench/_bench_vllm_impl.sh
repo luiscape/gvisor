@@ -199,6 +199,22 @@ LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:/usr/loc
     # how to confirm which algorithm NCCL actually selected.
     [[ -n "${NCCL_DEBUG:-}" ]] && CB_ENV+=$'\n'"NCCL_DEBUG=$NCCL_DEBUG"
     [[ -n "${NCCL_DEBUG_SUBSYS:-}" ]] && CB_ENV+=$'\n'"NCCL_DEBUG_SUBSYS=$NCCL_DEBUG_SUBSYS"
+    # NCCL-native multicast path (NCCL_CKPT_PATCH=1): LD_PRELOAD the patched
+    # libnccl over the torch-bundled one and turn on its checkpoint control
+    # thread. The engine is not modified; /sleep already provides the quiesce
+    # that ncclCommSuspend requires.
+    #
+    # GVISOR_CUDA_MULTICAST_SHIM_DIR is what tells the sentry it owns a
+    # multicast transition in this container. NCCL's control thread speaks the
+    # same marker protocol as the interposer, so pointing that variable at the
+    # same directory makes gVisor's existing orchestration drive NCCL --
+    # gate/lock/suspend before the checkpoint, rebuild after the restore
+    # toggle -- with no change to gVisor itself.
+    if [[ "${NCCL_CKPT_PATCH:-0}" = "1" ]]; then
+        CB_ENV+=$'\n'"LD_PRELOAD=$NCCL_CKPT_PATCH_PATH"
+        CB_ENV+=$'\n'"NCCL_CKPT_CTRL_DIR=$NCCL_CKPT_CTRL_DIR"
+        CB_ENV+=$'\n'"GVISOR_CUDA_MULTICAST_SHIM_DIR=$NCCL_CKPT_CTRL_DIR"
+    fi
     cb_write_bundle
 
     # ── cold boot ─────────────────────────────────────────────────────────
