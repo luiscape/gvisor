@@ -139,6 +139,21 @@ time, which is why it was written off.
 The TP=4 row is the new capability: it previously required NVLS off, because
 live multicast made the process un-checkpointable outright.
 
+## Measuring a pass rate: check the disk first
+
+A TP=2 rate measured here as 2/5 and then 3/5, against 8/8 in these notes, on
+a machine that was otherwise healthy (fabric `Completed`, persistence on).
+The cause was the disk: each trial leaves a ~10GB checkpoint image, 77 runs
+had accumulated 881GB, and the volume was full. That surfaces as `failed to
+save MemoryFile pages: no space left on device`, which the trial harness files
+under "other" -- the bucket that means "possibly ours". Cleaned up, the same
+configuration measures **4/5**, the single failure being the restore toggle.
+
+`cb_require_disk` now refuses to start below 60GB free, and the trial and
+sweep harnesses delete each run's artifacts once classified (`KEEP_ARTIFACTS=1`
+opts out). Any pass rate measured before those landed should be treated as a
+lower bound.
+
 ## Parameter sweep (2026-08-12): which vLLM configurations are covered
 
 vLLM 0.27 can create multicast from four places -- NCCL NVLS, custom
