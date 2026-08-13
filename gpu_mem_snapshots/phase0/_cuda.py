@@ -32,6 +32,12 @@ CU_MULTICAST_GRANULARITY_RECOMMENDED = 0x1
 CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED = 103
 CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED = 132
 
+# Legacy (pre-VMM) CUDA IPC. A different API from cuMemExport/Import above:
+# it shares cuMemAlloc'd memory via an opaque 64-byte handle rather than an
+# OS handle, and is what cudaIpcGetMemHandle/cudaIpcOpenMemHandle call.
+CU_IPC_HANDLE_SIZE = 64
+CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 0x1
+
 
 # ---------------------------------------------------------------------------
 # structs (layouts from cuda.h, x86_64)
@@ -62,6 +68,10 @@ class CUmemAllocationProp(ctypes.Structure):
 
 class CUmemAccessDesc(ctypes.Structure):
     _fields_ = [("location", CUmemLocation), ("flags", ctypes.c_int)]
+
+
+class CUipcMemHandle(ctypes.Structure):
+    _fields_ = [("reserved", ctypes.c_byte * 64)]
 
 
 class CUmulticastObjectProp(ctypes.Structure):
@@ -104,6 +114,13 @@ _protos = {
     "cuMemSetAccess": (_c_ull, ctypes.c_size_t, ctypes.POINTER(CUmemAccessDesc), ctypes.c_size_t),
     "cuMemExportToShareableHandle": (ctypes.c_void_p, _c_ull, ctypes.c_int, _c_ull),
     "cuMemImportFromShareableHandle": (_c_ull_p, ctypes.c_void_p, ctypes.c_int),
+    # Legacy CUDA IPC. CUipcMemHandle is a 64-byte struct passed BY VALUE to
+    # cuIpcOpenMemHandle, so it needs a real ctypes.Structure -- a pointer or
+    # a bytes object would be silently wrong.
+    "cuIpcGetMemHandle": (ctypes.POINTER(CUipcMemHandle), _c_ull),
+    "cuIpcOpenMemHandle_v2": (_c_ull_p, CUipcMemHandle, ctypes.c_uint),
+    "cuIpcCloseMemHandle": (_c_ull,),
+    "cuMemFree_v2": (_c_ull,),
     "cuMemsetD32_v2": (_c_ull, ctypes.c_uint, ctypes.c_size_t),
     "cuMemcpyDtoH_v2": (ctypes.c_void_p, _c_ull, ctypes.c_size_t),
     "cuMulticastCreate": (_c_ull_p, ctypes.POINTER(CUmulticastObjectProp)),
@@ -230,6 +247,33 @@ def reserve_map_rw(handle, size, dev, va_hint=0):
     d.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE
     call("cuMemSetAccess", va.value, size, ctypes.byref(d), 1)
     return va.value
+
+
+def mem_alloc(size):
+    """cuMemAlloc_v2: a legacy (non-VMM) device allocation."""
+    p = _c_ull()
+    call("cuMemAlloc_v2", ctypes.byref(p), size)
+    return p.value
+
+
+def ipc_get_handle(dptr):
+    """cuIpcGetMemHandle: opaque 64-byte handle, shareable as plain bytes."""
+    h = CUipcMemHandle()
+    call("cuIpcGetMemHandle", ctypes.byref(h), dptr)
+    return bytes(bytearray(h.reserved))
+
+
+def ipc_open_handle(blob):
+    """cuIpcOpenMemHandle_v2: map a peer's legacy IPC handle. Returns a VA."""
+    h = CUipcMemHandle.from_buffer_copy(blob)
+    p = _c_ull()
+    call("cuIpcOpenMemHandle_v2", ctypes.byref(p), h,
+         CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS)
+    return p.value
+
+
+def ipc_close_handle(dptr):
+    call("cuIpcCloseMemHandle", dptr)
 
 
 def export_posix_fd(handle):

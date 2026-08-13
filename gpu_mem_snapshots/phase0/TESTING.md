@@ -4,6 +4,18 @@ There are two working mechanisms and about twenty runners in this directory,
 accumulated across several lines of investigation. This is the map. Start
 here.
 
+## What is actually broken (read this first)
+
+`IPC_CHECKPOINT_BISECT.md` isolates, natively and deterministically, the two
+driver defects that cap every mechanism here. Multicast is not one of them --
+it is a *consequence* of the first:
+
+1. **A live imported VMM handle breaks `restore`** (`cuMemImportFromShareableHandle`). `cuMemRelease` of the import is necessary and sufficient; unmapping is not enough, and mapping is not required. Reversible, which is what makes suspend/replay viable at all.
+2. **`cuIpcGetMemHandle` breaks `checkpoint`** on the exporter, and only freeing the allocation clears it. Not reversible, so no interposer can cover legacy CUDA IPC -- this is why vLLM's custom all-reduce must stay off.
+
+Both reproduce with no gVisor, no NCCL, no PyTorch and no multicast, in
+`ipc_scale_probe.py`.
+
 ## Which mechanism should I use?
 
 Multicast objects (`NV_MEMORY_MULTICAST_FABRIC`, class `0x00fd`) make a
@@ -78,6 +90,8 @@ all GPUs reading 0 MiB before you start.
 
 **Diagnostics and probes** (answer one question; not pass/fail suites)
 
+`ipc_scale_probe.py` (**which sharing step breaks cuda-checkpoint** -- native,
+deterministic, `--stage everything`; see `IPC_CHECKPOINT_BISECT.md`),
 `run_fd_identity_gvisor.sh` (rendezvous identity oracle),
 `run_p2p_reexport_gvisor.sh` (re-export fidelity),
 `run_census.sh` (nvproxy object-graph census across a checkpoint).
@@ -93,6 +107,7 @@ all GPUs reading 0 MiB before you start.
 
 | Doc | Contents |
 | --- | --- |
+| `IPC_CHECKPOINT_BISECT.md` | **what is actually broken in the driver**: a stage-by-stage native bisect of both the VMM and the legacy `cuIpc*` sharing paths, and what each implies for the mechanisms here |
 | `GVISOR_MULTICAST_CR.md` | **the interposer's production doc**: how it works, the ordering rules and why each exists, results, parameter sweep, known limitations |
 | `NCCL_PATCH_TESTS.md` | the NCCL fork: test tiers, results, the two ordering rules, rejection paths |
 | `NCCL_PATCH.md` | the NCCL patch design and invariants |
