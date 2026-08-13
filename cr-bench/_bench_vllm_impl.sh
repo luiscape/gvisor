@@ -45,10 +45,25 @@ EAGER="${EAGER:-0}"
 CB_SHM_MB="${CB_SHM_MB:-8192}"
 CB_GPU=1
 APP_LOG="/applog/vllm.log"
-# NCCL knobs (multi-GPU). NCCL_CUMEM_ENABLE=0 forces the classic cuMemAlloc
-# allocator: cuda-checkpoint's coverage of cuMemCreate/cuMemMap (VMM)
-# allocations is driver-dependent, so default to the safe path.
-NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
+# NCCL knobs (multi-GPU). NCCL_CUMEM_ENABLE picks which API NCCL uses for its
+# intra-node P2P buffers, and with the interposer in play that choice decides
+# whether the workload can be restored at all:
+#
+#   0  classic allocator -> NCCL shares P2P buffers over LEGACY CUDA IPC.
+#      Measured at TP=2: ~48 live legacy imports per worker. The interposer
+#      can close them but cannot get them back at their original addresses
+#      (cuIpcOpenMemHandle takes no address hint), so the resume fails.
+#   1  VMM allocator -> the same buffers go through cuMemCreate/cuMemMap,
+#      which the interposer restores at IDENTICAL addresses via retained
+#      address reservations. Measured: 0 legacy imports, 49 VMM imports, and
+#      the full sleep/checkpoint/restore/wake_up cycle PASSES with compile
+#      and CUDA graphs on.
+#
+# So 1 is the correct default here, not the cautious-looking 0. The old
+# comment ("cuda-checkpoint's VMM coverage is driver-dependent, default to the
+# safe path") predates the interposer: cuda-checkpoint is no longer the thing
+# restoring these mappings.
+NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-1}"
 # NCCL_NVLS_ENABLE=0 disables NVLS (NVLink SHARP) multicast, which allocates
 # fabric memory (cuMemExportToShareableHandle) that cuda-checkpoint cannot
 # checkpoint. Empty (default) leaves NCCL's own default in effect.
