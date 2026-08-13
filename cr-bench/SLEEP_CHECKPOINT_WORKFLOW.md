@@ -56,6 +56,67 @@ vLLM with compile + piecewise CUDA graphs cannot be restored. That was true of
 `cuda-checkpoint` alone; it is not true with the interposer releasing and
 replaying the cross-process imports.
 
+## Compatibility
+
+The rule behind every row: **a live cross-process import breaks restore.** What
+decides a feature's fate is only which API it shares memory through.
+
+- **VMM** (`cuMemCreate` / `cuMemMap` / multicast) -- the interposer releases
+  these before the checkpoint and remaps them at **identical** addresses,
+  because `cuMemAddressReserve` takes an address hint and the reservation is
+  retained across the checkpoint. Works.
+- **Legacy CUDA IPC** (`cuIpcGetMemHandle` / `cuIpcOpenMemHandle`) -- the
+  interposer can close these but cannot place them back:
+  `cuIpcOpenMemHandle` has no address hint and the driver packs from the low
+  end of its region. Does not work, and cannot be made to.
+
+### By feature
+
+| Feature | Shares memory via | Checkpointable | Evidence |
+| --- | --- | --- | --- |
+| `torch.compile` + CUDA graphs (`EAGER=0`) | n/a | **yes** | TP=2 and TP=4, exact match |
+| NCCL P2P with `NCCL_CUMEM_ENABLE=1` | VMM | **yes** | 51 imports remapped identical |
+| NCCL P2P with `NCCL_CUMEM_ENABLE=0` | legacy IPC | **no** | ~48 imports, all moved |
+| NCCL NVLS multicast (TP>=4) | VMM multicast | **yes** | TP=4, NVLS confirmed via `NCCL_DEBUG` |
+| torch symmetric memory | VMM multicast | **yes** | PyTorch tier `SYMM_MEM=1`, WORLD=2/4/8 -- **not** yet confirmed inside vLLM |
+| vLLM custom all-reduce | legacy IPC | **no** | 10 imports at TP=2, 30 at TP=4, all moved |
+| FlashInfer all-reduce | not established | **unknown** | no coverage; never built against a matching CUDA |
+
+### By configuration (measured, vLLM under gVisor, full sleep/C/R/wake cycle)
+
+`EAGER=0` throughout, so compile and CUDA graphs are on in every row.
+
+| TP | `NCCL_CUMEM_ENABLE` | custom all-reduce | NVLS | legacy imports/worker | result |
+| --- | --- | --- | --- | --- | --- |
+| 2 | 0 | on | n/a | 58 | FAIL |
+| 2 | 0 | off | n/a | 48 | FAIL |
+| 2 | 1 | **off** | n/a | **0** | **PASS** (exact match) |
+| 2 | 1 | on | n/a | 10 | FAIL |
+| 4 | 1 | **off** | engaged | **0** | **PASS** (exact match) |
+| 4 | 1 | on | engaged | 30 | FAIL |
+
+TP=2 rows say "n/a" for NVLS because two-GPU NCCL uses direct P2P and never
+forms a multicast group.
+
+### Does enabling NVLS let custom all-reduce work? No.
+
+They are independent layers and enabling one does not remove the other:
+
+- **NVLS** is NCCL's algorithm for a collective. Its multicast objects go
+  through the VMM API, so the interposer handles them.
+- **Custom all-reduce** is vLLM's own all-reduce, bypassing NCCL entirely, with
+  peer buffers exchanged over legacy CUDA IPC.
+
+The decisive detail is that vLLM allocates and exchanges those IPC handles in
+`CustomAllreduce`'s constructor, **whether or not the collective is ever
+invoked**. So even with NVLS winning every runtime dispatch, the legacy imports
+are live at checkpoint time -- and live imports are the thing that breaks
+restore. Measured with NVLS confirmed engaged at TP=4: 30 imports per worker,
+all 30 moved, `wake_up` fails.
+
+The import count scales as `buffers x (world - 1)`: 10 at TP=2, 30 at TP=4. So
+this gets worse with scale, not better.
+
 ## The two settings that matter, and why
 
 ### `NCCL_CUMEM_ENABLE=1` — required
