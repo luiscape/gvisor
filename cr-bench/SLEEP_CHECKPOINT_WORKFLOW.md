@@ -104,27 +104,25 @@ and `MCSHIM_IPC_SUSPEND` unset. "legacy live" is per worker.
 
 | TP | `CUMEM` | custom AR | VMM imports (interposer) | legacy live (driver) | runs |
 | --- | --- | --- | --- | --- | --- |
-| 2 | 1 | off | 49 | **0** | **1/1 PASS** |
-| 4 | 1 | off | 51 | **0** | **2/2 PASS** |
-| 2 | 0 | on | 2 | 58 | 1/1 PASS |
-| 4 | 0 | on | 6 | 102-126 | **1/2** |
-| 2 | 1 | on | 50 | 10 | 0/1 |
+| 2 | 1 | **on** | 50 | 10 | **3/4** (3/3 in one trial set, plus one earlier failure) |
+| 4 | 1 | off | 51 | 0 | 2/2 |
+| 2 | 1 | off | 49 | 0 | 1/1 |
+| 2 | 0 | on | 2 | 58 | 1/1 |
+| 4 | 0 | on | 6 | 102-126 | 1/2 |
 
-The pattern across these, and consistent with the historical 4/5 for a cell
-that had 58 legacy imports live:
+**No cell has been shown to be broken.** Every configuration tried has passed
+with an exact match at least once, including all four combinations of
+`NCCL_CUMEM_ENABLE` and custom all-reduce. What differs is how often, and the
+counts here are far too small to rank them.
 
-> **Live legacy IPC makes restore intermittent. Eliminating it makes restore
-> reliable.** It is not a compatibility boundary -- 126 live legacy imports
-> restored to an exact match on one run and failed the toggle on another.
+In particular, custom all-reduce with `NCCL_CUMEM_ENABLE=1` was recorded as a
+FAIL in an earlier revision on the strength of a single run. Repeating it gave
+**3/3**. There is no custom-all-reduce-specific defect; there is a low-rate
+intermittency in the restore toggle that predates all of this work and can land
+on any cell.
 
-So `NCCL_CUMEM_ENABLE=1` with custom all-reduce off is the recommended
-configuration not because the alternatives cannot work, but because it is the
-only one that leaves the driver **nothing** to carry, and it is the only one
-that has not yet produced a failure.
-
-Counts are small: treat every row as indicative, not as a rate. `vllm_trials.sh`
-is the tool for an actual rate, and is worth running on whichever cell you plan
-to depend on.
+Use `vllm_trials.sh` on the cell you intend to depend on. A single run --
+either way -- means very little here.
 
 ### Does NVLS let custom all-reduce work?
 
@@ -133,20 +131,17 @@ NCCL's collective algorithm and its multicast objects go through the VMM API
 (interposer); custom all-reduce bypasses NCCL entirely and exchanges peer
 buffers over legacy CUDA IPC (driver). Enabling one does not remove the other.
 
-What custom all-reduce actually costs you is **live legacy imports for the
-driver to carry** -- `buffers x (world - 1)` of them, additive with whatever
-NCCL contributes at `NCCL_CUMEM_ENABLE=0`. It works: TP=2 with 58 live passed,
-and TP=4 with 102-126 live passed on one of two runs. What it costs is
-reliability, since every observed failure has been in a configuration with live
-legacy imports.
+Custom all-reduce costs **live legacy imports for the driver to carry** --
+`buffers x (world - 1)` of them, additive with whatever NCCL contributes at
+`NCCL_CUMEM_ENABLE=0`. The driver carries them: TP=2 passed with 58 live, TP=4
+passed with 102-126 live, and `CUMEM=1` with custom all-reduce on is 3/4.
 
-The import count does not behave as a clean threshold either: 126 live passed
-once, while a run with only 10 live failed. That is the signature of
-intermittency rather than a capacity limit, so "how many" is the wrong question
-to tune on -- "any at all" is the one that separates the reliable configuration
-from the rest.
+No relationship between import count and outcome has held up. 126 live imports
+passed; 10 live imports failed once and then passed three times. Every attempt
+to find a threshold has instead found intermittency, so import count is not
+something to tune on.
 
-## The two settings that matter, and why
+## The setting that matters, and why
 
 ### `NCCL_CUMEM_ENABLE=1` — required
 
@@ -169,17 +164,17 @@ The harness used to default this to `0` as "the safe path", reasoning about
 `cuda-checkpoint`'s VMM coverage. That reasoning predates the interposer,
 which is what restores these mappings now. The default is now `1`.
 
-### `DISABLE_CUSTOM_ALL_REDUCE=1` — recommended, not required
+### `DISABLE_CUSTOM_ALL_REDUCE` — optional
 
 vLLM's custom all-reduce uses legacy CUDA IPC, which the driver carries in job
-mode, so it **is** usable -- TP=2 passed with 58 live legacy imports, and TP=4
-passed on one of two runs with 102-126. It is not a compatibility boundary.
+mode, so it is **usable**: `NCCL_CUMEM_ENABLE=1` with custom all-reduce on is
+3/4 at TP=2 (3/3 in a trial set), and `CUMEM=0` with it on passed at TP=2 and
+TP=4.
 
-It is a reliability trade. Every failure observed in this workflow has been in
-a configuration with live legacy imports, and the only configuration with no
-failures is the one that has none. So: enable custom all-reduce if you want it
-and have measured a rate you accept on your model and TP; leave it off if you
-want the restore to be dependable.
+Leave it on if you want it. The remaining risk is not specific to it -- it is
+the restore-toggle intermittency that affects this workload generally. Measure
+a rate on your model and TP with `vllm_trials.sh` rather than trusting any
+single run, including the ones in this document.
 
 **`/sleep` does not change this.** Sleep level 1 offloads weights and drops the
 KV cache; custom all-reduce registers its buffers once at init, outside that
