@@ -1648,6 +1648,25 @@ static int do_suspend(void) {
 /* bindings/mappings that need all handles resolved come last (phase 3).    */
 /* ------------------------------------------------------------------ */
 
+/* Where in the resume sequence legacy IPC imports are reopened.
+ *
+ * cuIpcOpenMemHandle takes no address hint, so an import only returns to its
+ * original address if the allocation state the driver sees then matches what
+ * it saw originally. Which point in the rebuild that is, is an empirical
+ * question: "late" (after every VMM mapping is back) is the default because
+ * it maximises how much of the original layout is in place, but an
+ * application that opened its IPC handles before allocating most of its VMM
+ * memory may need "early". Switchable so it can be measured rather than
+ * argued about. */
+static int ipc_reopen_early(void) {
+	static int v = -1;
+	if (v < 0)
+		v = getenv("MCSHIM_IPC_EARLY") != NULL;
+	return v;
+}
+
+static int resume_reopen_ipc(int p1_ipc);
+
 /* Must hold g_lock. */
 static int do_resume(void) {
 	int groups = 0, imports = 0, remapped = 0, rebound = 0, served = 0;
@@ -1750,6 +1769,9 @@ static int do_resume(void) {
 		}
 	}
 
+	if (ipc_reopen_early() && resume_reopen_ipc(p1_ipc) != 0)
+		return -1;
+
 	/* Phase 3: rebuild bindings and re-map every VA at its IDENTICAL
 	 * address, now that all handles (local and imported) are resolved. */
 	for (int gi = 0; gi < MAXN; gi++) {
@@ -1816,7 +1838,23 @@ static int do_resume(void) {
 	 * A moved import is silent corruption: the application still holds the
 	 * old pointer and nothing returns an error. So verify, and fail loudly
 	 * rather than hand back a working-looking process. */
-	int ipc_reopened = 0;
+	if (!ipc_reopen_early() && resume_reopen_ipc(p1_ipc) != 0)
+		return -1;
+
+	if (saved)
+		r_cuCtxSetCurrent(saved);
+	if (r_cuCtxSynchronize)
+		r_cuCtxSynchronize();
+	mclog("RESUME done: groups=%d imports=%d served=%d rebound=%d "
+	      "remapped=%d",
+	      groups, imports, served, rebound, remapped);
+	return 0;
+}
+
+/* Reopen every legacy IPC import, in its original open order, and verify each
+ * lands where it was. Must hold g_lock. */
+static int resume_reopen_ipc(int p1_ipc) {
+	int ipc_reopened = 0, ipc_moved = 0;
 	for (int pass_seq = 0; pass_seq < g_ipc_seq; pass_seq++) {
 		for (int i = 0; i < MAXN; i++) {
 			if (!g_ipc[i].used || !g_ipc[i].is_import ||
@@ -1836,32 +1874,41 @@ static int do_resume(void) {
 				return -1;
 			}
 			if (np != g_ipc[i].ptr) {
-				mclog("RESUME: FATAL: IPC import seq=%d moved: "
-				      "0x%llx -> 0x%llx. The application still "
-				      "points at the old address; failing rather "
-				      "than corrupting it silently.",
+				/* Keep going rather than stopping at the first
+				 * mismatch: how MANY move, and by how much, is
+				 * what distinguishes a placement-ordering bug
+				 * from the approach being unworkable. The resume
+				 * still fails below -- the application holds the
+				 * old pointers, so a moved import is silent
+				 * corruption, not a warning. */
+				ipc_moved++;
+				mclog("RESUME: IPC import seq=%d MOVED: 0x%llx -> "
+				      "0x%llx (delta %+lld MiB)",
 				      g_ipc[i].seq,
 				      (unsigned long long)g_ipc[i].ptr,
-				      (unsigned long long)np);
-				return -1;
+				      (unsigned long long)np,
+				      ((long long)np - (long long)g_ipc[i].ptr) /
+				          (1024 * 1024));
+				continue;
 			}
 			ipc_reopened++;
 			mcvlog("RESUME: reopened IPC import seq=%d va=0x%llx",
 			       g_ipc[i].seq, (unsigned long long)np);
 		}
 	}
-	if (ipc_reopened || p1_ipc)
+	if (ipc_reopened || p1_ipc || ipc_moved)
 		mclog("RESUME: legacy IPC done (%d reopened at identical VAs, "
-		      "%d served)",
-		      ipc_reopened, p1_ipc);
-
-	if (saved)
-		r_cuCtxSetCurrent(saved);
-	if (r_cuCtxSynchronize)
-		r_cuCtxSynchronize();
-	mclog("RESUME done: groups=%d imports=%d served=%d rebound=%d "
-	      "remapped=%d",
-	      groups, imports, served, rebound, remapped);
+		      "%d MOVED, %d served)",
+		      ipc_reopened, ipc_moved, p1_ipc);
+	if (ipc_moved) {
+		mclog("RESUME: FATAL: %d of %d legacy IPC imports did not return "
+		      "to their original address. cuIpcOpenMemHandle takes no "
+		      "address hint, so placement depends on the allocation "
+		      "state at reopen time matching the original (try "
+		      "MCSHIM_IPC_EARLY=1).",
+		      ipc_moved, ipc_moved + ipc_reopened);
+		return -1;
+	}
 	return 0;
 }
 

@@ -210,6 +210,11 @@ LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:/usr/loc
         CB_ENV+=$'\n'"CUDA_PATH=$cu_home"
         CB_ENV+=$'\n'"PATH=$cu_home/bin:/usr/local/bin:/usr/bin:/bin"
     fi
+    # Interposer tuning passthrough. MCSHIM_IPC_EARLY moves the legacy CUDA
+    # IPC reopen to before the VMM remap; which position preserves the
+    # original addresses is workload-dependent, so it has to be measurable
+    # from here.
+    [[ -n "${MCSHIM_IPC_EARLY:-}" ]] && CB_ENV+=$'\n'"MCSHIM_IPC_EARLY=$MCSHIM_IPC_EARLY"
     # Diagnostics passthrough: NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NVLS is
     # how to confirm which algorithm NCCL actually selected.
     [[ -n "${NCCL_DEBUG:-}" ]] && CB_ENV+=$'\n'"NCCL_DEBUG=$NCCL_DEBUG"

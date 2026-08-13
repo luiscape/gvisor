@@ -138,6 +138,44 @@ The mixed row is the one that matters: it is the engine shape, where NCCL
 holds VMM imports and custom all-reduce holds legacy ones, and both have to be
 torn down and rebuilt in a single pass.
 
+### ...but it does not scale to vLLM, and the reason is structural
+
+Run against real vLLM TP=2 (custom all-reduce on, 58 live legacy imports per
+worker), the reopen preserves **0 of 58** addresses. Every import moves *down*,
+and the reopened set lands as one dense contiguous run where the originals were
+spread across gaps:
+
+```
+IPC import seq=94  MOVED: 0x7eaba3600000 -> 0x7eaa72800000 (delta -4878 MiB)
+IPC import seq=109 MOVED: 0x7eaaf2000000 -> 0x7eaa75000000 (delta -2000 MiB)
+IPC import seq=116 MOVED: 0x7eaaf1800000 -> 0x7eaa78200000 (delta -1942 MiB)
+legacy IPC done (0 reopened at identical VAs, 58 MOVED, 59 served)
+```
+
+Tested at both replay positions -- after the VMM remap (default) and before it
+(`MCSHIM_IPC_EARLY=1`) -- with identical results, so this is not a matter of
+where in the resume the reopen sits.
+
+The driver packs IPC mappings from the low end of its region. The original
+addresses are spread because, *at the time the application first opened them*,
+lower addresses were occupied by allocations that no longer exist by the time
+the rebuild runs. Reproducing the original layout would therefore require
+reproducing the allocation **history**, not merely the live set -- and the live
+object graph is deliberately not an allocation log. There is no address hint on
+`cuIpcOpenMemHandle` to override the choice with.
+
+So close-and-reopen preserves legacy IPC addresses when the layout is simple
+(the probe's 1-6 imports, 6/6) and cannot when it is not (vLLM's 58, 0/58).
+The interposer detects this and fails the resume loudly rather than handing
+back a process whose pointers are silently wrong.
+
+**What this leaves for custom all-reduce.** Transparent replay is out. The
+remaining options are to leave `DISABLE_CUSTOM_ALL_REDUCE=1` (status quo, no
+engine change), or to have vLLM re-run its own IPC handle exchange after
+restore -- it already owns that code path, and unlike the interposer it can
+update the pointers it handed out. That is the same engine-fork shape already
+contemplated for the NCCL path, not a new class of work.
+
 ### A native-only keying limitation this surfaced (pre-existing)
 
 The mixed test initially hung in the *VMM* path with `timed out fetching group

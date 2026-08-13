@@ -29,11 +29,15 @@ Two caveats worth knowing before designing against this:
   gVisor does. It does not change the VMM result, but standalone it makes
   `cuda-checkpoint` refuse *any* legacy-IPC exporter outright at checkpoint --
   a much bleaker and non-representative picture.
-- **`mcshim` covers VMM imports only** (zero `cuIpc*` references), so legacy
-  IPC -- vLLM's custom all-reduce -- is still uncovered. The bisect says that
-  gap is closable by the same release/replay shape, and `legacy_va_probe.py`
-  confirms a reopened import lands at its original VA across a restore,
-  provided it is reopened in order with nothing allocated in between.
+- **`mcshim` now interposes `cuIpc*` too**, closing legacy imports at suspend
+  and reopening them afterwards. Native A/B, job mode: legacy-only 2/6 -> 6/6,
+  VMM+legacy live together 0/3 -> 3/3. **But it does not scale to vLLM**: with
+  58 live legacy imports per worker, 0 of 58 return to their original address,
+  because `cuIpcOpenMemHandle` has no address hint and the driver packs from
+  the low end of its region. The interposer fails the resume loudly rather
+  than corrupting pointers. So custom all-reduce still needs
+  `DISABLE_CUSTOM_ALL_REDUCE=1`, or an engine that re-runs its own IPC
+  exchange after restore.
 
 ## Which mechanism should I use?
 
