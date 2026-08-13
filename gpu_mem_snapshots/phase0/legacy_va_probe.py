@@ -107,6 +107,41 @@ def importer(chan, args):
     reopen_stable = (va2 == va1)
     order_sensitive = (va3 != va1)
 
+    # Can placement be FORCED back? This decides whether legacy IPC imports
+    # can be replayed at all.
+    #
+    # cuIpcOpenMemHandle takes no address hint, but it appears to hand out the
+    # lowest free address in its region -- which is exactly why a reopen after
+    # the address space has changed lands BELOW the original (measured in
+    # vLLM: every import moved down, into one dense run). If that is the rule,
+    # then reserving the gap underneath the target should push the driver back
+    # up to the original address.
+    #
+    # va3 is deliberately a moved address (an allocation was interposed above),
+    # so this reproduces the failing case and then tries to repair it.
+    # Does a VA reservation count as "occupied" for cuIpcOpenMemHandle's
+    # placement? If it does, the driver's choice is steerable: fence off the
+    # region it would otherwise pick and it must land elsewhere. If it does
+    # not -- if the import lands on top of a reservation, or the reservation
+    # is simply ignored -- then placement cannot be controlled at all and
+    # replaying legacy IPC imports at fixed addresses is impossible.
+    steerable = None
+    cu.ipc_close_handle(va3)
+    try:
+        resv = cu.reserve_va(BUF_BYTES, va1)  # fence off the natural slot
+        va_f = cu.ipc_open_handle(blob)
+        steerable = (va_f != va1)
+        cu.log(tag, f"open #3b (natural slot 0x{va1:016x} reserved) "
+                    f"va=0x{va_f:016x} "
+                    + ("AVOIDED the reservation -> steerable"
+                       if steerable else
+                       "IGNORED the reservation -> NOT steerable"))
+        cu.ipc_close_handle(va_f)
+        cu.call("cuMemAddressFree", resv, BUF_BYTES)
+    except Exception as e:  # noqa: BLE001 - a failure here is itself the answer
+        cu.log(tag, f"open #3b steering probe failed: {e}")
+    va3 = cu.ipc_open_handle(blob)
+
     # (3) the case that matters: close the import, let the parent drive a real
     # checkpoint/restore, then reopen and compare.
     cu.ipc_close_handle(va3)
@@ -128,7 +163,8 @@ def importer(chan, args):
               f"va_survives_cr={int(va4 == va1)} content=0x{got:08x} "
               f"blob_changed={int(not blob_same)} "
               f"reopen_stable={int(reopen_stable)} "
-              f"order_sensitive={int(order_sensitive)}")
+              f"order_sensitive={int(order_sensitive)} "
+              f"placement_steerable={steerable}")
     chan.recv(expect="EXIT")
     chan.send("EXIT")  # release the exporter rather than EOF-ing it
     os._exit(0 if ok else 1)

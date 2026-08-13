@@ -276,6 +276,15 @@ def ipc_close_handle(dptr):
     call("cuIpcCloseMemHandle", dptr)
 
 
+def reserve_va(size, addr_hint=0, alignment=0):
+    """cuMemAddressReserve at a fixed address. Unlike cuIpcOpenMemHandle this
+    DOES take an address hint, which is what makes it usable to fence off a
+    region and steer where a later placement-free API lands."""
+    va = _c_ull()
+    call("cuMemAddressReserve", ctypes.byref(va), size, alignment, addr_hint, 0)
+    return va.value
+
+
 def export_posix_fd(handle):
     fd = ctypes.c_int(-1)
     call("cuMemExportToShareableHandle", ctypes.byref(fd), handle,
