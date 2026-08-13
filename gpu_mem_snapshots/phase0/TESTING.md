@@ -10,11 +10,29 @@ here.
 driver defects that cap every mechanism here. Multicast is not one of them --
 it is a *consequence* of the first:
 
-1. **A live imported VMM handle breaks `restore`** (`cuMemImportFromShareableHandle`). `cuMemRelease` of the import is necessary and sufficient; unmapping is not enough, and mapping is not required. Reversible, which is what makes suspend/replay viable at all.
-2. **`cuIpcGetMemHandle` breaks `checkpoint`** on the exporter, and only freeing the allocation clears it. Not reversible, so no interposer can cover legacy CUDA IPC -- this is why vLLM's custom all-reduce must stay off.
+> **A live cross-process import -- VMM or legacy CUDA IPC -- breaks `restore`.
+> Releasing it before the checkpoint is necessary and sufficient. Nothing else
+> in either sharing sequence matters.**
 
-Both reproduce with no gVisor, no NCCL, no PyTorch and no multicast, in
-`ipc_scale_probe.py`.
+Exporting is fine. The export FD is fine. A peer holding that FD is fine. The
+mapping is irrelevant, and unmapping is not a remedy -- only releasing the
+import is. It reproduces with no gVisor, no NCCL, no PyTorch and no multicast.
+
+This explains the three error strings that made the "toggle bug" look like one
+flaky failure: `"invalid argument"` is a live mapped VMM import, `"out of
+memory"` an unmapped one, `"unknown error"` a live legacy IPC import. Only the
+ranks actually holding an import fail, which is why some workers toggled fine.
+
+Two caveats worth knowing before designing against this:
+
+- **Run the probe in job mode** (`cuda-checkpoint --launch-job`), which is what
+  gVisor does. It does not change the VMM result, but standalone it makes
+  `cuda-checkpoint` refuse *any* legacy-IPC exporter outright at checkpoint --
+  a much bleaker and non-representative picture.
+- **`mcshim` covers VMM imports only** (zero `cuIpc*` references), so legacy
+  IPC -- vLLM's custom all-reduce -- is still uncovered. The bisect says that
+  gap is closable by the same release/replay shape, subject to measuring
+  whether `cuIpcOpenMemHandle` returns identical VAs after restore.
 
 ## Which mechanism should I use?
 

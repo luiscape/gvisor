@@ -9,8 +9,17 @@ driving `lock -> checkpoint -> restore -> unlock` (the same phased sequence as
 `pkg/sentry/control/state_cuda.go`).
 
 ```
+# standalone: one --action per pid
 python3 ipc_scale_probe.py --world 2 --allocs 1 --stage everything --trials 3
+
+# job mode: what gVisor actually does (--cuda-checkpoint-path wraps the
+# container command, so every CUDA process shares one job file)
+cuda-checkpoint --launch-job python3 ipc_scale_probe.py --stage everything ...
 ```
+
+**Run both.** Job mode is not a packaging detail: it does not change the VMM
+result at all, but it changes the legacy CUDA IPC result completely, and the
+job-mode answer is the one that applies to gVisor.
 
 Every stage is a strict superset of the one above it, so the first failing
 stage names the precise step that arms the failure. Results below are
@@ -46,26 +55,48 @@ Reading down the table:
   it has been so expensive to diagnose: the failure surfaces one phase after
   its cause.
 
+The VMM ladder is **identical in job mode** — same stages fail, same phase,
+same error strings (verified: `share`, `nomap`, `import`, `unmap`, `release`).
+
 ### Legacy CUDA IPC (`cuIpcGetMemHandle` / `cuIpcOpenMemHandle`)
 
-| stage | what the process holds at checkpoint time | result |
-| --- | --- | --- |
-| `legacy-alloc` | `cuMemAlloc`, never shared | pass |
-| `legacy-export` | + `cuIpcGetMemHandle` (handle never even leaves the process) | **FAIL** — checkpoint: `"OS call failed or operation not supported on this OS"` |
-| `legacy-import` | + peers `cuIpcOpenMemHandle` | **FAIL** — checkpoint |
-| `legacy-close` | peers `cuIpcCloseMemHandle` before the checkpoint | **FAIL** — checkpoint |
-| `legacy-free` | peers close **and** the exporter `cuMemFree`s the allocation | pass |
+Here, and only here, job mode matters:
 
-This is a different defect with an inverted shape:
+| stage | what the process holds at checkpoint time | standalone | **job mode** |
+| --- | --- | --- | --- |
+| `legacy-alloc` | `cuMemAlloc`, never shared | pass | pass |
+| `legacy-export` | + `cuIpcGetMemHandle` | **FAIL** — checkpoint: `"OS call failed or operation not supported on this OS"` | **pass** |
+| `legacy-import` | + peers `cuIpcOpenMemHandle` | **FAIL** — checkpoint | **FAIL** — restore: `"unknown error"` |
+| `legacy-close` | peers `cuIpcCloseMemHandle` before the checkpoint | **FAIL** — checkpoint | **pass** |
+| `legacy-free` | peers close **and** exporter `cuMemFree`s | pass | pass |
 
-- It fires on the **exporter**, at **checkpoint** rather than restore.
-- Merely *calling* `cuIpcGetMemHandle` is enough. No peer has to do anything;
-  the handle need not leave the process.
-- The importer closing its handle does **not** clear it. Only destroying the
-  exported allocation does, and an application cannot do that — it is its data.
+Standalone, `cuda-checkpoint` refuses any process that has ever called
+`cuIpcGetMemHandle` — it cannot reason about peers it was not told about, so
+exporting alone is fatal and only destroying the allocation clears it.
 
-So legacy IPC is **not** recoverable by any suspend/resume protocol short of
-freeing and repopulating device memory.
+**Given the job file, that refusal disappears.** Exporting is fine, and
+closing the imports restores checkpointability. What remains is a live
+*import*, failing at *restore* — i.e. **exactly the same defect as the VMM
+path**, in the same phase, with the same remedy.
+
+## The unified conclusion (job mode, which is what gVisor uses)
+
+> A live cross-process **import** — VMM or legacy — breaks `restore`.
+> Releasing the import before the checkpoint is necessary and sufficient.
+> Nothing else in either sharing sequence matters.
+
+This also explains the two error strings that made the "toggle bug" look like
+one flaky failure with an inconsistent signature:
+
+| observed | cause |
+| --- | --- |
+| `"invalid argument"` | live **VMM** import, mapped |
+| `"out of memory"` | live **VMM** import, unmapped |
+| `"unknown error"` | live **legacy IPC** import |
+
+and its shape: only the ranks actually holding a live import fail, which is
+why some workers toggled fine and others did not (`legacy-import` in job mode
+fails 1 of 2 processes).
 
 ## Why this matters here
 
@@ -79,25 +110,42 @@ together as one flaky "toggle bug":
   Enabling cuMem makes NCCL use VMM allocations and take live imports; one
   import is enough. The earlier "pass rate tracks import count" reading was
   an artifact of partial teardown, not of count.
-- **vLLM's custom all-reduce is out of reach of any interposer.** It uses the
-  legacy `cuIpc*` path, whose taint cannot be released. This retroactively
-  justifies requiring `DISABLE_CUSTOM_ALL_REDUCE=1`: it is not a workaround
-  we have failed to remove, it is a hard consequence of the second defect.
+- **vLLM's custom all-reduce is reachable after all** — but only in job mode,
+  and only if something closes its legacy imports. An earlier revision of this
+  document concluded the opposite, from the standalone table alone; that was
+  wrong, and it is exactly the error that running only the convenient
+  configuration produces.
 - **TASK.md's "measure before implementing: IPC taint" gate is answered, and
   it passes** for the VMM path (`teardown` and `release` both pass). Work
   items 1-4 are therefore sufficient; device memory content stays
   cuda-checkpoint's responsibility and does **not** become nvproxy's problem.
 
-## Coverage gap this exposes
+## Coverage gap this exposes, and the work item it implies
 
 `mcshim.c` interposes the VMM API only — it contains **zero** references to
-`cuIpc*`. Any workload using legacy CUDA IPC is uncovered, and per the second
-table cannot be covered by release-and-replay. The only options there are to
-disable the feature in the application or to have the *allocation itself*
-recreated across the checkpoint.
+`cuIpc*`. So today any workload using legacy CUDA IPC is uncovered.
+
+The job-mode table says that gap is **closable, by the mechanism already
+built**. The interposer's VMM handling is `cuMemRelease` at suspend and
+re-import at resume; the legacy path needs the same shape:
+
+- intercept `cuIpcOpenMemHandle` / `cuIpcCloseMemHandle`, tracking each live
+  import the way `KIND_IMP` already tracks VMM ones;
+- `cuIpcCloseMemHandle` every live import at suspend (`legacy-close` proves
+  this is sufficient);
+- re-open at resume. Unlike VMM, the handle is an opaque 64-byte blob rather
+  than an OS handle, so the existing FD-based rendezvous does not apply and
+  the blob must be re-fetched from the exporter after restore.
+
+The open question is VA identity: `cuIpcOpenMemHandle` chooses the address,
+and the invariant this whole design rests on is that VAs are unchanged across
+restore. That needs measuring before this is committed to.
 
 ## Notes for anyone re-running this
 
+- **Always run both standalone and job mode.** The legacy result inverts
+  between them. Testing only the convenient one produced a confidently stated
+  and wrong conclusion here once already.
 - The two error strings for the same VMM defect (`"invalid argument"` when
   mapped, `"out of memory"` when not) are the same refusal; do not treat them
   as separate bugs.

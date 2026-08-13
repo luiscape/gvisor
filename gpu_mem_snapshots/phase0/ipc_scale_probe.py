@@ -512,6 +512,13 @@ def main():
     global VERBOSE
     VERBOSE = args.verbose
 
+    # gVisor wraps the container command in `cuda-checkpoint --launch-job`, so
+    # all its CUDA processes share one job file. Whether that changes any of
+    # the results below is itself a question worth answering, so record it.
+    job = os.environ.get("CUDA_CHECKPOINT_JOB_FILE")
+    print(f"job mode: {job if job else 'OFF (standalone --action per pid)'}",
+          flush=True)
+
     stages = {"all": list(STAGES), "legacy": list(LEGACY_STAGES),
               "everything": list(ALL_STAGES)}.get(args.stage, [args.stage])
     summary = [run_stage(args, s) for s in stages]
