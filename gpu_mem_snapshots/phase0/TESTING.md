@@ -31,8 +31,9 @@ Two caveats worth knowing before designing against this:
   a much bleaker and non-representative picture.
 - **`mcshim` covers VMM imports only** (zero `cuIpc*` references), so legacy
   IPC -- vLLM's custom all-reduce -- is still uncovered. The bisect says that
-  gap is closable by the same release/replay shape, subject to measuring
-  whether `cuIpcOpenMemHandle` returns identical VAs after restore.
+  gap is closable by the same release/replay shape, and `legacy_va_probe.py`
+  confirms a reopened import lands at its original VA across a restore,
+  provided it is reopened in order with nothing allocated in between.
 
 ## Which mechanism should I use?
 
@@ -110,6 +111,8 @@ all GPUs reading 0 MiB before you start.
 
 `ipc_scale_probe.py` (**which sharing step breaks cuda-checkpoint** -- native,
 deterministic, `--stage everything`; see `IPC_CHECKPOINT_BISECT.md`),
+`legacy_va_probe.py` (does a reopened legacy IPC import land at the same VA
+across a restore -- run it under `cuda-checkpoint --launch-job`),
 `run_fd_identity_gvisor.sh` (rendezvous identity oracle),
 `run_p2p_reexport_gvisor.sh` (re-export fidelity),
 `run_census.sh` (nvproxy object-graph census across a checkpoint).

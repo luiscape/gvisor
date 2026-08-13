@@ -137,9 +137,36 @@ re-import at resume; the legacy path needs the same shape:
   than an OS handle, so the existing FD-based rendezvous does not apply and
   the blob must be re-fetched from the exporter after restore.
 
-The open question is VA identity: `cuIpcOpenMemHandle` chooses the address,
-and the invariant this whole design rests on is that VAs are unchanged across
-restore. That needs measuring before this is committed to.
+### VA identity: measured, and it holds
+
+`cuIpcOpenMemHandle` picks its own address — unlike `cuMemAddressReserve` it
+takes no hint — so whether a reopened import lands where it was is the
+driver's choice, not ours. Since a moved buffer is silent corruption rather
+than an error, this had to be measured before building anything.
+
+`legacy_va_probe.py`, job mode, 3/3 identical runs:
+
+| question | answer |
+| --- | --- |
+| plain close then reopen | **same VA** |
+| close, allocate something else, reopen | **moves** |
+| close, checkpoint, restore, reopen | **same VA**, contents intact |
+| is the 64-byte IPC blob still valid after restore? | **no, it changes** |
+
+So the driver hands out the next free slot rather than a stable address. The
+VA is preserved across checkpoint/restore *provided nothing perturbs the
+allocation state in between*, which yields two rules for the interposer:
+
+1. **Reopen in the original order, with no allocations interposed.** This is
+   the same class of ordering discipline mcshim already enforces for
+   multicast, so it fits the existing structure rather than fighting it.
+2. **Re-fetch the blob from the exporter after restore.** The existing
+   rendezvous serves an FD; legacy IPC needs a variant that serves 64 bytes.
+
+Rule 1 is a real constraint, not a formality: the interposed-allocation case
+moves the import by exactly one slot, so any allocation slipped into the
+resume path — by the interposer itself, or by a rank that is not fully
+quiesced — would silently relocate a buffer the application still points at.
 
 ## Notes for anyone re-running this
 
