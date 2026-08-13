@@ -58,64 +58,93 @@ replaying the cross-process imports.
 
 ## Compatibility
 
-The rule behind every row: **a live cross-process import breaks restore.** What
-decides a feature's fate is only which API it shares memory through.
+Two different mechanisms carry shared memory across the checkpoint, and the
+split is not the one an earlier revision of this document claimed:
 
-- **VMM** (`cuMemCreate` / `cuMemMap` / multicast) -- the interposer releases
-  these before the checkpoint and remaps them at **identical** addresses,
-  because `cuMemAddressReserve` takes an address hint and the reservation is
-  retained across the checkpoint. Works.
+- **VMM** (`cuMemCreate` / `cuMemMap` / multicast) -- the **interposer**
+  releases these before the checkpoint and remaps them at identical addresses,
+  which it can do because `cuMemAddressReserve` takes an address hint and the
+  reservation is retained.
 - **Legacy CUDA IPC** (`cuIpcGetMemHandle` / `cuIpcOpenMemHandle`) -- the
-  interposer can close these but cannot place them back:
-  `cuIpcOpenMemHandle` has no address hint and the driver packs from the low
-  end of its region. Does not work, and cannot be made to.
+  **driver** carries these, via R610's job mode (`--launch-job`), which
+  documents CUDA IPC support. Measured: vLLM TP=2 with 58 live legacy imports
+  per worker checkpoints and restores to an exact match with the interposer not
+  touching them at all.
+
+So the interposer must **leave legacy IPC alone** (`MCSHIM_IPC_SUSPEND` unset,
+the default). It has the machinery to close and reopen legacy imports, and
+using it is actively harmful here: `cuIpcOpenMemHandle` has no address hint, so
+what it closes it cannot put back (measured: 0 of 58 returned to their original
+address). That teardown is only for environments where the driver does *not*
+cover IPC -- standalone/non-job mode, or pre-R610.
+
+An earlier revision concluded legacy IPC was categorically unrestorable and
+that custom all-reduce therefore had to stay off. That was wrong twice over: it
+measured the consequences of the interposer's own teardown rather than a driver
+limitation, and it drew categorical conclusions from single runs of an
+intermittent workload. What is actually true is a **reliability** difference,
+not a compatibility one (below).
 
 ### By feature
 
-| Feature | Shares memory via | Checkpointable | Evidence |
+| Feature | Shares memory via | Carried by | Status |
 | --- | --- | --- | --- |
-| `torch.compile` + CUDA graphs (`EAGER=0`) | n/a | **yes** | TP=2 and TP=4, exact match |
-| NCCL P2P with `NCCL_CUMEM_ENABLE=1` | VMM | **yes** | 51 imports remapped identical |
-| NCCL P2P with `NCCL_CUMEM_ENABLE=0` | legacy IPC | **no** | ~48 imports, all moved |
-| NCCL NVLS multicast (TP>=4) | VMM multicast | **yes** | TP=4, NVLS confirmed via `NCCL_DEBUG` |
-| torch symmetric memory | VMM multicast | **yes** | PyTorch tier `SYMM_MEM=1`, WORLD=2/4/8 -- **not** yet confirmed inside vLLM |
-| vLLM custom all-reduce | legacy IPC | **no** | 10 imports at TP=2, 30 at TP=4, all moved |
-| FlashInfer all-reduce | not established | **unknown** | no coverage; never built against a matching CUDA |
+| `torch.compile` + CUDA graphs (`EAGER=0`) | n/a | n/a | **works**, TP=2 and TP=4 |
+| NCCL P2P, `NCCL_CUMEM_ENABLE=1` | VMM | interposer | **works** |
+| NCCL P2P, `NCCL_CUMEM_ENABLE=0` | legacy IPC | driver (job mode) | **works at TP=2**; see scale limit |
+| NCCL NVLS multicast (TP>=4) | VMM multicast | interposer | **works**, NVLS confirmed via `NCCL_DEBUG` |
+| torch symmetric memory | VMM multicast | interposer | **works** in the PyTorch tier; **not** confirmed inside vLLM |
+| vLLM custom all-reduce | legacy IPC | driver (job mode) | **works at TP=2**; see scale limit |
+| FlashInfer all-reduce | not established | -- | **unknown**, no coverage |
 
-### By configuration (measured, vLLM under gVisor, full sleep/C/R/wake cycle)
+### By configuration
 
-`EAGER=0` throughout, so compile and CUDA graphs are on in every row.
+All measured end to end under gVisor with `EAGER=0` (compile + CUDA graphs on)
+and `MCSHIM_IPC_SUSPEND` unset. "legacy live" is per worker.
 
-| TP | `NCCL_CUMEM_ENABLE` | custom all-reduce | NVLS | legacy imports/worker | result |
+| TP | `CUMEM` | custom AR | VMM imports (interposer) | legacy live (driver) | runs |
 | --- | --- | --- | --- | --- | --- |
-| 2 | 0 | on | n/a | 58 | FAIL |
-| 2 | 0 | off | n/a | 48 | FAIL |
-| 2 | 1 | **off** | n/a | **0** | **PASS** (exact match) |
-| 2 | 1 | on | n/a | 10 | FAIL |
-| 4 | 1 | **off** | engaged | **0** | **PASS** (exact match) |
-| 4 | 1 | on | engaged | 30 | FAIL |
+| 2 | 1 | off | 49 | **0** | **1/1 PASS** |
+| 4 | 1 | off | 51 | **0** | **2/2 PASS** |
+| 2 | 0 | on | 2 | 58 | 1/1 PASS |
+| 4 | 0 | on | 6 | 102-126 | **1/2** |
+| 2 | 1 | on | 50 | 10 | 0/1 |
 
-TP=2 rows say "n/a" for NVLS because two-GPU NCCL uses direct P2P and never
-forms a multicast group.
+The pattern across these, and consistent with the historical 4/5 for a cell
+that had 58 legacy imports live:
 
-### Does enabling NVLS let custom all-reduce work? No.
+> **Live legacy IPC makes restore intermittent. Eliminating it makes restore
+> reliable.** It is not a compatibility boundary -- 126 live legacy imports
+> restored to an exact match on one run and failed the toggle on another.
 
-They are independent layers and enabling one does not remove the other:
+So `NCCL_CUMEM_ENABLE=1` with custom all-reduce off is the recommended
+configuration not because the alternatives cannot work, but because it is the
+only one that leaves the driver **nothing** to carry, and it is the only one
+that has not yet produced a failure.
 
-- **NVLS** is NCCL's algorithm for a collective. Its multicast objects go
-  through the VMM API, so the interposer handles them.
-- **Custom all-reduce** is vLLM's own all-reduce, bypassing NCCL entirely, with
-  peer buffers exchanged over legacy CUDA IPC.
+Counts are small: treat every row as indicative, not as a rate. `vllm_trials.sh`
+is the tool for an actual rate, and is worth running on whichever cell you plan
+to depend on.
 
-The decisive detail is that vLLM allocates and exchanges those IPC handles in
-`CustomAllreduce`'s constructor, **whether or not the collective is ever
-invoked**. So even with NVLS winning every runtime dispatch, the legacy imports
-are live at checkpoint time -- and live imports are the thing that breaks
-restore. Measured with NVLS confirmed engaged at TP=4: 30 imports per worker,
-all 30 moved, `wake_up` fails.
+### Does NVLS let custom all-reduce work?
 
-The import count scales as `buffers x (world - 1)`: 10 at TP=2, 30 at TP=4. So
-this gets worse with scale, not better.
+NVLS is irrelevant to the question -- they are independent layers. NVLS is
+NCCL's collective algorithm and its multicast objects go through the VMM API
+(interposer); custom all-reduce bypasses NCCL entirely and exchanges peer
+buffers over legacy CUDA IPC (driver). Enabling one does not remove the other.
+
+What custom all-reduce actually costs you is **live legacy imports for the
+driver to carry** -- `buffers x (world - 1)` of them, additive with whatever
+NCCL contributes at `NCCL_CUMEM_ENABLE=0`. It works: TP=2 with 58 live passed,
+and TP=4 with 102-126 live passed on one of two runs. What it costs is
+reliability, since every observed failure has been in a configuration with live
+legacy imports.
+
+The import count does not behave as a clean threshold either: 126 live passed
+once, while a run with only 10 live failed. That is the signature of
+intermittency rather than a capacity limit, so "how many" is the wrong question
+to tune on -- "any at all" is the one that separates the reliable configuration
+from the rest.
 
 ## The two settings that matter, and why
 
@@ -140,26 +169,24 @@ The harness used to default this to `0` as "the safe path", reasoning about
 `cuda-checkpoint`'s VMM coverage. That reasoning predates the interposer,
 which is what restores these mappings now. The default is now `1`.
 
-### `DISABLE_CUSTOM_ALL_REDUCE=1` — still required
+### `DISABLE_CUSTOM_ALL_REDUCE=1` — recommended, not required
 
-vLLM's custom all-reduce uses legacy CUDA IPC directly, and unlike NCCL it has
-no VMM mode to switch to. Measured with everything else already correct
-(`NCCL_CUMEM_ENABLE=1`, TP=2):
+vLLM's custom all-reduce uses legacy CUDA IPC, which the driver carries in job
+mode, so it **is** usable -- TP=2 passed with 58 live legacy imports, and TP=4
+passed on one of two runs with 102-126. It is not a compatibility boundary.
 
-| | legacy imports/worker | result |
-| --- | --- | --- |
-| `DISABLE_CUSTOM_ALL_REDUCE=1` | 0 | **PASS**, exact match |
-| `DISABLE_CUSTOM_ALL_REDUCE=0` | 10 | `10 MOVED`, resume fails, `wake_up` fails |
+It is a reliability trade. Every failure observed in this workflow has been in
+a configuration with live legacy imports, and the only configuration with no
+failures is the one that has none. So: enable custom all-reduce if you want it
+and have measured a rate you accept on your model and TP; leave it off if you
+want the restore to be dependable.
 
-**`/sleep` does not help here.** Sleep level 1 offloads weights and drops the
-KV cache; the custom all-reduce buffers are registered once at init and are
-outside that scope, so they are still live and still imported at checkpoint
-time. Sleep solves quiescing and frees the large allocations — which is what
-makes checkpointing tractable — but it does not release the IPC registrations
-that break restore.
-
-Closing that last gap needs vLLM to re-run its own IPC exchange after restore.
-It owns those pointers and can update them; the interposer cannot.
+**`/sleep` does not change this.** Sleep level 1 offloads weights and drops the
+KV cache; custom all-reduce registers its buffers once at init, outside that
+scope, so they are still live and imported at checkpoint time. Sleep gives
+quiesce and frees the large allocations — which is what makes checkpointing
+tractable — but it does not reduce the number of IPC registrations the driver
+has to carry.
 
 ## Symmetric memory
 

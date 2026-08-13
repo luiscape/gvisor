@@ -300,6 +300,26 @@ static int mcverbose(void) {
 	return v;
 }
 
+/* Whether to tear legacy CUDA IPC imports down at all -- OFF by default.
+ *
+ * R610's job mode (`cuda-checkpoint --launch-job`) is documented to support
+ * CUDA IPC, and measurement agrees: with the interposer ignoring legacy IPC
+ * entirely, vLLM at NCCL_CUMEM_ENABLE=0 with custom all-reduce on -- 58 live
+ * legacy imports per worker -- checkpointed and restored. So the driver
+ * handles these, and touching them is not merely unnecessary but harmful:
+ * cuIpcOpenMemHandle has no address hint, so anything the interposer closes
+ * it cannot put back where it was (measured: 0 of 58 returned).
+ *
+ * Kept behind a flag rather than deleted because the teardown is correct and
+ * useful where the driver does NOT cover IPC -- standalone (non-job) mode, or
+ * pre-R610 drivers -- and because it is the only way to A/B the question. */
+static int ipc_suspend_enabled(void) {
+	static int v = -1;
+	if (v < 0)
+		v = getenv("MCSHIM_IPC_SUSPEND") != NULL;
+	return v;
+}
+
 #define mcvlog(...)                                                            \
 	do {                                                                   \
 		if (mcverbose())                                               \
@@ -1607,12 +1627,19 @@ static int do_suspend(void) {
 	 *
 	 * Closing order does not matter; REOPEN order does, and is replayed
 	 * from each entry's seq on resume. */
-	int ipc_closed = 0;
+	int ipc_closed = 0, ipc_live = 0;
 	for (int i = 0; i < MAXN; i++) {
 		if (g_ipc[i].serving)
 			ipc_stop_serving(&g_ipc[i]);
 		if (!g_ipc[i].used || !g_ipc[i].is_import)
 			continue;
+		if (!ipc_suspend_enabled()) {
+			/* Left for the driver's job-mode IPC support to carry
+			 * across the checkpoint. Counted so the log still says
+			 * how much legacy IPC is in play. */
+			ipc_live++;
+			continue;
+		}
 		if (g_ipc[i].ctx)
 			r_cuCtxSetCurrent(g_ipc[i].ctx);
 		CUresult rc = r_cuIpcCloseMemHandle(g_ipc[i].ptr);
@@ -1633,8 +1660,9 @@ static int do_suspend(void) {
 	if (r_cuCtxSynchronize)
 		r_cuCtxSynchronize();
 	mclog("SUSPEND done: groups=%d imports=%d unmapped=%d unbound=%d "
-	      "released=%d ipc_closed=%d",
-	      groups, imports, unmapped, unbound, released, ipc_closed);
+	      "released=%d ipc_closed=%d ipc_left_live=%d",
+	      groups, imports, unmapped, unbound, released, ipc_closed,
+	      ipc_live);
 	return 0;
 }
 
@@ -1664,6 +1692,8 @@ static int ipc_reopen_early(void) {
 		v = getenv("MCSHIM_IPC_EARLY") != NULL;
 	return v;
 }
+
+
 
 static int resume_reopen_ipc(int p1_ipc);
 
@@ -1726,6 +1756,8 @@ static int do_resume(void) {
 	 * starts fetching. */
 	int p1_ipc = 0;
 	for (int i = 0; i < MAXN; i++) {
+		if (!ipc_suspend_enabled())
+			break; /* no importer will fetch; do not re-export */
 		if (!g_ipc[i].used || g_ipc[i].is_import)
 			continue;
 		if (g_ipc[i].ctx)
@@ -1855,6 +1887,8 @@ static int do_resume(void) {
  * lands where it was. Must hold g_lock. */
 static int resume_reopen_ipc(int p1_ipc) {
 	int ipc_reopened = 0, ipc_moved = 0;
+	if (!ipc_suspend_enabled())
+		return 0; /* nothing was torn down, so nothing to rebuild */
 	for (int pass_seq = 0; pass_seq < g_ipc_seq; pass_seq++) {
 		for (int i = 0; i < MAXN; i++) {
 			if (!g_ipc[i].used || !g_ipc[i].is_import ||
