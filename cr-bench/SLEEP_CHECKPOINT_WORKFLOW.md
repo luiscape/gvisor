@@ -10,7 +10,7 @@ The target workflow, and what `bench_4_vllm_multi.sh` implements:
 6. `POST /wake_up`
 7. requests verified against a pre-checkpoint reference answer
 
-## It passes, at TP=2 and TP=4
+## It passes, at TP=2, TP=4 and TP=8
 
 H100 + NVSwitch, driver 610.57.04, `runsc-phase0`, interposer enabled:
 
@@ -21,16 +21,40 @@ sudo CUDA_MULTICAST_SHIM=1 CUDA_CKPT_JOB_FILE=1 CUDA_CKPT_SEQUENTIAL=1 \
      bash cr-bench/bench_4_vllm_multi.sh --gpus 0,1,2,3 --tp 4
 ```
 
-| step | TP=2 | TP=4 |
-| --- | --- | --- |
-| cold boot (run -> health) | 215 s | 251 s |
-| checkpoint | 12.3 s, 9.6 GB | 23.9 s, 16 GB |
-| GPU memory after checkpoint | 0 MiB | 0 MiB (all four) |
-| `runsc restore` | 4.0 s | 6.2 s |
-| health after restore | 4.1 s | 6.3 s |
-| `POST /wake_up` | **ok** | **ok** |
-| first inference after restore | 14.8 s | 25.7 s |
-| answer vs. pre-checkpoint reference | **EXACT MATCH** | **EXACT MATCH** |
+| step | TP=2 | TP=4 | TP=8 |
+| --- | --- | --- | --- |
+| cold boot (run -> health) | 215 s | 251 s | 318 s |
+| checkpoint | 12.3 s, 9.6 GB | 23.9 s, 16 GB | 57.9 s, 30 GB |
+| GPU memory after checkpoint | 0 MiB | 0 MiB | 0 MiB (all eight) |
+| `runsc restore` | 4.0 s | 6.2 s | 12.4 s |
+| health after restore | 4.1 s | 6.3 s | 12.5 s |
+| `POST /wake_up` | **ok** | **ok** | **ok** |
+| first inference after restore | 14.8 s | 25.7 s | 60.2 s |
+| answer vs. pre-checkpoint reference | **EXACT MATCH** | **EXACT MATCH** | **EXACT MATCH** |
+
+TP=2 and TP=4 above are `Qwen2.5-1.5B-Instruct`; TP=8 needs
+`heads % 8 == 0`, which that model does not satisfy (12 heads), so TP=8 uses
+`Qwen2.5-3B-Instruct` (16 heads, intermediate 11008 -- clean at 2, 4 and 8).
+That model was first run at TP=4 as a control, so a TP=8 result could not be
+confounded by the model change; it passed with an exact match.
+
+TP=8 accounting was uniform across all eight workers --
+`groups=3 imports=55 released=58 ipc_closed=0 ipc_left_live=0` -- and NCCL
+reported NVLS available and allocated on all eight devices.
+
+Caching a TP=8-capable model, since the sandbox runs `--network=none`:
+
+```
+sudo docker run --rm --network=host --entrypoint python3 \
+  -v /data/cr-bench/rootfs-cr-bench-vllm/app/hf_cache:/hf \
+  -e HF_HOME=/hf -e HF_HUB_OFFLINE=0 cr-bench-vllm -c \
+  "from huggingface_hub import snapshot_download; \
+   snapshot_download('Qwen/Qwen2.5-3B-Instruct', \
+     allow_patterns=['*.json','*.safetensors','*.txt'])"
+```
+
+The image bakes `HF_HUB_OFFLINE=1` and its entrypoint is the server, so both
+have to be overridden.
 
 `torch.compile` and CUDA graphs are **on** (`EAGER=0`). Interposer accounting
 per worker, TP=4: `groups=2 imports=51 released=53 remapped=53 ipc_closed=0`
