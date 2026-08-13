@@ -10,31 +10,46 @@ The target workflow, and what `bench_4_vllm_multi.sh` implements:
 6. `POST /wake_up`
 7. requests verified against a pre-checkpoint reference answer
 
-## It passes
+## It passes, at TP=2 and TP=4
 
-vLLM TP=2, 2x H100, driver 610.57.04, `runsc-phase0`, interposer enabled:
+H100 + NVSwitch, driver 610.57.04, `runsc-phase0`, interposer enabled:
 
 ```
 sudo CUDA_MULTICAST_SHIM=1 CUDA_CKPT_JOB_FILE=1 CUDA_CKPT_SEQUENTIAL=1 \
      EAGER=0 DISABLE_CUSTOM_ALL_REDUCE=1 NCCL_CUMEM_ENABLE=1 \
      RUNSC=/usr/local/bin/runsc-phase0 \
-     bash cr-bench/bench_4_vllm_multi.sh --gpus 0,1 --tp 2
+     bash cr-bench/bench_4_vllm_multi.sh --gpus 0,1,2,3 --tp 4
 ```
 
-| step | result |
-| --- | --- |
-| cold boot (run -> health) | 215 s |
-| checkpoint | 12.3 s, 9.6 GB image |
-| GPU memory after checkpoint | 0 MiB on both GPUs |
-| `runsc restore` | 4.0 s |
-| health after restore | 4.1 s |
-| `POST /wake_up` | **ok** |
-| first inference after restore | 14.8 s |
-| answer vs. pre-checkpoint reference | **EXACT MATCH** |
+| step | TP=2 | TP=4 |
+| --- | --- | --- |
+| cold boot (run -> health) | 215 s | 251 s |
+| checkpoint | 12.3 s, 9.6 GB | 23.9 s, 16 GB |
+| GPU memory after checkpoint | 0 MiB | 0 MiB (all four) |
+| `runsc restore` | 4.0 s | 6.2 s |
+| health after restore | 4.1 s | 6.3 s |
+| `POST /wake_up` | **ok** | **ok** |
+| first inference after restore | 14.8 s | 25.7 s |
+| answer vs. pre-checkpoint reference | **EXACT MATCH** | **EXACT MATCH** |
 
 `torch.compile` and CUDA graphs are **on** (`EAGER=0`). Interposer accounting
-per worker: `groups=2 imports=49 released=51 remapped=51 ipc_closed=0`, all
-rebuilt at identical VAs.
+per worker, TP=4: `groups=2 imports=51 released=53 remapped=53 ipc_closed=0`
+-- every mapping back at an identical VA, no legacy IPC anywhere.
+
+**TP=4 exercises NVLS**, which TP=2 does not: 2-GPU NCCL uses direct P2P, so
+the multicast path is only really under test from 4 ranks up. Confirmed rather
+than assumed, with `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NVLS,REG`:
+
+```
+NVLS multicast support is available on dev 0..3 (NVLS_NCHANNELS 16)
+NVLS rank 0..3 (dev 0..3) alloc done
+NVLS importing shareableHandle ... from rank 0
+4 nvls channels
+```
+
+Worth noting the tracked multicast group count is `groups=2` at both TP=2 and
+TP=4, so that number alone is not evidence that NVLS engaged -- the NCCL debug
+output is.
 
 This supersedes `gpu_mem_snapshots/PROGRESS.md`'s conclusion that multi-GPU
 vLLM with compile + piecewise CUDA graphs cannot be restored. That was true of

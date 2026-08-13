@@ -23,8 +23,10 @@
 #  Notes:
 #    - Driver >= R570 is strongly recommended (CUDA IPC support in
 #      cuda-checkpoint).
-#    - NCCL_CUMEM_ENABLE=0 is set by default so NCCL uses classic
-#      allocations (override with NCCL_CUMEM_ENABLE=1 to test VMM).
+#    - NCCL_CUMEM_ENABLE=1 by default: NCCL's P2P buffers then go through the
+#      VMM API, which the interposer restores at identical addresses. With 0
+#      they go through legacy CUDA IPC, which cannot be replayed -- see
+#      SLEEP_CHECKPOINT_WORKFLOW.md.
 #    - The default model (Qwen2.5-1.5B-Instruct) works with TP=2 and
 #      TP=4.  Qwen2.5-0.5B-Instruct (14 heads) only supports TP=2.
 #
