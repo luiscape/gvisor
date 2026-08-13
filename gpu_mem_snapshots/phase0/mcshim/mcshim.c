@@ -125,6 +125,15 @@ typedef struct {
 	unsigned long long flags;
 } CUmulticastObjectProp;
 
+/* Legacy (pre-VMM) CUDA IPC. A separate API from cuMemExport/Import: it
+ * shares cuMemAlloc'd memory through an opaque 64-byte blob rather than an OS
+ * handle, and the blob is passed to cuIpcOpenMemHandle BY VALUE. */
+#define CU_IPC_HANDLE_SIZE 64
+
+typedef struct {
+	unsigned char reserved[CU_IPC_HANDLE_SIZE];
+} CUipcMemHandle;
+
 /* ------------------------------------------------------------------ */
 /* Logging                                                            */
 /* ------------------------------------------------------------------ */
@@ -245,6 +254,10 @@ static CUresult (*r_cuMemImportFromShareableHandle)(
 static CUresult (*r_cuCtxGetCurrent)(CUcontext *);
 static CUresult (*r_cuCtxSetCurrent)(CUcontext);
 static CUresult (*r_cuCtxSynchronize)(void);
+static CUresult (*r_cuIpcGetMemHandle)(CUipcMemHandle *, CUdeviceptr);
+static CUresult (*r_cuIpcOpenMemHandle)(CUdeviceptr *, CUipcMemHandle,
+                                        unsigned int);
+static CUresult (*r_cuIpcCloseMemHandle)(CUdeviceptr);
 
 #define CU_MEM_HANDLE_TYPE_POSIX_FD 0x1
 
@@ -267,6 +280,12 @@ static void resolve_reals(void) {
 	REAL(r_cuCtxGetCurrent, "cuCtxGetCurrent");
 	REAL(r_cuCtxSetCurrent, "cuCtxSetCurrent");
 	REAL(r_cuCtxSynchronize, "cuCtxSynchronize");
+	REAL(r_cuIpcGetMemHandle, "cuIpcGetMemHandle");
+	/* cuda.h #defines cuIpcOpenMemHandle to the _v2 ABI; resolve that
+	 * first and fall back for drivers that only export the old name. */
+	REAL(r_cuIpcOpenMemHandle, "cuIpcOpenMemHandle_v2");
+	REAL(r_cuIpcOpenMemHandle, "cuIpcOpenMemHandle");
+	REAL(r_cuIpcCloseMemHandle, "cuIpcCloseMemHandle");
 }
 
 
@@ -355,9 +374,36 @@ typedef struct {
 	CUdevice dev; /* device hosting the memory (unbind is per-device) */
 } Bind;
 
+/* Legacy CUDA IPC participation. Kept in its own table rather than folded
+ * into Alloc: legacy IPC has no CUmemGenericAllocationHandle to key on (only
+ * a device pointer), and none of Alloc's mapping/bind machinery applies.
+ *
+ * The rendezvous key is the ORIGINAL blob. The blob a re-export produces
+ * after a restore is different (measured -- see legacy_va_probe.py), so it
+ * cannot identify anything across the checkpoint; but both the exporter and
+ * its importers saw the same original bytes, which makes those bytes a
+ * cross-process name that survives. */
+typedef struct {
+	int used;
+	int is_import; /* 1 = we opened a peer's handle; 0 = we exported */
+	CUdeviceptr ptr; /* import: VA from cuIpcOpenMemHandle
+	                  * export: the local pointer we exported */
+	CUipcMemHandle blob0; /* the original blob: the rendezvous key */
+	unsigned int flags; /* import: flags passed to cuIpcOpenMemHandle */
+	CUcontext ctx;
+	int seq; /* open order; imports must be reopened in it */
+	/* Exporter-side serving state (post-resume). */
+	int serving;
+	int serve_sock;
+	char serve_path[104];
+	CUipcMemHandle blob_new;
+} IpcEnt;
+
 static Alloc g_alloc[MAXN];
 static Mapping g_map[MAXN];
 static Bind g_bind[MAXN];
+static IpcEnt g_ipc[MAXN];
+static int g_ipc_seq;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_suspended;
 
@@ -608,6 +654,134 @@ CUresult cuMemImportFromShareableHandle(CUmemGenericAllocationHandle *h,
 			      "ord=%d",
 			      i, (unsigned long long)*h, a->key_dev, a->key_ino,
 			      a->key_ord);
+		}
+		pthread_mutex_unlock(&g_lock);
+	}
+	return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* Legacy CUDA IPC interposition                                      */
+/*                                                                    */
+/* In job mode -- the only mode where legacy IPC is checkpointable at  */
+/* all -- a live import is the sole thing blocking restore. Exporting  */
+/* is fine and needs no teardown; the importer must close, and reopen  */
+/* afterwards. (Measured: IPC_CHECKPOINT_BISECT.md.)                   */
+/* ------------------------------------------------------------------ */
+
+static int ipc_new(void) {
+	for (int i = 0; i < MAXN; i++)
+		if (!g_ipc[i].used)
+			return i;
+	return -1;
+}
+
+/* Find the live import that owns a device pointer. */
+static int ipc_find_import(CUdeviceptr p) {
+	for (int i = 0; i < MAXN; i++)
+		if (g_ipc[i].used && g_ipc[i].is_import && g_ipc[i].ptr == p)
+			return i;
+	return -1;
+}
+
+static int ipc_find_export(CUdeviceptr p) {
+	for (int i = 0; i < MAXN; i++)
+		if (g_ipc[i].used && !g_ipc[i].is_import && g_ipc[i].ptr == p)
+			return i;
+	return -1;
+}
+
+/* FNV-1a over the original blob: a short, stable, cross-process name for one
+ * shared allocation, usable as a socket path. */
+static unsigned long blob_key(const CUipcMemHandle *b) {
+	unsigned long h = 1469598103934665603UL;
+	for (int i = 0; i < CU_IPC_HANDLE_SIZE; i++) {
+		h ^= b->reserved[i];
+		h *= 1099511628211UL;
+	}
+	return h;
+}
+
+CUresult cuIpcGetMemHandle(CUipcMemHandle *handle, CUdeviceptr dptr) {
+	resolve_reals();
+	CUresult rc = r_cuIpcGetMemHandle(handle, dptr);
+	if (rc != CUDA_SUCCESS || !handle)
+		return rc;
+	pthread_mutex_lock(&g_lock);
+	/* Re-exporting the same pointer is idempotent from our point of view:
+	 * keep the FIRST blob, since that is the one peers used as the key. */
+	if (ipc_find_export(dptr) < 0) {
+		int i = ipc_new();
+		if (i >= 0) {
+			IpcEnt *e = &g_ipc[i];
+			memset(e, 0, sizeof(*e));
+			e->used = 1;
+			e->is_import = 0;
+			e->ptr = dptr;
+			e->blob0 = *handle;
+			e->serve_sock = -1;
+			e->seq = g_ipc_seq++;
+			r_cuCtxGetCurrent(&e->ctx);
+			mclog("track IPC-EXPORT idx=%d ptr=0x%llx key=%016lx", i,
+			      (unsigned long long)dptr, blob_key(handle));
+		} else {
+			mclog("IPC-EXPORT table full; ptr=0x%llx UNTRACKED",
+			      (unsigned long long)dptr);
+		}
+	}
+	pthread_mutex_unlock(&g_lock);
+	return rc;
+}
+
+CUresult cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle,
+                            unsigned int flags) {
+	resolve_reals();
+	CUresult rc = r_cuIpcOpenMemHandle(pdptr, handle, flags);
+	if (rc != CUDA_SUCCESS || !pdptr)
+		return rc;
+	pthread_mutex_lock(&g_lock);
+	int i = ipc_new();
+	if (i >= 0) {
+		IpcEnt *e = &g_ipc[i];
+		memset(e, 0, sizeof(*e));
+		e->used = 1;
+		e->is_import = 1;
+		e->ptr = *pdptr;
+		e->blob0 = handle;
+		e->flags = flags;
+		e->serve_sock = -1;
+		e->seq = g_ipc_seq++;
+		r_cuCtxGetCurrent(&e->ctx);
+		mclog("track IPC-IMPORT idx=%d seq=%d va=0x%llx key=%016lx", i,
+		      e->seq, (unsigned long long)*pdptr, blob_key(&handle));
+	} else {
+		/* An untracked import is not merely unsupported, it is a
+		 * silent restore failure later, so say so loudly now. */
+		mclog("IPC-IMPORT table full; va=0x%llx UNTRACKED -- restore "
+		      "WILL fail",
+		      (unsigned long long)*pdptr);
+	}
+	pthread_mutex_unlock(&g_lock);
+	return rc;
+}
+
+/* cuda.h maps cuIpcOpenMemHandle to the _v2 ABI; both names must resolve to
+ * the wrapper or an app linking the versioned symbol bypasses the shim. */
+CUresult cuIpcOpenMemHandle_v2(CUdeviceptr *pdptr, CUipcMemHandle handle,
+                               unsigned int flags) {
+	return cuIpcOpenMemHandle(pdptr, handle, flags);
+}
+
+CUresult cuIpcCloseMemHandle(CUdeviceptr dptr) {
+	resolve_reals();
+	CUresult rc = r_cuIpcCloseMemHandle(dptr);
+	if (rc == CUDA_SUCCESS) {
+		pthread_mutex_lock(&g_lock);
+		int i = ipc_find_import(dptr);
+		if (i >= 0) {
+			g_ipc[i].used = 0;
+			mcvlog("untrack IPC-IMPORT idx=%d va=0x%llx", i,
+			       (unsigned long long)dptr);
 		}
 		pthread_mutex_unlock(&g_lock);
 	}
@@ -984,6 +1158,133 @@ static void stop_serving(Alloc *a) {
 	mclog("stopped serving group fd");
 }
 
+/* ------------------------------------------------------------------ */
+/* Legacy IPC rendezvous: same shape as the fd rendezvous above, but   */
+/* the payload is 64 opaque bytes, so no SCM_RIGHTS is involved.       */
+/* ------------------------------------------------------------------ */
+
+static int ipc_sock_path(const IpcEnt *e, char *out, size_t n) {
+	int w = snprintf(out, n, "%s/ipcblob-%016lx.sock", g_dir,
+	                 blob_key(&e->blob0));
+	if (w < 0 || (size_t)w >= n) {
+		mclog("IPC socket path too long (MCSHIM_DIR=%s)", g_dir);
+		return -1;
+	}
+	return 0;
+}
+
+typedef struct {
+	int sock;
+	CUipcMemHandle blob;
+	char path[104];
+} IpcServeArgs;
+
+static void *ipc_serve_thread(void *arg) {
+	IpcServeArgs *sa = arg;
+	mclog("serving IPC blob on %s", sa->path);
+	for (;;) {
+		int c = accept(sa->sock, NULL, NULL);
+		if (c < 0)
+			break;
+		ssize_t w = write(c, sa->blob.reserved, CU_IPC_HANDLE_SIZE);
+		if (w != CU_IPC_HANDLE_SIZE)
+			mclog("IPC serve: short write (%zd): %s", w,
+			      strerror(errno));
+		close(c);
+	}
+	mclog("IPC serve thread for %s exiting", sa->path);
+	free(sa);
+	return NULL;
+}
+
+/* Must hold g_lock. */
+static int ipc_start_serving(IpcEnt *e, const CUipcMemHandle *blob) {
+	if (ipc_sock_path(e, e->serve_path, sizeof(e->serve_path)) != 0)
+		return -1;
+	struct sockaddr_un sa;
+	unlink(e->serve_path);
+	int s = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (s < 0)
+		return -1;
+	memset(&sa, 0, sizeof(sa));
+	sa.sun_family = AF_UNIX;
+	strcpy(sa.sun_path, e->serve_path);
+	if (bind(s, (struct sockaddr *)&sa, sizeof(sa)) != 0 ||
+	    listen(s, 64) != 0) {
+		mclog("RESUME: IPC bind/listen(%s) failed: %s", e->serve_path,
+		      strerror(errno));
+		close(s);
+		return -1;
+	}
+	IpcServeArgs *args = malloc(sizeof(*args));
+	if (!args) {
+		close(s);
+		return -1;
+	}
+	args->sock = s;
+	args->blob = *blob;
+	strcpy(args->path, e->serve_path);
+	pthread_t t;
+	if (pthread_create(&t, NULL, ipc_serve_thread, args) != 0) {
+		close(s);
+		free(args);
+		return -1;
+	}
+	pthread_detach(t);
+	e->serve_sock = s;
+	e->blob_new = *blob;
+	e->serving = 1;
+	return 0;
+}
+
+static void ipc_stop_serving(IpcEnt *e) {
+	if (!e->serving)
+		return;
+	if (e->serve_sock >= 0) {
+		close(e->serve_sock); /* unblocks accept -> thread exits */
+		e->serve_sock = -1;
+	}
+	if (e->serve_path[0])
+		unlink(e->serve_path);
+	e->serving = 0;
+}
+
+/* Importer-side: connect (with retry; the exporter may not be serving yet)
+ * and read the re-exported blob. */
+static int ipc_fetch_blob(const IpcEnt *e, CUipcMemHandle *out, int timeout_ms) {
+	char path[104];
+	if (ipc_sock_path(e, path, sizeof(path)) != 0)
+		return -1;
+	struct sockaddr_un sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sun_family = AF_UNIX;
+	strcpy(sa.sun_path, path);
+	for (int waited = 0; waited < timeout_ms; waited += 100) {
+		int s = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (s < 0)
+			return -1;
+		if (connect(s, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+			size_t got = 0;
+			while (got < CU_IPC_HANDLE_SIZE) {
+				ssize_t r = read(s, out->reserved + got,
+				                 CU_IPC_HANDLE_SIZE - got);
+				if (r <= 0)
+					break;
+				got += (size_t)r;
+			}
+			close(s);
+			if (got == CU_IPC_HANDLE_SIZE)
+				return 0;
+		} else {
+			close(s);
+		}
+		struct timespec ts = {0, 100 * 1000 * 1000};
+		nanosleep(&ts, NULL);
+	}
+	mclog("RESUME: timed out fetching IPC blob from %s", path);
+	return -1;
+}
+
 /* Importer-side: connect (with retry; the creator may not be serving yet)
  * and receive the new group fd. */
 static int fetch_group_fd(const Alloc *a, int timeout_ms) {
@@ -1300,6 +1601,31 @@ static int do_suspend(void) {
 		released++;
 	}
 
+	/* Legacy CUDA IPC imports. Only the import blocks the restore -- the
+	 * exporter keeps its allocation and needs no teardown -- so close
+	 * every live one and leave the exports alone.
+	 *
+	 * Closing order does not matter; REOPEN order does, and is replayed
+	 * from each entry's seq on resume. */
+	int ipc_closed = 0;
+	for (int i = 0; i < MAXN; i++) {
+		if (g_ipc[i].serving)
+			ipc_stop_serving(&g_ipc[i]);
+		if (!g_ipc[i].used || !g_ipc[i].is_import)
+			continue;
+		if (g_ipc[i].ctx)
+			r_cuCtxSetCurrent(g_ipc[i].ctx);
+		CUresult rc = r_cuIpcCloseMemHandle(g_ipc[i].ptr);
+		if (rc != CUDA_SUCCESS) {
+			mclog("SUSPEND: cuIpcCloseMemHandle(0x%llx) rc=%d",
+			      (unsigned long long)g_ipc[i].ptr, rc);
+			return -1;
+		}
+		ipc_closed++;
+		mclog("SUSPEND: closed IPC import idx=%d seq=%d va=0x%llx", i,
+		      g_ipc[i].seq, (unsigned long long)g_ipc[i].ptr);
+	}
+
 	ctx_probe("suspend-exit");
 
 	if (saved)
@@ -1307,8 +1633,8 @@ static int do_suspend(void) {
 	if (r_cuCtxSynchronize)
 		r_cuCtxSynchronize();
 	mclog("SUSPEND done: groups=%d imports=%d unmapped=%d unbound=%d "
-	      "released=%d",
-	      groups, imports, unmapped, unbound, released);
+	      "released=%d ipc_closed=%d",
+	      groups, imports, unmapped, unbound, released, ipc_closed);
 	return 0;
 }
 
@@ -1375,8 +1701,34 @@ static int do_resume(void) {
 			}
 		}
 	}
-	mclog("RESUME: phase1 done (%d MC creators, %d UC exporters served)",
-	      p1_mc, p1_uc);
+	/* Legacy IPC exporters re-export and serve here too, in phase 1, for
+	 * the same anti-deadlock reason: a rank that is an exporter to one
+	 * peer and an importer from another must be serving before anybody
+	 * starts fetching. */
+	int p1_ipc = 0;
+	for (int i = 0; i < MAXN; i++) {
+		if (!g_ipc[i].used || g_ipc[i].is_import)
+			continue;
+		if (g_ipc[i].ctx)
+			r_cuCtxSetCurrent(g_ipc[i].ctx);
+		/* The blob a re-export produces differs from the original, so
+		 * importers cannot reuse what they have; serve the new one
+		 * under the original blob's key, which both sides still know. */
+		CUipcMemHandle nb;
+		CUresult rc = r_cuIpcGetMemHandle(&nb, g_ipc[i].ptr);
+		if (rc != CUDA_SUCCESS) {
+			mclog("RESUME: cuIpcGetMemHandle(0x%llx) rc=%d",
+			      (unsigned long long)g_ipc[i].ptr, rc);
+			return -1;
+		}
+		if (ipc_start_serving(&g_ipc[i], &nb) != 0)
+			return -1;
+		p1_ipc++;
+	}
+
+	mclog("RESUME: phase1 done (%d MC creators, %d UC exporters served, "
+	      "%d IPC exporters served)",
+	      p1_mc, p1_uc, p1_ipc);
 
 	/* Phase 2: importers fetch the re-exported fd and re-import (new
 	 * handle). Serving is already up for every exporter, so no deadlock. */
@@ -1449,6 +1801,59 @@ static int do_resume(void) {
 				return -1;
 		}
 	}
+
+	/* Phase 4: reopen legacy IPC imports.
+	 *
+	 * Last, and in ascending open order. cuIpcOpenMemHandle takes no
+	 * address hint -- unlike cuMemAddressReserve, the driver picks the
+	 * address, and it picks the next free slot. So the original VA comes
+	 * back only if the allocation state it sees matches what it saw the
+	 * first time, which is why this runs after every VMM mapping has been
+	 * restored to its identical address, and why nothing may allocate in
+	 * between. (Measured: an interposed allocation moves the import by
+	 * exactly one slot -- legacy_va_probe.py.)
+	 *
+	 * A moved import is silent corruption: the application still holds the
+	 * old pointer and nothing returns an error. So verify, and fail loudly
+	 * rather than hand back a working-looking process. */
+	int ipc_reopened = 0;
+	for (int pass_seq = 0; pass_seq < g_ipc_seq; pass_seq++) {
+		for (int i = 0; i < MAXN; i++) {
+			if (!g_ipc[i].used || !g_ipc[i].is_import ||
+			    g_ipc[i].seq != pass_seq)
+				continue;
+			if (g_ipc[i].ctx)
+				r_cuCtxSetCurrent(g_ipc[i].ctx);
+			CUipcMemHandle nb;
+			if (ipc_fetch_blob(&g_ipc[i], &nb, 60000) != 0)
+				return -1;
+			CUdeviceptr np = 0;
+			CUresult rc =
+			    r_cuIpcOpenMemHandle(&np, nb, g_ipc[i].flags);
+			if (rc != CUDA_SUCCESS) {
+				mclog("RESUME: cuIpcOpenMemHandle(seq=%d) rc=%d",
+				      g_ipc[i].seq, rc);
+				return -1;
+			}
+			if (np != g_ipc[i].ptr) {
+				mclog("RESUME: FATAL: IPC import seq=%d moved: "
+				      "0x%llx -> 0x%llx. The application still "
+				      "points at the old address; failing rather "
+				      "than corrupting it silently.",
+				      g_ipc[i].seq,
+				      (unsigned long long)g_ipc[i].ptr,
+				      (unsigned long long)np);
+				return -1;
+			}
+			ipc_reopened++;
+			mcvlog("RESUME: reopened IPC import seq=%d va=0x%llx",
+			       g_ipc[i].seq, (unsigned long long)np);
+		}
+	}
+	if (ipc_reopened || p1_ipc)
+		mclog("RESUME: legacy IPC done (%d reopened at identical VAs, "
+		      "%d served)",
+		      ipc_reopened, p1_ipc);
 
 	if (saved)
 		r_cuCtxSetCurrent(saved);
@@ -1631,6 +2036,10 @@ static const WrapEntry *wrap_table(void) {
 	     (void *)cuMemExportToShareableHandle},
 	    {"cuMemImportFromShareableHandle",
 	     (void *)cuMemImportFromShareableHandle},
+	    {"cuIpcGetMemHandle", (void *)cuIpcGetMemHandle},
+	    {"cuIpcOpenMemHandle", (void *)cuIpcOpenMemHandle_v2},
+	    {"cuIpcOpenMemHandle_v2", (void *)cuIpcOpenMemHandle_v2},
+	    {"cuIpcCloseMemHandle", (void *)cuIpcCloseMemHandle},
 	    {"cuLaunchKernel", (void *)cuLaunchKernel},
 	    {"cuLaunchKernelEx", (void *)cuLaunchKernelEx},
 	    {"cuLaunchCooperativeKernel", (void *)cuLaunchCooperativeKernel},

@@ -120,7 +120,40 @@ together as one flaky "toggle bug":
   items 1-4 are therefore sufficient; device memory content stays
   cuda-checkpoint's responsibility and does **not** become nvproxy's problem.
 
-## Coverage gap this exposes, and the work item it implies
+## Status: the gap is closed (native)
+
+`mcshim` now interposes `cuIpcGetMemHandle` / `cuIpcOpenMemHandle(_v2)` /
+`cuIpcCloseMemHandle`, closes every live legacy import at suspend, and
+re-fetches + reopens them at resume, verifying each lands at its original VA.
+Measured with `ipc_scale_probe.py --mcshim`, job mode, native:
+
+| case | no shim | with shim |
+| --- | --- | --- |
+| `legacy-import`, W=2, 1 import/rank | 2/6 | **6/6** |
+| `legacy-import`, W=4, 6 imports/rank | 1/4 | **4/4** |
+| `import --with-legacy` (VMM **and** legacy live at once), W=2 | 0/3 | **3/3** |
+| `import` VMM only (regression check) | — | **3/3** |
+
+The mixed row is the one that matters: it is the engine shape, where NCCL
+holds VMM imports and custom all-reduce holds legacy ones, and both have to be
+torn down and rebuilt in a single pass.
+
+### A native-only keying limitation this surfaced (pre-existing)
+
+The mixed test initially hung in the *VMM* path with `timed out fetching group
+fd`. That is not the legacy work: natively every NVIDIA export FD is an open
+of `/dev/nvidiactl`, so they all share one `st_dev:st_ino`, and the shim
+disambiguates by creation ordinal. The ordinals only agree when a rank is not
+both exporter and importer of the same key — an all-to-all topology defeats
+them, and each rank waits on an ordinal nobody serves.
+
+Under gVisor this does not arise: nvproxy's fdinfo oracle supplies a unique
+`(client, object)`. Legacy IPC is immune in either environment because it keys
+on the blob, which is unique and identical on both sides. `--vmm-star` gives
+the probe a one-exporter topology so the native mixed case is testable; the
+all-to-all native case remains a known limitation of the existing keying.
+
+## The gap as originally scoped
 
 `mcshim.c` interposes the VMM API only — it contains **zero** references to
 `cuIpc*`. So today any workload using legacy CUDA IPC is uncovered.

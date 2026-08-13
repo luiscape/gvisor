@@ -212,13 +212,34 @@ def rank_proc(rank, chan, args):
         gran = cu.alloc_granularity(prop)
         size = max(BUF_BYTES, gran)
 
+        # --with-legacy adds a legacy cuIpc* buffer alongside the VMM one, so
+        # a single process holds BOTH kinds of import at once. That is the
+        # realistic engine shape (NCCL takes VMM imports, vLLM's custom
+        # all-reduce takes legacy ones) and the case the interposer has to
+        # get right as a whole rather than one API at a time.
+        legacy_ptrs, legacy_blob_hex, legacy_opened = [], "", []
+        if args.with_legacy:
+            with cu.watchdog("legacy alloc+export", 120, tag):
+                for _ in range(args.allocs):
+                    p = cu.mem_alloc(BUF_BYTES)
+                    cu.memset_u32(p, 0xB5000000 | rank, 16)
+                    legacy_ptrs.append(p)
+                legacy_blob_hex = b"".join(
+                    cu.ipc_get_handle(p) for p in legacy_ptrs).hex()
+
+        # In star mode a non-exporting rank must not export at all, not merely
+        # withhold the FD: the shim keys the rendezvous by creation ordinal
+        # natively, so an unused export still shifts this rank's import to a
+        # different ordinal than the exporter serves.
+        do_export = (stage not in ("plain", "alloc") and
+                     (not args.vmm_star or rank == 0))
         my_fds, my_vas, my_handles = [], [], []
         with cu.watchdog("local alloc+export", 120, tag):
             for _ in range(args.allocs):
                 h = cu.mem_create(size, prop)
                 my_handles.append(h)
                 my_vas.append(cu.reserve_map_rw(h, size, dev))
-                if stage not in ("plain", "alloc"):
+                if do_export:
                     my_fds.append(cu.export_posix_fd(h))
             # Own each buffer with a known pattern, so a silently broken
             # restore is caught rather than assumed away.
@@ -229,8 +250,21 @@ def rank_proc(rank, chan, args):
         # Publish ours, then take the peers' descriptors from the parent.
         # Before the "share" stage the FDs stay local -- publishing them would
         # make peers import, which is the very step being isolated.
-        publish = my_fds if stage in SHARING_STAGES else []
-        chan.send(f"FDS rank={rank}", fds=publish)
+        # --vmm-star: only rank 0 exports VMM memory, so the topology is one
+        # exporter and N importers rather than all-to-all.
+        #
+        # This exists to avoid a pre-existing limitation of the interposer's
+        # NATIVE rendezvous keying, not because all-to-all is unrealistic.
+        # Natively every NVIDIA export FD is an open of /dev/nvidiactl and so
+        # shares one st_dev:st_ino; the shim disambiguates by creation
+        # ordinal, which only lines up when a rank is not simultaneously an
+        # exporter and an importer of the same key. Under gVisor the nvproxy
+        # fdinfo oracle supplies a genuinely unique (client, object) and the
+        # limitation does not apply. Legacy IPC is immune either way: it keys
+        # on the blob, which is unique and identical on both sides.
+        publish = my_fds if (stage in SHARING_STAGES and
+                             (not args.vmm_star or rank == 0)) else []
+        chan.send(f"FDS rank={rank} blobs={legacy_blob_hex}", fds=publish)
         if args.close_exports:
             for fd in my_fds:
                 os.close(fd)
@@ -241,6 +275,14 @@ def rank_proc(rank, chan, args):
                 msg, fds = chan.recv()
             if msg.startswith("GO"):
                 break
+            if msg.startswith("PEERBLOBS"):
+                raw = bytes.fromhex(msg.split("blobs=", 1)[1])
+                with cu.watchdog("cuIpcOpenMemHandle", 180, tag):
+                    for i in range(0, len(raw), cu.CU_IPC_HANDLE_SIZE):
+                        legacy_opened.append(cu.ipc_open_handle(
+                            raw[i:i + cu.CU_IPC_HANDLE_SIZE]))
+                v(f"opened {len(legacy_opened)} legacy imports")
+                continue
             with cu.watchdog(f"importing {len(fds)} peer FDs", 180, tag):
                 for fd in fds:
                     if stage == "share":
@@ -283,7 +325,8 @@ def rank_proc(rank, chan, args):
             v("teardown complete; no IPC handles live anywhere")
 
         cu.call("cuCtxSynchronize")
-        chan.send(f"READY pid={os.getpid()} imports={imported} "
+        chan.send(f"READY pid={os.getpid()} "
+                  f"imports={imported + len(legacy_opened)} "
                   f"held_fds={len(held_fds)}")
 
         # Idle with the imports live while the parent drives cuda-checkpoint.
@@ -295,6 +338,20 @@ def rank_proc(rank, chan, args):
             if got != want:
                 raise RuntimeError(f"buffer {i} content changed: "
                                    f"0x{got:08x} != 0x{want:08x}")
+        for i, p in enumerate(legacy_ptrs):
+            got = cu.read_u32(p, 1)[0]
+            want = 0xB5000000 | rank
+            if got != want:
+                raise RuntimeError(f"legacy buffer {i} content changed: "
+                                   f"0x{got:08x} != 0x{want:08x}")
+        # Read through a peer's legacy import too: a reopened import that
+        # landed at the right address but the wrong memory would otherwise
+        # pass unnoticed.
+        for i, p in enumerate(legacy_opened):
+            got = cu.read_u32(p, 1)[0]
+            if (got & 0xFFFF0000) != 0xB5000000:
+                raise RuntimeError(f"legacy import {i} reads 0x{got:08x}, "
+                                   f"not a peer's pattern")
         chan.send("RESULT PASS")
         chan.recv(expect="EXIT")
     except Exception as e:  # noqa: BLE001 - report, don't crash silently
@@ -335,6 +392,50 @@ def parallel(fn, items):
         return list(ex.map(fn, items))
 
 
+# ---------------------------------------------------------------------------
+# mcshim control: the interposer's existence-based marker protocol.
+#   create $MCSHIM_DIR/suspend -> each rank suspends, acks suspended.<pid>
+#   remove it                  -> each rank resumes,  acks resumed.<pid>
+# ---------------------------------------------------------------------------
+
+def shim_wait(shim_dir, pids, kind, timeout_s=120):
+    """Wait for every rank to acknowledge, or report who did not."""
+    deadline = time.monotonic() + timeout_s
+    pending = set(pids)
+    while pending and time.monotonic() < deadline:
+        for pid in list(pending):
+            if os.path.exists(os.path.join(shim_dir, f"{kind}.{pid}")):
+                pending.discard(pid)
+            elif os.path.exists(os.path.join(shim_dir, f"error.{pid}")):
+                raise RuntimeError(f"interposer reported an error on pid {pid} "
+                                   f"while waiting for {kind}")
+        if pending:
+            time.sleep(0.1)
+    if pending:
+        raise RuntimeError(f"interposer did not ack {kind} on pids "
+                           f"{sorted(pending)} within {timeout_s}s")
+
+
+def shim_clear(shim_dir):
+    for f in os.listdir(shim_dir):
+        if f.split(".")[0] in ("suspended", "resumed", "error", "present"):
+            os.unlink(os.path.join(shim_dir, f))
+
+
+def shim_suspend(shim_dir, pids):
+    shim_clear(shim_dir)
+    open(os.path.join(shim_dir, "suspend"), "w").close()
+    shim_wait(shim_dir, pids, "suspended")
+
+
+def shim_resume(shim_dir, pids):
+    for f in os.listdir(shim_dir):
+        if f.startswith("suspended."):
+            os.unlink(os.path.join(shim_dir, f))
+    os.unlink(os.path.join(shim_dir, "suspend"))
+    shim_wait(shim_dir, pids, "resumed")
+
+
 def one_trial(args, trial):
     mp = multiprocessing.get_context("fork")
     parent_socks, child_socks, procs = [], [], []
@@ -357,10 +458,11 @@ def one_trial(args, trial):
     # sharing passes OS file descriptors (SCM_RIGHTS); legacy CUDA IPC passes
     # opaque 64-byte blobs, which are just bytes.
     legacy = args.stage in LEGACY_STAGES
-    by_rank = {}
+    by_rank, blobs_by_rank = {}, {}
     for rank in range(args.world):
         msg, fds = chans[rank].recv(expect="FDS")
-        by_rank[rank] = msg.split("blobs=", 1)[1] if legacy else fds
+        blobs_by_rank[rank] = msg.split("blobs=", 1)[1] if "blobs=" in msg else ""
+        by_rank[rank] = blobs_by_rank[rank] if legacy else fds
     for rank in range(args.world):
         if legacy:
             peers = "".join(b for r, b in by_rank.items() if r != rank)
@@ -370,6 +472,10 @@ def one_trial(args, trial):
             peers = [fd for r, fds in by_rank.items() if r != rank for fd in fds]
             for i in range(0, len(peers), 16):
                 chans[rank].send("PEERS", fds=peers[i:i + 16])
+            # --with-legacy: the same ranks also swap legacy IPC blobs.
+            lp = "".join(b for r, b in blobs_by_rank.items() if r != rank)
+            if lp:
+                chans[rank].send(f"PEERBLOBS blobs={lp}")
         chans[rank].send("GO")
     if not legacy:
         for fds in by_rank.values():
@@ -400,6 +506,26 @@ def one_trial(args, trial):
         return parallel(fn, targets) if args.parallel_restore or action != "restore" \
             else [fn(p) for p in targets]
 
+    # With the interposer in play, it releases the shared resources before
+    # the checkpoint and rebuilds them after the restore -- the whole point
+    # being that the application never has to know. The ranks are idle on a
+    # socket here, so no separate quiesce step is needed.
+    shim = args.mcshim
+    if shim:
+        try:
+            shim_suspend(shim, pids)
+        except RuntimeError as e:
+            print(f"  trial {trial}: interposer suspend FAILED: {e}", flush=True)
+            for rank in range(args.world):
+                try:
+                    chans[rank].send("EXIT")
+                except OSError:
+                    pass
+            for p in procs:
+                p.kill()
+            return {"imports": 0, "ok": False, "restore_failed": 0,
+                    "first_fail_index": None, "errs": [f"shim suspend: {e}"]}
+
     lock = parallel(
         lambda p: ckpt(args.cuda_checkpoint, p, "lock", extra=("--timeout", "30000")),
         pids)
@@ -420,6 +546,15 @@ def one_trial(args, trial):
     if any(r["rc"] == 0 for r in lock):
         phases["unlock"] = parallel(
             lambda p: ckpt(args.cuda_checkpoint, p, "unlock"), pids)
+
+    shim_err = None
+    if shim:
+        try:
+            shim_resume(shim, pids)
+        except (RuntimeError, OSError) as e:
+            shim_err = f"shim resume: {e}"
+            ok = False
+            print(f"    interposer resume FAILED: {e}", flush=True)
 
     # A rank whose CUDA context did not come back can block indefinitely on
     # its first post-restore call, so never wait on it without a deadline.
@@ -460,6 +595,8 @@ def one_trial(args, trial):
                         for r in phases["checkpoint"] if r["rc"] != 0})
     if any(r["rc"] != 0 for r in lock):
         errs += sorted({"lock: " + r["out"] for r in lock if r["rc"] != 0})
+    if shim_err:
+        errs.append(shim_err)
     print(f"  trial {trial}: imports/proc={imports} verified={verified}/{args.world} "
           f"lock={'ok' if all(r['rc']==0 for r in lock) else 'FAIL'} "
           f"checkpoint={'ok' if phases.get('checkpoint') and all(r['rc']==0 for r in phases['checkpoint']) else 'FAIL/skip'} "
@@ -503,6 +640,17 @@ def main():
                          "the peers' live imports (isolates import from export)")
     ap.add_argument("--parallel-restore", action="store_true",
                     help="restore all at once instead of serially")
+    ap.add_argument("--vmm-star", action="store_true",
+                    help="only rank 0 exports VMM memory (see --with-legacy; "
+                         "avoids the native VMM keying limitation)")
+    ap.add_argument("--with-legacy", action="store_true",
+                    help="also hold legacy cuIpc* imports, so one process has "
+                         "both kinds live at once (the engine shape)")
+    ap.add_argument("--mcshim", metavar="DIR", default=None,
+                    help="drive the mcshim interposer's suspend/resume around "
+                         "the checkpoint, using DIR as its control directory. "
+                         "Requires running under LD_PRELOAD=mcshim.so with "
+                         "MCSHIM_DIR=DIR.")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--cuda-checkpoint", default=os.environ.get(
         "CUDA_CHECKPOINT", "/usr/local/bin/cuda-checkpoint"))
