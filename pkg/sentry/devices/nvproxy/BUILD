@@ -42,6 +42,8 @@ go_template_instance(
 go_library(
     name = "nvproxy",
     srcs = [
+        "fabric.go",
+        "fabric_unsafe.go",
         "fds_mutex.go",
         "frontend.go",
         "frontend_mmap.go",
@@ -49,6 +51,7 @@ go_library(
         "frontend_mmap_unsafe.go",
         "frontend_unsafe.go",
         "handlers.go",
+        "multicast.go",
         "nvproxy.go",
         "nvproxy_unsafe.go",
         "object.go",
@@ -102,10 +105,14 @@ go_library(
 
 go_test(
     name = "nvproxy_test",
-    srcs = ["nvproxy_test.go"],
+    srcs = [
+        "multicast_test.go",
+        "nvproxy_test.go",
+    ],
     library = ":nvproxy",
     deps = [
         "//pkg/abi/nvgpu",
+        "//pkg/context",
         "//pkg/seccomp",
         "//pkg/sentry/devices/nvproxy/nvconf",
         "@org_golang_x_sys//unix:go_default_library",
