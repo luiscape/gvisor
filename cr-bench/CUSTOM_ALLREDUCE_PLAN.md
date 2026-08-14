@@ -129,6 +129,59 @@ why with the 1.0 evidence.
   makes cuIpcOpenMemHandle *choose* the low region at init but not at resume.
   TP=2/TP=4 do not exhibit this (all their imports live in the high arena).
 
+### TP=8 investigation (session 2): what was learned, where it stands
+
+The low-region imports are now fully characterized, and the news is mixed.
+
+**What they are.** vLLM's small custom-AR buffers (0x41300-byte signal pads and
+0x200000 metadata) are *suballocated* by cudaMalloc inside driver-owned
+regions (`0x31..`-`0x3b..`). The 16 MB / 0x801300 data buffers get dedicated
+mappings in the high user arena.
+
+**Why they cannot be replayed, measured three ways:**
+
+1. The driver never re-chooses the low region in a mature process. Even an
+   immediate same-blob reopen IN THE SAME LIVE PROCESS, seconds after the
+   close, lands ~75 TB away (the walk's own safety check caught this before
+   it became silent corruption).
+2. User reservations are not honored there: fixed-address reserves of
+   *provably free* low-region space (verified with cuMemGetAddressRange
+   probes) are silently bumped to the high arena. So no fence, plug, or hold
+   can even be built.
+3. Denying the low band at first-open (to force the smalls high from the
+   start) fails the same way: the band `[0x20.., 0x31e0..)` is already
+   driver-occupied when the first import happens.
+
+**Dead ends tried and reverted, with their costs:**
+
+- *Adjacency-probing classifier* -- misfired in the high arena and regressed
+  TP=4 to 0-for-2. Replaced by a size threshold (`MCSHIM_IPC_REPLAY_MIN`,
+  default 4 MB), which matches every observation: <=2 MB imports are
+  suballocated/unreplayable, >=8 MB ones replay cleanly.
+- *Freeing all held ranges up front* (chasing an arena-recreation theory) --
+  broke the walk's invariant that every not-yet-reopened target stays
+  reserved, letting import N squat on import M's address. Reverted to
+  per-import release.
+- *Allocation padding* (`MCSHIM_ALLOC_PAD_MIN`, force smalls past the
+  suballocation threshold at cudaMalloc time) -- did not change placement in
+  one run; the interposition may not be reaching the allocating call (torch
+  may use cudaMallocAsync or resolve the symbol before the shim loads).
+  Unverified rather than disproven; kept behind its env var.
+
+**Where that leaves TP=8:** small imports must cross the checkpoint live,
+carried by the driver's job-mode support -- which is exactly the intermittent
+path (the size-classified run failed on the toggle with 24 live per worker).
+So TP=8 custom-AR reduces to T2 (driver reliability / toggle retry) or to
+making vLLM's small buffers big enough to get dedicated mappings (a one-line
+engine change: pad the signal-pad allocation), unless the padding
+interposition can be made to catch the right call.
+
+**Verification debt (do first next session):** after the classifier revert,
+TP=4 measured 2/3 -- consistent with the historical toggle rate but below the
+5/5 the landed build measured. Rerun 5 trials of TP=4 `MCSHIM_IPC_SUSPEND=1`
+on the current build before trusting anything else; if it is not back at 5/5,
+diff against commit 3c6cabe8d, which is the known-good.
+
 ### Step 1.4 — acceptance
 
 - Native rig: 10/10 with all imports at identical VAs.

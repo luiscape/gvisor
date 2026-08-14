@@ -323,6 +323,22 @@ static int ipc_suspend_enabled(void) {
 	return v;
 }
 
+/* MCSHIM_IPC_REPLAY_MIN=<bytes> (default 4 MB): imports whose exporter
+ * allocation is smaller than this are left live across the checkpoint
+ * instead of closed and replayed. See the classifier comment in do_suspend. */
+static size_t ipc_replay_min(void) {
+	static long long v = -1;
+	if (v < 0) {
+		const char *e = getenv("MCSHIM_IPC_REPLAY_MIN");
+		v = e ? atoll(e) : (4 << 20);
+		if (v < 0)
+			v = 0;
+	}
+	return (size_t)v;
+}
+
+
+
 #define mcvlog(...)                                                            \
 	do {                                                                   \
 		if (mcverbose())                                               \
@@ -429,6 +445,7 @@ typedef struct {
 	 * before the close; the reopen must land on range_base. */
 	CUdeviceptr range_base;
 	size_t range_size;
+	int closed; /* 1 = closed by suspend; only these are reopened */
 } IpcEnt;
 
 static Alloc g_alloc[MAXN];
@@ -708,6 +725,44 @@ static int ipc_new(void) {
 	return -1;
 }
 
+/* MCSHIM_ALLOC_PAD_MIN=<bytes>: round device allocations up to this size.
+ *
+ * Small cudaMalloc allocations are suballocated inside driver-owned regions.
+ * An IPC import of one inherits that placement, and driver-owned placements
+ * are unreplayable (reservations are not honored there, and even a same-blob
+ * reopen in the same live process moves). Padding the EXPORTER's allocation
+ * past the suballocation threshold gives it a dedicated mapping in user
+ * space, which makes its imports replayable by the existing machinery.
+ * Costs memory on every padded allocation; engines route almost everything
+ * through their own pooled allocators, so in practice this hits the handful
+ * of direct cudaMallocs -- exactly the custom-all-reduce buffers. */
+static size_t alloc_pad_min(void) {
+	static long long v = -1;
+	if (v < 0) {
+		const char *e = getenv("MCSHIM_ALLOC_PAD_MIN");
+		v = e ? atoll(e) : 0;
+		if (v < 0)
+			v = 0;
+	}
+	return (size_t)v;
+}
+
+static CUresult (*r_cuMemAlloc)(CUdeviceptr *, size_t);
+
+CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize) {
+	resolve_reals();
+	REAL(r_cuMemAlloc, "cuMemAlloc_v2");
+	if (!r_cuMemAlloc)
+		return 3; /* CUDA_ERROR_NOT_INITIALIZED */
+	size_t want = alloc_pad_min();
+	if (want && bytesize < want) {
+		mcvlog("cuMemAlloc pad 0x%zx -> 0x%zx", bytesize, want);
+		bytesize = want;
+	}
+	return r_cuMemAlloc(dptr, bytesize);
+}
+
+
 /* Find the live import that owns a device pointer. */
 static int ipc_find_import(CUdeviceptr p) {
 	for (int i = 0; i < MAXN; i++)
@@ -765,9 +820,43 @@ CUresult cuIpcGetMemHandle(CUipcMemHandle *handle, CUdeviceptr dptr) {
 	return rc;
 }
 
+/* MCSHIM_IPC_LOWBAND=<base>:<size> (hex): reserve a low VA band before the
+ * first legacy IPC import is placed.
+ *
+ * Small imports opened early in an engine's life land isolated in a low
+ * region the driver never chooses again once the address space is populated
+ * -- so their addresses are unreproducible at restore. Denying the band at
+ * first-open pushes them into the high arena from the start, where replay is
+ * measured to work. The reservation is held for the process lifetime; it is
+ * address space only, no memory. */
+static void ipc_lowband_plug(void) {
+	static int done;
+	if (done)
+		return;
+	done = 1;
+	const char *e = getenv("MCSHIM_IPC_LOWBAND");
+	if (!e)
+		return;
+	unsigned long long base = 0, size = 0;
+	if (sscanf(e, "%llx:%llx", &base, &size) != 2 || !size) {
+		mclog("LOWBAND: bad MCSHIM_IPC_LOWBAND=%s (want base:size hex)",
+		      e);
+		return;
+	}
+	CUdeviceptr r = 0;
+	CUresult rc = r_cuMemAddressReserve(&r, (size_t)size, 0,
+	                                    (CUdeviceptr)base, 0);
+	mclog("LOWBAND: reserve 0x%llx+0x%llx -> rc=%d got=0x%llx%s", base,
+	      size, rc, (unsigned long long)r,
+	      (rc == CUDA_SUCCESS && r != base) ? " (MISLANDED; freeing)" : "");
+	if (rc == CUDA_SUCCESS && r != base)
+		r_cuMemAddressFree(r, (size_t)size);
+}
+
 CUresult cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle,
                             unsigned int flags) {
 	resolve_reals();
+	ipc_lowband_plug();
 	CUresult rc = r_cuIpcOpenMemHandle(pdptr, handle, flags);
 	if (rc != CUDA_SUCCESS || !pdptr)
 		return rc;
@@ -784,8 +873,30 @@ CUresult cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle,
 		e->serve_sock = -1;
 		e->seq = g_ipc_seq++;
 		r_cuCtxGetCurrent(&e->ctx);
-		mclog("track IPC-IMPORT idx=%d seq=%d va=0x%llx key=%016lx", i,
-		      e->seq, (unsigned long long)*pdptr, blob_key(&handle));
+		/* Record the placement's CONTEXT, not just the address. The
+		 * driver places imports inside internal arenas, and which arena
+		 * it picks at first-open decides whether a replay can ever get
+		 * the address back (TP=8 places some imports in a low arena that
+		 * a fresh open never chooses again). The neighbours say what the
+		 * arena was created next to. */
+		CUdeviceptr rb = 0, nb_lo = 0, nb_hi = 0;
+		size_t rs = 0, ns_lo = 0, ns_hi = 0;
+		CUresult lo_rc = 999, hi_rc = 999;
+		if (r_cuMemGetAddressRange &&
+		    r_cuMemGetAddressRange(&rb, &rs, *pdptr) == CUDA_SUCCESS) {
+			if (rb >= (2u << 20))
+				lo_rc = r_cuMemGetAddressRange(
+				    &nb_lo, &ns_lo, rb - 1);
+			hi_rc = r_cuMemGetAddressRange(&nb_hi, &ns_hi,
+			                               rb + rs);
+		}
+		mclog("track IPC-IMPORT idx=%d seq=%d va=0x%llx key=%016lx "
+		      "range=0x%llx+0x%zx below=[rc=%d 0x%llx+0x%zx] "
+		      "above=[rc=%d 0x%llx+0x%zx]",
+		      i, e->seq, (unsigned long long)*pdptr, blob_key(&handle),
+		      (unsigned long long)rb, rs,
+		      lo_rc, (unsigned long long)nb_lo, ns_lo,
+		      hi_rc, (unsigned long long)nb_hi, ns_hi);
 	} else {
 		/* An untracked import is not merely unsupported, it is a
 		 * silent restore failure later, so say so loudly now. */
@@ -1662,6 +1773,7 @@ static int do_suspend(void) {
 		 * the reservation silently land elsewhere. */
 		g_ipc[i].resv = 0;
 		g_ipc[i].resv_size = 0;
+		g_ipc[i].closed = 0;
 		if (r_cuMemGetAddressRange &&
 		    r_cuMemGetAddressRange(&g_ipc[i].range_base,
 		                           &g_ipc[i].range_size,
@@ -1669,12 +1781,42 @@ static int do_suspend(void) {
 			g_ipc[i].range_base = g_ipc[i].ptr;
 			g_ipc[i].range_size = 0;
 		}
+		/* Classify BEFORE closing, because closing an unreplayable
+		 * import is unrecoverable: even an immediate reopen of the same
+		 * blob in the same live process lands ~75 TB away (measured --
+		 * the placement is a one-time young-process decision the driver
+		 * never repeats). Such imports must cross the checkpoint live,
+		 * carried by the driver's own (intermittent) job-mode support.
+		 *
+		 * The classifier is SIZE. Small exporter allocations are
+		 * suballocated inside driver-owned regions where user
+		 * reservations are not honored (fixed-address reserves of
+		 * provably free space get bumped), so no replay can ever place
+		 * them; allocations with dedicated mappings live in user space
+		 * where close+hold+walk is measured to work. Every observation
+		 * so far separates cleanly: 0x41300 and 0x200000 imports are
+		 * driver-owned (TP=8's signal pads), 0x801300 and 0x1000000
+		 * ones are replayable (TP=2/4/8 data buffers). An adjacency-
+		 * probing classifier was tried and misfires in the high arena;
+		 * a wrong guess here is loud, not corrupting (live imports can
+		 * fail the toggle; replayed ones verify their address). */
+		if (g_ipc[i].range_size &&
+		    g_ipc[i].range_size < ipc_replay_min()) {
+			ipc_live++;
+			mclog("SUSPEND: leaving IPC import seq=%d va=0x%llx "
+			      "(0x%zx bytes; suballocated -> unreplayable) "
+			      "live for the driver to carry",
+			      g_ipc[i].seq, (unsigned long long)g_ipc[i].ptr,
+			      g_ipc[i].range_size);
+			continue;
+		}
 		CUresult rc = r_cuIpcCloseMemHandle(g_ipc[i].ptr);
 		if (rc != CUDA_SUCCESS) {
 			mclog("SUSPEND: cuIpcCloseMemHandle(0x%llx) rc=%d",
 			      (unsigned long long)g_ipc[i].ptr, rc);
 			return -1;
 		}
+		g_ipc[i].closed = 1;
 		ipc_closed++;
 		mcvlog("SUSPEND: closed IPC import idx=%d seq=%d va=0x%llx "
 		       "range=0x%llx+0x%zx",
@@ -1698,7 +1840,7 @@ static int do_suspend(void) {
 		if (!ipc_suspend_enabled())
 			break;
 		if (!g_ipc[i].used || !g_ipc[i].is_import ||
-		    !g_ipc[i].range_size)
+		    !g_ipc[i].closed || !g_ipc[i].range_size)
 			continue;
 		if (g_ipc[i].ctx)
 			r_cuCtxSetCurrent(g_ipc[i].ctx);
@@ -1713,35 +1855,31 @@ static int do_suspend(void) {
 			ipc_held++;
 			continue;
 		}
-		/* Diagnose, precisely. */
+		/* The hold attempt is the CLASSIFIER. If the hint was honored,
+		 * this import lives in reservable address space and the replay
+		 * machinery can put it back. If not -- reserve failed, or
+		 * succeeded somewhere else while the wanted range sits provably
+		 * free -- then the range is inside a driver-owned region
+		 * (0x31..-0x3b.. here) where user reservations are not honored,
+		 * fences cannot be built, and no replay can work. Mark it for
+		 * revival below. */
 		if (rc == CUDA_SUCCESS) {
-			mclog("SUSPEND: reserve for seq=%d MISLANDED: wanted "
-			      "0x%llx+0x%zx, got 0x%llx (hint not honored -> "
-			      "something occupies the range)",
-			      g_ipc[i].seq, (unsigned long long)base, sz,
-			      (unsigned long long)r);
+			mcvlog("SUSPEND: reserve for seq=%d mislanded: wanted "
+			       "0x%llx+0x%zx, got 0x%llx -> driver-owned range",
+			       g_ipc[i].seq, (unsigned long long)base, sz,
+			       (unsigned long long)r);
 			r_cuMemAddressFree(r, sz);
 		} else {
-			mclog("SUSPEND: reserve for seq=%d FAILED rc=%d "
-			      "(wanted 0x%llx+0x%zx)",
-			      g_ipc[i].seq, rc, (unsigned long long)base, sz);
-		}
-		/* What sits on the wanted range right now? Probe a few spots. */
-		for (int p = 0; p < 3; p++) {
-			CUdeviceptr q = base + (sz * p) / 3;
-			CUdeviceptr ob = 0;
-			size_t osz = 0;
-			CUresult prc =
-			    r_cuMemGetAddressRange(&ob, &osz, q);
-			mclog("SUSPEND:   probe 0x%llx -> rc=%d base=0x%llx "
-			      "size=0x%zx",
-			      (unsigned long long)q, prc,
-			      (unsigned long long)ob, osz);
+			mcvlog("SUSPEND: reserve for seq=%d failed rc=%d "
+			       "(wanted 0x%llx+0x%zx) -> driver-owned range",
+			       g_ipc[i].seq, rc, (unsigned long long)base, sz);
 		}
 	}
-	if (ipc_closed)
-		mclog("SUSPEND: legacy IPC: %d closed, %d ranges held",
-		      ipc_closed, ipc_held);
+
+	if (ipc_closed || ipc_live)
+		mclog("SUSPEND: legacy IPC: %d closed+held (replayable), "
+		      "%d left live (driver-owned or suspend disabled)",
+		      ipc_closed, ipc_live);
 
 	ctx_probe("suspend-exit");
 
@@ -1989,37 +2127,32 @@ static int resume_reopen_ipc(int p1_ipc) {
 	int nplugs = 0;
 	if (!ipc_suspend_enabled())
 		return 0; /* nothing was torn down, so nothing to rebuild */
+
+
 	for (int pass_seq = 0; pass_seq < g_ipc_seq; pass_seq++) {
 		for (int i = 0; i < MAXN; i++) {
 			if (!g_ipc[i].used || !g_ipc[i].is_import ||
-			    g_ipc[i].seq != pass_seq)
+			    !g_ipc[i].closed || g_ipc[i].seq != pass_seq)
 				continue;
 			if (g_ipc[i].ctx)
 				r_cuCtxSetCurrent(g_ipc[i].ctx);
 			CUipcMemHandle nb;
 			if (ipc_fetch_blob(&g_ipc[i], &nb, 60000) != 0)
 				return -1;
-			/* Release the held range immediately before reopening, so
-			 * the target is free exactly when the driver picks. */
+			/* Release the held range immediately before THIS reopen
+			 * and no earlier: every other target must stay reserved,
+			 * or this import can squat on a later import's address.
+			 * (Freeing them all up front was tried while chasing the
+			 * TP=8 low-arena problem; it did not help that and broke
+			 * the TP=4 walk.) */
 			if (g_ipc[i].resv) {
 				CUresult frc = r_cuMemAddressFree(
 				    g_ipc[i].resv, g_ipc[i].resv_size);
 				if (frc != CUDA_SUCCESS)
 					mclog("RESUME: freeing held range for "
-					      "seq=%d rc=%d (reservation did not "
-					      "survive the checkpoint?)",
+					      "seq=%d rc=%d",
 					      g_ipc[i].seq, frc);
 				g_ipc[i].resv = 0;
-			} else if (mcverbose()) {
-				/* No held range: what sits on the target now? */
-				CUdeviceptr ob = 0;
-				size_t osz = 0;
-				CUresult prc = r_cuMemGetAddressRange(
-				    &ob, &osz, g_ipc[i].ptr);
-				mclog("RESUME: target 0x%llx pre-open probe: "
-				      "rc=%d base=0x%llx size=0x%zx",
-				      (unsigned long long)g_ipc[i].ptr, prc,
-				      (unsigned long long)ob, osz);
 			}
 			CUdeviceptr np = 0;
 			CUresult rc =
@@ -2331,6 +2464,8 @@ static const WrapEntry *wrap_table(void) {
 	     (void *)cuMemExportToShareableHandle},
 	    {"cuMemImportFromShareableHandle",
 	     (void *)cuMemImportFromShareableHandle},
+	    {"cuMemAlloc", (void *)cuMemAlloc_v2},
+	    {"cuMemAlloc_v2", (void *)cuMemAlloc_v2},
 	    {"cuIpcGetMemHandle", (void *)cuIpcGetMemHandle},
 	    {"cuIpcOpenMemHandle", (void *)cuIpcOpenMemHandle_v2},
 	    {"cuIpcOpenMemHandle_v2", (void *)cuIpcOpenMemHandle_v2},
