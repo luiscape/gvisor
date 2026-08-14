@@ -87,7 +87,6 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		useDevGofer:            opts.UseDevGofer,
 		procDriverNvidiaParams: opts.HostSettings.ProcDriverNvidiaParams,
 		frontendFDs:            make(map[*frontendFD]struct{}),
-		uvmFDs:                 make(map[*uvmFD]struct{}),
 		clients:                make(map[nvgpu.Handle]*rootClient),
 	}
 	// Force ModifyDeviceFiles in /proc/driver/nvidia/params to 0. This is
@@ -217,7 +216,6 @@ type nvproxy struct {
 
 	fdsMu       fdsMutex `state:"nosave"`
 	frontendFDs map[*frontendFD]struct{}
-	uvmFDs      map[*uvmFD]struct{}
 
 	clientsMu sync.RWMutex `state:"nosave"`
 	clients   map[nvgpu.Handle]*rootClient

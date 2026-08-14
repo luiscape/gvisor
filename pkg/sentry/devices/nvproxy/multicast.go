@@ -17,6 +17,7 @@ package nvproxy
 import (
 	goContext "context"
 	"fmt"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
@@ -143,12 +144,19 @@ func (o *multicastFabricObject) removeAttachMem(params nvgpu.NV00FD_CTRL_DETACH_
 // Restore implements restorableObjectImpl.Restore.
 //
 // It replays the saved allocation, then the recorded ATTACH_GPU and
-// ATTACH_MEM controls, in order. Per the Phase 0 attach_blocking measurement
-// (gpu_mem_snapshots/phase0/), ATTACH_GPU does not block, but ATTACH_MEM
-// blocks until ALL participating GPUs have joined the multicast object; a
-// caller restoring multiple clients of one multicast object must therefore
-// complete every client's ATTACH_GPU replay before any client's ATTACH_MEM
-// replay (see restoreAttachesSplit).
+// ATTACH_MEM controls, in order.
+//
+// KNOWN LIMITATION (cross-client ordering): ATTACH_GPU does not block, but
+// ATTACH_MEM blocks in the driver until ALL participating GPUs have joined
+// the multicast object (measured). afterLoad restores objects serially, so if
+// several clients of ONE multicast object are restored through this path, the
+// first client's ATTACH_MEM replay would wait for peers whose ATTACH_GPU has
+// not been replayed yet -- a deadlock, surfaced only by the watchdog below.
+// This path is unreachable in the cuda-checkpoint flow (the interposer
+// empties the multicast graph before save); it matters only for a plain
+// sentry checkpoint taken with live multicast objects. Fixing it requires
+// splitting the replay into an all-clients ATTACH_GPU pass followed by an
+// all-clients ATTACH_MEM pass.
 func (o *multicastFabricObject) Restore(ctx goContext.Context) error {
 	if err := o.params.restore(); err != nil {
 		return fmt.Errorf("failed to replay multicast fabric alloc: %w", err)
@@ -179,12 +187,22 @@ func (o *multicastFabricObject) restoreAttachGPUs(ctx goContext.Context) error {
 
 // restoreAttachMems replays the recorded ATTACH_MEM controls.
 //
-// NOTE: ATTACH_MEM blocks until all participating GPUs have attached (see
-// Restore); the caller is responsible for ordering across clients.
+// ATTACH_MEM blocks in the driver until all participating GPUs have attached
+// (see Restore). The replay is a raw host ioctl that cannot be cancelled, so
+// a cross-client ordering deadlock cannot be timed out -- but it must not be
+// silent either. A watchdog names the stuck object loudly if the replay
+// exceeds a generous bound.
 func (o *multicastFabricObject) restoreAttachMems(ctx goContext.Context) error {
 	for _, am := range o.attachedMems {
 		params := am.params
+		const attachMemWatchdog = 60 * time.Second
+		wd := time.AfterFunc(attachMemWatchdog, func() {
+			log.Warningf("nvproxy: ATTACH_MEM replay on multicast object %v:%v (hMemory %v) still blocked after %s; "+
+				"likely waiting for a peer client's ATTACH_GPU that the serial restore has not replayed yet (see Restore's known limitation)",
+				o.client.handle, o.handle, am.params.HMemory, attachMemWatchdog)
+		})
 		status, err := controlObjectOnHost(o.params.fd.hostFD, o.client.handle, o.handle, nvgpu.NV00FD_CTRL_CMD_ATTACH_MEM, &params)
+		wd.Stop()
 		if err != nil || status != nvgpu.NV_OK {
 			return fmt.Errorf("failed to replay NV00FD_CTRL_CMD_ATTACH_MEM (subdevice %v, hMemory %v, offset %#x): errno=%v status=%#x", am.params.HSubDevice, am.params.HMemory, am.params.Offset, err, status)
 		}
