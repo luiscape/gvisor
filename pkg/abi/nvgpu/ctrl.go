@@ -526,11 +526,61 @@ const (
 )
 
 // +marshal
+// +stateify savable
 type NV00FD_CTRL_ATTACH_GPU_PARAMS struct {
 	_             structs.HostLayout
 	HSubDevice    Handle
 	Flags         uint32
 	DevDescriptor uint64
+}
+
+// NV00FD_CTRL_GET_INFO_PARAMS is the parameter type for
+// NV00FD_CTRL_CMD_GET_INFO, from src/common/sdk/nvidia/inc/ctrl/ctrl00fd.h.
+//
+// +marshal
+type NV00FD_CTRL_GET_INFO_PARAMS struct {
+	_               structs.HostLayout
+	Alignment       uint64
+	AllocSize       uint64
+	PageSize        uint32
+	NumMaxGpus      uint32
+	NumAttachedGpus uint32
+	_               uint32
+}
+
+// NV00FD_CTRL_ATTACH_MEM_PARAMS is the parameter type for
+// NV00FD_CTRL_CMD_ATTACH_MEM, from src/common/sdk/nvidia/inc/ctrl/ctrl00fd.h.
+//
+// Note: 555+ appends a trailing NvU32 subPageOffset ("for future use only,
+// must be zero"); it occupies what is padding in the pre-555 layout, so the
+// wire size (40 bytes) is unchanged. SubPageOffset below reflects the 555+
+// layout and reads as zero on older drivers.
+//
+// +marshal
+// +stateify savable
+type NV00FD_CTRL_ATTACH_MEM_PARAMS struct {
+	_             structs.HostLayout
+	HSubDevice    Handle
+	HMemory       Handle
+	Offset        uint64
+	MapOffset     uint64
+	MapLength     uint64
+	Flags         uint32
+	SubPageOffset uint32
+}
+
+// NV00FD_CTRL_DETACH_MEM_PARAMS is the parameter type for
+// NV00FD_CTRL_CMD_DETACH_MEM, from src/common/sdk/nvidia/inc/ctrl/ctrl00fd.h.
+//
+// +marshal
+// +stateify savable
+type NV00FD_CTRL_DETACH_MEM_PARAMS struct {
+	_          structs.HostLayout
+	HSubDevice Handle
+	_          uint32
+	Offset     uint64
+	Flags      uint32
+	_          uint32
 }
 
 // From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080bios.h:
@@ -591,6 +641,11 @@ const (
 	NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS = 0x2080110b
 
 	NV2080_CTRL_FIFO_DISABLE_CHANNELS_MAX_ENTRIES = 64
+)
+
+// From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fla.h:
+const (
+	NV2080_CTRL_CMD_FLA_GET_FABRIC_MEM_STATS = 0x20803504
 )
 
 // From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080flcn.h:
