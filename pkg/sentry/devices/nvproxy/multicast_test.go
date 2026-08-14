@@ -173,32 +173,6 @@ func TestMulticastABIStructSizes(t *testing.T) {
 	}
 }
 
-func TestPatchAllocSize(t *testing.T) {
-	// A marshaled NV_MEMORY_ALLOCATION_PARAMS with a known Size, then patched.
-	for _, params := range []interface {
-		SizeBytes() int
-		MarshalBytes([]byte) []byte
-	}{
-		&nvgpu.NV_MEMORY_ALLOCATION_PARAMS{Size: 0x1000},
-		&nvgpu.NV_MEMORY_ALLOCATION_PARAMS_V545{NV_MEMORY_ALLOCATION_PARAMS: nvgpu.NV_MEMORY_ALLOCATION_PARAMS{Size: 0x1000}},
-	} {
-		buf := make([]byte, params.SizeBytes())
-		params.MarshalBytes(buf)
-		const want = uint64(0x20000000)
-		if !patchAllocSize(buf, want) {
-			t.Fatalf("patchAllocSize returned false for %T (size %d)", params, len(buf))
-		}
-		var base nvgpu.NV_MEMORY_ALLOCATION_PARAMS
-		base.UnmarshalBytes(buf[:base.SizeBytes()])
-		if base.Size != want {
-			t.Errorf("%T: patched Size = %#x, want %#x", params, base.Size, want)
-		}
-	}
-	// A buffer of unexpected length must be rejected, not silently corrupted.
-	if patchAllocSize(make([]byte, 7), 0x1000) {
-		t.Errorf("patchAllocSize accepted a 7-byte buffer")
-	}
-}
 
 func TestObjectGraphCensusHandles(t *testing.T) {
 	ctx := context.Background()

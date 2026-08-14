@@ -41,7 +41,6 @@ type Checkpoint struct {
 	cudaCheckpointPath        string
 	cudaCheckpointSequential  bool
 	cudaBlockerTimeout        time.Duration
-	cudaMulticastSuspend      bool
 	saveRestoreExecArgv       string
 	saveRestoreExecTimeout    time.Duration
 
@@ -78,7 +77,7 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.cudaCheckpointPath, "cuda-checkpoint-path", "", "path to the cuda-checkpoint binary in the container")
 	f.BoolVar(&c.cudaCheckpointSequential, "cuda-checkpoint-sequential", false, "run cuda-checkpoint sequentially in the container")
 	f.DurationVar(&c.cudaBlockerTimeout, "cuda-blocker-timeout", control.DefaultCudaBlockerTimeout, "how long to wait for CUDA checkpoint blockers (multicast/fabric objects, exported-object FDs) to be released before failing the checkpoint")
-	f.BoolVar(&c.cudaMulticastSuspend, "cuda-multicast-suspend", false, "DISPROVEN, do not use: releases multicast objects from nvproxy. This makes the checkpoint save succeed but the restore toggle then refuses (\"unknown error\"), because libcuda's userspace bookkeeping still lists the allocation and cuda-checkpoint owns its restore -- a refusal that happens above the ioctl boundary nvproxy mediates, so it cannot be fixed from nvproxy. Use --cuda-multicast-shim-path instead, which tears the multicast layer down in-process through libcuda. Retained only so the negative result is not rediscovered.")
+
 	f.StringVar(&c.saveRestoreExecArgv, "save-restore-exec-argv", "", "argv (split by spaces) for a save/restore binary that's automatically executed in the sandbox before saving and after restoring. If the execution fails, the save/restore process will fail.")
 	f.DurationVar(&c.saveRestoreExecTimeout, "save-restore-exec-timeout", control.DefaultSaveRestoreExecTimeout, "timeout for the binary pointed to by save-restore-exec-argv.")
 
@@ -126,7 +125,6 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		CudaCheckpointPath:         c.cudaCheckpointPath,
 		CudaCheckpointSequential:   c.cudaCheckpointSequential,
 		CudaBlockerTimeout:         c.cudaBlockerTimeout,
-		CudaMulticastSuspend:       c.cudaMulticastSuspend,
 		SaveRestoreExecArgv:        c.saveRestoreExecArgv,
 		SaveRestoreExecTimeout:     c.saveRestoreExecTimeout,
 		SaveRestoreExecContainerID: cont.ID,

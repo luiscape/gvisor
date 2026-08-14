@@ -1635,7 +1635,6 @@ type CheckpointOpts struct {
 	CudaCheckpointPath        string
 	CudaCheckpointSequential  bool
 	CudaBlockerTimeout        time.Duration
-	CudaMulticastSuspend      bool
 
 	// Save/restore exec options.
 	SaveRestoreExecArgv        string
@@ -1655,7 +1654,6 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 		CudaCheckpointPath:             opts.CudaCheckpointPath,
 		CudaCheckpointSequential:       opts.CudaCheckpointSequential,
 		CudaBlockerTimeout:             opts.CudaBlockerTimeout,
-		CudaMulticastSuspend:           opts.CudaMulticastSuspend,
 		ExecOpts: control.SaveRestoreExecOpts{
 			Argv:        opts.SaveRestoreExecArgv,
 			Timeout:     opts.SaveRestoreExecTimeout,

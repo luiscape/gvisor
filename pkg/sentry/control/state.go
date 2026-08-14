@@ -112,11 +112,6 @@ type SaveOpts struct {
 	// (multicast/fabric objects, exported-object FDs) to be released before
 	// failing the checkpoint. Zero means a default timeout.
 	CudaBlockerTimeout time.Duration `json:"cuda_blocker_timeout"`
-
-	// CudaMulticastSuspend enables experimental nvproxy multicast
-	// suspend/replay across checkpoint/restore (R610+ cuda-checkpoint job
-	// semantics). See state.SaveOpts.CudaMulticastSuspend.
-	CudaMulticastSuspend bool `json:"cuda_multicast_suspend"`
 }
 
 // SaveRestoreExecOpts contains options for executing a binary
@@ -145,7 +140,6 @@ func ConvertToStateSaveOpts(o *SaveOpts) (*state.SaveOpts, error) {
 		CudaCheckpointPath:             o.CudaCheckpointPath,
 		CudaCheckpointSequential:       o.CudaCheckpointSequential,
 		CudaBlockerTimeout:             o.CudaBlockerTimeout,
-		CudaMulticastSuspend:           o.CudaMulticastSuspend,
 	}
 	if err := setSaveOpts(o, saveOpts); err != nil {
 		saveOpts.Close()

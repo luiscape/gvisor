@@ -221,13 +221,6 @@ type nvproxy struct {
 
 	clientsMu sync.RWMutex `state:"nosave"`
 	clients   map[nvgpu.Handle]*rootClient
-
-	// suspendedMulticast are multicast (00FD) objects torn down host-side by
-	// SuspendMulticastObjects before a cuda-checkpoint checkpoint action, to
-	// be replayed by ReplayMulticastObjects after the post-restore toggle.
-	// It is only accessed with the sandbox quiesced (during checkpoint save
-	// and restore), so it needs no separate lock.
-	suspendedMulticast []*suspendedMulticastObject
 }
 
 func nvproxyFromVFS(vfsObj *vfs.VirtualFilesystem) *nvproxy {

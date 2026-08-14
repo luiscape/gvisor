@@ -85,12 +85,20 @@ and must not be waited on forever.
 - Driver 610.57.04 support, a handful of new-in-610 ioctls
   (`NV2080_CTRL_CMD_FLA_GET_FABRIC_MEM_STATS` was required for TP workers to
   reach checkpoint at all).
-- **`multicast.go` / `fabric_unsafe.go` — kept as a negative result.**
-  Sentry-side multicast suspend/replay is *disproven*: freeing the RM objects
-  from nvproxy makes the save succeed but the restore toggle refuses, because
-  libcuda's own userspace bookkeeping still lists them. This is the
-  measurement that dictates the entire architecture — teardown must happen
-  through libcuda, in-process, which is why the interposer exists.
+- **`multicast.go` — attach-control recording** (TASK.md item 2): a
+  multicast object's state is built after allocation by `ATTACH_GPU` /
+  `ATTACH_MEM` controls, so a narrow allowlist of them is recorded on the
+  object and replayed after the alloc when nvproxy's own `afterLoad` restores
+  the object graph. Detaches remove the recorded entry.
+- **Removed: the sentry-side multicast suspend/replay** (`--cuda-multicast-
+  suspend`, `SuspendMulticastObjects`/`ReplayMulticastObjects`, the fabric
+  drain PoC and its UVM range tracking). It was *disproven*: freeing the RM
+  objects from nvproxy makes the save succeed, but the restore toggle then
+  refuses, because libcuda's own userspace bookkeeping still lists them — a
+  refusal above the ioctl boundary nvproxy mediates. That measurement dictates
+  the entire architecture (teardown must happen through libcuda, in-process,
+  which is why the interposer exists); the mechanism itself is deleted and
+  this paragraph plus git history are its record.
 
 ### `pkg/sentry/mm` — `MAP_FIXED_NOREPLACE` (cherry-pick of PR #14008)
 

@@ -126,7 +126,7 @@ across a restore -- run it under `cuda-checkpoint --launch-job`),
 | Runner | Why |
 | --- | --- |
 | `run_phase0.sh` | Phase 0 measurements; their conclusions are in `README.md` |
-| `run_gate_test.sh`, `run_suspend_test.sh` | the nvproxy-only suspend/replay path, which cannot work: freeing the objects from nvproxy makes the checkpoint save succeed but the restore toggle refuses, because libcuda's userspace bookkeeping still lists the allocation |
+| `run_gate_test.sh`, `run_suspend_test.sh` | the nvproxy-only suspend/replay path, which cannot work: freeing the objects from nvproxy makes the checkpoint save succeed but the restore toggle refuses, because libcuda's userspace bookkeeping still lists the allocation. The mechanism itself (`--cuda-multicast-suspend`, `SuspendMulticastObjects`, the fabric drain) has since been DELETED from the tree; these runners are unrunnable and kept only as the record of the negative result |
 
 ## Documents
 
