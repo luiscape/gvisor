@@ -253,6 +253,23 @@ func cudaShimWaitAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kerne
 			cleanup()
 			if err == nil {
 				delete(pending, tg)
+				continue
+			}
+			// A failed transition acks with error.<pid> instead. Fail
+			// fast: without this, a shim-side failure surfaces as this
+			// loop's full timeout. (The interposer removes any stale
+			// error file when it begins a new transition, so an error
+			// here is from the transition being waited on.)
+			errPath := fmt.Sprintf("%s/error.%d", dir, tg.ID())
+			ctx, pop, cleanup, ok = cudaShimPathOp(sctx, tg, errPath)
+			if !ok {
+				delete(pending, tg)
+				continue
+			}
+			_, err = k.VFS().StatAt(ctx, creds, pop, &vfs.StatOptions{})
+			cleanup()
+			if err == nil {
+				return fmt.Errorf("multicast interposer: process %d reported an error during %q (see its MCSHIM_LOG for the cause)", tg.ID(), prefix)
 			}
 		}
 		if len(pending) == 0 {
@@ -291,9 +308,6 @@ func waitCudaProcsRunning(sctx context.Context, k *kernel.Kernel, cudaCheckpoint
 		time.Sleep(cudaShimPollInterval)
 	}
 }
-
-
-
 
 // cudaShimProcsWith returns the subset of cudaProcs that have written the file
 // "<prefix>.<pid>" in the rendezvous directory.
