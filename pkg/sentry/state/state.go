@@ -80,6 +80,11 @@ type SaveOpts struct {
 	// CudaCheckpointSequential indicates whether cuda-checkpoint should be run
 	// sequentially (rather than in parallel).
 	CudaCheckpointSequential bool
+
+	// CudaBlockerTimeout is how long to wait for CUDA checkpoint blockers
+	// (multicast/fabric objects, exported-object FDs) to be released before
+	// failing the checkpoint. Zero means a default timeout.
+	CudaBlockerTimeout time.Duration
 }
 
 // Close releases resources owned by opts.

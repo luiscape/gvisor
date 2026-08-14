@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -45,7 +46,36 @@ const (
 	// cudaCheckpointSequentialKey is the checkpoint state key for whether to run
 	// cuda-checkpoint sequentially.
 	cudaCheckpointSequentialKey = "cuda-checkpoint-sequential"
+
+	// cudaLockTimeoutMS is how long (in milliseconds) each `cuda-checkpoint
+	// --action lock` invocation waits for a process to reach a lockable state.
+	// NCCL/CUDA-IPC-coupled processes only become lockable once every job
+	// member is locking in parallel (a rank spinning in an unfinished collective
+	// cannot be quiesced until its peers are too), so this must be generous.
+	cudaLockTimeoutMS = 30000
+
+	// cudaBlockerPollInterval is how often the checkpoint-blocker gate
+	// re-polls nvproxy for live blockers before giving up.
+	cudaBlockerPollInterval = 500 * time.Millisecond
+
+	// cudaLockGateAttempts bounds how many times the (gate, lock) pair is
+	// retried when the lock cannot quiesce every rank. Only meaningful with
+	// the multicast interposer, whose gate is what gets released between
+	// attempts to let a deadlocked collective drain.
+	cudaLockGateAttempts = 8
+
+	// cudaLockGateRetryDelay is how long the gate stays released between
+	// attempts, giving in-flight collectives time to complete.
+	cudaLockGateRetryDelay = 500 * time.Millisecond
 )
+
+// DefaultCudaBlockerTimeout is the default for SaveOpts.CudaBlockerTimeout:
+// how long preSaveCuda waits for checkpoint blockers (multicast/fabric
+// objects, exported-object FDs) to disappear before failing the checkpoint.
+// Blockers only disappear if the application tears the resources down itself,
+// so a short default just bounds the wait; nvproxy-driven multicast suspend
+// (which removes the blockers) is a separate, later step.
+const DefaultCudaBlockerTimeout = 10 * time.Second
 
 func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	if o.CudaCheckpointPath == "" {
@@ -67,12 +97,31 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		}
 	}
 	sctx := k.SupervisorContext()
+
 	cudaProcs := cudaProcs(sctx, k, o.CudaCheckpointPath, k.NvidiaDriverVersion.Major())
+
+	// Gate: cuda-checkpoint cannot serialize multicast/fabric memory or live
+	// CUDA IPC exports; attempting to checkpoint with such resources live
+	// hangs or corrupts the snapshot. Poll (the app may be tearing them down)
+	// and fail loudly with a per-client attribution if they persist.
+	//
+	// Multicast objects are exempt when something is going to release them
+	// later in the sequence, between the cuda-checkpoint lock and checkpoint
+	// phases: either nvproxy's own suspend/replay, or the LD_PRELOADed
+	// interposer that checkpointCudaProcs drives (see state_cuda_shim.go).
+	// All other fabric/exported-fd blockers always gate.
+	multicastWillBeReleased := cudaShimDir(k, cudaProcs) != ""
+	if err := waitForCudaCheckpointBlockers(k, o.CudaBlockerTimeout, multicastWillBeReleased); err != nil {
+		if wasPaused {
+			k.Pause()
+		}
+		return err
+	}
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {
 		tg.SigsegvLock()
 	}
-	err := toggleCudaProcs(sctx, k, o.CudaCheckpointPath, cudaProcs, nil, o.CudaCheckpointSequential)
+	err := checkpointCudaProcs(sctx, k, o.CudaCheckpointPath, cudaProcs, o.CudaCheckpointSequential, o.CudaBlockerTimeout)
 	if wasPaused {
 		k.Pause()
 	}
@@ -81,12 +130,60 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		for _, tg := range cudaProcs {
 			tg.SigsegvUnlock()
 		}
+		// Bring multicast back and let the application run again.
+		if dir := cudaShimDir(k, cudaProcs); dir != "" {
+			unwindCudaMulticastShim(sctx, k, cudaProcs, dir)
+		}
 		return err
 	}
 	k.AddStateToCheckpoint(cudaCheckpointPathKey, o.CudaCheckpointPath)
 	k.AddStateToCheckpoint(cudaCheckpointSequentialKey, o.CudaCheckpointSequential)
 	k.AddStateToCheckpoint(cudaProcsKey, cudaProcs)
 	return nil
+}
+
+// waitForCudaCheckpointBlockers polls nvproxy for checkpoint blockers
+// (fabric RM objects and exported-object FDs) until they disappear or timeout
+// elapses, in which case it returns an error attributing the blockers to
+// their owning clients/tasks.
+//
+// When multicastWillBeReleased is true, blockers of kind "multicast" are NOT
+// waited for: they are released between the cuda-checkpoint lock and
+// checkpoint phases (by nvproxy's suspend/replay or by the interposer) and
+// rebuilt after the post-restore toggle, so the application need not release
+// them itself.
+func waitForCudaCheckpointBlockers(k *kernel.Kernel, timeout time.Duration, multicastWillBeReleased bool) error {
+	if timeout <= 0 {
+		timeout = DefaultCudaBlockerTimeout
+	}
+	deadline := time.Now().Add(timeout)
+	blockers := gatedBlockers(nvproxy.CheckpointBlockers(k.VFS()), multicastWillBeReleased)
+	for len(blockers) != 0 {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("cuda-checkpoint cannot proceed: %d resource(s) it cannot serialize are still live after %s: %s",
+				len(blockers), timeout, nvproxy.FormatBlockersByClient(blockers))
+		}
+		log.Infof("Waiting for CUDA checkpoint blockers to be released: %s", nvproxy.FormatBlockersByClient(blockers))
+		time.Sleep(cudaBlockerPollInterval)
+		blockers = gatedBlockers(nvproxy.CheckpointBlockers(k.VFS()), multicastWillBeReleased)
+	}
+	return nil
+}
+
+// gatedBlockers returns the blockers that must gate the checkpoint. When
+// multicastWillBeReleased is true, multicast objects are released later in the
+// checkpoint sequence and are not gated; all other blockers always gate.
+func gatedBlockers(blockers []nvproxy.CheckpointBlocker, multicastWillBeReleased bool) []nvproxy.CheckpointBlocker {
+	if !multicastWillBeReleased {
+		return blockers
+	}
+	var out []nvproxy.CheckpointBlocker
+	for _, b := range blockers {
+		if b.Kind != "multicast" {
+			out = append(out, b)
+		}
+	}
+	return out
 }
 
 // cudaProcs returns a list of all CUDA processes in the sandbox. It selects
@@ -114,6 +211,14 @@ func cudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string
 			procs = append(procs, tg)
 		}
 	})
+	// ForEachThreadGroup iterates a map, so without this the order in which
+	// cuda-checkpoint actions are issued -- and therefore which process is
+	// toggled first on restore -- differs on every run. That never caused a
+	// failure by itself (measured: no ordering rule fits the observed toggle
+	// failures, and parallel toggling is no better), but it makes any failure
+	// unreproducible run to run, which is a debugging tax on every
+	// investigation downstream of this list.
+	sort.Slice(procs, func(i, j int) bool { return procs[i].ID() < procs[j].ID() })
 
 	// procs may contain NVML-only processes, which don't use CUDA. As of
 	// writing, calling cuda-checkpoint on them will fail for all tested drivers.
@@ -153,11 +258,36 @@ func postResumeCuda(k *kernel.Kernel, timeline *timing.Timeline) error {
 	cudaCheckpointSequential := k.PopCheckpointState(cudaCheckpointSequentialKey).(bool)
 	cudaProcs := k.PopCheckpointState(cudaProcsKey).([]*kernel.ThreadGroup)
 	timeline.Reached("starting cuda-ckpt")
+	// Phase 0 instrumentation: the pre-toggle census shows what
+	// nvproxy.afterLoad() replayed; diffing against the post-toggle census
+	// shows what the cuda-checkpoint restore recreates through libcuda.
+	censusPre := logCudaObjectCensus(k, "post-load/pre-toggle")
 	// FIXME: b/460451448 - pass --device-map to cuda-checkpoint if accepted
-	err := toggleCudaProcs(k.SupervisorContext(), k, cudaCheckpointPath, cudaProcs, timeline, cudaCheckpointSequential)
+	err := restoreCudaProcs(k.SupervisorContext(), k, cudaCheckpointPath, cudaProcs, timeline, cudaCheckpointSequential)
+	if err == nil {
+		censusPost := logCudaObjectCensus(k, "post-toggle")
+		logCudaObjectCensusDiff(censusPre, censusPost)
+	}
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {
 		tg.SigsegvUnlock()
+	}
+
+	// Rebuild the interposer's multicast objects and CUDA IPC imports.
+	//
+	// Ordering here is doubly constrained. It must run after the restore
+	// toggle has finished on EVERY process, or a rank rebuilds on a context
+	// whose device state is not restored yet and latches a sticky 719. It
+	// must also run after SigsegvUnlock above: the rebuild touches GPU
+	// memory, and while the SIGSEGV lock is held the resulting page faults
+	// cannot be serviced, which faults every rank's context with
+	// CUDA_ERROR_ILLEGAL_ADDRESS (700). Both were observed.
+	if err == nil {
+		if rerr := resumeCudaMulticastShim(k.SupervisorContext(), k, cudaCheckpointPath, cudaProcs); rerr != nil {
+			err = fmt.Errorf("failed to resume multicast interposer: %w", rerr)
+		} else {
+			timeline.Reached("multicast interposer resumed")
+		}
 	}
 	return err
 }
@@ -173,7 +303,7 @@ type checkpointProc struct {
 // containing the running cuda-checkpoint process and a cleanup function which
 // must be called to release resources. If cudaProc has exited, it returns
 // (checkpointProc.tg == nil, err == nil).
-func invokeCudaCheckpoint(sctx context.Context, k *kernel.Kernel, proc *Proc, cudaCheckpointPath string, cudaProc *kernel.ThreadGroup, opFlag string, nullFD *vfs.FileDescription) (checkpointProc, func(), error) {
+func invokeCudaCheckpoint(sctx context.Context, k *kernel.Kernel, proc *Proc, cudaCheckpointPath string, cudaProc *kernel.ThreadGroup, opArgs []string, nullFD *vfs.FileDescription) (checkpointProc, func(), error) {
 	pid := cudaProc.ID()
 	leader := cudaProc.Leader()
 	contID := leader.ContainerID()
@@ -191,14 +321,11 @@ func invokeCudaCheckpoint(sctx context.Context, k *kernel.Kernel, proc *Proc, cu
 	cu.Add(func() {
 		mntns.DecRef(ctx)
 	})
+	argv := append([]string{"cuda-checkpoint"}, opArgs...)
+	argv = append(argv, "--pid", strconv.FormatInt(int64(pid), 10))
 	args := &ExecArgs{
-		Filename: cudaCheckpointPath,
-		Argv: []string{
-			"cuda-checkpoint",
-			opFlag,
-			"--pid",
-			strconv.FormatInt(int64(pid), 10),
-		},
+		Filename:       cudaCheckpointPath,
+		Argv:           argv,
 		ContainerID:    contID,
 		MountNamespace: mntns,
 		PIDNamespace:   leader.PIDNamespace(),
@@ -209,7 +336,7 @@ func invokeCudaCheckpoint(sctx context.Context, k *kernel.Kernel, proc *Proc, cu
 
 	// Provide standard streams to cuda-checkpoint. Use /dev/null as stdin
 	// and direct cuda-checkpoint's stdout/stderr to a pipe.
-	ckptDesc := fmt.Sprintf("cuda-checkpoint %s for PID %d in container %q", opFlag, pid, contID)
+	ckptDesc := fmt.Sprintf("cuda-checkpoint %s for PID %d in container %q", strings.Join(opArgs, " "), pid, contID)
 	args.FDTable = k.NewFDTable()
 	cu.Add(func() {
 		args.FDTable.DecRef(ctx)
@@ -282,7 +409,7 @@ func filterCudaProcsUsingGetState(sctx context.Context, k *kernel.Kernel, cudaCh
 	proc := &Proc{Kernel: k}
 	ckptProcs := make(map[*kernel.ThreadGroup]checkpointProc)
 	for _, cudaProc := range cudaProcs {
-		ckptProc, cleanup, err := invokeCudaCheckpoint(sctx, k, proc, cudaCheckpointPath, cudaProc, "--get-state", nullFD)
+		ckptProc, cleanup, err := invokeCudaCheckpoint(sctx, k, proc, cudaCheckpointPath, cudaProc, []string{"--get-state"}, nullFD)
 		if err != nil {
 			log.Warningf("Failed to get state for PID %d: %v", cudaProc.ID(), err)
 			continue
@@ -318,132 +445,293 @@ func filterCudaProcsUsingGetState(sctx context.Context, k *kernel.Kernel, cudaCh
 	return res
 }
 
-func toggleCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, timeline *timing.Timeline, sequential bool) error {
-	start := time.Now()
-
-	// Open /dev/null once for the stdin of all cuda-checkpoint processes.
+// openCudaCheckpointNullFD opens /dev/null to use as stdin for cuda-checkpoint
+// child processes. The returned cleanup must be called when the caller is done.
+func openCudaCheckpointNullFD(sctx context.Context, k *kernel.Kernel) (*vfs.FileDescription, func()) {
 	nullVD := k.VFS().NewAnonVirtualDentry("null")
-	defer nullVD.DecRef(sctx)
 	nullFD, err := memdev.NewNullFD(sctx, nullVD.Mount(), nullVD.Dentry(), vfs.OpenOptions{})
 	if err != nil {
 		log.Warningf("Failed to open /dev/null for cuda-checkpoint stdin: %v", err)
-	} else {
-		defer nullFD.DecRef(sctx)
+		return nil, func() { nullVD.DecRef(sctx) }
 	}
+	return nullFD, func() {
+		nullFD.DecRef(sctx)
+		nullVD.DecRef(sctx)
+	}
+}
 
-	// Call cuda-checkpoint for each CUDA PID.
-	ckptTimerNames := make([]string, len(cudaProcs))
-	for i, cudaProc := range cudaProcs {
-		ckptTimerNames[i] = fmt.Sprintf("cuda-ckpt %s", cudaProc.ID())
-	}
-	var ckptTimings []*timing.Lease
-	if !sequential {
-		ckptTimelines := timeline.MultiFork(ckptTimerNames)
-		ckptTimings = make([]*timing.Lease, len(cudaProcs))
-		for i := range cudaProcs {
-			ckptTimings[i] = ckptTimelines[i].Lease()
-		}
-	}
-	defer func() {
-		for _, t := range ckptTimings {
-			t.End()
-		}
-	}()
+// runCudaAction invokes `cuda-checkpoint <opArgs...> --pid <pid>` on every
+// process in cudaProcs. When parallel is true all invocations run concurrently;
+// otherwise they run one at a time. It returns the processes for which the
+// action succeeded (exit status 0) and a combined error describing any failures.
+func runCudaAction(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, opArgs []string, parallel bool, nullFD *vfs.FileDescription) ([]*kernel.ThreadGroup, error) {
 	proc := &Proc{Kernel: k}
 	ckptProcs := make(map[*kernel.ThreadGroup]checkpointProc)
 	var errs []error
-	for i, cudaProc := range cudaProcs {
-		var ckptTiming *timing.Lease
-		if sequential {
-			ckptTiming = timeline.Fork(ckptTimerNames[i]).Lease()
-		} else {
-			ckptTiming = ckptTimings[i]
-		}
-		ckptProc, cleanup, err := invokeCudaCheckpoint(sctx, k, proc, cudaCheckpointPath, cudaProc, "--toggle", nullFD)
+	for _, cudaProc := range cudaProcs {
+		ckptProc, cleanup, err := invokeCudaCheckpoint(sctx, k, proc, cudaCheckpointPath, cudaProc, opArgs, nullFD)
 		if err != nil {
-			ckptTiming.Reached("invoke error")
 			errs = append(errs, err)
-			break
+			continue
 		}
 		if ckptProc.tg == nil {
-			ckptTiming.Reached("tg nil")
 			continue
 		}
 		ckptProcs[cudaProc] = ckptProc
-		ckptTimeline := ckptTiming.Transfer()
-		if sequential {
-			ckptProc.tg.WaitExited()
-			if status := ckptProc.tg.ExitStatus(); status != 0 {
-				ckptTimeline.Reached("exec error")
-			}
-			ckptTimeline.End()
-		} else {
-			go func() {
-				defer ckptTimeline.End()
-				ckptProc.tg.WaitExited()
-				if status := ckptProc.tg.ExitStatus(); status != 0 {
-					ckptTimeline.Reached("exec error")
-				}
-			}()
-		}
 		defer cleanup()
+		// In sequential mode, wait for each invocation to finish before starting
+		// the next. In parallel mode, all invocations are launched first and
+		// waited on below.
+		if !parallel {
+			ckptProc.tg.WaitExited()
+		}
 	}
-	timeline.Reached("cuda-ckpts invoked")
-	// Wait for all cuda-checkpoint processes to exit. Remove all failed
-	// cuda-checkpoint attempts from ckptProcs, so ckptProcs only contains the
-	// successful ones.
+	var succeeded []*kernel.ThreadGroup
 	for cudaProc, ckptProc := range ckptProcs {
-		if !sequential {
+		if parallel {
 			ckptProc.tg.WaitExited()
 		}
 		if status := ckptProc.tg.ExitStatus(); status != 0 {
+			out := ""
 			if ckptProc.out != nil {
-				errs = append(errs, fmt.Errorf("%q failed with exit status %d; output: %q", ckptProc.desc, status, ckptProc.out.String()))
-			} else {
-				errs = append(errs, fmt.Errorf("%q failed with exit status %d", ckptProc.desc, status))
+				out = ckptProc.out.String()
 			}
-			delete(ckptProcs, cudaProc)
-		} else if log.IsLogging(log.Debug) && ckptProc.out != nil {
-			log.Debugf("%s succeeded; output: %q", ckptProc.desc, ckptProc.out.String())
+			errs = append(errs, fmt.Errorf("%q failed with exit status %d; output: %q", ckptProc.desc, status, out))
+		} else {
+			succeeded = append(succeeded, cudaProc)
+			if log.IsLogging(log.Debug) && ckptProc.out != nil {
+				log.Debugf("%s succeeded; output: %q", ckptProc.desc, ckptProc.out.String())
+			}
 		}
 	}
-	timeline.Reached("cuda-ckpts waited")
-	if len(errs) > 0 {
-		// If any cuda-checkpoint process failed, we need to undo the --toggle
-		// operation for all the successful ones to restore the original state.
-		// This is best-effort.
-		undoCkptProcs := make(map[string]checkpointProc)
-		for cudaProc, ckptProc := range ckptProcs {
-			undoCkptProc, cleanup, err := invokeCudaCheckpoint(sctx, k, proc, cudaCheckpointPath, cudaProc, "--toggle", nullFD)
-			if err != nil {
-				log.Warningf("Failed to invoke cuda-checkpoint to undo %q: %v", ckptProc.desc, err)
-				continue
+	return succeeded, errors.Join(errs...)
+}
+
+// checkpointCudaProcs suspends all CUDA processes in cudaProcs using
+// cuda-checkpoint's two-phase lock/checkpoint protocol. The two phases are
+// required for correctness when the processes are coupled through NCCL and/or
+// CUDA IPC (as in tensor-parallel inference engines):
+//
+//  1. Lock ALL processes in parallel. Locking every job member before
+//     checkpointing any is essential: a rank spinning inside an unfinished
+//     collective can only be quiesced once its peers are locking too. Issuing a
+//     full per-process --toggle (lock+checkpoint) instead lets one rank finish
+//     checkpointing while its peer keeps spinning waiting for it, deadlocking
+//     the snapshot.
+//  2. Checkpoint all locked processes, releasing their GPU state.
+func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, sequential bool, blockerTimeout time.Duration) error {
+	start := time.Now()
+	nullFD, cleanup := openCudaCheckpointNullFD(sctx, k)
+	defer cleanup()
+
+	// Phase 0 instrumentation (multicast suspend/replay design): snapshot the
+	// nvproxy object graph before quiescing, so we can diff it against the
+	// post-checkpoint graph below.
+	censusPre := logCudaObjectCensus(k, "pre-lock")
+
+	// Phase 1: bar the application from the GPU, then lock every process in
+	// parallel so coupled ranks quiesce together. --timeout bounds how long
+	// each lock waits for its process to become lockable.
+	//
+	// The gate and the lock cover different halves of the problem, and neither
+	// suffices alone. The gate stops *new* submissions but cannot drain work
+	// already in flight. The lock drains and preempts in-flight work but
+	// cannot keep up with a workload that never idles, and then reports
+	// "device not ready". So gate first, leaving the lock only the in-flight
+	// work to deal with.
+	//
+	// Gating can however deadlock a collective: a rank gated just before
+	// submitting collective N starves peers already spinning in N, and the
+	// lock cannot quiesce those peers either. Releasing the gate lets that
+	// collective complete, so retry the pair a bounded number of times -- each
+	// attempt is a fresh chance to catch every rank between collectives. If it
+	// never converges, fail cleanly with the application still running.
+	shimDir := cudaShimDir(k, cudaProcs)
+	lockArgs := []string{"--action", "lock", "--timeout", strconv.Itoa(cudaLockTimeoutMS)}
+	var locked []*kernel.ThreadGroup
+	var err error
+	for attempt := 1; ; attempt++ {
+		if shimDir != "" {
+			if err = armCudaMulticastShimGate(sctx, k, cudaProcs, shimDir); err != nil {
+				return err
 			}
-			if undoCkptProc.tg == nil {
-				continue
-			}
-			if sequential {
-				undoCkptProc.tg.WaitExited()
-			}
-			undoCkptProcs[ckptProc.desc] = undoCkptProc
-			defer cleanup()
 		}
-		for ckptProcDesc, undoCkptProc := range undoCkptProcs {
-			if !sequential {
-				undoCkptProc.tg.WaitExited()
-			}
-			if status := undoCkptProc.tg.ExitStatus(); status != 0 {
-				if undoCkptProc.out != nil {
-					log.Warningf("Undoing %q failed with exit status %d; output: %q", ckptProcDesc, status, undoCkptProc.out.String())
-				} else {
-					log.Warningf("Undoing %q failed with exit status %d", ckptProcDesc, status)
-				}
-			}
+		locked, err = runCudaAction(sctx, k, cudaCheckpointPath, cudaProcs, lockArgs, true /* parallel */, nullFD)
+		if err == nil {
+			break
 		}
-		// Combine all errors and return.
-		return errors.Join(errs...)
+		// Unlock whatever did lock, so ranks holding peers back can make
+		// progress before the next attempt.
+		if _, uerr := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "unlock"}, true, nullFD); uerr != nil {
+			log.Warningf("cuda-checkpoint unlock between lock attempts failed: %v", uerr)
+		}
+		if shimDir == "" || attempt >= cudaLockGateAttempts {
+			break
+		}
+		log.Infof("cuda-checkpoint lock attempt %d/%d did not quiesce all ranks; releasing the interposer gate to let in-flight collectives drain, then retrying: %v",
+			attempt, cudaLockGateAttempts, err)
+		if rerr := cudaShimSetMarker(sctx, k, cudaProcs, shimDir, cudaShimGateMarker, false /* set */); rerr != nil {
+			log.Warningf("failed to release multicast interposer gate between lock attempts: %v", rerr)
+		}
+		time.Sleep(cudaLockGateRetryDelay)
 	}
-	log.Infof("cuda-checkpoint on %d processes took [%s]", len(ckptProcs), time.Since(start))
-	timeline.Reached("cuda-ckpts done")
+	if err != nil {
+		if shimDir != "" {
+			unwindCudaMulticastShim(sctx, k, cudaProcs, shimDir)
+		}
+		return fmt.Errorf("cuda-checkpoint lock phase failed: %w", err)
+	}
+
+	// Interposer teardown, sandwiched inside the lock.
+	//
+	// Two constraints collide. The interposer must issue libcuda calls
+	// (cuMemUnmap / cuMulticastUnbind / cuMemRelease), which a locked process
+	// cannot do. But it must not tear multicast down while the application is
+	// still using it, and the application cannot simply be gated first: a rank
+	// gated before submitting its next collective starves peers already
+	// spinning in that collective, so the gate alone deadlocks the drain
+	// (observed with NVLS disabled and a workload with no idle gap).
+	//
+	// cuda-checkpoint's parallel lock is precisely the thing that can quiesce
+	// coupled ranks. So: arm the gate while still locked -- the interposer only
+	// flips a flag and issues no CUDA calls, so this is safe -- then unlock, so
+	// the teardown runs against an already-drained GPU that the application is
+	// barred from touching. Then re-lock for the checkpoint.
+	if shimDir != "" {
+		undo := func() {
+			unwindCudaMulticastShim(sctx, k, locked, shimDir)
+			if _, uerr := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "unlock"}, true, nullFD); uerr != nil {
+				log.Warningf("cuda-checkpoint unlock during checkpoint unwind failed: %v", uerr)
+			}
+		}
+		if _, err := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "unlock"}, true, nullFD); err != nil {
+			undo()
+			return fmt.Errorf("cuda-checkpoint unlock before multicast teardown failed: %w", err)
+		}
+		if err := suspendCudaMulticastShim(sctx, k, locked); err != nil {
+			undo()
+			return err
+		}
+		// Verify rather than trust: the interposer acknowledging its suspend
+		// does not by itself prove the process is serializable. Re-run the
+		// gate with nothing exempt, so anything left unreleased fails here
+		// instead of becoming a snapshot that only misbehaves after restore.
+		if err := waitForCudaCheckpointBlockers(k, blockerTimeout, false /* multicastWillBeReleased */); err != nil {
+			undo()
+			return fmt.Errorf("multicast interposer suspended but resources remain: %w", err)
+		}
+		var err error
+		if locked, err = runCudaAction(sctx, k, cudaCheckpointPath, cudaProcs, lockArgs, true /* parallel */, nullFD); err != nil {
+			undo()
+			return fmt.Errorf("cuda-checkpoint re-lock after multicast teardown failed: %w", err)
+		}
+	}
+
+	// Phase 2: checkpoint all locked processes.
+	if _, err := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "checkpoint"}, !sequential, nullFD); err != nil {
+		logCudaObjectCensus(k, "post-checkpoint-FAILED")
+		// Best-effort undo: restore then unlock, returning the app to running.
+		if _, rerr := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "restore"}, !sequential, nullFD); rerr != nil {
+			log.Warningf("cuda-checkpoint restore after checkpoint-phase failure also failed: %v", rerr)
+		}
+		if _, uerr := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "unlock"}, true, nullFD); uerr != nil {
+			log.Warningf("cuda-checkpoint unlock after checkpoint-phase failure also failed: %v", uerr)
+		}
+		return fmt.Errorf("cuda-checkpoint checkpoint phase failed: %w", err)
+	}
+
+	// Phase 0 instrumentation: what did `--action checkpoint` free (via
+	// libcuda's in-sandbox NV_ESC_RM_FREE ioctls) and what survived? The
+	// survival of physical memory objects decides where multicast attach
+	// replay can live (nvproxy.afterLoad vs. after the restore toggle).
+	censusPost := logCudaObjectCensus(k, "post-checkpoint")
+	logCudaObjectCensusDiff(censusPre, censusPost)
+
+	log.Infof("cuda-checkpoint lock+checkpoint on %d processes took [%s]", len(locked), time.Since(start))
+	return nil
+}
+
+// logCudaObjectCensus logs a per-client class histogram of the live nvproxy
+// RM object graph, labeled with the checkpoint phase it was taken at.
+func logCudaObjectCensus(k *kernel.Kernel, label string) []nvproxy.ClientObjectCensus {
+	census := nvproxy.ObjectGraphCensus(k.VFS())
+	if census == nil {
+		return nil
+	}
+	log.Infof("nvproxy object census [%s]: %d client(s)", label, len(census))
+	for i := range census {
+		log.Infof("nvproxy object census [%s]: %s", label, census[i].String())
+	}
+	return census
+}
+
+// logCudaObjectCensusDiff logs, per client, the classes whose live-object
+// counts changed between the pre-lock and post-checkpoint censuses.
+func logCudaObjectCensusDiff(pre, post []nvproxy.ClientObjectCensus) {
+	postByClient := make(map[uint32]*nvproxy.ClientObjectCensus, len(post))
+	for i := range post {
+		postByClient[post[i].Client.Val] = &post[i]
+	}
+	for i := range pre {
+		p := &pre[i]
+		q := postByClient[p.Client.Val]
+		if q == nil {
+			log.Infof("nvproxy census diff: client %v: RELEASED during checkpoint (had %d object(s))", p.Client, p.Total)
+			continue
+		}
+		var sb strings.Builder
+		for class, n := range p.Classes {
+			if m := q.Classes[class]; m != n {
+				fmt.Fprintf(&sb, " %v:%d->%d", class, n, m)
+			}
+		}
+		for class, m := range q.Classes {
+			if _, ok := p.Classes[class]; !ok {
+				fmt.Fprintf(&sb, " %v:0->%d", class, m)
+			}
+		}
+		if sb.Len() == 0 {
+			log.Infof("nvproxy census diff: client %v: unchanged (%d object(s))", p.Client, p.Total)
+		} else {
+			log.Infof("nvproxy census diff: client %v: %d->%d object(s):%s", p.Client, p.Total, q.Total, sb.String())
+		}
+	}
+	for i := range post {
+		found := false
+		for j := range pre {
+			if pre[j].Client.Val == post[i].Client.Val {
+				found = true
+				break
+			}
+		}
+		if !found {
+			log.Infof("nvproxy census diff: client %v: NEW during checkpoint (%d object(s))", post[i].Client, post[i].Total)
+		}
+	}
+}
+
+// restoreCudaProcs resumes all CUDA processes in cudaProcs, the inverse of
+// checkpointCudaProcs.
+//
+// Unlike the save side (which must lock all coupled processes in parallel
+// before checkpointing any), the restore side uses a full per-process --toggle
+// (restore + unlock in one atomic step), sequentially by default: with a
+// cuda-checkpoint job (--launch-job), members must be toggled one at a time so
+// the job file can re-establish shared CUDA IPC mappings deterministically —
+// each importer's restore rendezvouses with an already-running exporter.
+// Splitting restore and unlock into separate all-process phases breaks that
+// protocol (observed: importer restore fails with "unknown error" or resumed
+// ranks hit "unspecified launch failure" on their first kernel launch).
+func restoreCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, timeline *timing.Timeline, sequential bool) error {
+	start := time.Now()
+	nullFD, cleanup := openCudaCheckpointNullFD(sctx, k)
+	defer cleanup()
+
+	restored, err := runCudaAction(sctx, k, cudaCheckpointPath, cudaProcs, []string{"--toggle"}, !sequential, nullFD)
+	timeline.Reached("cuda toggled to running")
+	if err != nil {
+		return fmt.Errorf("cuda-checkpoint restore toggle failed: %w", err)
+	}
+	log.Infof("cuda-checkpoint restore toggle on %d processes took [%s]", len(restored), time.Since(start))
 	return nil
 }
