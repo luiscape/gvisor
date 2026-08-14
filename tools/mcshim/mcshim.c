@@ -395,6 +395,11 @@ typedef struct {
 	int serve_sock;
 	char serve_path[104]; /* must fit sockaddr_un.sun_path (108) */
 	int serving;
+	/* Set by do_suspend once this object is fully torn down (released on
+	 * the device); do_resume rebuilds only objects with this set, so a
+	 * resume after a PARTIAL suspend failure unwinds exactly what was torn
+	 * down instead of double-creating live objects. Cleared on resume. */
+	int torn_down;
 } Alloc;
 
 typedef struct {
@@ -464,10 +469,20 @@ static int g_ipc_seq;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_suspended;
 
+/* Sticky: an object the shim failed to track cannot be torn down at suspend,
+ * and an untracked live import turns a restore failure into silent corruption.
+ * Once set, do_suspend refuses (fail loudly at checkpoint, not after). */
+static int g_alloc_overflow;
+
 static int alloc_new(void) {
 	for (int i = 0; i < MAXN; i++)
 		if (g_alloc[i].kind == KIND_FREE)
 			return i;
+	if (!g_alloc_overflow) {
+		g_alloc_overflow = 1;
+		mclog("FATAL: alloc table full (MAXN=%d); object untracked -- "
+		      "suspend is disabled for this process", MAXN);
+	}
 	return -1;
 }
 
@@ -733,44 +748,6 @@ static int ipc_new(void) {
 	return -1;
 }
 
-/* MCSHIM_ALLOC_PAD_MIN=<bytes>: round device allocations up to this size.
- *
- * Small cudaMalloc allocations are suballocated inside driver-owned regions.
- * An IPC import of one inherits that placement, and driver-owned placements
- * are unreplayable (reservations are not honored there, and even a same-blob
- * reopen in the same live process moves). Padding the EXPORTER's allocation
- * past the suballocation threshold gives it a dedicated mapping in user
- * space, which makes its imports replayable by the existing machinery.
- * Costs memory on every padded allocation; engines route almost everything
- * through their own pooled allocators, so in practice this hits the handful
- * of direct cudaMallocs -- exactly the custom-all-reduce buffers. */
-static size_t alloc_pad_min(void) {
-	static long long v = -1;
-	if (v < 0) {
-		const char *e = getenv("MCSHIM_ALLOC_PAD_MIN");
-		v = e ? atoll(e) : 0;
-		if (v < 0)
-			v = 0;
-	}
-	return (size_t)v;
-}
-
-static CUresult (*r_cuMemAlloc)(CUdeviceptr *, size_t);
-
-CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize) {
-	resolve_reals();
-	REAL(r_cuMemAlloc, "cuMemAlloc_v2");
-	if (!r_cuMemAlloc)
-		return 3; /* CUDA_ERROR_NOT_INITIALIZED */
-	size_t want = alloc_pad_min();
-	if (want && bytesize < want) {
-		mcvlog("cuMemAlloc pad 0x%zx -> 0x%zx", bytesize, want);
-		bytesize = want;
-	}
-	return r_cuMemAlloc(dptr, bytesize);
-}
-
-
 /* Find the live import that owns a device pointer. */
 static int ipc_find_import(CUdeviceptr p) {
 	for (int i = 0; i < MAXN; i++)
@@ -828,43 +805,9 @@ CUresult cuIpcGetMemHandle(CUipcMemHandle *handle, CUdeviceptr dptr) {
 	return rc;
 }
 
-/* MCSHIM_IPC_LOWBAND=<base>:<size> (hex): reserve a low VA band before the
- * first legacy IPC import is placed.
- *
- * Small imports opened early in an engine's life land isolated in a low
- * region the driver never chooses again once the address space is populated
- * -- so their addresses are unreproducible at restore. Denying the band at
- * first-open pushes them into the high arena from the start, where replay is
- * measured to work. The reservation is held for the process lifetime; it is
- * address space only, no memory. */
-static void ipc_lowband_plug(void) {
-	static int done;
-	if (done)
-		return;
-	done = 1;
-	const char *e = getenv("MCSHIM_IPC_LOWBAND");
-	if (!e)
-		return;
-	unsigned long long base = 0, size = 0;
-	if (sscanf(e, "%llx:%llx", &base, &size) != 2 || !size) {
-		mclog("LOWBAND: bad MCSHIM_IPC_LOWBAND=%s (want base:size hex)",
-		      e);
-		return;
-	}
-	CUdeviceptr r = 0;
-	CUresult rc = r_cuMemAddressReserve(&r, (size_t)size, 0,
-	                                    (CUdeviceptr)base, 0);
-	mclog("LOWBAND: reserve 0x%llx+0x%llx -> rc=%d got=0x%llx%s", base,
-	      size, rc, (unsigned long long)r,
-	      (rc == CUDA_SUCCESS && r != base) ? " (MISLANDED; freeing)" : "");
-	if (rc == CUDA_SUCCESS && r != base)
-		r_cuMemAddressFree(r, (size_t)size);
-}
-
 CUresult cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle,
                             unsigned int flags) {
 	resolve_reals();
-	ipc_lowband_plug();
 	CUresult rc = r_cuIpcOpenMemHandle(pdptr, handle, flags);
 	if (rc != CUDA_SUCCESS || !pdptr)
 		return rc;
@@ -1664,6 +1607,12 @@ static int do_suspend(void) {
 	CUcontext saved = NULL;
 	r_cuCtxGetCurrent(&saved);
 
+	if (g_alloc_overflow) {
+		mclog("SUSPEND: refusing: alloc table overflowed earlier, so "
+		      "some object is untracked and cannot be torn down");
+		return -1;
+	}
+
 	ctx_probe("suspend-entry");
 
 	/* Stop serving any previous resume's re-exported fds first: a held
@@ -1708,6 +1657,7 @@ static int do_suspend(void) {
 			      (unsigned long long)g_alloc[gi].handle, rc);
 			return -1;
 		}
+		g_alloc[gi].torn_down = 1;
 		released++;
 		mclog("SUSPEND: released MC group idx=%d handle=0x%llx", gi,
 		      (unsigned long long)g_alloc[gi].handle);
@@ -1749,6 +1699,7 @@ static int do_suspend(void) {
 			      (unsigned long long)g_alloc[ii].handle, rc);
 			return -1;
 		}
+		g_alloc[ii].torn_down = 1;
 		released++;
 	}
 
@@ -1910,25 +1861,6 @@ static int do_suspend(void) {
 /* bindings/mappings that need all handles resolved come last (phase 3).    */
 /* ------------------------------------------------------------------ */
 
-/* Where in the resume sequence legacy IPC imports are reopened.
- *
- * cuIpcOpenMemHandle takes no address hint, so an import only returns to its
- * original address if the allocation state the driver sees then matches what
- * it saw originally. Which point in the rebuild that is, is an empirical
- * question: "late" (after every VMM mapping is back) is the default because
- * it maximises how much of the original layout is in place, but an
- * application that opened its IPC handles before allocating most of its VMM
- * memory may need "early". Switchable so it can be measured rather than
- * argued about. */
-static int ipc_reopen_early(void) {
-	static int v = -1;
-	if (v < 0)
-		v = getenv("MCSHIM_IPC_EARLY") != NULL;
-	return v;
-}
-
-
-
 static int resume_reopen_ipc(int p1_ipc);
 
 /* Must hold g_lock. */
@@ -1958,15 +1890,22 @@ static int do_resume(void) {
 		if (g_alloc[gi].ctx)
 			r_cuCtxSetCurrent(g_alloc[gi].ctx);
 		if (g_alloc[gi].kind == KIND_MC && !g_alloc[gi].imported) {
-			/* Multicast creator: new group handle, then serve it. */
-			CUmemGenericAllocationHandle newmc = 0;
-			if (r_cuMulticastCreate(&newmc, &g_alloc[gi].mprop) !=
-			    CUDA_SUCCESS) {
-				mclog("RESUME: cuMulticastCreate idx=%d failed",
-				      gi);
-				return -1;
+			/* Multicast creator: new group handle, then serve it.
+			 * After a PARTIAL suspend failure a group may still be
+			 * live (torn_down unset); serve its existing handle
+			 * without recreating, so peers that DID tear down can
+			 * still refetch during the unwind. */
+			CUmemGenericAllocationHandle newmc = g_alloc[gi].handle;
+			if (g_alloc[gi].torn_down) {
+				if (r_cuMulticastCreate(&newmc,
+				                        &g_alloc[gi].mprop) !=
+				    CUDA_SUCCESS) {
+					mclog("RESUME: cuMulticastCreate idx=%d "
+					      "failed", gi);
+					return -1;
+				}
+				alloc_push_aka(&g_alloc[gi], newmc);
 			}
-			alloc_push_aka(&g_alloc[gi], newmc);
 			if (g_alloc[gi].has_key &&
 			    reexport_serve(gi, newmc) != 0)
 				return -1;
@@ -2020,6 +1959,8 @@ static int do_resume(void) {
 	for (int gi = 0; gi < MAXN; gi++) {
 		if (g_alloc[gi].ctx)
 			r_cuCtxSetCurrent(g_alloc[gi].ctx);
+		if (!g_alloc[gi].torn_down)
+			continue; /* still live (partial suspend); nothing to redo */
 		if (g_alloc[gi].kind == KIND_MC && g_alloc[gi].imported) {
 			CUmemGenericAllocationHandle newmc = 0;
 			if (reimport(gi, &newmc) != 0)
@@ -2035,12 +1976,11 @@ static int do_resume(void) {
 		}
 	}
 
-	if (ipc_reopen_early() && resume_reopen_ipc(p1_ipc) != 0)
-		return -1;
-
 	/* Phase 3: rebuild bindings and re-map every VA at its IDENTICAL
 	 * address, now that all handles (local and imported) are resolved. */
 	for (int gi = 0; gi < MAXN; gi++) {
+		if (!g_alloc[gi].torn_down)
+			continue; /* binds and maps are still live */
 		if (g_alloc[gi].ctx)
 			r_cuCtxSetCurrent(g_alloc[gi].ctx);
 		if (g_alloc[gi].kind == KIND_MC) {
@@ -2104,8 +2044,12 @@ static int do_resume(void) {
 	 * A moved import is silent corruption: the application still holds the
 	 * old pointer and nothing returns an error. So verify, and fail loudly
 	 * rather than hand back a working-looking process. */
-	if (!ipc_reopen_early() && resume_reopen_ipc(p1_ipc) != 0)
+	if (resume_reopen_ipc(p1_ipc) != 0)
 		return -1;
+
+	/* Everything is rebuilt; the next suspend starts from a clean slate. */
+	for (int gi = 0; gi < MAXN; gi++)
+		g_alloc[gi].torn_down = 0;
 
 	if (saved)
 		r_cuCtxSetCurrent(saved);
@@ -2291,8 +2235,7 @@ static int resume_reopen_ipc(int p1_ipc) {
 		mclog("RESUME: FATAL: %d of %d legacy IPC imports did not return "
 		      "to their original address. cuIpcOpenMemHandle takes no "
 		      "address hint, so placement depends on the allocation "
-		      "state at reopen time matching the original (try "
-		      "MCSHIM_IPC_EARLY=1).",
+		      "state at reopen time matching the original.",
 		      ipc_moved, ipc_moved + ipc_reopened);
 		return -1;
 	}
@@ -2366,22 +2309,24 @@ static pthread_mutex_t g_gate_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_gate_cv = PTHREAD_COND_INITIALIZER;
 
 /* Arm before the teardown begins, so no app thread can slip between the
- * decision to suspend and the first unmap. */
+ * decision to suspend and the first unmap. g_suspended is read locklessly on
+ * the gate_wait fast path, so all transitions are atomic stores. */
 static void gate_arm(void) {
 	pthread_mutex_lock(&g_gate_lock);
-	g_suspended = 1;
+	__atomic_store_n(&g_suspended, 1, __ATOMIC_SEQ_CST);
 	pthread_mutex_unlock(&g_gate_lock);
 }
 
 static void gate_disarm(void) {
 	pthread_mutex_lock(&g_gate_lock);
-	g_suspended = 0;
+	__atomic_store_n(&g_suspended, 0, __ATOMIC_SEQ_CST);
 	pthread_cond_broadcast(&g_gate_cv);
 	pthread_mutex_unlock(&g_gate_lock);
 }
 
 static void gate_wait(void) {
-	if (!g_suspended) /* fast path: one load on every GPU submission */
+	/* fast path: one load on every GPU submission */
+	if (!__atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST))
 		return;
 	static __thread int logged;
 	pthread_mutex_lock(&g_gate_lock);
@@ -2470,8 +2415,7 @@ static const WrapEntry *wrap_table(void) {
 	     (void *)cuMemExportToShareableHandle},
 	    {"cuMemImportFromShareableHandle",
 	     (void *)cuMemImportFromShareableHandle},
-	    {"cuMemAlloc", (void *)cuMemAlloc_v2},
-	    {"cuMemAlloc_v2", (void *)cuMemAlloc_v2},
+
 	    {"cuIpcGetMemHandle", (void *)cuIpcGetMemHandle},
 	    {"cuIpcOpenMemHandle", (void *)cuIpcOpenMemHandle_v2},
 	    {"cuIpcOpenMemHandle_v2", (void *)cuIpcOpenMemHandle_v2},
@@ -2631,6 +2575,11 @@ static void *control_thread(void *arg) {
 		int want = marker_exists("suspend");
 		if (want != prev) {
 			prev = want;
+			/* Drop any stale error ack before starting this
+			 * transition: the sentry fast-fails on error.<pid>, so
+			 * only errors from the transition in flight may be
+			 * visible. */
+			marker_rm(ack_e);
 			pthread_mutex_lock(&g_lock);
 			resolve_reals();
 			int rc;
