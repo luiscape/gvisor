@@ -100,6 +100,35 @@ Fallback if all placement control fails in situ: T1 is impossible as designed;
 escalate to T3 as the supported path and T2 as the long-term fix, and document
 why with the 1.0 evidence.
 
+### Execution log (updated as it happens)
+
+- **1.0 + 1.1 landed and paid off immediately.** The distinct-outcome logging
+  plus the two-pass suspend took the reservation problem from 72/72
+  refused-or-mislanded to **30/30 ranges held**. The one-at-a-time
+  close/reserve interaction was the whole story on the suspend side.
+- **Retention alone was not sufficient** (as suspected): with targets held,
+  reopens landed in *other* free holes below -- between import clusters and
+  where `/sleep` freed memory. A single fence over `[landed, target)` is
+  unbuildable (it would cross the other imports' held reservations), so the
+  walk was added: wherever an open lands is by construction the lowest free
+  hole; close it, plug exactly that hole, reopen; plugs persist until every
+  import is placed. ~183 plugs, 2 walked-back imports per worker in practice.
+- **Results:** TP=4 custom-AR-on **5/5** (was 3/5), TP=2 **3/3**, recommended
+  config and PyTorch NVLS tier regression-free. `MCSHIM_IPC_SUSPEND=1` is the
+  switch; still opt-in.
+- **TP=8 exposes a residual sub-problem, distinct from everything above:**
+  `7 reopened at identical VAs, 1 walked back, 21 MOVED`. The 21 movers'
+  *original* addresses live in a **low VA region** (`0x31ce400000`-ish),
+  nowhere near the `0x7e...` arena where reopens land -- so they land *above*
+  target and the walk (which only handles landing below) never engages.
+  Plausibly these buffers were originally placed adjacent to vLLM's sleep-pool
+  VMM reservations at init. Next moves, in order: (a) confirm what the low
+  region adjoins (log `cuMemGetAddressRange` neighbours at *track* time, not
+  suspend time); (b) if the region is reconstructible, hold-and-walk works
+  there too once the arena choice is understood -- the open question is what
+  makes cuIpcOpenMemHandle *choose* the low region at init but not at resume.
+  TP=2/TP=4 do not exhibit this (all their imports live in the high arena).
+
 ### Step 1.4 — acceptance
 
 - Native rig: 10/10 with all imports at identical VAs.
