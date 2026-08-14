@@ -168,7 +168,10 @@ sglang_run() {
     # process's env, so it cannot help here. /etc/ld.so.preload is immune to
     # env overwrites, so inject the interposer that way, into this run's
     # PRIVATE overlay (never the shared rootfs cache).
-    if [[ "${CUDA_MULTICAST_SHIM:-0}" = "1" ]]; then
+    # SKIP_LDSO_INJECT=1 leaves this to the sentry, which (new) writes
+    # /etc/ld.so.preload itself through the container's VFS -- set it to A/B
+    # the sentry-side injection against this harness-side one.
+    if [[ "${CUDA_MULTICAST_SHIM:-0}" = "1" && "${SKIP_LDSO_INJECT:-0}" != "1" ]]; then
         echo "$CUDA_MULTICAST_SHIM_PATH" | sudo tee "$ROOTFS_MERGED/etc/ld.so.preload" >/dev/null
         ok "Injected interposer via /etc/ld.so.preload (memory-saver overwrites LD_PRELOAD)"
     fi

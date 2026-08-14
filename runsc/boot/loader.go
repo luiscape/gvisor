@@ -33,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/coverage"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/fd"
+	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/gomaxprocs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/memutil"
@@ -80,6 +81,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/raw"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/runsc/boot/filter"
 	pf "gvisor.dev/gvisor/runsc/boot/portforward"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
@@ -1482,6 +1484,27 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	}
 	info.procArgs.Envv = env
 
+	// The env append above only covers processes that inherit the initial
+	// environment. Launchers that REWRITE LD_PRELOAD when spawning workers --
+	// SGLang's torch_memory_saver needs its own hook library there -- evict
+	// the interposer from exactly the processes that hold the shared GPU
+	// state, and the resulting failure is silent: the checkpoint succeeds and
+	// the restore toggle fails. /etc/ld.so.preload is immune, because the
+	// loader consults it on every exec regardless of environment. Write it
+	// through the container's VFS (so it lands in the overlay, never in the
+	// user's rootfs on the host), appending rather than clobbering, and treat
+	// failure (e.g. a read-only root) as non-fatal: the env append above
+	// still covers the common case.
+	//
+	// This does preload the interposer into every binary in the container,
+	// including the cuda-checkpoint processes the sentry execs (which is why
+	// LD_PRELOAD is deliberately NOT put in the spec env below). That is
+	// benign: the interposer only activates when a tracked CUDA symbol is
+	// resolved, which cuda-checkpoint never does.
+	if err := l.writeLdSoPreload(info); err != nil {
+		log.Warningf("Could not add the multicast interposer to /etc/ld.so.preload for container %q (continuing with env-based preload only, which a launcher that rewrites LD_PRELOAD can defeat): %v", info.containerName, err)
+	}
+
 	// Record the rendezvous directory in the container spec, which is how
 	// control/state_cuda_shim.go discovers that gVisor owns an interposer
 	// here (it reads SpecEnviron). Note what is deliberately NOT put in the
@@ -1501,6 +1524,58 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 		}
 	}
 	log.Infof("Preloaded multicast interposer %q into container %q (rendezvous dir %q)", info.conf.CUDAMulticastShimPath, info.containerName, shimDir)
+	return nil
+}
+
+// writeLdSoPreload appends the interposer path to the container's
+// /etc/ld.so.preload (creating the file if absent), through the container's
+// own mount namespace. Idempotent: a path already listed is not added again,
+// which also makes container restarts and restores safe.
+func (l *Loader) writeLdSoPreload(info *containerInfo) error {
+	mntns := info.procArgs.MountNamespace
+	if mntns == nil {
+		return fmt.Errorf("container mount namespace is not set up yet")
+	}
+	ctx := info.procArgs.NewContext(l.k)
+	creds := info.procArgs.Credentials
+	root := mntns.Root(ctx)
+	defer root.DecRef(ctx)
+	vfsObj := root.Mount().Filesystem().VirtualFilesystem()
+	target := &vfs.PathOperation{
+		Root:  root,
+		Start: root,
+		Path:  fspath.Parse("/etc/ld.so.preload"),
+	}
+
+	// Read what is already there, if anything, so the write is append-only
+	// and idempotent.
+	existing := ""
+	if fd, err := vfsObj.OpenAt(ctx, creds, target, &vfs.OpenOptions{Flags: linux.O_RDONLY}); err == nil {
+		buf := make([]byte, 4096)
+		if n, rerr := fd.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{}); rerr == nil || n > 0 {
+			existing = string(buf[:n])
+		}
+		fd.DecRef(ctx)
+	}
+	for _, line := range strings.Fields(existing) {
+		if line == info.conf.CUDAMulticastShimPath {
+			return nil // already present
+		}
+	}
+
+	fd, err := vfsObj.OpenAt(ctx, creds, target, &vfs.OpenOptions{
+		Flags: linux.O_WRONLY | linux.O_CREAT | linux.O_APPEND,
+		Mode:  0644,
+	})
+	if err != nil {
+		return fmt.Errorf("opening /etc/ld.so.preload: %w", err)
+	}
+	defer fd.DecRef(ctx)
+	data := info.conf.CUDAMulticastShimPath + "\n"
+	if _, err := fd.Write(ctx, usermem.BytesIOSequence([]byte(data)), vfs.WriteOptions{}); err != nil {
+		return fmt.Errorf("writing /etc/ld.so.preload: %w", err)
+	}
+	log.Infof("Added multicast interposer to /etc/ld.so.preload in container %q", info.containerName)
 	return nil
 }
 

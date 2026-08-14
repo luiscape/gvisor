@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -225,6 +226,14 @@ func cudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string
 			procs = append(procs, tg)
 		}
 	})
+	// ForEachThreadGroup iterates a map, so without this the order in which
+	// cuda-checkpoint actions are issued -- and therefore which process is
+	// toggled first on restore -- differs on every run. That never caused a
+	// failure by itself (measured: no ordering rule fits the observed toggle
+	// failures, and parallel toggling is no better), but it makes any failure
+	// unreproducible run to run, which is a debugging tax on every
+	// investigation downstream of this list.
+	sort.Slice(procs, func(i, j int) bool { return procs[i].ID() < procs[j].ID() })
 
 	// procs may contain NVML-only processes, which don't use CUDA. As of
 	// writing, calling cuda-checkpoint on them will fail for all tested drivers.
