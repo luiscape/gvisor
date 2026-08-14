@@ -119,6 +119,44 @@ def importer(chan, args):
     #
     # va3 is deliberately a moved address (an allocation was interposed above),
     # so this reproduces the failing case and then tries to repair it.
+    # Can a moved import be forced back to an EXACT address?
+    #
+    # The steering probe below shows a reservation is respected, but "lands
+    # somewhere else" is not the requirement -- "lands exactly on the recorded
+    # address" is. This reproduces the vLLM failure direction first (the import
+    # comes back BELOW where it was) and then tries to repair it.
+    #
+    # To get a downward move, mimic what the engine does: something occupies
+    # the low region when the import is first opened, and is gone by the time
+    # it is reopened (in vLLM, the weights and KV cache that /sleep released).
+    exact = None
+    cu.ipc_close_handle(va3)
+    filler = cu.mem_alloc(BUF_BYTES)          # occupy the low slot
+    va_hi = cu.ipc_open_handle(blob)          # import lands above it
+    cu.ipc_close_handle(va_hi)
+    cu.call("cuMemFree_v2", filler)           # low slot free again
+    va_lo = cu.ipc_open_handle(blob)          # ... so this packs low
+    cu.log(tag, f"reopen after freeing the filler  va=0x{va_lo:016x} "
+                f"(target 0x{va_hi:016x}, "
+                f"{'MOVED DOWN' if va_lo < va_hi else 'did not move down'})")
+    if va_lo < va_hi:
+        cu.ipc_close_handle(va_lo)
+        gap = va_hi - va_lo
+        try:
+            resv = cu.reserve_va(gap, va_lo)  # fence off everything below
+            va_fix = cu.ipc_open_handle(blob)
+            exact = (va_fix == va_hi)
+            cu.log(tag, f"reopen with gap 0x{gap:x} fenced at 0x{va_lo:016x} "
+                        f"va=0x{va_fix:016x} "
+                        + ("EXACT -- placement is controllable"
+                           if exact else
+                           f"off by {va_fix - va_hi:+d} bytes"))
+            cu.ipc_close_handle(va_fix)
+            cu.call("cuMemAddressFree", resv, gap)
+        except Exception as e:  # noqa: BLE001 - a failure here is the answer
+            cu.log(tag, f"exact-placement attempt failed: {e}")
+    va3 = cu.ipc_open_handle(blob)
+
     # Does a VA reservation count as "occupied" for cuIpcOpenMemHandle's
     # placement? If it does, the driver's choice is steerable: fence off the
     # region it would otherwise pick and it must land elsewhere. If it does
@@ -127,6 +165,7 @@ def importer(chan, args):
     # replaying legacy IPC imports at fixed addresses is impossible.
     steerable = None
     cu.ipc_close_handle(va3)
+    va1 = va1  # (target for the steering probe below is the original address)
     try:
         resv = cu.reserve_va(BUF_BYTES, va1)  # fence off the natural slot
         va_f = cu.ipc_open_handle(blob)
@@ -164,7 +203,7 @@ def importer(chan, args):
               f"blob_changed={int(not blob_same)} "
               f"reopen_stable={int(reopen_stable)} "
               f"order_sensitive={int(order_sensitive)} "
-              f"placement_steerable={steerable}")
+              f"placement_steerable={steerable} exact_placement={exact}")
     chan.recv(expect="EXIT")
     chan.send("EXIT")  # release the exporter rather than EOF-ing it
     os._exit(0 if ok else 1)

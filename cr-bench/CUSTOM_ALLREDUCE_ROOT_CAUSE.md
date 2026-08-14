@@ -106,12 +106,56 @@ original open order:
    region is the target itself;
 3. free the reservation once the import is placed.
 
-This is unbuilt. What is measured is that each step's primitive behaves as
-required -- reservations steer placement, closing imports makes the toggle
-reliable, and the interposer already tracks every import with its original
-address and open order. What is not yet known is whether step 2 lands exactly
-on the target rather than merely above it, which is the thing to test first,
-and cheaply, in `legacy_va_probe.py` before touching `mcshim.c`.
+### Step 2 works in isolation
+
+`legacy_va_probe.py` reproduces the failure and repairs it. A filler occupies
+the low slot so the import lands high; the filler is freed (as `/sleep` frees
+the weights and KV cache); the reopen then packs low, exactly as in vLLM; and
+fencing the gap puts it back on the nose:
+
+```
+reopen after freeing the filler   va=0x7a4e39e00000 (target 0x7a4e3a200000, MOVED DOWN)
+reopen with gap 0x400000 fenced   va=0x7a4e3a200000 EXACT -- placement is controllable
+placement_steerable=True exact_placement=True
+```
+
+### ...and does not survive contact with vLLM yet
+
+Implemented in `mcshim.c` behind `MCSHIM_IPC_SUSPEND=1` and run against vLLM
+TP=4, it does not fire, for a reason the probe could not have shown:
+
+- With the interposer closing the imports, they come back **+21.6 GB above**
+  their original addresses, not below. The fence-the-gap-underneath repair
+  only applies to a downward move, so it never triggers (`0 needed
+  re-placing`).
+- The upward move is self-inflicted. Closing an import **frees its VA range**
+  before the checkpoint, so the restore is free to put something else there.
+  The VMM path does not have this problem because it *retains* the address
+  reservation across the checkpoint -- that is what "re-mapped IDENTICAL
+  (retained-reservation)" in its log means.
+- Applying the same retention to legacy IPC -- `cuMemGetAddressRange` before
+  closing, then `cuMemAddressReserve` over the range -- currently **fails to
+  take the reservation** (72 attempts, all refused), including after rounding
+  the size up to a 2 MB granule (an IPC allocation's size is whatever the
+  exporter asked for; vLLM's is `0x801300`). `cuMemAddressReserve`'s address
+  argument is a hint rather than a requirement, so it can also silently return
+  a different address.
+
+So the diagnosis is complete and the repair is not. The next things to try,
+in order:
+
+1. Log the actual return code and returned address from the failing
+   `cuMemAddressReserve`, rather than inferring. The current message does not
+   distinguish "call failed" from "succeeded at the wrong address".
+2. Close **all** imports first, then reserve all the ranges in a second pass.
+   The current code closes and reserves one import at a time, so a rounded
+   reservation is taken while neighbouring imports are still mapped.
+3. Only then revisit the fence-the-gap repair, which is what handles whatever
+   residual drift the retention does not.
+
+`MCSHIM_IPC_SUSPEND` remains **off by default**, so none of this is in the
+shipped path, and the recommended configuration still passes (verified after
+these changes: TP=4, exact match).
 
 ## Current recommendation
 

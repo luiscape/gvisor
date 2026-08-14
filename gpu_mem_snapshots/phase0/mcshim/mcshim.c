@@ -258,6 +258,7 @@ static CUresult (*r_cuIpcGetMemHandle)(CUipcMemHandle *, CUdeviceptr);
 static CUresult (*r_cuIpcOpenMemHandle)(CUdeviceptr *, CUipcMemHandle,
                                         unsigned int);
 static CUresult (*r_cuIpcCloseMemHandle)(CUdeviceptr);
+static CUresult (*r_cuMemGetAddressRange)(CUdeviceptr *, size_t *, CUdeviceptr);
 
 #define CU_MEM_HANDLE_TYPE_POSIX_FD 0x1
 
@@ -286,6 +287,8 @@ static void resolve_reals(void) {
 	REAL(r_cuIpcOpenMemHandle, "cuIpcOpenMemHandle_v2");
 	REAL(r_cuIpcOpenMemHandle, "cuIpcOpenMemHandle");
 	REAL(r_cuIpcCloseMemHandle, "cuIpcCloseMemHandle");
+	REAL(r_cuMemGetAddressRange, "cuMemGetAddressRange_v2");
+	REAL(r_cuMemGetAddressRange, "cuMemGetAddressRange");
 }
 
 
@@ -417,6 +420,11 @@ typedef struct {
 	int serve_sock;
 	char serve_path[104];
 	CUipcMemHandle blob_new;
+	/* Address reservation held across the checkpoint so the range cannot be
+	 * taken while the import is closed (the same trick the VMM path uses --
+	 * see remap_alloc's "retained-reservation"). */
+	CUdeviceptr resv;
+	size_t resv_size;
 } IpcEnt;
 
 static Alloc g_alloc[MAXN];
@@ -1642,11 +1650,50 @@ static int do_suspend(void) {
 		}
 		if (g_ipc[i].ctx)
 			r_cuCtxSetCurrent(g_ipc[i].ctx);
+		/* Learn the mapping's extent before closing it: the reopen has
+		 * to land on the same address, and the only way to guarantee
+		 * the range is still available then is to hold a reservation
+		 * over it for the duration. Without this the range is free
+		 * across the checkpoint and the restore fills it with
+		 * something else, which is what pushes the reopened imports
+		 * tens of GB away from where they belong. */
+		CUdeviceptr base = 0;
+		size_t sz = 0;
+		int have_range = r_cuMemGetAddressRange &&
+		                 r_cuMemGetAddressRange(&base, &sz,
+		                                        g_ipc[i].ptr) ==
+		                     CUDA_SUCCESS;
 		CUresult rc = r_cuIpcCloseMemHandle(g_ipc[i].ptr);
 		if (rc != CUDA_SUCCESS) {
 			mclog("SUSPEND: cuIpcCloseMemHandle(0x%llx) rc=%d",
 			      (unsigned long long)g_ipc[i].ptr, rc);
 			return -1;
+		}
+		g_ipc[i].resv = 0;
+		g_ipc[i].resv_size = 0;
+		if (have_range && sz) {
+			/* cuMemAddressReserve needs a granularity multiple, and
+			 * an IPC allocation's size is whatever the exporter asked
+			 * for (0x801300 in vLLM), so round up. Imports sit a whole
+			 * number of granules apart, so the rounded range abuts the
+			 * next one rather than overlapping it. */
+			const size_t gran = 2u << 20;
+			sz = (sz + gran - 1) & ~(gran - 1);
+			CUdeviceptr r = 0;
+			if (r_cuMemAddressReserve(&r, sz, 0, base, 0) ==
+			        CUDA_SUCCESS &&
+			    r == base) {
+				g_ipc[i].resv = r;
+				g_ipc[i].resv_size = sz;
+			} else {
+				if (r)
+					r_cuMemAddressFree(r, sz);
+				mclog("SUSPEND: could not hold VA 0x%llx+0x%zx "
+				      "for IPC import seq=%d; its reopen may "
+				      "not land correctly",
+				      (unsigned long long)base, sz,
+				      g_ipc[i].seq);
+			}
 		}
 		ipc_closed++;
 		mclog("SUSPEND: closed IPC import idx=%d seq=%d va=0x%llx", i,
@@ -1886,7 +1933,7 @@ static int do_resume(void) {
 /* Reopen every legacy IPC import, in its original open order, and verify each
  * lands where it was. Must hold g_lock. */
 static int resume_reopen_ipc(int p1_ipc) {
-	int ipc_reopened = 0, ipc_moved = 0;
+	int ipc_reopened = 0, ipc_moved = 0, ipc_replaced = 0;
 	if (!ipc_suspend_enabled())
 		return 0; /* nothing was torn down, so nothing to rebuild */
 	for (int pass_seq = 0; pass_seq < g_ipc_seq; pass_seq++) {
@@ -1899,6 +1946,13 @@ static int resume_reopen_ipc(int p1_ipc) {
 			CUipcMemHandle nb;
 			if (ipc_fetch_blob(&g_ipc[i], &nb, 60000) != 0)
 				return -1;
+			/* Release the held range immediately before reopening, so
+			 * the target is free exactly when the driver picks. */
+			if (g_ipc[i].resv) {
+				r_cuMemAddressFree(g_ipc[i].resv,
+				                   g_ipc[i].resv_size);
+				g_ipc[i].resv = 0;
+			}
 			CUdeviceptr np = 0;
 			CUresult rc =
 			    r_cuIpcOpenMemHandle(&np, nb, g_ipc[i].flags);
@@ -1907,6 +1961,52 @@ static int resume_reopen_ipc(int p1_ipc) {
 				      g_ipc[i].seq, rc);
 				return -1;
 			}
+
+			/* Steer it back if it landed low.
+			 *
+			 * cuIpcOpenMemHandle takes no address hint, but it does
+			 * take the lowest free address in its region -- and
+			 * cuMemAddressReserve DOES take a fixed address, and a
+			 * reservation counts as occupied for that choice. So
+			 * fencing off everything between where it landed and
+			 * where it belongs makes the original address the lowest
+			 * free one, and the retry lands exactly on it.
+			 *
+			 * Landing low is the expected direction: the imports were
+			 * opened when the space beneath them was occupied by
+			 * allocations that are gone by rebuild time (in vLLM, the
+			 * weights and KV cache /sleep released). */
+			if (np != g_ipc[i].ptr && np < g_ipc[i].ptr) {
+				size_t gap = (size_t)(g_ipc[i].ptr - np);
+				CUdeviceptr fence = 0;
+				CUdeviceptr low = np;
+				if (r_cuIpcCloseMemHandle(np) != CUDA_SUCCESS) {
+					mclog("RESUME: close before re-place "
+					      "(seq=%d) failed", g_ipc[i].seq);
+					return -1;
+				}
+				if (r_cuMemAddressReserve(&fence, gap, 0, low, 0) !=
+				    CUDA_SUCCESS) {
+					mclog("RESUME: fence reserve seq=%d "
+					      "[0x%llx,+0x%zx) failed",
+					      g_ipc[i].seq,
+					      (unsigned long long)low, gap);
+					return -1;
+				}
+				np = 0;
+				rc = r_cuIpcOpenMemHandle(&np, nb, g_ipc[i].flags);
+				/* The import is placed by now, so the fence has
+				 * done its job and only wastes address space. */
+				r_cuMemAddressFree(fence, gap);
+				if (rc != CUDA_SUCCESS) {
+					mclog("RESUME: re-place open seq=%d rc=%d",
+					      g_ipc[i].seq, rc);
+					return -1;
+				}
+				if (np == g_ipc[i].ptr)
+					ipc_replaced++;
+			}
+
 			if (np != g_ipc[i].ptr) {
 				/* Keep going rather than stopping at the first
 				 * mismatch: how MANY move, and by how much, is
@@ -1932,8 +2032,8 @@ static int resume_reopen_ipc(int p1_ipc) {
 	}
 	if (ipc_reopened || p1_ipc || ipc_moved)
 		mclog("RESUME: legacy IPC done (%d reopened at identical VAs, "
-		      "%d MOVED, %d served)",
-		      ipc_reopened, ipc_moved, p1_ipc);
+		      "of which %d needed re-placing; %d MOVED, %d served)",
+		      ipc_reopened, ipc_replaced, ipc_moved, p1_ipc);
 	if (ipc_moved) {
 		mclog("RESUME: FATAL: %d of %d legacy IPC imports did not return "
 		      "to their original address. cuIpcOpenMemHandle takes no "
