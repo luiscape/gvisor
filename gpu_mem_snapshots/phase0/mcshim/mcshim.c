@@ -425,6 +425,10 @@ typedef struct {
 	 * see remap_alloc's "retained-reservation"). */
 	CUdeviceptr resv;
 	size_t resv_size;
+	/* The mapping's true extent (cuMemGetAddressRange), captured just
+	 * before the close; the reopen must land on range_base. */
+	CUdeviceptr range_base;
+	size_t range_size;
 } IpcEnt;
 
 static Alloc g_alloc[MAXN];
@@ -1650,55 +1654,94 @@ static int do_suspend(void) {
 		}
 		if (g_ipc[i].ctx)
 			r_cuCtxSetCurrent(g_ipc[i].ctx);
-		/* Learn the mapping's extent before closing it: the reopen has
-		 * to land on the same address, and the only way to guarantee
-		 * the range is still available then is to hold a reservation
-		 * over it for the duration. Without this the range is free
-		 * across the checkpoint and the restore fills it with
-		 * something else, which is what pushes the reopened imports
-		 * tens of GB away from where they belong. */
-		CUdeviceptr base = 0;
-		size_t sz = 0;
-		int have_range = r_cuMemGetAddressRange &&
-		                 r_cuMemGetAddressRange(&base, &sz,
-		                                        g_ipc[i].ptr) ==
-		                     CUDA_SUCCESS;
+		/* Learn the mapping's extent before closing it (the reopen must
+		 * land back on it), then close. The RESERVE happens in a second
+		 * pass below, after every import is closed: reserving here, one
+		 * import at a time, asks for a granule-rounded range while the
+		 * neighbouring imports are still mapped, and any overlap makes
+		 * the reservation silently land elsewhere. */
+		g_ipc[i].resv = 0;
+		g_ipc[i].resv_size = 0;
+		if (r_cuMemGetAddressRange &&
+		    r_cuMemGetAddressRange(&g_ipc[i].range_base,
+		                           &g_ipc[i].range_size,
+		                           g_ipc[i].ptr) != CUDA_SUCCESS) {
+			g_ipc[i].range_base = g_ipc[i].ptr;
+			g_ipc[i].range_size = 0;
+		}
 		CUresult rc = r_cuIpcCloseMemHandle(g_ipc[i].ptr);
 		if (rc != CUDA_SUCCESS) {
 			mclog("SUSPEND: cuIpcCloseMemHandle(0x%llx) rc=%d",
 			      (unsigned long long)g_ipc[i].ptr, rc);
 			return -1;
 		}
-		g_ipc[i].resv = 0;
-		g_ipc[i].resv_size = 0;
-		if (have_range && sz) {
-			/* cuMemAddressReserve needs a granularity multiple, and
-			 * an IPC allocation's size is whatever the exporter asked
-			 * for (0x801300 in vLLM), so round up. Imports sit a whole
-			 * number of granules apart, so the rounded range abuts the
-			 * next one rather than overlapping it. */
-			const size_t gran = 2u << 20;
-			sz = (sz + gran - 1) & ~(gran - 1);
-			CUdeviceptr r = 0;
-			if (r_cuMemAddressReserve(&r, sz, 0, base, 0) ==
-			        CUDA_SUCCESS &&
-			    r == base) {
-				g_ipc[i].resv = r;
-				g_ipc[i].resv_size = sz;
-			} else {
-				if (r)
-					r_cuMemAddressFree(r, sz);
-				mclog("SUSPEND: could not hold VA 0x%llx+0x%zx "
-				      "for IPC import seq=%d; its reopen may "
-				      "not land correctly",
-				      (unsigned long long)base, sz,
-				      g_ipc[i].seq);
-			}
-		}
 		ipc_closed++;
-		mclog("SUSPEND: closed IPC import idx=%d seq=%d va=0x%llx", i,
-		      g_ipc[i].seq, (unsigned long long)g_ipc[i].ptr);
+		mcvlog("SUSPEND: closed IPC import idx=%d seq=%d va=0x%llx "
+		       "range=0x%llx+0x%zx",
+		       i, g_ipc[i].seq, (unsigned long long)g_ipc[i].ptr,
+		       (unsigned long long)g_ipc[i].range_base,
+		       g_ipc[i].range_size);
 	}
+
+	/* Second pass: hold every closed import's range across the checkpoint,
+	 * so the restore cannot put something else there (which is what pushed
+	 * reopened imports 21.6 GB away). Now that ALL imports are closed, a
+	 * granule-rounded reservation cannot collide with a still-mapped
+	 * neighbour.
+	 *
+	 * cuMemAddressReserve's addr argument is a HINT: on contention it
+	 * SUCCEEDS at a different address rather than failing. Both outcomes
+	 * are logged distinctly, with what occupies the wanted range, because
+	 * conflating them cost a day of theorizing already. */
+	int ipc_held = 0;
+	for (int i = 0; i < MAXN; i++) {
+		if (!ipc_suspend_enabled())
+			break;
+		if (!g_ipc[i].used || !g_ipc[i].is_import ||
+		    !g_ipc[i].range_size)
+			continue;
+		if (g_ipc[i].ctx)
+			r_cuCtxSetCurrent(g_ipc[i].ctx);
+		const size_t gran = 2u << 20;
+		CUdeviceptr base = g_ipc[i].range_base;
+		size_t sz = (g_ipc[i].range_size + gran - 1) & ~(gran - 1);
+		CUdeviceptr r = 0;
+		CUresult rc = r_cuMemAddressReserve(&r, sz, 0, base, 0);
+		if (rc == CUDA_SUCCESS && r == base) {
+			g_ipc[i].resv = r;
+			g_ipc[i].resv_size = sz;
+			ipc_held++;
+			continue;
+		}
+		/* Diagnose, precisely. */
+		if (rc == CUDA_SUCCESS) {
+			mclog("SUSPEND: reserve for seq=%d MISLANDED: wanted "
+			      "0x%llx+0x%zx, got 0x%llx (hint not honored -> "
+			      "something occupies the range)",
+			      g_ipc[i].seq, (unsigned long long)base, sz,
+			      (unsigned long long)r);
+			r_cuMemAddressFree(r, sz);
+		} else {
+			mclog("SUSPEND: reserve for seq=%d FAILED rc=%d "
+			      "(wanted 0x%llx+0x%zx)",
+			      g_ipc[i].seq, rc, (unsigned long long)base, sz);
+		}
+		/* What sits on the wanted range right now? Probe a few spots. */
+		for (int p = 0; p < 3; p++) {
+			CUdeviceptr q = base + (sz * p) / 3;
+			CUdeviceptr ob = 0;
+			size_t osz = 0;
+			CUresult prc =
+			    r_cuMemGetAddressRange(&ob, &osz, q);
+			mclog("SUSPEND:   probe 0x%llx -> rc=%d base=0x%llx "
+			      "size=0x%zx",
+			      (unsigned long long)q, prc,
+			      (unsigned long long)ob, osz);
+		}
+	}
+	if (ipc_closed)
+		mclog("SUSPEND: legacy IPC: %d closed, %d ranges held",
+		      ipc_closed, ipc_held);
 
 	ctx_probe("suspend-exit");
 
@@ -1932,8 +1975,18 @@ static int do_resume(void) {
 
 /* Reopen every legacy IPC import, in its original open order, and verify each
  * lands where it was. Must hold g_lock. */
+/* Temporary reservations plugging arena holes during the reopen walk. Freed
+ * once every import is placed; until then they are what keeps import N+1 from
+ * falling into the holes already probed for import N. */
+#define IPC_MAX_PLUGS 16384
+static struct {
+	CUdeviceptr base;
+	size_t size;
+} g_plugs[IPC_MAX_PLUGS];
+
 static int resume_reopen_ipc(int p1_ipc) {
 	int ipc_reopened = 0, ipc_moved = 0, ipc_replaced = 0;
+	int nplugs = 0;
 	if (!ipc_suspend_enabled())
 		return 0; /* nothing was torn down, so nothing to rebuild */
 	for (int pass_seq = 0; pass_seq < g_ipc_seq; pass_seq++) {
@@ -1949,9 +2002,24 @@ static int resume_reopen_ipc(int p1_ipc) {
 			/* Release the held range immediately before reopening, so
 			 * the target is free exactly when the driver picks. */
 			if (g_ipc[i].resv) {
-				r_cuMemAddressFree(g_ipc[i].resv,
-				                   g_ipc[i].resv_size);
+				CUresult frc = r_cuMemAddressFree(
+				    g_ipc[i].resv, g_ipc[i].resv_size);
+				if (frc != CUDA_SUCCESS)
+					mclog("RESUME: freeing held range for "
+					      "seq=%d rc=%d (reservation did not "
+					      "survive the checkpoint?)",
+					      g_ipc[i].seq, frc);
 				g_ipc[i].resv = 0;
+			} else if (mcverbose()) {
+				/* No held range: what sits on the target now? */
+				CUdeviceptr ob = 0;
+				size_t osz = 0;
+				CUresult prc = r_cuMemGetAddressRange(
+				    &ob, &osz, g_ipc[i].ptr);
+				mclog("RESUME: target 0x%llx pre-open probe: "
+				      "rc=%d base=0x%llx size=0x%zx",
+				      (unsigned long long)g_ipc[i].ptr, prc,
+				      (unsigned long long)ob, osz);
 			}
 			CUdeviceptr np = 0;
 			CUresult rc =
@@ -1962,49 +2030,89 @@ static int resume_reopen_ipc(int p1_ipc) {
 				return -1;
 			}
 
-			/* Steer it back if it landed low.
+			/* Walk it back if it landed low.
 			 *
-			 * cuIpcOpenMemHandle takes no address hint, but it does
-			 * take the lowest free address in its region -- and
-			 * cuMemAddressReserve DOES take a fixed address, and a
-			 * reservation counts as occupied for that choice. So
-			 * fencing off everything between where it landed and
-			 * where it belongs makes the original address the lowest
-			 * free one, and the retry lands exactly on it.
+			 * cuIpcOpenMemHandle takes no address hint; it takes the
+			 * lowest free hole in its arena. The import's own range is
+			 * protected (we held a reservation over it across the
+			 * checkpoint), but the arena has OTHER free holes below it
+			 * -- between the import clusters, and where /sleep freed
+			 * the weights and KV cache -- and the driver prefers those.
 			 *
-			 * Landing low is the expected direction: the imports were
-			 * opened when the space beneath them was occupied by
-			 * allocations that are gone by rebuild time (in vLLM, the
-			 * weights and KV cache /sleep released). */
-			if (np != g_ipc[i].ptr && np < g_ipc[i].ptr) {
-				size_t gap = (size_t)(g_ipc[i].ptr - np);
-				CUdeviceptr fence = 0;
-				CUdeviceptr low = np;
+			 * A single fence over [landed, target) cannot work: that
+			 * span crosses the other imports' held reservations, and a
+			 * reservation cannot overlap an existing one. So plug the
+			 * holes one at a time instead. Wherever the open lands IS,
+			 * by construction, the lowest free hole: close it, reserve
+			 * exactly there, and open again. Each iteration eliminates
+			 * one hole, so this terminates, and once nothing below the
+			 * target is free the open lands exactly on it. Plugs stay
+			 * until every import is placed (they are what stops import
+			 * N+1 falling into the same holes), then all are freed. */
+			int hops = 0;
+			while (np != g_ipc[i].ptr && np < g_ipc[i].ptr) {
+				if (nplugs >= IPC_MAX_PLUGS) {
+					mclog("RESUME: seq=%d still 0x%llx short "
+					      "of target after %d hole plugs; "
+					      "giving up",
+					      g_ipc[i].seq,
+					      (unsigned long long)(g_ipc[i].ptr - np),
+					      nplugs);
+					break;
+				}
 				if (r_cuIpcCloseMemHandle(np) != CUDA_SUCCESS) {
-					mclog("RESUME: close before re-place "
+					mclog("RESUME: close during re-place "
 					      "(seq=%d) failed", g_ipc[i].seq);
 					return -1;
 				}
-				if (r_cuMemAddressReserve(&fence, gap, 0, low, 0) !=
-				    CUDA_SUCCESS) {
-					mclog("RESUME: fence reserve seq=%d "
-					      "[0x%llx,+0x%zx) failed",
-					      g_ipc[i].seq,
-					      (unsigned long long)low, gap);
+				/* Plug the hole it fell into. Sized like the
+				 * mapping (that is how much of the hole the open
+				 * proved free), capped so it cannot spill past the
+				 * target range. */
+				const size_t gran = 2u << 20;
+				size_t psz = (g_ipc[i].range_size + gran - 1) &
+				             ~(gran - 1);
+				if (psz > (size_t)(g_ipc[i].ptr - np))
+					psz = (size_t)(g_ipc[i].ptr - np);
+				if (psz < gran)
+					psz = gran;
+				CUdeviceptr plug = 0;
+				CUresult prc = r_cuMemAddressReserve(&plug, psz, 0,
+				                                     np, 0);
+				if (prc != CUDA_SUCCESS) {
+					mclog("RESUME: plugging hole at 0x%llx+0x%zx "
+					      "failed rc=%d (seq=%d)",
+					      (unsigned long long)np, psz, prc,
+					      g_ipc[i].seq);
 					return -1;
 				}
+				if (plug != np) {
+					/* Hint not honored: the hole is smaller than
+					 * psz. Take what we got anyway (it plugs SOME
+					 * hole) and keep walking. */
+					mcvlog("RESUME: plug mislanded 0x%llx -> "
+					       "0x%llx (hole smaller than 0x%zx)",
+					       (unsigned long long)np,
+					       (unsigned long long)plug, psz);
+				}
+				g_plugs[nplugs].base = plug;
+				g_plugs[nplugs].size = psz;
+				nplugs++;
+				hops++;
 				np = 0;
 				rc = r_cuIpcOpenMemHandle(&np, nb, g_ipc[i].flags);
-				/* The import is placed by now, so the fence has
-				 * done its job and only wastes address space. */
-				r_cuMemAddressFree(fence, gap);
 				if (rc != CUDA_SUCCESS) {
-					mclog("RESUME: re-place open seq=%d rc=%d",
-					      g_ipc[i].seq, rc);
+					mclog("RESUME: re-place open seq=%d rc=%d "
+					      "after %d plugs",
+					      g_ipc[i].seq, rc, hops);
 					return -1;
 				}
-				if (np == g_ipc[i].ptr)
-					ipc_replaced++;
+			}
+			if (hops && np == g_ipc[i].ptr) {
+				ipc_replaced++;
+				mcvlog("RESUME: seq=%d walked back to 0x%llx in %d "
+				       "hole plugs",
+				       g_ipc[i].seq, (unsigned long long)np, hops);
 			}
 
 			if (np != g_ipc[i].ptr) {
@@ -2030,10 +2138,16 @@ static int resume_reopen_ipc(int p1_ipc) {
 			       g_ipc[i].seq, (unsigned long long)np);
 		}
 	}
+	/* Every import is placed (or we are about to fail); the hole plugs
+	 * have served their purpose. */
+	for (int p = 0; p < nplugs; p++)
+		r_cuMemAddressFree(g_plugs[p].base, g_plugs[p].size);
+
 	if (ipc_reopened || p1_ipc || ipc_moved)
 		mclog("RESUME: legacy IPC done (%d reopened at identical VAs, "
-		      "of which %d needed re-placing; %d MOVED, %d served)",
-		      ipc_reopened, ipc_replaced, ipc_moved, p1_ipc);
+		      "of which %d walked back via %d hole plugs; %d MOVED, "
+		      "%d served)",
+		      ipc_reopened, ipc_replaced, nplugs, ipc_moved, p1_ipc);
 	if (ipc_moved) {
 		mclog("RESUME: FATAL: %d of %d legacy IPC imports did not return "
 		      "to their original address. cuIpcOpenMemHandle takes no "
