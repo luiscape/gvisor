@@ -1653,6 +1653,7 @@ type CheckpointOpts struct {
 	ExcludeCommittedZeroPages bool
 	CudaCheckpointPath        string
 	CudaCheckpointSequential  bool
+	CudaBlockerTimeout        time.Duration
 	SplitFSCheckpointPaths    []checkpoint.ResourceID
 
 	// Save/restore exec options.
@@ -1680,6 +1681,7 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 		Resume:                         opts.Resume,
 		CudaCheckpointPath:             opts.CudaCheckpointPath,
 		CudaCheckpointSequential:       opts.CudaCheckpointSequential,
+		CudaBlockerTimeout:             opts.CudaBlockerTimeout,
 		SplitFSCheckpointPaths:         opts.SplitFSCheckpointPaths,
 		RunscVersion:                   version.Version(),
 		ExecOpts: control.SaveRestoreExecOpts{

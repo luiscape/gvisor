@@ -109,6 +109,11 @@ type SaveOpts struct {
 	// sequentially (rather than in parallel).
 	CudaCheckpointSequential bool `json:"cuda_checkpoint_sequential"`
 
+	// CudaBlockerTimeout is how long to wait for CUDA checkpoint blockers
+	// (multicast/fabric objects, exported-object FDs) to be released before
+	// failing the checkpoint. Zero means a default timeout.
+	CudaBlockerTimeout time.Duration `json:"cuda_blocker_timeout"`
+
 	// SplitFSCheckpointPaths is the list of paths to include in the filesystem
 	// for split checkpoint. If non-empty, split filesystem checkpoint is enabled.
 	// For capturing all of tmpfs, the value should be "all-tmpfs".
@@ -143,6 +148,7 @@ func ConvertToStateSaveOpts(o *SaveOpts) (*state.SaveOpts, error) {
 		Resume:                         o.Resume,
 		CudaCheckpointPath:             o.CudaCheckpointPath,
 		CudaCheckpointSequential:       o.CudaCheckpointSequential,
+		CudaBlockerTimeout:             o.CudaBlockerTimeout,
 	}
 	if err := setSaveOpts(o, saveOpts); err != nil {
 		saveOpts.Close()

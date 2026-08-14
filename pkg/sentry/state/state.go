@@ -81,6 +81,11 @@ type SaveOpts struct {
 	// sequentially (rather than in parallel).
 	CudaCheckpointSequential bool
 
+	// CudaBlockerTimeout is how long to wait for CUDA checkpoint blockers
+	// (multicast/fabric objects, exported-object FDs) to be released before
+	// failing the checkpoint. Zero means a default timeout.
+	CudaBlockerTimeout time.Duration
+
 	// FSSaveOpts contains options for filesystem checkpoint. If non-nil, we
 	// should split filesystem to separate pages from the full checkpoint.
 	FSSaveOpts *kernel.FSSaveOpts
