@@ -1596,13 +1596,21 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 // /etc/ld.so.preload (creating the file if absent), through the container's
 // own mount namespace. Idempotent: a path already listed is not added again,
 // which also makes container restarts and restores safe.
+// Known limitation: this runs at container CREATION only. A restored
+// container gets a freshly assembled filesystem, and processes spawned after
+// the restore will not see this file unless the restore-side rootfs carries
+// it. Processes that existed at checkpoint time are unaffected (the library
+// is already mapped into them).
 func (l *Loader) writeLdSoPreload(info *containerInfo) error {
 	mntns := info.procArgs.MountNamespace
 	if mntns == nil {
 		return fmt.Errorf("container mount namespace is not set up yet")
 	}
 	ctx := info.procArgs.NewContext(l.k)
-	creds := info.procArgs.Credentials
+	// Root credentials, not the container's: this is sentry-managed
+	// configuration (like the marker files), and a non-root container must
+	// not fail the injection just because /etc is root-owned.
+	creds := auth.NewRootCredentials(l.k.RootUserNamespace())
 	root := mntns.Root(ctx)
 	defer root.DecRef(ctx)
 	vfsObj := root.Mount().Filesystem().VirtualFilesystem()
@@ -1613,11 +1621,12 @@ func (l *Loader) writeLdSoPreload(info *containerInfo) error {
 	}
 
 	// Read what is already there, if anything, so the write is append-only
-	// and idempotent.
+	// and idempotent. 64 KiB is far beyond any plausible ld.so.preload; a
+	// larger file only risks a harmless duplicate append.
 	existing := ""
 	if fd, err := vfsObj.OpenAt(ctx, creds, target, &vfs.OpenOptions{Flags: linux.O_RDONLY}); err == nil {
-		buf := make([]byte, 4096)
-		if n, rerr := fd.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{}); rerr == nil || n > 0 {
+		buf := make([]byte, 64<<10)
+		if n, _ := fd.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{}); n > 0 {
 			existing = string(buf[:n])
 		}
 		fd.DecRef(ctx)
