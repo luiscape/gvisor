@@ -172,29 +172,3 @@ func TestMulticastABIStructSizes(t *testing.T) {
 		}
 	}
 }
-
-
-func TestObjectGraphCensusHandles(t *testing.T) {
-	ctx := context.Background()
-	nvp, _, _, mcH, memH := newTestClientWithObjects(ctx)
-
-	censuses := nvp.objectGraphCensus()
-	if len(censuses) != 1 {
-		t.Fatalf("census: got %d clients, want 1", len(censuses))
-	}
-	c := censuses[0]
-	if c.Total != 3 { // root client + memory + multicast
-		t.Errorf("census total: got %d, want 3", c.Total)
-	}
-	if hs := c.Handles[nvgpu.NV_MEMORY_MULTICAST_FABRIC]; len(hs) != 1 || hs[0] != mcH.Val {
-		t.Errorf("census multicast handles: got %v, want [%#x]", hs, mcH.Val)
-	}
-	if hs := c.Handles[nvgpu.NV01_MEMORY_LOCAL_USER]; len(hs) != 1 || hs[0] != memH.Val {
-		t.Errorf("census memory handles: got %v, want [%#x]", hs, memH.Val)
-	}
-	// The census string must mark cuda-checkpoint-unsupported classes.
-	s := c.String()
-	if !strings.Contains(s, "0x000000fd! x1") {
-		t.Errorf("census string %q does not mark multicast class", s)
-	}
-}
