@@ -323,18 +323,26 @@ static int ipc_suspend_enabled(void) {
 	return v;
 }
 
-/* MCSHIM_IPC_REPLAY_MIN=<bytes> (default 4 MB): imports whose exporter
- * allocation is smaller than this are left live across the checkpoint
- * instead of closed and replayed. See the classifier comment in do_suspend. */
-static size_t ipc_replay_min(void) {
-	static long long v = -1;
-	if (v < 0) {
-		const char *e = getenv("MCSHIM_IPC_REPLAY_MIN");
-		v = e ? atoll(e) : (4 << 20);
-		if (v < 0)
-			v = 0;
+/* MCSHIM_IPC_REPLAY_FLOOR=<hex VA> (default 0x40000000000): imports whose
+ * range sits BELOW this address are left live across the checkpoint instead
+ * of closed and replayed.
+ *
+ * The populations separate by ADDRESS REGION, not size (a size threshold was
+ * tried and misclassified TP=4, whose small imports live high and replay
+ * fine). Every unreplayable import observed sits in a low driver region
+ * (0x31..-0x3a.., placements the driver makes once in a young process and
+ * never repeats -- even a same-blob reopen in the same live process moves);
+ * every replayable one sits in the high per-mapping area (~0x7e..). 4 TB
+ * splits them with orders of magnitude to spare on both sides. */
+static CUdeviceptr ipc_replay_floor(void) {
+	static unsigned long long v;
+	static int init;
+	if (!init) {
+		const char *e = getenv("MCSHIM_IPC_REPLAY_FLOOR");
+		v = e ? strtoull(e, NULL, 16) : 0x40000000000ULL;
+		init = 1;
 	}
-	return (size_t)v;
+	return (CUdeviceptr)v;
 }
 
 
@@ -1800,14 +1808,12 @@ static int do_suspend(void) {
 		 * probing classifier was tried and misfires in the high arena;
 		 * a wrong guess here is loud, not corrupting (live imports can
 		 * fail the toggle; replayed ones verify their address). */
-		if (g_ipc[i].range_size &&
-		    g_ipc[i].range_size < ipc_replay_min()) {
+		if (g_ipc[i].range_base < ipc_replay_floor()) {
 			ipc_live++;
 			mclog("SUSPEND: leaving IPC import seq=%d va=0x%llx "
-			      "(0x%zx bytes; suballocated -> unreplayable) "
-			      "live for the driver to carry",
-			      g_ipc[i].seq, (unsigned long long)g_ipc[i].ptr,
-			      g_ipc[i].range_size);
+			      "(low-region placement -> unreplayable) live "
+			      "for the driver to carry",
+			      g_ipc[i].seq, (unsigned long long)g_ipc[i].ptr);
 			continue;
 		}
 		CUresult rc = r_cuIpcCloseMemHandle(g_ipc[i].ptr);
