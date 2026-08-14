@@ -62,10 +62,14 @@ QUIESCE="${QUIESCE:-release}"
 # this expensive warmup on restore is the main C/R use-case.
 TORCH_COMPILE="${TORCH_COMPILE:-1}"
 EAGER="${EAGER:-0}"
-# NCCL knobs (multi-GPU) — same rationale as the vLLM benchmarks:
-# NCCL_CUMEM_ENABLE=0 forces classic allocations (cuda-checkpoint coverage
+# NCCL knobs (multi-GPU) — same rationale as the vLLM benchmarks, including
+# the same corrected default: 1 puts NCCL's P2P buffers on the VMM API, which
+# the interposer restores at identical addresses; 0 puts them on legacy CUDA
+# IPC, which rides the driver's intermittent live-import path. See
+# SLEEP_CHECKPOINT_WORKFLOW.md.
+# (Old rationale, kept for the record: 0 forces classic allocations,
 # of VMM allocations is driver-dependent).
-NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
+NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-1}"
 
 sglang_parse_flags() {
     while [[ $# -gt 0 ]]; do
@@ -157,6 +161,18 @@ sglang_run() {
     # ── rootfs + bundle ───────────────────────────────────────────────────
     cb_prepare_rootfs
 
+    # SGLang's --enable-memory-saver OVERWRITES LD_PRELOAD when spawning its
+    # TP workers (it needs its own hook library there), which silently drops
+    # the interposer from exactly the processes that hold the shared-memory
+    # state. gVisor's --cuda-multicast-shim-path only touches the initial
+    # process's env, so it cannot help here. /etc/ld.so.preload is immune to
+    # env overwrites, so inject the interposer that way, into this run's
+    # PRIVATE overlay (never the shared rootfs cache).
+    if [[ "${CUDA_MULTICAST_SHIM:-0}" = "1" ]]; then
+        echo "$CUDA_MULTICAST_SHIM_PATH" | sudo tee "$ROOTFS_MERGED/etc/ld.so.preload" >/dev/null
+        ok "Injected interposer via /etc/ld.so.preload (memory-saver overwrites LD_PRELOAD)"
+    fi
+
     # triton attention + pytorch sampling: avoid FlashInfer JIT (needs
     # nvcc/nvrtc at runtime; same reasoning as vLLM benchmarks).
     local extra_args=""
@@ -189,6 +205,13 @@ $extra_args \
 HF_HUB_OFFLINE=1
 NCCL_CUMEM_ENABLE=$NCCL_CUMEM_ENABLE
 LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cu13/lib"
+    # Interposer knobs, same as the vLLM impl. Without the passthrough these
+    # env-gated features silently never fire inside the sandbox.
+    [[ -n "${MCSHIM_IPC_SUSPEND:-}" ]] && CB_ENV+=$'\n'"MCSHIM_IPC_SUSPEND=$MCSHIM_IPC_SUSPEND"
+    [[ -n "${MCSHIM_IPC_REPLAY_FLOOR:-}" ]] && CB_ENV+=$'\n'"MCSHIM_IPC_REPLAY_FLOOR=$MCSHIM_IPC_REPLAY_FLOOR"
+    [[ -n "${MCSHIM_VERBOSE:-}" ]] && CB_ENV+=$'\n'"MCSHIM_VERBOSE=$MCSHIM_VERBOSE"
+    [[ -n "${NCCL_DEBUG:-}" ]] && CB_ENV+=$'\n'"NCCL_DEBUG=$NCCL_DEBUG"
+    [[ -n "${NCCL_DEBUG_SUBSYS:-}" ]] && CB_ENV+=$'\n'"NCCL_DEBUG_SUBSYS=$NCCL_DEBUG_SUBSYS"
     cb_write_bundle
 
     # ── cold boot ─────────────────────────────────────────────────────────
