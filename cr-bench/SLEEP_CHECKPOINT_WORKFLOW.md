@@ -170,6 +170,37 @@ imports failed once then passed three times -- so this is not a capacity limit
 to tune around. But the presence of live legacy imports does track the failure
 rate, which is the practical form of the same observation.
 
+## SGLang
+
+The same workflow passes for SGLang (`bench_6_sglang_multi.sh`, its
+`/release_memory_occupation` + `/resume_memory_occupation` standing in for
+sleep/wake):
+
+| | TP=2 | TP=4 |
+| --- | --- | --- |
+| trials | **3/3** | 1/1 |
+| checkpoint / restore | 22 s / 9.7 s | — / 17.1 s |
+| first inference after restore | 21 s | 42 s |
+| answer vs. reference | EXACT MATCH | EXACT MATCH |
+| toggle errors | 0 | 0 |
+| VMM imports replayed at identical VAs | 96/worker | 96/worker |
+
+Required: `CUDA_MULTICAST_SHIM=1 NCCL_CUMEM_ENABLE=1 MCSHIM_IPC_SUSPEND=1`,
+and the interposer must be injected via **`/etc/ld.so.preload`** — SGLang's
+`--enable-memory-saver` overwrites `LD_PRELOAD` when spawning TP workers,
+which silently evicts an env-injected interposer from exactly the processes
+holding the shared state (that was the entirety of SGLang's historical
+"restore toggle failure").
+
+Scope notes, so the passes are not over-read:
+
+- SGLang's fast all-reduce is its **symm-mem** implementation (VMM-based; the
+  96 imports above). It creates one 24 MB multicast group at boot, but
+  SGLang's own sleep releases it **before** the checkpoint, so multicast was
+  never live across the C/R boundary in these runs.
+- **NCCL NVLS did not engage** (`0 nvls channels` at TP=4 in this config), so
+  NVLS-under-SGLang remains untested — not failed, unexercised.
+
 ## The settings that matter, and why
 
 ### `NCCL_CUMEM_ENABLE=1` — required
