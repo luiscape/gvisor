@@ -218,17 +218,56 @@ checkpointed and restored coherently when they belong to the same
 `cuda-checkpoint` *job*. This requires driver R610+ (see
 [cuda-checkpoint 610 features](https://github.com/NVIDIA/cuda-checkpoint#610-features)).
 
-To enable this, set the `--cuda-checkpoint-path` flag to the path of the
-`cuda-checkpoint` binary inside the container filesystem. When it is set for a
-GPU container on driver R610+, gVisor automatically wraps that container's command in
-`cuda-checkpoint --launch-job`, which launches the workload inside a job so that
-all of its CUDA processes are grouped together. The flag is applied per
-container, so a sidecar container that does no GPU work (or lacks the binary) is
-unaffected.
+To enable this, set the *runtime* `--cuda-checkpoint-path` flag to the path of
+the `cuda-checkpoint` binary inside the container filesystem. When it is set
+for a GPU container on driver R610+, gVisor automatically wraps that
+container's command in `cuda-checkpoint --launch-job`, which launches the
+workload inside a job so that all of its CUDA processes are grouped together.
+The flag is applied per container, so a sidecar container that does no GPU work
+(or lacks the binary) is unaffected.
+
+Note that this runtime flag and the `runsc checkpoint --cuda-checkpoint-path`
+flag described above share a name but act at different times: the runtime flag
+wraps the container command at creation, while the checkpoint flag locates the
+binary used to orchestrate the checkpoint itself. They almost always point at
+the same binary, so the checkpoint-time flag defaults to the runtime
+configuration and only one of them needs to be set explicitly.
 
 Processes in a job must be toggled sequentially, so this must be paired with
 `runsc checkpoint --cuda-checkpoint-sequential`, which invokes `cuda-checkpoint`
 sequentially instead of in parallel.
+
+### Multicast / NVLS support (multi-GPU)
+
+`cuda-checkpoint` refuses to checkpoint a process that holds live *multicast*
+objects (created via `cuMulticastCreate`, used by NCCL NVLS on NVSwitch
+systems and by PyTorch symmetric memory) or live CUDA VMM imports
+(`cuMemImportFromShareableHandle`). Multi-GPU tensor-parallel workloads hold
+both. gVisor can checkpoint them anyway using a small LD_PRELOAD interposer,
+[mcshim](https://github.com/google/gvisor/tree/master/tools/mcshim), that
+releases this state before the checkpoint and rebuilds it at identical GPU
+virtual addresses after restore, so application pointers and captured CUDA
+graphs remain valid.
+
+To enable it, build `mcshim.so`, place it in the container image, and set the
+runtime `--cuda-multicast-shim-path` flag to its in-container path. gVisor
+then arranges for the container's processes to load the interposer (via the
+`LD_PRELOAD` environment variable *and* an entry appended to the container's
+`/etc/ld.so.preload`, which covers launchers that rewrite their children's
+environment) and drives it automatically during `runsc checkpoint` and
+`runsc restore`. This also requires driver R610+ and the job configuration
+described above.
+
+The interposer and gVisor rendezvous through a directory inside the container
+(`/tmp/mcshim` by default, overridable with the `MCSHIM_DIR` container
+environment variable). This directory must reside on a filesystem that is part
+of the checkpoint image — not a host bind mount — because a marker file in it
+must survive the restore.
+
+Restoring such a snapshot needs no extra flags. However, to take a *further*
+checkpoint of a restored container, the restoring runtime must also be
+configured with `--cuda-multicast-shim-path`: that is how gVisor re-discovers
+that the container carries the interposer.
 
 ### Limitation
 
