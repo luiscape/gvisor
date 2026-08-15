@@ -68,6 +68,10 @@ type multicastFabricObject struct {
 
 	params capturedRmAllocParams
 
+	// numGPUs is the allocation's numGpus: how many GPUs must ATTACH_GPU
+	// before the object is usable (and before ATTACH_MEM can succeed).
+	numGPUs uint32
+
 	// attachedGPUs and attachedMems are recorded state-mutating controls,
 	// replayed in order (all GPU attaches, then all mem attaches) after the
 	// alloc replay. Both are protected by client.objsMu.
@@ -76,9 +80,13 @@ type multicastFabricObject struct {
 }
 
 func newMulticastFabricObject[Params any](fd *frontendFD, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *Params) *multicastFabricObject {
-	return &multicastFabricObject{
+	o := &multicastFabricObject{
 		params: captureRmAllocParams(fd, ioctlParams, rightsRequested, allocParams),
 	}
+	if ng, ok := any(allocParams).(interface{ GetNumGPUs() uint32 }); ok {
+		o.numGPUs = ng.GetNumGPUs()
+	}
+	return o
 }
 
 // Release implements objectImpl.Release.
@@ -128,17 +136,62 @@ func (o *multicastFabricObject) recordAttachMem(params nvgpu.NV00FD_CTRL_ATTACH_
 
 // removeAttachMem removes the recorded attach matching a successful
 // NV00FD_CTRL_CMD_DETACH_MEM (which identifies the binding by subdevice and
-// offset into the multicast object).
+// offset into the multicast object), and returns the removed attach's
+// HMemory and true, or false if no recorded attach matched.
+//
+// Matching on HSubDevice assumes one subdevice handle per GPU per client
+// (the driver itself matches on the GPU behind the subdevice); a client
+// holding multiple subdevice handles for one GPU and detaching via a
+// different handle than it attached with would leave a stale record.
 //
 // Precondition: o.client.objsMu must be locked.
-func (o *multicastFabricObject) removeAttachMem(params nvgpu.NV00FD_CTRL_DETACH_MEM_PARAMS) {
+func (o *multicastFabricObject) removeAttachMem(ctx context.Context, params nvgpu.NV00FD_CTRL_DETACH_MEM_PARAMS) (nvgpu.Handle, bool) {
 	for i, am := range o.attachedMems {
 		if am.params.HSubDevice == params.HSubDevice && am.params.Offset == params.Offset {
+			hMemory := am.params.HMemory
 			o.attachedMems = append(o.attachedMems[:i], o.attachedMems[i+1:]...)
-			return
+			return hMemory, true
 		}
 	}
-	log.Warningf("nvproxy: DETACH_MEM on %v:%v (subdevice %v, offset %#x) does not match any recorded attach", o.client.handle, o.handle, params.HSubDevice, params.Offset)
+	ctx.Warningf("nvproxy: DETACH_MEM on %v:%v (subdevice %v, offset %#x) does not match any recorded attach", o.client.handle, o.handle, params.HSubDevice, params.Offset)
+	return nvgpu.Handle{}, false
+}
+
+// attachMemsReference reports whether any recorded ATTACH_MEM still
+// references hMemory.
+//
+// Precondition: o.client.objsMu must be locked.
+func (o *multicastFabricObject) attachMemsReference(hMemory nvgpu.Handle) bool {
+	for _, am := range o.attachedMems {
+		if am.params.HMemory == hMemory {
+			return true
+		}
+	}
+	return false
+}
+
+// checkReplayable returns an error if o's recorded attach controls can no
+// longer be replayed, i.e. if a referenced object has been freed. The driver
+// dups hMemory internally on ATTACH_MEM, so the application may legally free
+// its handle while the attachment lives on -- but then no faithful replay
+// exists, and the save must fail rather than the restore.
+//
+// Precondition: the sandbox is paused (called from beforeSave).
+func (o *multicastFabricObject) checkReplayable() error {
+	for _, ag := range o.attachedGPUs {
+		if _, ok := o.client.resources[ag.params.HSubDevice]; !ok {
+			return fmt.Errorf("recorded ATTACH_GPU references freed subdevice handle %v", ag.params.HSubDevice)
+		}
+	}
+	for _, am := range o.attachedMems {
+		if _, ok := o.client.resources[am.params.HMemory]; !ok {
+			return fmt.Errorf("recorded ATTACH_MEM references freed memory handle %v", am.params.HMemory)
+		}
+		if _, ok := o.client.resources[am.params.HSubDevice]; !ok {
+			return fmt.Errorf("recorded ATTACH_MEM references freed subdevice handle %v", am.params.HSubDevice)
+		}
+	}
+	return nil
 }
 
 // Restore implements restorableObjectImpl.Restore.
@@ -147,16 +200,21 @@ func (o *multicastFabricObject) removeAttachMem(params nvgpu.NV00FD_CTRL_DETACH_
 // ATTACH_MEM controls, in order.
 //
 // KNOWN LIMITATION (cross-client ordering): ATTACH_GPU does not block, but
-// ATTACH_MEM blocks in the driver until ALL participating GPUs have joined
-// the multicast object (measured). afterLoad restores objects serially, so if
-// several clients of ONE multicast object are restored through this path, the
-// first client's ATTACH_MEM replay would wait for peers whose ATTACH_GPU has
-// not been replayed yet -- a deadlock, surfaced only by the watchdog below.
-// This path is unreachable in the cuda-checkpoint flow (the interposer
-// empties the multicast graph before save); it matters only for a plain
-// sentry checkpoint taken with live multicast objects. Fixing it requires
-// splitting the replay into an all-clients ATTACH_GPU pass followed by an
-// all-clients ATTACH_MEM pass.
+// once every participating GPU has joined, ATTACH_MEM is completed by the
+// driver for all of them together: on R610 an early ATTACH_MEM blocks in the
+// driver until the team is complete (measured); other driver versions may
+// instead fail it with NV_ERR_NOT_READY. afterLoad restores objects serially,
+// so if several clients of ONE multicast object were restored through this
+// path, the first client's ATTACH_MEM replay would wait for peers whose
+// ATTACH_GPU has not been replayed yet -- a deadlock. restoreAttachMems
+// therefore fails fast when the recorded state itself proves the team cannot
+// be complete (fewer recorded ATTACH_GPUs than the allocation's numGpus),
+// and a watchdog names the object loudly if the driver blocks anyway. This
+// path is unreachable in the cuda-checkpoint flow (the interposer empties
+// the multicast graph before save); it matters only for a plain sentry
+// checkpoint taken with live multicast objects. Lifting the limitation
+// requires splitting the replay into an all-clients ATTACH_GPU pass followed
+// by an all-clients ATTACH_MEM pass.
 func (o *multicastFabricObject) Restore(ctx goContext.Context) error {
 	if err := o.params.restore(); err != nil {
 		return fmt.Errorf("failed to replay multicast fabric alloc: %w", err)
@@ -193,6 +251,15 @@ func (o *multicastFabricObject) restoreAttachGPUs(ctx goContext.Context) error {
 // silent either. A watchdog names the stuck object loudly if the replay
 // exceeds a generous bound.
 func (o *multicastFabricObject) restoreAttachMems(ctx goContext.Context) error {
+	if len(o.attachedMems) > 0 && uint32(len(o.attachedGPUs)) < o.numGPUs {
+		// This object's replay alone cannot complete the team, and a serial
+		// restore cannot guarantee that peer clients' ATTACH_GPU replays have
+		// run (the topological sort imposes no cross-client order), so the
+		// first ATTACH_MEM may block (R610) or fail (NV_ERR_NOT_READY); see
+		// Restore's known limitation. Fail deterministically instead of
+		// depending on restore order.
+		return fmt.Errorf("multicast object records %d ATTACH_GPUs but requires %d GPUs; a serial restore cannot guarantee the peer attaches ATTACH_MEM would wait for", len(o.attachedGPUs), o.numGPUs)
+	}
 	for _, am := range o.attachedMems {
 		params := am.params
 		const attachMemWatchdog = 60 * time.Second
@@ -233,6 +300,9 @@ func (o *multicastFabricObject) hostDevFDForMinor(ctx goContext.Context, minor u
 	// client (or host /dev) to be reachable from ctx.
 	// openHostDevFileForRestore panics on failure, consistent with the restore
 	// path this runs on.
+	if minor > nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX {
+		return hostDevFD{}, fmt.Errorf("recorded device minor %d exceeds NV_MINOR_DEVICE_NUMBER_REGULAR_MAX", minor)
+	}
 	dev := nvp.regularDevs[minor]
 	if dev == nil {
 		return hostDevFD{}, fmt.Errorf("no /dev/nvidia%d device", minor)
@@ -243,10 +313,14 @@ func (o *multicastFabricObject) hostDevFDForMinor(ctx goContext.Context, minor u
 
 // ctrlMemoryMulticastFabricAttachMem proxies NV00FD_CTRL_CMD_ATTACH_MEM like
 // rmControlSimple, and additionally records the successful attach on the
-// target multicast object for replay at restore time. It also records a
-// dependency of the multicast object on the attached memory object, so that
-// the memory is restored first and a free of the memory cascades to the
-// multicast object, mirroring the driver.
+// target multicast object for replay at restore time. It also records
+// restore-ordering-only dependencies of the multicast object on the attached
+// memory and subdevice objects, so that the replay finds them already
+// restored. The edges must not cascade frees: the driver dups hMemory
+// internally (see
+// src/nvidia/src/kernel/mem_mgr/mem_multicast_fabric.c:memorymulticastfabricCtrlAttachMem_IMPL()),
+// so the application may legally free its hMemory while the attachment --
+// and the multicast object -- live on.
 func ctrlMemoryMulticastFabricAttachMem(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
 	var ctrlParams nvgpu.NV00FD_CTRL_ATTACH_MEM_PARAMS
 	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
@@ -256,18 +330,34 @@ func ctrlMemoryMulticastFabricAttachMem(fi *frontendIoctlState, ioctlParams *nvg
 		return 0, err
 	}
 	n, err := rmControlInvoke(fi, ioctlParams, &ctrlParams)
-	if err != nil || ioctlParams.Status != nvgpu.NV_OK {
+	if err != nil {
 		return n, err
+	}
+	// Record before CopyOut: the shadow graph must reflect host-side reality
+	// even if the copy-out to the application faults afterwards (an
+	// unrecorded host-side attach would replay an incomplete binding at
+	// restore). This matches rmAllocInvoke, which records on host success
+	// before any copy-out; the CopyOut itself is unconditional after a
+	// successful syscall, like rmControlSimple.
+	if ioctlParams.Status == nvgpu.NV_OK {
+		nvp := fi.fd.dev.nvp
+		// The lock is taken after the host invoke, diverging from the
+		// rmDupObject/rmFree convention (lock held across the call):
+		// ATTACH_MEM can block in the driver until all participating GPUs
+		// have attached, and holding objsMu across it would deadlock a peer
+		// thread of the same client issuing that ATTACH_GPU. The cost is a
+		// benign race: a concurrent free+realloc of the same handle could
+		// mis-attribute this record, which only a racy application can
+		// trigger.
+		if mcObj, unlock := nvp.getMulticastObjectWithLock(fi.ctx, ioctlParams.HClient, ioctlParams.HObject); mcObj != nil {
+			mcObj.recordAttachMem(ctrlParams)
+			mcObj.client.objAddRestoreDep(ioctlParams.HObject, ctrlParams.HMemory)
+			mcObj.client.objAddRestoreDep(ioctlParams.HObject, ctrlParams.HSubDevice)
+			unlock()
+		}
 	}
 	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
 		return n, err
-	}
-
-	nvp := fi.fd.dev.nvp
-	if mcObj, unlock := nvp.getMulticastObjectWithLock(fi.ctx, ioctlParams.HClient, ioctlParams.HObject); mcObj != nil {
-		mcObj.recordAttachMem(ctrlParams)
-		mcObj.client.objAddDep(ioctlParams.HObject, ctrlParams.HMemory)
-		unlock()
 	}
 	return n, nil
 }
@@ -283,20 +373,29 @@ func ctrlMemoryMulticastFabricDetachMem(fi *frontendIoctlState, ioctlParams *nvg
 		return 0, err
 	}
 	n, err := rmControlInvoke(fi, ioctlParams, &ctrlParams)
-	if err != nil || ioctlParams.Status != nvgpu.NV_OK {
+	if err != nil {
 		return n, err
+	}
+	// Unrecord before CopyOut, for the same reason ATTACH_MEM records before
+	// it: a stale record surviving a copy-out fault would replay an attach
+	// the application detached.
+	if ioctlParams.Status == nvgpu.NV_OK {
+		nvp := fi.fd.dev.nvp
+		if mcObj, unlock := nvp.getMulticastObjectWithLock(fi.ctx, ioctlParams.HClient, ioctlParams.HObject); mcObj != nil {
+			if hMemory, ok := mcObj.removeAttachMem(fi.ctx, ctrlParams); ok && !mcObj.attachMemsReference(hMemory) {
+				// No remaining recorded attach references the memory object,
+				// so the replay no longer needs it restored first. The
+				// subdevice restore-edge is deliberately retained: it is
+				// redundant with the one ATTACH_GPU added (there is no
+				// DETACH_GPU), and objFree cleans both sides when either
+				// object goes away.
+				mcObj.client.objRemoveRestoreDep(ioctlParams.HObject, hMemory)
+			}
+			unlock()
+		}
 	}
 	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
 		return n, err
-	}
-
-	nvp := fi.fd.dev.nvp
-	if mcObj, unlock := nvp.getMulticastObjectWithLock(fi.ctx, ioctlParams.HClient, ioctlParams.HObject); mcObj != nil {
-		mcObj.removeAttachMem(ctrlParams)
-		// Note: the dependency on the memory object is intentionally retained;
-		// dependencies record freeing order, and the driver keeps the
-		// association until the objects are freed.
-		unlock()
 	}
 	return n, nil
 }

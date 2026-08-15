@@ -1,4 +1,4 @@
-// Copyright 2025 The gVisor Authors.
+// Copyright 2026 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 package nvproxy
 
 import (
+	"runtime"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -30,6 +31,9 @@ import (
 // multicast attach controls at restore time).
 func controlObjectOnHost(hostFD int32, root, object nvgpu.Handle, cmd uint32, ctrlParams marshal.Marshallable) (uint32, error) {
 	buf := make([]byte, ctrlParams.SizeBytes())
+	if len(buf) == 0 {
+		return 0, unix.EINVAL
+	}
 	ctrlParams.MarshalBytes(buf)
 	ioctlParams := nvgpu.NVOS54_PARAMETERS{
 		HClient:    root,
@@ -38,10 +42,13 @@ func controlObjectOnHost(hostFD int32, root, object nvgpu.Handle, cmd uint32, ct
 		Params:     p64FromPtr(unsafe.Pointer(&buf[0])),
 		ParamsSize: uint32(len(buf)),
 	}
-	_, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(hostFD), frontendIoctlCmd(nvgpu.NV_ESC_RM_CONTROL, nvgpu.SizeofNVOS54Parameters), uintptr(unsafe.Pointer(&ioctlParams)))
-	// buf must remain alive for the duration of the ioctl; referencing it
-	// below also prevents the GC from collecting it earlier.
+	// unix.Syscall, not RawSyscall: some replayed controls block in the driver
+	// (e.g. NV00FD_CTRL_CMD_ATTACH_MEM waits for all participating GPUs), and
+	// a blocking ioctl outside entersyscall would wedge the M's P and could
+	// stall the scheduler and GC.
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(hostFD), frontendIoctlCmd(nvgpu.NV_ESC_RM_CONTROL, nvgpu.SizeofNVOS54Parameters), uintptr(unsafe.Pointer(&ioctlParams)))
 	ctrlParams.UnmarshalBytes(buf)
+	runtime.KeepAlive(buf)
 	if errno != 0 {
 		return ioctlParams.Status, errno
 	}
