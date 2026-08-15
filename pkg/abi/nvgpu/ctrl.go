@@ -234,6 +234,20 @@ type NV0000_CTRL_OS_UNIX_EXPORT_OBJECT struct {
 	Data [12]byte // union
 }
 
+// From src/common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000unix.h:
+const (
+	// NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM is the
+	// NV0000_CTRL_OS_UNIX_EXPORT_OBJECT.Type value for which Data is
+	// struct {hDevice, hParent, hObject Handle}.
+	NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM = 0
+
+	// NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_FLAGS_EMPTY_FD is the
+	// EMPTY_FD flag bit in NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS.Flags:
+	// the fd is created without an associated object (objects are attached
+	// later, e.g. by NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECTS_TO_FD).
+	NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_FLAGS_EMPTY_FD = 0x1
+)
+
 // +marshal
 type NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS struct {
 	_      structs.HostLayout
@@ -551,10 +565,10 @@ type NV00FD_CTRL_GET_INFO_PARAMS struct {
 // NV00FD_CTRL_ATTACH_MEM_PARAMS is the parameter type for
 // NV00FD_CTRL_CMD_ATTACH_MEM, from src/common/sdk/nvidia/inc/ctrl/ctrl00fd.h.
 //
-// Note: 555+ appends a trailing NvU32 subPageOffset ("for future use only,
-// must be zero"); it occupies what is padding in the pre-555 layout, so the
-// wire size (40 bytes) is unchanged. SubPageOffset below reflects the 555+
-// layout and reads as zero on older drivers.
+// Note: 580+ appends a trailing NvU32 subPageOffset ("for future use only,
+// must be zero"); it occupies what is tail padding in the pre-580 layout, so
+// the wire size (40 bytes) is unchanged. SubPageOffset below reflects the
+// 580+ layout and reads as zero on older drivers.
 //
 // +marshal
 // +stateify savable
@@ -573,7 +587,6 @@ type NV00FD_CTRL_ATTACH_MEM_PARAMS struct {
 // NV00FD_CTRL_CMD_DETACH_MEM, from src/common/sdk/nvidia/inc/ctrl/ctrl00fd.h.
 //
 // +marshal
-// +stateify savable
 type NV00FD_CTRL_DETACH_MEM_PARAMS struct {
 	_          structs.HostLayout
 	HSubDevice Handle

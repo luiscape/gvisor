@@ -132,8 +132,9 @@ type frontendFD struct {
 	clients map[*rootClient]struct{}
 
 	// exportedObj, if non-nil, records that an RM object was exported into
-	// this FD via NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD. Such an FD
-	// represents live CUDA IPC and blocks cuda-checkpoint; it is reported by
+	// this FD via NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD or
+	// NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECTS_TO_FD. Such an FD represents
+	// live CUDA IPC and blocks cuda-checkpoint; it is reported by
 	// nvproxy.checkpointBlockers() until this FD is closed. exportedObj is
 	// protected by dev.nvp.fdsMu.
 	exportedObj *exportedObjInfo
@@ -1029,10 +1030,13 @@ func ctrlMemoryMulticastFabricAttachGPU(fi *frontendIoctlState, ioctlParams *nvg
 	if err == nil && ioctlParams.Status == nvgpu.NV_OK {
 		// Record the successful attach on the multicast object for replay at
 		// restore time. The device descriptor FD number is meaningless at
-		// replay; record the device minor instead.
+		// replay; record the device minor instead. The restore-ordering-only
+		// dependency makes the replay find the subdevice already restored
+		// without tying the multicast object's lifetime to it.
 		nvp := fi.fd.dev.nvp
 		if mcObj, unlock := nvp.getMulticastObjectWithLock(fi.ctx, ioctlParams.HClient, ioctlParams.HObject); mcObj != nil {
 			mcObj.recordAttachGPU(ctrlParams, devDesc.dev.minor)
+			mcObj.client.objAddRestoreDep(ioctlParams.HObject, ctrlParams.HSubDevice)
 			unlock()
 		}
 	}

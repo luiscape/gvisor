@@ -181,6 +181,15 @@ func (nvp *nvproxy) beforeSave() {
 			if _, ok := obj.impl.(restorableObjectImpl); !ok {
 				panic(fmt.Sprintf("nvproxy: object handle %v:%v (class %v, type %T) is not restorable", client.handle, obj.handle, obj.class, obj.impl))
 			}
+			if mcObj, ok := obj.impl.(*multicastFabricObject); ok {
+				// Fail the save rather than the restore: a recorded attach
+				// whose referenced object has since been freed cannot be
+				// replayed (the driver-side attachment survives only via the
+				// driver's internal dup, which we cannot reproduce).
+				if err := mcObj.checkReplayable(); err != nil {
+					panic(fmt.Sprintf("nvproxy: multicast object handle %v:%v cannot be checkpointed: %v", client.handle, obj.handle, err))
+				}
+			}
 		}
 	}
 }
@@ -221,6 +230,19 @@ func (nvp *nvproxy) afterLoad(ctx goContext.Context) {
 		// objects.
 		for _, client := range nvp.clients {
 			for _, obj := range client.resources {
+				// Recorded multicast ATTACH_GPU controls identify the GPU by
+				// device minor; remap them like frontendFDs above, or the
+				// replay would attach the old minor's device.
+				if mcObj, ok := obj.impl.(*multicastFabricObject); ok {
+					for i := range mcObj.attachedGPUs {
+						oldMinor := mcObj.attachedGPUs[i].devMinor
+						oldDev, ok := dr.OldDeviceByMinor[oldMinor]
+						if !ok {
+							panic(fmt.Sprintf("nvproxy: remapping does not contain a saved device with minor number %d: %+v", oldMinor, dr))
+						}
+						mcObj.attachedGPUs[i].devMinor = dr.NewDeviceByOld[oldDev].Minor
+					}
+				}
 				if obj.class == nvgpu.NV01_DEVICE_0 {
 					obj := obj.impl.(*rmAllocObject)
 					var allocParams nvgpu.NV0080_ALLOC_PARAMETERS
@@ -270,6 +292,11 @@ func (nvp *nvproxy) afterLoad(ctx goContext.Context) {
 		}
 		objsVisited[obj] = false
 		for dep := range obj.deps {
+			dfsConsider(dep)
+		}
+		// Restore-ordering-only dependencies participate in the sort but not
+		// in freeing; see object.restoreDeps.
+		for dep := range obj.restoreDeps {
 			dfsConsider(dep)
 		}
 		objsVisited[obj] = true
