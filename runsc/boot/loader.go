@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1477,14 +1478,42 @@ func (l *Loader) setupCudaCheckpointJob(info *containerInfo) error {
 	if len(info.procArgs.Argv) == 0 {
 		return fmt.Errorf("container has no command to wrap")
 	}
+	// With the exec-FD entrypoint dropped below, kernel.CreateProcess
+	// resolves Argv[0] literally in the container's mount namespace: it must
+	// be an absolute path (no PATH search), and it must exist. Validate now
+	// and degrade to an unwrapped command on failure -- a missing or relative
+	// path must cost the job wrap, not the container boot (the flag is
+	// runtime-wide, and a GPU sidecar image may simply not carry the binary).
+	if !filepath.IsAbs(info.conf.CUDACheckpointPath) {
+		log.Warningf("--cuda-checkpoint-path %q is not absolute; not wrapping container %q in a cuda-checkpoint job", info.conf.CUDACheckpointPath, info.containerName)
+		return nil
+	}
+	if mntns := info.procArgs.MountNamespace; mntns != nil {
+		ctx := info.procArgs.NewContext(l.k)
+		creds := auth.NewRootCredentials(l.k.RootUserNamespace())
+		root := mntns.Root(ctx)
+		pop := &vfs.PathOperation{
+			Root:               root,
+			Start:              root,
+			Path:               fspath.Parse(info.conf.CUDACheckpointPath),
+			FollowFinalSymlink: true,
+		}
+		_, err := root.Mount().Filesystem().VirtualFilesystem().StatAt(ctx, creds, pop, &vfs.StatOptions{})
+		root.DecRef(ctx)
+		if err != nil {
+			log.Warningf("--cuda-checkpoint-path %q not found in container %q (%v); not wrapping its command in a cuda-checkpoint job", info.conf.CUDACheckpointPath, info.containerName, err)
+			return nil
+		}
+	}
 	origArgv := info.procArgs.Argv
 	// If the entrypoint was provided as a host FD (the `runsc run` fast path),
 	// drop it so that cuda-checkpoint is resolved from the container rootfs and
-	// the original argv is resolved by cuda-checkpoint's exec.
-	if info.execFD != nil {
-		info.execFD.Close()
-		info.execFD = nil
-	}
+	// the original argv is resolved by cuda-checkpoint's exec. By this point
+	// createContainerProcess has already consumed info.execFD into
+	// info.procArgs.File, so that is what must be cleared (the deferred DecRef
+	// in createContainerProcess still releases the host FD); with both File
+	// and Filename empty, kernel.CreateProcess resolves Argv[0].
+	info.procArgs.File = nil
 	info.procArgs.Filename = ""
 	info.procArgs.Argv = append([]string{info.conf.CUDACheckpointPath, "--launch-job"}, origArgv...)
 	log.Infof("Wrapped container %q command in a cuda-checkpoint job", info.containerName)
@@ -1529,22 +1558,15 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	}
 	// The interposer and the sentry rendezvous through this directory. Only
 	// set it if the container has not chosen one itself.
-	hasDir := false
+	shimDir, hasDir := "", false
 	for _, e := range env {
-		if strings.HasPrefix(e, control.CudaMulticastShimDirEnv+"=") {
-			hasDir = true
+		if v, ok := strings.CutPrefix(e, control.CudaMulticastShimDirEnv+"="); ok {
+			shimDir, hasDir = v, true
 			break
 		}
 	}
-	shimDir := control.DefaultCudaMulticastShimDir
-	if hasDir {
-		for _, e := range env {
-			if v, ok := strings.CutPrefix(e, control.CudaMulticastShimDirEnv+"="); ok {
-				shimDir = v
-				break
-			}
-		}
-	} else {
+	if !hasDir {
+		shimDir = control.DefaultCudaMulticastShimDir
 		env = append(env, control.CudaMulticastShimDirEnv+"="+shimDir)
 	}
 	info.procArgs.Envv = env
@@ -1576,26 +1598,51 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	// spec: LD_PRELOAD, because the sentry passes SpecEnviron to the
 	// cuda-checkpoint processes it execs and preloading the interposer into
 	// those would be wrong.
-	if info.spec != nil && info.spec.Process != nil {
-		found := false
-		for _, e := range info.spec.Process.Env {
-			if strings.HasPrefix(e, control.CudaMulticastShimMarkerEnv+"=") {
-				found = true
-				break
-			}
-		}
-		if !found {
-			info.spec.Process.Env = append(info.spec.Process.Env, control.CudaMulticastShimMarkerEnv+"="+shimDir)
-		}
-	}
+	injectCudaShimMarkerEnv(info.spec)
 	log.Infof("Preloaded multicast interposer %q into container %q (rendezvous dir %q)", info.conf.CUDAMulticastShimPath, info.containerName, shimDir)
 	return nil
+}
+
+// injectCudaShimMarkerEnv appends the interposer marker env entry
+// (control.CudaMulticastShimMarkerEnv) to spec.Process.Env if it is not
+// already present, deriving the rendezvous directory the same way
+// setupCudaMulticastShim does: the container's own MCSHIM_DIR if set, else
+// the default. Idempotent.
+//
+// This is called at container creation, and again on the restore path: the
+// restore-side specs come from the user's bundle, which never carried the
+// marker, and without it a checkpoint taken after a restore would not
+// discover the interposer (control's cudaShimDir reads SpecEnviron) and
+// would fail its blocker gate.
+func injectCudaShimMarkerEnv(spec *specs.Spec) {
+	if spec == nil || spec.Process == nil {
+		return
+	}
+	for _, e := range spec.Process.Env {
+		if strings.HasPrefix(e, control.CudaMulticastShimMarkerEnv+"=") {
+			return
+		}
+	}
+	shimDir := control.DefaultCudaMulticastShimDir
+	for _, e := range spec.Process.Env {
+		if v, ok := strings.CutPrefix(e, control.CudaMulticastShimDirEnv+"="); ok {
+			shimDir = v
+			break
+		}
+	}
+	spec.Process.Env = append(spec.Process.Env, control.CudaMulticastShimMarkerEnv+"="+shimDir)
 }
 
 // writeLdSoPreload appends the interposer path to the container's
 // /etc/ld.so.preload (creating the file if absent), through the container's
 // own mount namespace. Idempotent: a path already listed is not added again,
 // which also makes container restarts and restores safe.
+//
+// The write goes through the container's VFS: with a rootfs overlay (the
+// default --overlay2 configuration) it lands in the overlay rather than the
+// user's rootfs; with --overlay2=none it modifies the writable rootfs like
+// any container write would.
+//
 // Known limitation: this runs at container CREATION only. A restored
 // container gets a freshly assembled filesystem, and processes spawned after
 // the restore will not see this file unless the restore-side rootfs carries
@@ -1626,9 +1673,15 @@ func (l *Loader) writeLdSoPreload(info *containerInfo) error {
 	existing := ""
 	if fd, err := vfsObj.OpenAt(ctx, creds, target, &vfs.OpenOptions{Flags: linux.O_RDONLY}); err == nil {
 		buf := make([]byte, 64<<10)
-		if n, _ := fd.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{}); n > 0 {
-			existing = string(buf[:n])
+		filled := 0
+		for filled < len(buf) {
+			n, rerr := fd.Read(ctx, usermem.BytesIOSequence(buf[filled:]), vfs.ReadOptions{})
+			filled += int(n)
+			if rerr != nil || n == 0 {
+				break
+			}
 		}
+		existing = string(buf[:filled])
 		fd.DecRef(ctx)
 	}
 	for _, line := range strings.Fields(existing) {
@@ -1646,6 +1699,12 @@ func (l *Loader) writeLdSoPreload(info *containerInfo) error {
 	}
 	defer fd.DecRef(ctx)
 	data := info.conf.CUDAMulticastShimPath + "\n"
+	if existing != "" && !strings.HasSuffix(existing, "\n") {
+		// Never concatenate onto an existing entry: a missing trailing
+		// newline would corrupt both entries and make the loader print an
+		// error into every process's stderr.
+		data = "\n" + data
+	}
 	if _, err := fd.Write(ctx, usermem.BytesIOSequence([]byte(data)), vfs.WriteOptions{}); err != nil {
 		return fmt.Errorf("writing /etc/ld.so.preload: %w", err)
 	}

@@ -74,10 +74,9 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.Var(newCheckpointCompressionValue(statefile.CompressionLevelDefault, &c.compression), "compression", "compress checkpoint image on disk. Values: none|flate-best-speed.")
 	f.BoolVar(&c.excludeCommittedZeroPages, "exclude-committed-zero-pages", false, "exclude committed zero-filled pages from checkpoint")
 	f.BoolVar(&c.direct, "direct", false, "use O_DIRECT for writing checkpoint pages file")
-	f.StringVar(&c.cudaCheckpointPath, "cuda-checkpoint-path", "", "path to the cuda-checkpoint binary in the container")
+	f.StringVar(&c.cudaCheckpointPath, "cuda-checkpoint-path", "", "path to the cuda-checkpoint binary in the container. Defaults to the runtime's --cuda-checkpoint-path configuration if unset.")
 	f.BoolVar(&c.cudaCheckpointSequential, "cuda-checkpoint-sequential", false, "run cuda-checkpoint sequentially in the container")
-	f.DurationVar(&c.cudaBlockerTimeout, "cuda-blocker-timeout", control.DefaultCudaBlockerTimeout, "how long to wait for CUDA checkpoint blockers (multicast/fabric objects, exported-object FDs) to be released before failing the checkpoint")
-
+	f.DurationVar(&c.cudaBlockerTimeout, "cuda-checkpoint-blocker-timeout", control.DefaultCudaBlockerTimeout, "how long to wait for CUDA checkpoint blockers (multicast/fabric objects, exported-object FDs) to be released before failing the checkpoint")
 	f.StringVar(&c.saveRestoreExecArgv, "save-restore-exec-argv", "", "argv (split by spaces) for a save/restore binary that's automatically executed in the sandbox before saving and after restoring. If the execution fails, the save/restore process will fail.")
 	f.DurationVar(&c.saveRestoreExecTimeout, "save-restore-exec-timeout", control.DefaultSaveRestoreExecTimeout, "timeout for the binary pointed to by save-restore-exec-argv.")
 
@@ -103,6 +102,14 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	}
 
 	conf := args[0].(*config.Config)
+
+	// The runtime-level flag (which wraps the container in a cuda-checkpoint
+	// job at creation) and this checkpoint-time flag (which locates the
+	// binary to orchestrate the checkpoint) almost always point at the same
+	// binary; default to the runtime configuration so only one needs setting.
+	if c.cudaCheckpointPath == "" {
+		c.cudaCheckpointPath = conf.CUDACheckpointPath
+	}
 
 	cont, err := c.loadContainer(conf, f, container.LoadOpts{})
 	if err != nil {

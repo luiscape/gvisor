@@ -357,6 +357,21 @@ func (r *restorer) restore(l *Loader) error {
 	if err := specutils.RestoreValidateSpec(r.checkpointedSpecs, l.GetContainerSpecs(), l.root.conf); err != nil {
 		return fmt.Errorf("failed to handle restore spec validation: %w", err)
 	}
+	// The multicast-interposer marker env was injected into the in-memory
+	// container specs at creation (setupCudaMulticastShim), but the specs
+	// registered here come from the user's restore bundle, which never had
+	// it. Re-inject it so a checkpoint taken after this restore still
+	// discovers the interposer (control's cudaShimDir reads SpecEnviron).
+	// No driver-version check is needed: a checkpoint can only contain a
+	// suspended interposer if the creation-time checks passed.
+	if l.root.conf.CUDAMulticastShimPath != "" {
+		for name, spec := range l.GetContainerSpecs() {
+			if specutils.NVProxyEnabled(spec, l.root.conf) {
+				injectCudaShimMarkerEnv(spec)
+				log.Infof("Re-injected multicast interposer marker env into restored spec for container %q", name)
+			}
+		}
+	}
 	if l.root.conf.Network != config.NetworkSandbox && l.root.conf.Network != config.NetworkNone && l.root.conf.Network != config.NetworkHost {
 		return fmt.Errorf("checkpoint not supported when using %s networking", l.root.conf.Network)
 	}
