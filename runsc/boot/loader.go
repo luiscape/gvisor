@@ -1522,19 +1522,25 @@ func (l *Loader) setupCudaCheckpointJob(info *containerInfo) error {
 
 // setupCudaMulticastShim LD_PRELOADs the multicast suspend/resume interposer
 // into a GPU container (when --cuda-multicast-shim-path is set, nvproxy is
-// enabled, and the driver is R610+).
+// enabled, and the driver is R550+, cuda-checkpoint's minimum).
 //
 // cuda-checkpoint cannot checkpoint a process holding live multicast (0x00fd)
 // objects, which NCCL NVLS and torch _symmetric_memory both create. The
 // interposer releases them before the checkpoint and rebuilds them at
 // byte-identical VAs afterwards; control/state_cuda.go drives both transitions
 // around the cuda-checkpoint phases via the marker directory exported here.
+//
+// Unlike the cuda-checkpoint job wrap (setupCudaCheckpointJob, R610+), the
+// interposer is useful on pre-R610 drivers: drivers without job support
+// cannot carry ANY cross-process CUDA state across a checkpoint, and the
+// interposer's teardown is precisely what empties that state per process
+// before the (job-less, per-process) checkpoints run.
 func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	if info.conf.CUDAMulticastShimPath == "" || !specutils.NVProxyEnabled(info.spec, info.conf) {
 		return nil
 	}
-	if major := l.k.NvidiaDriverVersion.Major(); major < 610 {
-		log.Warningf("--cuda-multicast-shim-path is set but driver R%d is older than R610; not preloading the multicast interposer into container %q", major, info.containerName)
+	if major := l.k.NvidiaDriverVersion.Major(); major < 550 {
+		log.Warningf("--cuda-multicast-shim-path is set but driver R%d is older than R550 (cuda-checkpoint's minimum); not preloading the multicast interposer into container %q", major, info.containerName)
 		return nil
 	}
 	// Append to any LD_PRELOAD the container already sets rather than
