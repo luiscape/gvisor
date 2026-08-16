@@ -4,23 +4,34 @@ attach a NEW multicast (00FD) object on this driver?
 
 This is the R580 question. The interposer's rebuild does exactly this sequence
 after every restore (cuMulticastCreate -> AddDevice -> BindMem -> map); on
-610.57.04 it works. On 580.126.20 the e2e run fails at AddDevice, so this
-probe isolates whether that is a driver limitation (fails natively too) or
-something in the gVisor/nvproxy/interposer stack (passes natively).
+610.57.04 it works. On 580.126.20 AddDevice fails with
+CUDA_ERROR_INVALID_DEVICE(101) -- this probe isolates the failure and tests
+workaround candidates.
 
   child: init 2 GPUs, create a plain VMM allocation per GPU, write READY,
-         idle. When RESUME appears: cuMulticastCreate + AddDevice(x2) +
-         BindMem(x2) + map, write each step's result to RESULT, idle to STOP.
+         idle. When RESUME appears: run the selected rebuild VARIANT, write
+         each step's result to RESULT, idle to STOP.
   parent: waits READY, drives cuda-checkpoint lock -> checkpoint -> restore ->
          unlock on the child, touches RESUME, prints RESULT.
 
+Variants (MC_VARIANT env / --variant):
+  baseline  create+AddDevice on the pre-checkpoint primary contexts (known
+            FAIL on R580, PASS on R610)
+  newctx    create FRESH secondary contexts (cuCtxCreate) on both devices
+            after restore and run the sequence there -- if this works, the
+            interposer can rebuild inside its own fresh context
+  cycle     release + re-retain the primary contexts after restore (destroys
+            restored state; diagnostic only)
+  nofd      baseline but the multicast prop has handleTypes=0 (no export
+            capability) -- isolates the POSIX-FD capability path
+Every variant also reports CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED before
+and after restore.
+
 Modes:
-  --no-cr     skip the checkpoint cycle (control: proves the sequence works
-              on this driver in a never-checkpointed process)
-  --job       launch the child under `cuda-checkpoint --launch-job`
+  --no-cr     skip the checkpoint cycle (control)
 
 Usage:
-  sudo python3 native_mc_after_restore.py [--no-cr] [--job] \
+  sudo python3 native_mc_after_restore.py [--variant V] [--no-cr] \
       [--cuda-checkpoint /usr/local/bin/cuda-checkpoint]
 """
 
@@ -39,6 +50,8 @@ RESUME = "/tmp/native_mc_ar.resume"
 RESULT = "/tmp/native_mc_ar.result"
 STOP = "/tmp/native_mc_ar.stop"
 
+CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED = 132
+
 
 def _step(results, name, fn):
     try:
@@ -50,7 +63,45 @@ def _step(results, name, fn):
         raise
 
 
+def _mc_attr(devs):
+    vals = []
+    for d in devs:
+        v = ctypes.c_int()
+        cu.call("cuDeviceGetAttribute", ctypes.byref(v),
+                CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, d)
+        vals.append(v.value)
+    return vals
+
+
+def _build_multicast(results, ctxs, devs, handle_types):
+    cu.call("cuCtxSetCurrent", ctxs[0])
+    mprop = cu.CUmulticastObjectProp()
+    mprop.numDevices = 2
+    mprop.handleTypes = handle_types
+    g = ctypes.c_size_t()
+    _step(results, "granularity", lambda: cu.call(
+        "cuMulticastGetGranularity", ctypes.byref(g), ctypes.byref(mprop), 1))
+    mcsize = g.value
+    mprop.size = mcsize
+    mc = ctypes.c_ulonglong()
+    _step(results, "create", lambda: cu.call(
+        "cuMulticastCreate", ctypes.byref(mc), ctypes.byref(mprop)))
+    for d in devs:
+        _step(results, f"add_device_{d}", lambda d=d: cu.call(
+            "cuMulticastAddDevice", mc.value, d))
+    for i, d in enumerate(devs):
+        cu.call("cuCtxSetCurrent", ctxs[i])
+        p = cu.alloc_prop(d)
+        bmemh = cu.mem_create(mcsize, p)
+        _step(results, f"bind_mem_{d}", lambda m=bmemh: cu.call(
+            "cuMulticastBindMem", mc.value, 0, m, 0, mcsize, 0))
+    cu.call("cuCtxSetCurrent", ctxs[0])
+    _step(results, "map_mc_va", lambda: cu.reserve_map_rw(
+        mc.value, mcsize, devs[0]))
+
+
 def child():
+    variant = os.environ.get("MC_VARIANT", "baseline")
     for f in (READY, RESULT):
         if os.path.exists(f):
             os.remove(f)
@@ -63,57 +114,55 @@ def child():
         cu.call("cuDevicePrimaryCtxRetain", ctypes.byref(c), d.value)
         devs.append(d.value)
         ctxs.append(c)
-    # Realistic pre-checkpoint state: one plain VMM allocation per GPU
-    # (POSIX_FD-capable, like NCCL_CUMEM_ENABLE=1 allocations), never exported.
+    attr_before = _mc_attr(devs)
+    # Realistic pre-checkpoint state: one plain VMM allocation per GPU.
     prop0 = cu.alloc_prop(devs[0])
-    gran = cu.alloc_granularity(prop0)
-    size = gran
-    memhs = []
+    size = cu.alloc_granularity(prop0)
     for i, d in enumerate(devs):
         cu.call("cuCtxSetCurrent", ctxs[i])
         p = cu.alloc_prop(d)
         memh = cu.mem_create(size, p)
         cu.reserve_map_rw(memh, size, d)
-        memhs.append(memh)
     cu.call("cuCtxSetCurrent", ctxs[0])
     cu.call("cuCtxSynchronize")
     with open(READY, "w") as f:
         f.write(f"{os.getpid()}\n")
-    print(f"[child] ready pid={os.getpid()} size=0x{size:x}", flush=True)
+    print(f"[child] ready pid={os.getpid()} variant={variant} "
+          f"mc_attr_before={attr_before}", flush=True)
 
     while not os.path.exists(RESUME):
         time.sleep(0.2)
     print("[child] RESUME seen; building multicast", flush=True)
 
-    results = []
+    results = [f"variant={variant}", f"mc_attr_before={attr_before}"]
     try:
+        results.append(f"mc_attr_after={_mc_attr(devs)}")
+        handle_types = cu.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        if variant == "nofd":
+            handle_types = 0
+        if variant == "newctx":
+            # Fresh secondary contexts, leaving the restored primary contexts
+            # (and all restored state) untouched -- the only variant an
+            # interposer could actually use.
+            new_ctxs = []
+            for d in devs:
+                c = ctypes.c_void_p()
+                _step(results, f"ctx_create_{d}", lambda d=d, c=c: cu.call(
+                    "cuCtxCreate", ctypes.byref(c), 0, d))
+                new_ctxs.append(c)
+            ctxs = new_ctxs
+        elif variant == "cycle":
+            # Destroys restored state; diagnostic only.
+            for i, d in enumerate(devs):
+                _step(results, f"ctx_release_{d}", lambda d=d: cu.call(
+                    "cuDevicePrimaryCtxRelease", d))
+                c = ctypes.c_void_p()
+                _step(results, f"ctx_retain_{d}", lambda d=d, c=c: cu.call(
+                    "cuDevicePrimaryCtxRetain", ctypes.byref(c), d))
+                ctxs[i] = c
         cu.call("cuCtxSetCurrent", ctxs[0])
-        _step(results, "ctx_sync_after_restore", lambda: cu.call("cuCtxSynchronize"))
-        mprop = cu.CUmulticastObjectProp()
-        mprop.numDevices = 2
-        mprop.handleTypes = cu.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-        g = ctypes.c_size_t()
-        _step(results, "granularity", lambda: cu.call(
-            "cuMulticastGetGranularity", ctypes.byref(g), ctypes.byref(mprop), 1))
-        mcsize = g.value
-        mprop.size = mcsize
-        mc = ctypes.c_ulonglong()
-        _step(results, "create", lambda: cu.call(
-            "cuMulticastCreate", ctypes.byref(mc), ctypes.byref(mprop)))
-        for d in devs:
-            _step(results, f"add_device_{d}", lambda d=d: cu.call(
-                "cuMulticastAddDevice", mc.value, d))
-        # Bind fresh allocations of multicast granularity (the pre-restore
-        # ones may be smaller than the MC granularity).
-        for i, d in enumerate(devs):
-            cu.call("cuCtxSetCurrent", ctxs[i])
-            p = cu.alloc_prop(d)
-            bmemh = cu.mem_create(mcsize, p)
-            _step(results, f"bind_mem_{d}", lambda m=bmemh: cu.call(
-                "cuMulticastBindMem", mc.value, 0, m, 0, mcsize, 0))
-        cu.call("cuCtxSetCurrent", ctxs[0])
-        _step(results, "map_mc_va", lambda: cu.reserve_map_rw(
-            mc.value, mcsize, devs[0]))
+        _step(results, "ctx_sync", lambda: cu.call("cuCtxSynchronize"))
+        _build_multicast(results, ctxs, devs, handle_types)
         results.append("ALL=PASS")
     except cu.CudaError:
         results.append("ALL=FAIL")
@@ -135,18 +184,12 @@ def cc_action(cc, pid, *args):
     return r.returncode
 
 
-def find_cuda_pid(job_pid):
-    out = subprocess.run(["pgrep", "-P", str(job_pid)], capture_output=True,
-                         text=True)
-    kids = [int(x) for x in out.stdout.split()]
-    return kids[0] if kids else job_pid
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--child", action="store_true")
     ap.add_argument("--no-cr", action="store_true")
-    ap.add_argument("--job", action="store_true")
+    ap.add_argument("--variant", default="baseline",
+                    choices=["baseline", "newctx", "cycle", "nofd"])
     ap.add_argument("--cuda-checkpoint",
                     default="/usr/local/bin/cuda-checkpoint")
     args = ap.parse_args()
@@ -157,10 +200,9 @@ def main():
     for f in (READY, RESUME, RESULT, STOP):
         if os.path.exists(f):
             os.remove(f)
+    env = dict(os.environ, MC_VARIANT=args.variant)
     argv = [sys.executable, os.path.abspath(__file__), "--child"]
-    if args.job:
-        argv = [args.cuda_checkpoint, "--launch-job"] + argv
-    proc = subprocess.Popen(argv)
+    proc = subprocess.Popen(argv, env=env)
     try:
         while not os.path.exists(READY):
             if proc.poll() is not None:
@@ -169,23 +211,18 @@ def main():
             time.sleep(0.2)
         with open(READY) as f:
             pid = int(f.read().split()[0])
-        cuda_pid = find_cuda_pid(proc.pid) if args.job else pid
-        print(f"[parent] child ready, cuda pid={cuda_pid}", flush=True)
+        print(f"[parent] child ready, cuda pid={pid}", flush=True)
 
         if not args.no_cr:
-            if cc_action(args.cuda_checkpoint, cuda_pid, "--action", "lock",
+            if cc_action(args.cuda_checkpoint, pid, "--action", "lock",
                          "--timeout", "10000"):
                 return 1
-            if cc_action(args.cuda_checkpoint, cuda_pid, "--action",
-                         "checkpoint"):
+            if cc_action(args.cuda_checkpoint, pid, "--action", "checkpoint"):
                 return 1
-            print("[parent] checkpointed; GPU should be empty; restoring",
-                  flush=True)
-            if cc_action(args.cuda_checkpoint, cuda_pid, "--action",
-                         "restore"):
+            print("[parent] checkpointed; restoring", flush=True)
+            if cc_action(args.cuda_checkpoint, pid, "--action", "restore"):
                 return 1
-            if cc_action(args.cuda_checkpoint, cuda_pid, "--action",
-                         "unlock"):
+            if cc_action(args.cuda_checkpoint, pid, "--action", "unlock"):
                 return 1
         else:
             print("[parent] --no-cr: skipping checkpoint cycle", flush=True)
