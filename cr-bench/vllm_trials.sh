@@ -29,7 +29,7 @@ GPUS="${GPUS:-0,1}"
 MECH="${MECH:-mcshim}"
 export EAGER="${EAGER:-0}"
 export RUNSC="${RUNSC:-/usr/local/bin/runsc-phase0}"
-export CUDA_CKPT_JOB_FILE=1
+export CUDA_CKPT_JOB_FILE="${CUDA_CKPT_JOB_FILE:-1}"
 case "$MECH" in
   mcshim) export CUDA_MULTICAST_SHIM=1 NCCL_CKPT_PATCH=0 ;;
   nccl)
