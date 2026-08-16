@@ -96,6 +96,8 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 | `MCSHIM_DISABLE`         | unset           | silent: no control thread, acks, or gate (interposition/tracking stay active) |
 | `MCSHIM_IPC_SUSPEND`     | unset           | opt-in legacy-IPC close+replay across the checkpoint              |
 | `MCSHIM_IPC_REPLAY_FLOOR`| `0x40000000000` | hex VA; imports whose range base is below it are left live        |
+| `MCSHIM_MC_PROXY`        | unset           | pre-R610: rebuild multicast via the mcshim-helper process         |
+| `MCSHIM_HELPER`          | next to the .so | path to mcshim-helper (the loader sets it on pre-R610 drivers)    |
 | `MCSHIM_HOST_BUILD`      | unset           | build.sh: build with the host toolchain instead of docker         |
 | `MCSHIM_BUILD_IMAGE`     | pinned 22.04    | build.sh: alternative base image                                  |
 
@@ -103,6 +105,37 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 legacy imports sit in low driver-owned regions the driver places once per
 process and never repeats; replayable ones sit in the high per-mapping area.
 Low-region imports are left live for the driver's job-mode support to carry.
+On pre-R610 drivers no job exists and a live import fails the per-process
+restore toggle, so the gVisor loader sets the floor to 0 there (close and
+replay everything).
+
+## Pre-R610 drivers: the multicast proxy
+
+R610 is not required. On R580 (measured on 580.126.20), a
+cuda-checkpoint-restored process can import a multicast group fd, bind its
+memory into the group, and map the multicast VA -- but `cuMulticastCreate`
+and `cuMulticastAddDevice` fail with `CUDA_ERROR_INVALID_DEVICE` (and
+`cuCtxCreate` with OOM): the restore blocks fresh device admission at the
+process level. With `MCSHIM_MC_PROXY` set (the gVisor loader sets it
+automatically on pre-R610 drivers), the rebuild routes exactly those two
+calls through `mcshim-helper`, a never-checkpointed process exec'd for the
+duration of the rebuild:
+
+*   Creators send `CREATE` (the recorded group properties) and `ADDDEV` (their
+    recorded ordinals) to the helper, import the group fd it returns, and
+    serve that same fd to peers (re-exporting an imported group handle also
+    fails on R580).
+*   Importers re-import from the creator exactly as before, then fetch a
+    second fd for the helper and send their `ADDDEV`s.
+*   Binds, identical-VA mappings, and teardown are unchanged; the group
+    persists through the ranks' imports, so the helper exits when the
+    rebuild is done (and on EOF, so it can never be leaked).
+
+Known pre-R610 gap: restoring onto DIFFERENT GPUs. The rebuild's re-imports
+then fail with `CUDA_ERROR_INVALID_DEVICE` (the restored process cannot
+admit the new devices), and imports cannot be proxied -- the handles must
+live in the rank. Cross-GPU restore of multicast/VMM workloads requires
+R610+.
 
 ## Design summary
 

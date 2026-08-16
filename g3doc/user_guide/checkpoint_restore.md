@@ -249,14 +249,24 @@ releases this state before the checkpoint and rebuilds it at identical GPU
 virtual addresses after restore, so application pointers and captured CUDA
 graphs remain valid.
 
-To enable it, build `mcshim.so`, place it in the container image, and set the
-runtime `--cuda-multicast-shim-path` flag to its in-container path. gVisor
-then arranges for the container's processes to load the interposer (via the
-`LD_PRELOAD` environment variable *and* an entry appended to the container's
+To enable it, build `mcshim.so` (and its companion `mcshim-helper`), place
+them in the container image, and set the runtime `--cuda-multicast-shim-path`
+flag to the interposer's in-container path. gVisor then arranges for the
+container's processes to load the interposer (via the `LD_PRELOAD`
+environment variable *and* an entry appended to the container's
 `/etc/ld.so.preload`, which covers launchers that rewrite their children's
 environment) and drives it automatically during `runsc checkpoint` and
-`runsc restore`. This also requires driver R610+ and the job configuration
-described above.
+`runsc restore`.
+
+This works on driver R580+ (validated on 580.126.20 and 610.57.04). On R610+
+it pairs with the job configuration described above. On pre-R610 drivers,
+where no job support exists, gVisor automatically configures the interposer
+to (a) close and replay every CUDA IPC import across the checkpoint (a live
+import fails the per-process restore) and (b) rebuild multicast objects
+through `mcshim-helper`, a short-lived fresh process, because a restored
+process on those drivers cannot create or attach multicast groups itself.
+One feature remains R610-only: restoring a multicast/VMM workload onto
+*different* GPUs than it was checkpointed on.
 
 The interposer and gVisor rendezvous through a directory inside the container
 (`/tmp/mcshim` by default, overridable with the `MCSHIM_DIR` container
