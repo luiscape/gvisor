@@ -2281,10 +2281,14 @@ static int do_resume(void) {
 			 * without recreating, so peers that DID tear down can
 			 * still refetch during the unwind. */
 			CUmemGenericAllocationHandle newmc = g_alloc[gi].handle;
+			int need_serve = 1;
 			if (full[gi] && mc_proxy_enabled()) {
 				/* Pre-R610: create+attach in the helper, then hold
 				 * the group via our own import (binds and maps are
-				 * measured to work in the restored process). */
+				 * measured to work in the restored process). The
+				 * HELPER's export fd is also what gets served to
+				 * peers: re-exporting an imported group handle from
+				 * a restored process fails on R580. */
 				char cmd[160];
 				snprintf(cmd, sizeof(cmd),
 				         "CREATE %u %zu %llu %llu\n",
@@ -2305,14 +2309,24 @@ static int do_resume(void) {
 				CUresult rc = r_cuMemImportFromShareableHandle(
 				    &newmc, (void *)(intptr_t)mcfd,
 				    CU_MEM_HANDLE_TYPE_POSIX_FD);
-				close(mcfd);
 				if (rc != CUDA_SUCCESS) {
+					close(mcfd);
 					mclog("RESUME: import of proxied group "
 					      "idx=%d rc=%d", gi, rc);
 					return -1;
 				}
 				alloc_push_aka(&g_alloc[gi], newmc);
 				g_alloc[gi].torn_down = 0;
+				if (g_alloc[gi].has_key) {
+					fcntl(mcfd, F_SETFD, FD_CLOEXEC);
+					if (start_serving(&g_alloc[gi], mcfd) != 0) {
+						close(mcfd);
+						return -1;
+					}
+				} else {
+					close(mcfd);
+				}
+				need_serve = 0;
 			} else if (full[gi]) {
 				if (r_cuMulticastCreate(&newmc,
 				                        &g_alloc[gi].mprop) !=
@@ -2326,7 +2340,7 @@ static int do_resume(void) {
 				 * down, not skip it. */
 				g_alloc[gi].torn_down = 0;
 			}
-			if (g_alloc[gi].has_key &&
+			if (need_serve && g_alloc[gi].has_key &&
 			    reexport_serve(gi, newmc) != 0)
 				return -1;
 			groups++;
@@ -2390,15 +2404,14 @@ static int do_resume(void) {
 			alloc_push_aka(&g_alloc[gi], newmc);
 			g_alloc[gi].torn_down = 0; /* live again */
 			/* Pre-R610: this rank's AddDevice calls must also run in
-			 * the helper. Hand it the group via a fresh export of our
-			 * import (measured to work in restored processes). */
+			 * the helper. Re-exporting our import fails on R580, so
+			 * fetch a SECOND fd from the creator (still serving) and
+			 * hand that to the helper. */
 			if (mc_proxy_enabled() && g_alloc[gi].ndev > 0) {
-				int fd = -1;
-				CUresult rc = r_cuMemExportToShareableHandle(
-				    &fd, newmc, CU_MEM_HANDLE_TYPE_POSIX_FD, 0);
-				if (rc != CUDA_SUCCESS) {
-					mclog("RESUME: re-export for proxied "
-					      "AddDevice idx=%d rc=%d", gi, rc);
+				int fd = fetch_group_fd(&g_alloc[gi], 60 * 1000);
+				if (fd < 0) {
+					mclog("RESUME: refetch for proxied "
+					      "AddDevice idx=%d failed", gi);
 					return -1;
 				}
 				int ok = helper_txn("IMPORT\n", fd, NULL) == 0 &&
