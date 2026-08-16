@@ -233,6 +233,8 @@ LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:/usr/loc
     [[ -n "${MCSHIM_IPC_SUSPEND:-}" ]] && CB_ENV+=$'\n'"MCSHIM_IPC_SUSPEND=$MCSHIM_IPC_SUSPEND"
     [[ -n "${MCSHIM_IPC_LOWBAND:-}" ]] && CB_ENV+=$'\n'"MCSHIM_IPC_LOWBAND=$MCSHIM_IPC_LOWBAND"
     [[ -n "${MCSHIM_IPC_SUSPEND_MIN:-}" ]] && CB_ENV+=$'\n'"MCSHIM_IPC_SUSPEND_MIN=$MCSHIM_IPC_SUSPEND_MIN"
+    [[ -n "${MCSHIM_IPC_REPLAY_FLOOR:-}" ]] && CB_ENV+=$'\n'"MCSHIM_IPC_REPLAY_FLOOR=$MCSHIM_IPC_REPLAY_FLOOR"
+    [[ -n "${NCCL_WIN_ENABLE:-}" ]] && CB_ENV+=$'\n'"NCCL_WIN_ENABLE=$NCCL_WIN_ENABLE"
     [[ -n "${MCSHIM_ALLOC_PAD_MIN:-}" ]] && CB_ENV+=$'\n'"MCSHIM_ALLOC_PAD_MIN=$MCSHIM_ALLOC_PAD_MIN"
     # Diagnostics passthrough: NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NVLS is
     # how to confirm which algorithm NCCL actually selected.
