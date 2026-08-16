@@ -311,6 +311,15 @@ cb_prepare_rootfs() {
             "${ROOTFS_DIR}${CUDA_MULTICAST_SHIM_PATH}" \
             && ok "Staged multicast interposer at ${CUDA_MULTICAST_SHIM_PATH}" \
             || die "failed to stage $CUDA_MULTICAST_SHIM_SRC"
+        # The create/attach proxy helper (pre-R610 drivers). Staged next to
+        # the interposer, which is where the loader points MCSHIM_HELPER.
+        local shim_helper_src
+        shim_helper_src="${CUDA_MULTICAST_SHIM_HELPER_SRC:-$(dirname "$CUDA_MULTICAST_SHIM_SRC")/mcshim-helper}"
+        if [[ -f "$shim_helper_src" ]]; then
+            install -D -m 0755 "$shim_helper_src" \
+                "${ROOTFS_DIR}$(dirname "$CUDA_MULTICAST_SHIM_PATH")/mcshim-helper" \
+                && ok "Staged multicast proxy helper next to the interposer"
+        fi
     fi
     if [[ "${NCCL_CKPT_PATCH:-0}" = "1" ]]; then
         [[ -f "$NCCL_CKPT_PATCH_SRC" ]] || \
