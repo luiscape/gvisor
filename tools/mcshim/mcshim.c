@@ -87,9 +87,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -2047,6 +2049,186 @@ static int do_suspend(void) {
 /* bindings/mappings that need all handles resolved come last (phase 3).    */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Multicast proxy (pre-R610 drivers).                                */
+/*                                                                    */
+/* On R580, a cuda-checkpoint-restored process can IMPORT a multicast */
+/* group fd, BIND its memory to it, and MAP the multicast VA -- but   */
+/* cuMulticastCreate and cuMulticastAddDevice fail with               */
+/* CUDA_ERROR_INVALID_DEVICE, and cuCtxCreate fails with OOM: the     */
+/* restore blocks fresh device admission at the PROCESS level         */
+/* (measured: gpu_mem_snapshots/phase0/native_mc_after_restore.py).   */
+/* A never-checkpointed helper (mcshim-helper, exec'd here) performs  */
+/* exactly create+attach on the rank's behalf; the group persists     */
+/* once the rank holds its own import (measured:                      */
+/* native_mc_proxy_restore.py), so the helper exits right after the   */
+/* rebuild. Enabled by MCSHIM_MC_PROXY (the gVisor loader sets it on  */
+/* pre-R610 drivers).                                                 */
+/* ------------------------------------------------------------------ */
+
+static int g_helper_sock = -1;
+static pid_t g_helper_pid;
+
+static int mc_proxy_enabled(void) {
+	static int v = -1;
+	if (v < 0)
+		v = getenv("MCSHIM_MC_PROXY") != NULL;
+	return v;
+}
+
+/* Resolve the helper binary: $MCSHIM_HELPER, else "mcshim-helper" next to
+ * this library. */
+static int helper_path(char *buf, size_t n) {
+	const char *env = getenv("MCSHIM_HELPER");
+	if (env && *env) {
+		snprintf(buf, n, "%s", env);
+		return 0;
+	}
+	Dl_info info;
+	if (!dladdr((void *)&helper_path, &info) || !info.dli_fname)
+		return -1;
+	snprintf(buf, n, "%s", info.dli_fname);
+	char *slash = strrchr(buf, '/');
+	if (!slash)
+		return -1;
+	snprintf(slash + 1, n - (slash + 1 - buf), "mcshim-helper");
+	return 0;
+}
+
+static int helper_start(void) {
+	if (g_helper_sock >= 0)
+		return 0;
+	char path[512];
+	if (helper_path(path, sizeof(path)) != 0) {
+		mclog("RESUME: cannot locate mcshim-helper");
+		return -1;
+	}
+	int sp[2];
+	/* The child's end crosses exec, so no SOCK_CLOEXEC on creation; the
+	 * parent's end gets FD_CLOEXEC below. */
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) {
+		mclog("RESUME: helper socketpair: %s", strerror(errno));
+		return -1;
+	}
+	pid_t pid = fork();
+	if (pid < 0) {
+		mclog("RESUME: helper fork: %s", strerror(errno));
+		close(sp[0]);
+		close(sp[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		/* Child: exec the helper with only its socket end. The shim in
+		 * the child (ld.so.preload) is silenced; the helper resolves
+		 * the driver itself. */
+		close(sp[0]);
+		char fdstr[16];
+		snprintf(fdstr, sizeof(fdstr), "%d", sp[1]);
+		setenv("MCSHIM_DISABLE", "1", 1);
+		execl(path, path, fdstr, (char *)NULL);
+		_exit(127);
+	}
+	close(sp[1]);
+	fcntl(sp[0], F_SETFD, FD_CLOEXEC);
+	g_helper_sock = sp[0];
+	g_helper_pid = pid;
+	mclog("RESUME: multicast proxy helper started (pid=%d, %s)",
+	      (int)pid, path);
+	return 0;
+}
+
+/* One command round-trip: send line (+ optional fd), await "OK"/"ERR" (+
+ * optional fd). Bounded by the resume budget. */
+static int helper_txn(const char *cmd, int fd_send, int *fd_recv) {
+	if (helper_start() != 0)
+		return -1;
+	struct iovec iov = {(void *)cmd, strlen(cmd)};
+	char cbuf[CMSG_SPACE(sizeof(int))];
+	struct msghdr mh;
+	memset(&mh, 0, sizeof(mh));
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+	if (fd_send >= 0) {
+		mh.msg_control = cbuf;
+		mh.msg_controllen = sizeof(cbuf);
+		struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+		c->cmsg_level = SOL_SOCKET;
+		c->cmsg_type = SCM_RIGHTS;
+		c->cmsg_len = CMSG_LEN(sizeof(int));
+		memcpy(CMSG_DATA(c), &fd_send, sizeof(int));
+	}
+	if (sendmsg(g_helper_sock, &mh, 0) < 0) {
+		mclog("RESUME: helper send (%s): %s", cmd, strerror(errno));
+		return -1;
+	}
+	long budget = resume_budget_ms();
+	if (budget <= 0 || budget > 60000)
+		budget = 60000;
+	struct pollfd pfd = {g_helper_sock, POLLIN, 0};
+	int pr = poll(&pfd, 1, (int)budget);
+	if (pr <= 0) {
+		mclog("RESUME: helper reply timeout (%s)", cmd);
+		return -1;
+	}
+	char rbuf[128];
+	struct iovec riov = {rbuf, sizeof(rbuf) - 1};
+	char rcbuf[CMSG_SPACE(sizeof(int))];
+	memset(&mh, 0, sizeof(mh));
+	mh.msg_iov = &riov;
+	mh.msg_iovlen = 1;
+	mh.msg_control = rcbuf;
+	mh.msg_controllen = sizeof(rcbuf);
+	ssize_t r = recvmsg(g_helper_sock, &mh, MSG_CMSG_CLOEXEC);
+	if (r <= 0) {
+		mclog("RESUME: helper died (%s)", cmd);
+		return -1;
+	}
+	rbuf[r] = 0;
+	if (fd_recv) {
+		*fd_recv = -1;
+		for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c;
+		     c = CMSG_NXTHDR(&mh, c))
+			if (c->cmsg_level == SOL_SOCKET &&
+			    c->cmsg_type == SCM_RIGHTS)
+				memcpy(fd_recv, CMSG_DATA(c), sizeof(int));
+	}
+	if (strncmp(rbuf, "OK", 2) != 0) {
+		mclog("RESUME: helper %s -> %s", cmd, rbuf);
+		return -1;
+	}
+	return 0;
+}
+
+static void helper_stop(void) {
+	if (g_helper_sock < 0)
+		return;
+	/* Best-effort EXIT; EOF on our end makes the helper exit anyway. */
+	ssize_t n = write(g_helper_sock, "EXIT\n", 5);
+	(void)n;
+	close(g_helper_sock);
+	g_helper_sock = -1;
+	if (g_helper_pid > 0) {
+		for (int i = 0; i < 50; i++) {
+			if (waitpid(g_helper_pid, NULL, WNOHANG) != 0)
+				break;
+			struct timespec ts = {0, 100 * 1000 * 1000};
+			nanosleep(&ts, NULL);
+		}
+		g_helper_pid = 0;
+	}
+}
+
+/* Proxy a group's AddDevice list through the helper. */
+static int helper_add_devices(int gi) {
+	for (int d = 0; d < g_alloc[gi].ndev; d++) {
+		char cmd[64];
+		snprintf(cmd, sizeof(cmd), "ADDDEV %d\n", g_alloc[gi].devs[d]);
+		if (helper_txn(cmd, -1, NULL) != 0)
+			return -1;
+	}
+	return 0;
+}
+
 static int resume_reopen_ipc(int p1_ipc);
 
 /* Must hold g_lock. */
@@ -2099,7 +2281,39 @@ static int do_resume(void) {
 			 * without recreating, so peers that DID tear down can
 			 * still refetch during the unwind. */
 			CUmemGenericAllocationHandle newmc = g_alloc[gi].handle;
-			if (full[gi]) {
+			if (full[gi] && mc_proxy_enabled()) {
+				/* Pre-R610: create+attach in the helper, then hold
+				 * the group via our own import (binds and maps are
+				 * measured to work in the restored process). */
+				char cmd[160];
+				snprintf(cmd, sizeof(cmd),
+				         "CREATE %u %zu %llu %llu\n",
+				         g_alloc[gi].mprop.numDevices,
+				         (size_t)g_alloc[gi].mprop.size,
+				         (unsigned long long)g_alloc[gi].mprop.handleTypes,
+				         (unsigned long long)g_alloc[gi].mprop.flags);
+				int mcfd = -1;
+				if (helper_txn(cmd, -1, &mcfd) != 0 || mcfd < 0) {
+					mclog("RESUME: proxied cuMulticastCreate "
+					      "idx=%d failed", gi);
+					return -1;
+				}
+				if (helper_add_devices(gi) != 0) {
+					close(mcfd);
+					return -1;
+				}
+				CUresult rc = r_cuMemImportFromShareableHandle(
+				    &newmc, (void *)(intptr_t)mcfd,
+				    CU_MEM_HANDLE_TYPE_POSIX_FD);
+				close(mcfd);
+				if (rc != CUDA_SUCCESS) {
+					mclog("RESUME: import of proxied group "
+					      "idx=%d rc=%d", gi, rc);
+					return -1;
+				}
+				alloc_push_aka(&g_alloc[gi], newmc);
+				g_alloc[gi].torn_down = 0;
+			} else if (full[gi]) {
 				if (r_cuMulticastCreate(&newmc,
 				                        &g_alloc[gi].mprop) !=
 				    CUDA_SUCCESS) {
@@ -2175,6 +2389,24 @@ static int do_resume(void) {
 				return -1;
 			alloc_push_aka(&g_alloc[gi], newmc);
 			g_alloc[gi].torn_down = 0; /* live again */
+			/* Pre-R610: this rank's AddDevice calls must also run in
+			 * the helper. Hand it the group via a fresh export of our
+			 * import (measured to work in restored processes). */
+			if (mc_proxy_enabled() && g_alloc[gi].ndev > 0) {
+				int fd = -1;
+				CUresult rc = r_cuMemExportToShareableHandle(
+				    &fd, newmc, CU_MEM_HANDLE_TYPE_POSIX_FD, 0);
+				if (rc != CUDA_SUCCESS) {
+					mclog("RESUME: re-export for proxied "
+					      "AddDevice idx=%d rc=%d", gi, rc);
+					return -1;
+				}
+				int ok = helper_txn("IMPORT\n", fd, NULL) == 0 &&
+				         helper_add_devices(gi) == 0;
+				close(fd);
+				if (!ok)
+					return -1;
+			}
 			groups++;
 		} else if (g_alloc[gi].kind == KIND_IMP) {
 			if (g_alloc[gi].ctx)
@@ -2206,7 +2438,9 @@ static int do_resume(void) {
 			r_cuCtxSetCurrent(g_alloc[gi].ctx);
 		if (g_alloc[gi].kind == KIND_MC) {
 			CUmemGenericAllocationHandle mc = g_alloc[gi].handle;
-			if (!partial)
+			/* In proxy mode every AddDevice already ran in the helper
+			 * (phase 1 for creators, phase 2 for importers). */
+			if (!partial && !mc_proxy_enabled())
 				for (int d = 0; d < g_alloc[gi].ndev; d++)
 					if (r_cuMulticastAddDevice(
 					        mc, g_alloc[gi].devs[d]) !=
@@ -2988,6 +3222,10 @@ static void *control_thread(void *arg) {
 				 * edge converges once the underlying cause
 				 * clears. */
 				rc = do_resume();
+				/* The multicast-proxy helper (if any) is only
+				 * needed while the rebuild runs; the groups
+				 * persist through this process's imports. */
+				helper_stop();
 				if (rc == 0)
 					gate_disarm();
 			}

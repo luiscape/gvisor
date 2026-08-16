@@ -14,3 +14,5 @@
 /compile_commands.json
 # Built multicast interposer artifact.
 /tools/mcshim/*.so
+# Built multicast interposer helper artifact.
+/tools/mcshim/mcshim-helper

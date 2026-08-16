@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -1575,6 +1576,22 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 		shimDir = control.DefaultCudaMulticastShimDir
 		env = append(env, control.CudaMulticastShimDirEnv+"="+shimDir)
 	}
+	// Pre-R610 drivers block a cuda-checkpoint-restored process from
+	// cuMulticastCreate/cuMulticastAddDevice (CUDA_ERROR_INVALID_DEVICE) and
+	// have no job support to carry live CUDA IPC imports across a
+	// checkpoint. Configure the interposer accordingly, unless the user
+	// already chose: MCSHIM_MC_PROXY has it rebuild multicast through a
+	// fresh helper process (mcshim-helper, expected next to the interposer
+	// library), and MCSHIM_IPC_REPLAY_FLOOR=0 has it close and replay EVERY
+	// legacy IPC import (a live one fails the per-process restore toggle
+	// with "invalid argument").
+	if l.k.NvidiaDriverVersion.Major() < 610 {
+		env = appendEnvIfAbsent(env, "MCSHIM_MC_PROXY", "1")
+		env = appendEnvIfAbsent(env, "MCSHIM_IPC_REPLAY_FLOOR", "0")
+		env = appendEnvIfAbsent(env, "MCSHIM_HELPER",
+			path.Join(path.Dir(info.conf.CUDAMulticastShimPath), "mcshim-helper"))
+		log.Infof("Driver R%d < R610: multicast interposer configured for proxy rebuild and full legacy-IPC replay in container %q", l.k.NvidiaDriverVersion.Major(), info.containerName)
+	}
 	info.procArgs.Envv = env
 
 	// The env append above only covers processes that inherit the initial
@@ -1607,6 +1624,16 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	injectCudaShimMarkerEnv(info.spec)
 	log.Infof("Preloaded multicast interposer %q into container %q (rendezvous dir %q)", info.conf.CUDAMulticastShimPath, info.containerName, shimDir)
 	return nil
+}
+
+// appendEnvIfAbsent appends "key=value" to env unless key is already set.
+func appendEnvIfAbsent(env []string, key, value string) []string {
+	for _, e := range env {
+		if strings.HasPrefix(e, key+"=") {
+			return env
+		}
+	}
+	return append(env, key+"="+value)
 }
 
 // injectCudaShimMarkerEnv appends the interposer marker env entry
