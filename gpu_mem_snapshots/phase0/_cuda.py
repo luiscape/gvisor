@@ -214,6 +214,15 @@ def device_attr(attr, dev):
     return v.value
 
 
+def device_uuid(dev):
+    """cuDeviceGetUuid, formatted like nvidia-smi's "GPU-<8-4-4-4-12>" so it can
+    be fed straight to `cuda-checkpoint --device-map oldUuid=newUuid`."""
+    buf = (ctypes.c_char * 16)()
+    call("cuDeviceGetUuid", buf, dev)
+    h = bytes(buf).hex()
+    return f"GPU-{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+
 def alloc_prop(dev, handle_types=CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR):
     p = CUmemAllocationProp()
     p.type = CU_MEM_ALLOCATION_TYPE_PINNED
