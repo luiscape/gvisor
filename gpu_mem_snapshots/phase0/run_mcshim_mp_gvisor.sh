@@ -221,6 +221,29 @@ log "final rank statuses:"; sed 's/^/    /' <<<"$FINAL"
 n=$(grep -c "post-restore+mc-live pass" <<<"$FINAL"); [[ "$n" -ge "$WORLD" ]] || FAIL=1
 n=$(grep -c "failures=0" <<<"$FINAL"); [[ "$n" -ge "$WORLD" ]] || FAIL=1
 
+# Prove the restore actually landed on RESTORE_GPUS. A sandbox that silently
+# kept driving its original GPUs still verifies correctly and would otherwise
+# be reported as a PASS -- which is exactly what happened before the
+# frontendFD.load() remapping fix.
+EXPECT_UUIDS=""
+for g in ${RESTORE_GPUS//,/ }; do
+  EXPECT_UUIDS+=" $(nvidia-smi -i "$g" --query-gpu=uuid --format=csv,noheader)"
+done
+SEEN_UUIDS=$(grep -oE 'dev=GPU-[0-9a-f-]+' <<<"$FINAL" | sed 's/^dev=//' | sort -u)
+if [[ -z "$SEEN_UUIDS" ]]; then
+  log "FAIL: ranks did not report a device UUID; cannot prove GPU placement"
+  FAIL=1
+fi
+for u in $SEEN_UUIDS; do
+  if [[ " $EXPECT_UUIDS " == *" $u "* ]]; then
+    log "placement OK: a rank is on $u (in RESTORE_GPUS=$RESTORE_GPUS)"
+  else
+    log "FAIL: a rank is on $u, which is NOT one of RESTORE_GPUS=$RESTORE_GPUS"
+    log "      expected one of:$EXPECT_UUIDS"
+    FAIL=1
+  fi
+done
+
 echo ""
 log "==== SHIM LOG (suspend/resume/rendezvous) ===="
 runsc exec "$CID_R" /bin/sh -c "cat $MCDIR/mcshim.log 2>/dev/null" \
