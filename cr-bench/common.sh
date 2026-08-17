@@ -75,6 +75,37 @@ if [ -t 1 ]; then
 else
     B="" G="" R="" C="" Y="" Z=""
 fi
+# cb_assert_gpu_placement <comma-separated expected host GPU indices>
+#
+# Verifies that the GPU device files actually held by the GPU-using processes
+# are the expected ones. This exists because a restore that silently keeps
+# using the GPUs the checkpoint was taken from still serves correct results:
+# without this check a cross-GPU restore that never moved reads as a PASS,
+# which is exactly how a gVisor device-remapping bug went unnoticed.
+#
+# Engine-agnostic on purpose (no per-rank reporting from vLLM/SGLang needed),
+# and assumes this host runs no other GPU workloads, which is true for benches.
+cb_assert_gpu_placement() {
+    local expected="$1" seen bad=0 m p
+    seen=$(for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader | sort -u); do
+               ls -l "/proc/$p/fd" 2>/dev/null | grep -oE 'nvidia[0-9]+'
+           done | sort -u | sed 's/nvidia//' | sort -n | tr '\n' ' ')
+    if [[ -z "${seen// /}" ]]; then
+        warn "no GPU device FDs found; cannot verify GPU placement"
+        return 1
+    fi
+    for m in $seen; do
+        if [[ ",$expected," != *",$m,"* ]]; then
+            fail "GPU placement: sandbox holds /dev/nvidia$m, expected only {$expected}"
+            bad=1
+        fi
+    done
+    if [[ $bad -eq 0 ]]; then
+        ok "GPU placement verified: {${seen% }} within expected {$expected}"
+    fi
+    return $bad
+}
+
 info()   { echo -e "${B}${C}==> $*${Z}"; }
 ok()     { echo -e "    ${G}✓ $*${Z}"; }
 warn()   { echo -e "    ${Y}⚠ $*${Z}"; }
