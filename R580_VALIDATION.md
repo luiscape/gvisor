@@ -116,34 +116,65 @@ wake_up lifecycle.
 | Workload | TP | Move | Cold boot | Restore | 1st inference | Speedup | Result |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | vLLM | 2 | same | 219.4 s | 4.09 s | 14.9 s | **14.7x** | PASS |
-| vLLM | 4 | same | | | | | in progress |
-| vLLM | 2 | 0,1 -> 6,7 | | | | | queued |
-| vLLM | 4 | 0-3 -> 4-7 | | | | | queued |
-| vLLM trials (n=3) | 4 | same | | | | | queued |
+| vLLM | 4 | same | 320.6 s | 6.05 s | 25.9 s | **12.4x** | PASS |
+| vLLM | 2 | 0,1 -> 6,7 | -- | 3.70 s | -- | -- | **FAIL** (see below) |
+| vLLM trials (n=3) | 4 | same | | | | | in progress |
 | SGLang | 2 | same | | | | | queued |
 
 vLLM TP=2 checkpoint: 13.3 s, image 9.5 G, all 3 verification queries correct.
+vLLM TP=4 checkpoint image: 15 G, all 3 verification queries correct.
+
+### Cross-GPU at the engine level: blocked on unicast peer imports
+
+Cross-GPU restore works for the **multicast** layer (phase0 harness, W=2 and
+W=4, placement asserted) but vLLM TP=2 restored onto GPUs 6,7 fails:
+
+```
+[mcshim] RESUME: phase1 done (3 MC creators, 50 UC exporters served, 10 IPC exporters served)
+[mcshim] track IMPORT idx=0 ... import idx=0 classified as MC group    <- multicast OK
+[mcshim] RESUME: re-import idx=164 rc=101 after 100 attempts           <- unicast FAILS
+```
+
+`rc=101` is `CUDA_ERROR_INVALID_DEVICE`. The multicast group re-imports fine
+through the helper, then a **unicast VMM peer buffer** re-import fails, wake_up
+returns FAILED and the container exits.
+
+This is consistent with the R580 device-admission wall: a restored process
+cannot admit devices it did not hold at checkpoint, and after a cross-GPU
+restore its physical GPUs are exactly that. Multicast escapes it because
+create+attach can be proxied through a never-checkpointed helper; a unicast
+import cannot, because the resulting handle must live in the rank.
+
+The phase0 multicast harness does not exercise this path -- its resume logs
+show `imports=0` -- which is why it passes cross-GPU while vLLM does not.
+
+Prediction to test on R610: cross-GPU should work there, since R610 has no
+device-admission wall. If so `tools/mcshim/README.md`'s "pre-R610 gap" is
+correct after all, though for a narrower reason than stated (unicast VMM peer
+imports specifically, not imports in general).
+
+**Status: same-GPU cross-GPU-free restore is fully working on R580; GPU
+relocation of a full inference engine is not, and needs R610.**
 
 ## Verification hygiene
 
-Two layers of false confidence were found and removed; both had made a
-cross-GPU restore that **never moved** report PASS:
+The phase0 gVisor harness originally reported PASS purely on collective
+correctness, which a restore that never moved satisfies trivially -- that is how
+the device-namespace bug stayed hidden. It now asserts that every rank's
+`cuDeviceGetUuid` is one of the restore-target GPUs.
 
-1. `cb_assert_gpu_placement()` did not exist, yet `_bench_vllm_impl.sh` and
-   `_bench_sglang_impl.sh` already printed `placement verified: YES` and gated
-   PASS on `${PLACEMENT_OK:-1}` -- a variable nothing ever assigned.
-2. The phase0 gVisor harness reported PASS purely on collective correctness,
-   which a non-moved restore satisfies trivially.
+A correction to an earlier claim in this log: I also believed `cr-bench` never
+verified placement, having grepped only `_bench_vllm_impl.sh` for
+`$PLACEMENT_OK` and found it printed and gating the verdict but never assigned.
+That was wrong -- `common.sh:843` already compares memory in use on the restore
+set against the original set and clears `PLACEMENT_OK`, and it correctly failed
+the cross-GPU vLLM run above. A redundant second check was added and then
+reverted.
 
-Both now assert placement. The check reads `/dev/nvidia*` FDs from the **sentry**
-process, not `nvidia-smi --query-compute-apps`: under the sleep workflow the
-engine has released its device memory by restore time, so nvidia-smi lists no
-processes at all, while the sentry still holds every device it opened. Scoping
-to the sentry also excludes `nvidia-persistenced`, which holds all GPUs.
-
-Consequence: **`HANDOFF.md`'s R610 cross-GPU claim is not trustworthy** -- it was
-measured with the broken code path and with both checks dormant. It needs
-re-running on R610 before any such claim ships.
+That also weakens the suspicion that `HANDOFF.md`'s R610 cross-GPU result was an
+illusion: the existing check would have caught memory staying on the original
+GPUs. It should still be re-run on R610 with the current binaries, but it is no
+longer presumed wrong.
 
 ## Reproduce
 
