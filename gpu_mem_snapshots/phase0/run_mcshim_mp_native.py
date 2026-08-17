@@ -88,17 +88,53 @@ def rank_pids(world):
     return pids
 
 
+def driver_major():
+    """Host NVIDIA driver major version, or 0 if it cannot be determined."""
+    p = sh("nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader")
+    if p.returncode != 0 or not p.stdout.strip():
+        return 0
+    return int(p.stdout.strip().splitlines()[0].split(".")[0])
+
+
+def cc_has_job(cc):
+    """Does this cuda-checkpoint support --launch-job? (Absent before R610.)"""
+    p = sh(cc, "--help")
+    return "--launch-job" in (p.stdout + p.stderr)
+
+
+def shim_so():
+    """Prefer the repo's freshly built interposer over the phase0 copy: only
+    the former has the pre-R610 create/attach proxy and its helper binary."""
+    repo = os.path.normpath(
+        os.path.join(HERE, "..", "..", "tools", "mcshim", "mcshim.so"))
+    return repo if os.path.exists(repo) else os.path.join(
+        HERE, "mcshim", "mcshim.so")
+
+
 def launch(cc, world, preload):
     env = dict(os.environ)
     env["MCSHIM_DIR"] = DIR
     env["MCSHIM_LOG"] = os.path.join(DIR, "mcshim.log")
     if preload:
-        env["LD_PRELOAD"] = os.path.join(HERE, "mcshim", "mcshim.so")
+        so = shim_so()
+        env["LD_PRELOAD"] = so
+        # Pre-R610 a restored process cannot admit devices, so the shim has to
+        # rebuild create+attach through a never-checkpointed helper, and
+        # legacy IPC imports must not be left live across the checkpoint.
+        # Under gVisor the loader sets these; natively the harness must.
+        if driver_major() < 610:
+            env["MCSHIM_MC_PROXY"] = "1"
+            env["MCSHIM_IPC_REPLAY_FLOOR"] = "0"
+            env["MCSHIM_HELPER"] = os.path.join(
+                os.path.dirname(so), "mcshim-helper")
     else:
         env.pop("LD_PRELOAD", None)
-    argv = [cc, "--launch-job", sys.executable,
-            os.path.join(HERE, "mcshim_mp.py"),
-            "--world", str(world), "--dir", DIR]
+    wl = [sys.executable, os.path.join(HERE, "mcshim_mp.py"),
+          "--world", str(world), "--dir", DIR]
+    # --launch-job puts the launcher and every rank in one cuda-checkpoint
+    # job. It does not exist before R610, where per-pid actions are the only
+    # option -- which is what this harness drives regardless.
+    argv = ([cc, "--launch-job"] + wl) if cc_has_job(cc) else wl
     # Own session: the launcher forks rank children, and killing only the
     # launcher would reparent them (they then hold our stdout pipe open
     # forever). kill_job() nukes the whole process group instead.
