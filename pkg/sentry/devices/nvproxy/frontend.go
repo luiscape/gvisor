@@ -54,7 +54,16 @@ func (dev *frontendDevice) basename() string {
 	if dev.isCtlDevice() {
 		return "nvidiactl"
 	}
-	return fmt.Sprintf("nvidia%d", dev.minor)
+	return fmt.Sprintf("nvidia%d", dev.hostMinor())
+}
+
+// hostMinor returns the host device minor number backing dev, which differs
+// from dev.minor only after a restore that remapped this device to another GPU.
+func (dev *frontendDevice) hostMinor() uint32 {
+	if hostMinor, ok := dev.nvp.hostMinorByMinor[dev.minor]; ok {
+		return hostMinor
+	}
+	return dev.minor
 }
 
 // Open implements vfs.Device.Open.

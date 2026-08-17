@@ -214,6 +214,17 @@ type nvproxy struct {
 	devInfo                DeviceInfo
 	regularDevs            [nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1]*frontendDevice
 
+	// hostMinorByMinor translates a sandbox-visible regular device minor
+	// number to the host minor number backing it. It is empty until a restore
+	// remaps devices, and only contains entries for minors that moved; absent
+	// entries are identity. It exists because the application's device
+	// namespace must not change across restore: a process that opens
+	// /dev/nvidia0 after being restored onto a different GPU has to reach the
+	// GPU this sandbox is now entitled to, not the one the checkpoint was
+	// taken from. Set by nvproxy.afterLoad(), read by
+	// frontendDevice.basename().
+	hostMinorByMinor map[uint32]uint32
+
 	fdsMu       fdsMutex `state:"nosave"`
 	frontendFDs map[*frontendFD]struct{}
 

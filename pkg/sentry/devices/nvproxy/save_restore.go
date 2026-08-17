@@ -194,6 +194,34 @@ func (nvp *nvproxy) beforeSave() {
 	}
 }
 
+// initHostMinorsFromRemapping records the sandbox-minor => host-minor
+// translation implied by dr, so that device files opened after this restore
+// reach the GPUs this sandbox is now entitled to. The sandbox-visible minors
+// deliberately do not change: the application's device namespace must look the
+// same as it did before the checkpoint.
+//
+// Idempotent, and safe to call concurrently: it is invoked from both
+// nvproxy.afterLoad() and frontendFD.load(), which stateify does not order.
+//
+// Note this makes a single restore's remapping durable, not a chain of them: a
+// sandbox restored twice onto different GPUs would need the translations
+// composed, which requires the save side to record sandbox-visible minors
+// rather than host minors.
+func (nvp *nvproxy) initHostMinorsFromRemapping(dr *DeviceRemapping) {
+	nvp.fdsMu.Lock()
+	defer nvp.fdsMu.Unlock()
+	if nvp.hostMinorByMinor != nil {
+		return
+	}
+	hostMinors := make(map[uint32]uint32)
+	for oldID, newID := range dr.NewDeviceByOld {
+		if oldID.Minor != newID.Minor {
+			hostMinors[oldID.Minor] = newID.Minor
+		}
+	}
+	nvp.hostMinorByMinor = hostMinors
+}
+
 // afterLoad is invoked by stateify.
 func (nvp *nvproxy) afterLoad(ctx goContext.Context) {
 	Init()
@@ -203,27 +231,9 @@ func (nvp *nvproxy) afterLoad(ctx goContext.Context) {
 	}
 	nvp.abi = abiEntry.cons()
 	if dr := DeviceRemappingFromContext(ctx); dr != nil {
-		// Remap frontendFDs to their new frontendDevices.
-		// frontendFD.vfsfd.VirtualDentry() will still point to the original
-		// dentry, so e.g. /proc/[pid]/fd/ will be incorrect, but we don't have
-		// a way to get the correct dentry, which may not even exist
-		// (frontendFDs might have been opened from application-created device
-		// special files in any filesystem not mounted nodev).
-		func() {
-			nvp.fdsMu.Lock()
-			defer nvp.fdsMu.Unlock()
-			for fd := range nvp.frontendFDs {
-				oldMinor := fd.dev.minor
-				if oldMinor > nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX {
-					continue
-				}
-				oldDev, ok := dr.OldDeviceByMinor[oldMinor]
-				if !ok {
-					panic(fmt.Sprintf("nvproxy: remapping does not contain a saved device with minor number %d: %+v", oldMinor, dr))
-				}
-				fd.dev = nvp.regularDevs[dr.NewDeviceByOld[oldDev].Minor]
-			}
-		}()
+		// Also done by frontendFD.load(), since stateify does not order it
+		// against this hook; this call covers a sandbox with no frontend FDs.
+		nvp.initHostMinorsFromRemapping(dr)
 		// Remap objects to their new devices.
 		// Calls to CheckDevicesRemappable() already checked that all subdevice
 		// instances are 0, so we don't need to update any NV20_SUBDEVICE_0
@@ -329,6 +339,15 @@ func (nvp *nvproxy) afterLoad(ctx goContext.Context) {
 }
 
 func (fd *frontendFD) load(ctx goContext.Context) {
+	// Record the device remapping BEFORE reopening the host device file: the
+	// file to reopen is named after fd.dev, so reopening first would silently
+	// rebind this FD to the GPU the checkpoint was taken from. That GPU may
+	// belong to another sandbox, and the application would observe no error --
+	// it would just keep using the wrong device. nvproxy.afterLoad() does this
+	// too, but stateify does not order it against this hook.
+	if dr := DeviceRemappingFromContext(ctx); dr != nil {
+		fd.dev.nvp.initHostMinorsFromRemapping(dr)
+	}
 	basename := fd.dev.basename()
 	fd.hostFD = openHostDevFileForRestore(ctx, basename, fd.dev.nvp.useDevGofer, fd.containerName, fd.vfsfd.StatusFlags())
 	if err := fdnotifier.AddFD(fd.hostFD, &fd.internalQueue); err != nil {
