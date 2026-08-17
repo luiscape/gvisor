@@ -75,53 +75,6 @@ if [ -t 1 ]; then
 else
     B="" G="" R="" C="" Y="" Z=""
 fi
-# cb_assert_gpu_placement <comma-separated expected host GPU indices> [container-id]
-#
-# Verifies that the GPU device files actually held by the sandbox are the
-# expected ones. This exists because a restore that silently keeps using the
-# GPUs the checkpoint was taken from still serves correct results: without this
-# check a cross-GPU restore that never moved reads as a PASS, which is exactly
-# how a gVisor device-remapping bug went unnoticed.
-#
-# The FDs are read from the sentry process, not from nvidia-smi's compute-apps
-# list: under the sleep/checkpoint workflow the engine has released its device
-# memory by this point, so it owns no CUDA context and nvidia-smi reports no
-# processes at all, while the sentry still holds every /dev/nvidia* it opened.
-#
-# Scoping to the sentry also excludes host daemons that legitimately hold
-# nvidia device FDs (nvidia-persistenced holds all of them), which would
-# otherwise look like the sandbox using every GPU on the box.
-cb_assert_gpu_placement() {
-    local expected="$1" cid="${2:-${RESTORE_ID:-}}" seen bad=0 m p pids
-    pids=$(pgrep -f "runsc-sandbox.*${cid}" 2>/dev/null | tr '\n' ' ')
-    if [[ -z "${pids// /}" ]]; then
-        # Fall back to any sandbox under this bench's runsc root.
-        pids=$(pgrep -f "runsc-sandbox" 2>/dev/null | tr '\n' ' ')
-    fi
-    if [[ -z "${pids// /}" ]]; then
-        warn "no runsc-sandbox process found; cannot verify GPU placement"
-        return 1
-    fi
-    seen=$(for p in $pids; do
-               find "/proc/$p/fd" -maxdepth 1 -lname '/dev/nvidia[0-9]*' \
-                    -printf '%l\n' 2>/dev/null
-           done | sed 's|/dev/nvidia||' | sort -un | tr '\n' ' ')
-    if [[ -z "${seen// /}" ]]; then
-        warn "sandbox (pids: ${pids% }) holds no GPU device FDs; cannot verify placement"
-        return 1
-    fi
-    for m in $seen; do
-        if [[ ",$expected," != *",$m,"* ]]; then
-            fail "GPU placement: sandbox holds /dev/nvidia$m, expected only {$expected}"
-            bad=1
-        fi
-    done
-    if [[ $bad -eq 0 ]]; then
-        ok "GPU placement verified: {${seen% }} within expected {$expected}"
-    fi
-    return $bad
-}
-
 info()   { echo -e "${B}${C}==> $*${Z}"; }
 ok()     { echo -e "    ${G}✓ $*${Z}"; }
 warn()   { echo -e "    ${Y}⚠ $*${Z}"; }

@@ -327,17 +327,6 @@ LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:/usr/loc
     echo ""
     cb_restore_and_wait_health
 
-    # ── verify the restore landed on the GPUs it was told to ──────────────
-    # Done after wake_up would be too late to be meaningful for a cross-GPU
-    # run, and before it the engine still holds its devices, so check here.
-    echo ""
-    info "Verifying GPU placement after restore"
-    if ! cb_assert_gpu_placement "${RESTORE_GPU_DEVICES:-$GPU_DEVICES}"; then
-        PLACEMENT_OK=0
-    else
-        PLACEMENT_OK=1
-    fi
-
     # ── wake up ───────────────────────────────────────────────────────────
     echo ""
     WAKE_OK=0

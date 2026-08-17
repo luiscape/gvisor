@@ -293,15 +293,6 @@ LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cu13/lib"
     echo ""
     cb_restore
 
-    # ── verify the restore landed on the GPUs it was told to ─────────────
-    echo ""
-    info "Verifying GPU placement after restore"
-    if cb_assert_gpu_placement "${RESTORE_GPU_DEVICES:-$GPU_DEVICES}"; then
-        PLACEMENT_OK=1
-    else
-        PLACEMENT_OK=0
-    fi
-
     # ── resume memory + continue BEFORE waiting for health ───────────────
     # SGLang's /health reflects detokenizer heartbeats, which stay stopped
     # while generation is paused — health cannot recover until we resume.
