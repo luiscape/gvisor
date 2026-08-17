@@ -11,6 +11,10 @@
 #
 # Usage:
 #   sudo [RUNSC=...] [CUDA_CHECKPOINT=...] [WORLD=2] bash run_mcshim_mp_gvisor.sh
+#
+# Cross-GPU restore (checkpoint on one GPU set, restore onto another) is driven
+# by RESTORE_GPUS, which builds a second bundle for `runsc restore`:
+#   sudo WORLD=2 GPUS=0,1 RESTORE_GPUS=6,7 bash run_mcshim_mp_gvisor.sh
 set -uo pipefail
 cd "$(dirname "$0")"
 PHASE0_DIR=$(pwd)
@@ -18,6 +22,12 @@ PHASE0_DIR=$(pwd)
 RUNSC="${RUNSC:-/usr/local/bin/runsc-phase0}"
 CUDA_CHECKPOINT="${CUDA_CHECKPOINT:-/usr/local/bin/cuda-checkpoint}"
 WORLD="${WORLD:-2}"
+# Host GPU minors to run on, and to restore onto. Defaults: 0..WORLD-1, and the
+# same set (i.e. no move).
+GPUS="${GPUS:-}"
+[[ -n "$GPUS" ]] || GPUS=$(seq -s, 0 $((WORLD - 1)))
+RESTORE_GPUS="${RESTORE_GPUS:-}"
+[[ -n "$RESTORE_GPUS" ]] || RESTORE_GPUS="$GPUS"
 WORK=/tmp/mcshim-mp-gvisor-test
 STAGE=/opt/phase0
 MCDIR=/tmp/mcshim   # inside the sandbox (container /tmp tmpfs)
@@ -29,7 +39,12 @@ log(){ echo "[mcshim-mp-gvisor $(date +%H:%M:%S)] $*"; }
 [[ -x "$CUDA_CHECKPOINT" ]] || { log "cuda-checkpoint not found"; exit 1; }
 UVM_MAJOR=$(awk '$2=="nvidia-uvm"{print $1}' /proc/devices)
 
-JOB_FLAG=(--cuda-checkpoint-path "$CUDA_CHECKPOINT")
+# Configure the interposer the way the product does -- via the runsc flag, so
+# the sentry owns the LD_PRELOAD injection and (on pre-R610 drivers) sets
+# MCSHIM_MC_PROXY / MCSHIM_HELPER / MCSHIM_IPC_REPLAY_FLOOR itself -- rather
+# than hand-preloading it from the container env.
+JOB_FLAG=(--cuda-checkpoint-path "$CUDA_CHECKPOINT"
+          --cuda-multicast-shim-path "$STAGE/mcshim.so")
 runsc(){
   local sub="$1"
   if [[ "$sub" == "run" || "$sub" == "restore" ]]; then
@@ -46,23 +61,36 @@ trap cleanup EXIT
 
 cleanup
 rm -rf "$WORK" 2>/dev/null
-mkdir -p "$WORK"/{root,logs,img,bundle}
+mkdir -p "$WORK"/{root,logs,img,bundle,bundle-restore}
 
+# Prefer the repo's freshly built interposer over the phase0 copy: only the
+# former has the pre-R610 create/attach proxy, and only it ships the helper
+# binary the sentry points MCSHIM_HELPER at.
+SHIM_SRC="$PHASE0_DIR/../../tools/mcshim/mcshim.so"
+[[ -f "$SHIM_SRC" ]] || SHIM_SRC="$PHASE0_DIR/mcshim/mcshim.so"
+HELPER_SRC="$(dirname "$SHIM_SRC")/mcshim-helper"
 mkdir -p "$STAGE"
-cp "$PHASE0_DIR/mcshim_mp.py" "$PHASE0_DIR/_cuda.py" \
-   "$PHASE0_DIR/mcshim/mcshim.so" "$STAGE/"
+cp "$PHASE0_DIR/mcshim_mp.py" "$PHASE0_DIR/_cuda.py" "$SHIM_SRC" "$STAGE/"
+if [[ -f "$HELPER_SRC" ]]; then
+  cp "$HELPER_SRC" "$STAGE/"
+else
+  log "WARNING: no mcshim-helper next to $SHIM_SRC; pre-R610 rebuild will fail"
+fi
+log "staged interposer from $SHIM_SRC"
 for m in nvidia nvidia_uvm; do
   mkdir -p "$STAGE/sys_module_$m"; echo live > "$STAGE/sys_module_$m/initstate"
 done
 chmod -R a+rX "$STAGE"
 
-# GPU device nodes 0..WORLD-1.
-DEVICES=""
-for ((g=0; g<WORLD; g++)); do
+# write_bundle <dir> <comma-separated host GPU minors>
+write_bundle(){
+local BUNDLE_DIR="$1" GPU_LIST="$2" DEVICES="" g
+mkdir -p "$BUNDLE_DIR"
+for g in ${GPU_LIST//,/ }; do
   DEVICES+=",{\"path\": \"/dev/nvidia$g\", \"type\": \"c\", \"major\": 195, \"minor\": $g, \"fileMode\": 438}"
 done
 
-cat > "$WORK/bundle/config.json" <<EOF
+cat > "$BUNDLE_DIR/config.json" <<EOF
 {
   "ociVersion": "1.1.0",
   "process": {
@@ -74,7 +102,6 @@ cat > "$WORK/bundle/config.json" <<EOF
     ],
     "env": [
       "PATH=/usr/local/bin:/usr/bin:/bin",
-      "LD_PRELOAD=$STAGE/mcshim.so",
       "MCSHIM_DIR=$MCDIR",
       "MCSHIM_LOG=$MCDIR/mcshim.log"
     ],
@@ -101,6 +128,13 @@ cat > "$WORK/bundle/config.json" <<EOF
   }
 }
 EOF
+}
+
+write_bundle "$WORK/bundle" "$GPUS"
+write_bundle "$WORK/bundle-restore" "$RESTORE_GPUS"
+if [[ "$RESTORE_GPUS" != "$GPUS" ]]; then
+  log "CROSS-GPU run: checkpoint on GPUs $GPUS, restore onto $RESTORE_GPUS"
+fi
 
 rank_statuses(){
   local cid="$1"
@@ -160,7 +194,7 @@ runsc delete -force "$CID" >/dev/null 2>&1 || true
 
 log "restore"
 t0=$SECONDS
-runsc restore -detach -image-path "$WORK/img" -bundle "$WORK/bundle" \
+runsc restore -detach -image-path "$WORK/img" -bundle "$WORK/bundle-restore" \
   -pid-file "$WORK/pid-r" "$CID_R"
 REST_RC=$?
 log "restore rc=$REST_RC ($((SECONDS-t0))s)"

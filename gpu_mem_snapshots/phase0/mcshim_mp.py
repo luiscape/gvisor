@@ -53,6 +53,15 @@ def rank_main(rank, world, sock, args):
     if cu.device_attr(cu.CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, dev.value) != 1:
         status("FATAL no multicast support")
         return 1
+    # Which PHYSICAL GPU is this rank on? Re-queried every iteration (never
+    # cached) so a cross-GPU restore can be seen from inside the sandbox rather
+    # than inferred from host-side nvidia-smi accounting.
+    def cur_uuid():
+        try:
+            return cu.device_uuid(dev.value)
+        except cu.CudaError as e:
+            return f"unavailable({e.name})"
+
     ctx = ctypes.c_void_p()
     cu.call("cuDevicePrimaryCtxRetain", ctypes.byref(ctx), dev.value)
     cu.call("cuCtxSetCurrent", ctx)
@@ -139,7 +148,8 @@ def rank_main(rank, world, sock, args):
             status(f"iter={it} {tag}+mc-live FAIL: {'; '.join(errs)} "
                    f"failures={failures}")
         else:
-            status(f"iter={it} {tag}+mc-live pass failures={failures}")
+            status(f"iter={it} {tag}+mc-live pass failures={failures} "
+                   f"dev={cur_uuid()}")
         time.sleep(args.interval)
 
 
