@@ -188,6 +188,10 @@ sglang_run() {
     if [[ "$QUIESCE" = "release" ]]; then
         extra_args+=" --enable-memory-saver --enable-weights-cpu-backup"
     fi
+    # Free-form server arguments (e.g. SGLANG_EXTRA_ARGS="--disable-custom-all-reduce").
+    if [[ -n "${SGLANG_EXTRA_ARGS:-}" ]]; then
+        extra_args+=" $SGLANG_EXTRA_ARGS"
+    fi
     CB_CMD="exec python3 -m sglang.launch_server \
 --model-path $MODEL \
 --host 0.0.0.0 \
