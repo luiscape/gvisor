@@ -26,6 +26,9 @@ cd "$(dirname "$0")"
 TRIALS="${TRIALS:-3}"
 TP="${TP:-2}"
 GPUS="${GPUS:-0,1}"
+# RESTORE_GPUS restores every trial onto a different GPU set (cross-GPU device
+# remapping); empty restores in place.
+RESTORE_GPUS="${RESTORE_GPUS:-}"
 MECH="${MECH:-mcshim}"
 export EAGER="${EAGER:-0}"
 export RUNSC="${RUNSC:-/usr/local/bin/runsc-phase0}"
@@ -64,8 +67,9 @@ reap() {
 pass=0 toggle=0 other=0
 for ((i = 1; i <= TRIALS; i++)); do
     log=$(mktemp /tmp/vllmtrial.XXXXXX.log)
-    printf 'trial %d/%d (mech=%s TP=%s eager=%s seq=%s): ' "$i" "$TRIALS" "$MECH" "$TP" "$EAGER" "$CUDA_CKPT_SEQUENTIAL"
-    timeout 1500 bash ./bench_4_vllm_multi.sh --gpus "$GPUS" --tp "$TP" >"$log" 2>&1
+    printf 'trial %d/%d (mech=%s TP=%s eager=%s seq=%s%s): ' "$i" "$TRIALS" "$MECH" "$TP" "$EAGER" "$CUDA_CKPT_SEQUENTIAL" "${RESTORE_GPUS:+ move=$GPUS->$RESTORE_GPUS}"
+    timeout 1500 bash ./bench_4_vllm_multi.sh --gpus "$GPUS" --tp "$TP" \
+        ${RESTORE_GPUS:+--restore-gpus "$RESTORE_GPUS"} >"$log" 2>&1
     # cuda-checkpoint reports a failed restore toggle in the sentry log, not on
     # the benchmark's stdout, so classify against the run's artifacts too.
     art=$(grep -ohE '==> Artifacts at .*' "$log" | tail -1 | awk '{print $NF}')
