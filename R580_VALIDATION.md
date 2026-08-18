@@ -120,6 +120,7 @@ wake_up lifecycle.
 | vLLM trials (n=3) | 4 | same | -- | -- | -- | -- | **3/3 PASS, 0 toggle failures** |
 | SGLang | 2 | same | 560.2 s | 9.51 s | 22.5 s | **24.9x** | PASS |
 | SGLang | 4 | same | 627.5 s | 17.03 s | 45.2 s | **13.9x** | PASS |
+| SGLang | 2 | 0,1 -> 6,7 | -- | -- | 22.5 s | -- | **PASS** |
 | vLLM | 2 | 0,1 -> 6,7 | -- | 3.70 s | 14.9 s | -- | **PASS** (after `72267d698`) |
 | vLLM | 4 | 0-3 -> 4-7 | -- | -- | 26.0 s | -- | **PASS** |
 | vLLM | 2 | same (regression) | -- | -- | 14.9 s | 14.6x | PASS |
