@@ -120,7 +120,9 @@ wake_up lifecycle.
 | vLLM trials (n=3) | 4 | same | -- | -- | -- | -- | **3/3 PASS, 0 toggle failures** |
 | SGLang | 2 | same | 560.2 s | 9.51 s | 22.5 s | **24.9x** | PASS |
 | SGLang | 4 | same | 627.5 s | 17.03 s | 45.2 s | **13.9x** | PASS |
-| vLLM | 2 | 0,1 -> 6,7 | -- | 3.70 s | -- | -- | **FAIL** (see below) |
+| vLLM | 2 | 0,1 -> 6,7 | -- | 3.70 s | 14.9 s | -- | **PASS** (after `72267d698`) |
+| vLLM | 4 | 0-3 -> 4-7 | -- | -- | 26.0 s | -- | **PASS** |
+| vLLM | 2 | same (regression) | -- | -- | 14.9 s | 14.6x | PASS |
 
 Checkpoint times / image sizes: vLLM TP=2 13.3 s / 9.5 G, TP=4 15 G, SGLang TP=2
 24.8 s / 24 G, SGLang TP=4 60.6 s / 44 G. All passing runs answered all 3
@@ -130,7 +132,41 @@ The vLLM TP=4 trial count matches the 580.126.20 reference (3/3, 0 toggle
 failures), and SGLang's 24.9x is the largest speedup measured, because its cold
 boot is the longest (560 s).
 
-### Cross-GPU at the engine level: blocked on unicast peer imports
+### Cross-GPU at the engine level: fixed (`72267d698`)
+
+This was blocked, then root-caused and fixed. The original symptom and the
+diagnosis are kept below because the shape of the bug is instructive.
+
+**Fix:** `NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO` returns a
+`DeviceInstance` output. RM truthfully reports the device instance now backing
+the exported object (6 or 7 after a move), while a restored process's libcuda
+only knows the instances it enumerated before the checkpoint (0 and 1), so its
+lookup fails and it returns `CUDA_ERROR_INVALID_DEVICE` -- without any ioctl or
+RM status ever failing. nvproxy now translates that output back to the instance
+the application saw, exactly as it already remaps `DeviceInstance` in
+`NV01_DEVICE_0`'s allocation parameters.
+
+Result on vLLM TP=2, GPUs 0,1 -> 6,7:
+
+```
+nvproxy: GET_EXPORT_OBJECT_INFO: reporting device instance 6 as 0   (x100)
+nvproxy: GET_EXPORT_OBJECT_INFO: reporting device instance 7 as 1   (x100)
+vLLM wake_up -> {"status":"ok","sleeping":false}
+First inference: 14889 ms after restore -> "Paris"
+Restored on GPUs: 6,7 (placement verified: YES)
+RESULT: PASS
+```
+
+How it was found, in case a similar bug appears: the failing import was
+surrounded by controls that all succeeded, so the first useful step was proving
+the driver never rejected anything. `rmControlInvoke` now logs a nonzero RM
+`Status` at Debug -- a control can succeed at the ioctl level and still be
+rejected by RM, and that gap is what made this look like a driver limitation.
+Once the log showed no rejection anywhere, the cause had to be userspace-side
+validation of a value RM had reported, which pointed straight at the
+`DeviceInstance` output.
+
+### Original symptom and diagnosis (pre-fix)
 
 Cross-GPU restore works for the **multicast** layer (phase0 harness, W=2 and
 W=4, placement asserted) but vLLM TP=2 restored onto GPUs 6,7 fails:
@@ -168,9 +204,10 @@ tracking indices 164-213, so **164 is the first import attempted**. The rebuild
 aborts on the very first unicast peer import rather than failing on some
 particular buffer, which is what the device-admission explanation predicts.
 
-**Status: same-GPU restore is fully working on R580 for vLLM and SGLang at TP=2
-and TP=4, with compile + CUDA graphs preserved. GPU relocation works for the
-multicast layer but not for a full inference engine, and needs R610.**
+**Status: on R580, both same-GPU restore and GPU relocation work for vLLM at
+TP=2/TP=4 and SGLang at TP=2/TP=4, with NVLS, symmetric memory and custom
+all-reduce enabled and compile + CUDA graphs preserved.** The earlier conclusion
+that relocation needed R610 was wrong; it needed two nvproxy fixes.
 
 ## Caution for reviewers: a restore-path deadlock, now fixed
 
