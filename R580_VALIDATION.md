@@ -122,6 +122,29 @@ wake_up lifecycle.
 | SGLang | 4 | same | 627.5 s | 17.03 s | 45.2 s | **13.9x** | PASS |
 | SGLang | 2 | 0,1 -> 6,7 | -- | -- | 22.5 s | -- | **PASS** |
 | vLLM trials (n=3) | 2 | 0,1 -> 6,7 | -- | -- | -- | -- | **3/3 PASS, 0 toggle failures** (reviewed code) |
+| SGLang | 4 | 0-3 -> 4-7 | 628.4 s | 60.6 s | 16.84 s | 46.4 s | **PASS**, placement verified |
+| vLLM (full-cycle record) | 2 | 0,1 -> 6,7 | 216.4 s | 13.4 s / 9.5 G | 3.82 s | 14.8 s | **PASS**, 14.6x, placement verified |
+| vLLM (Qwen2.5-3B, no custom AR) | 8 | 0-7 -> same | 325.6 s | 30 G | 11.89 s | 69.8 s | **PASS**, 4.7x |
+| SGLang (Qwen2.5-3B, no custom AR) | 8 | 0-7 -> same | 687.4 s | 160.9 s | 19.6 s | 84.7 s | **PASS**, 8.1x |
+| phase0 gVisor harness | W=8 | 0-7 -> same | -- | -- | -- | -- | **PASS**, all 8 UUIDs asserted |
+
+TP=8 notes: Qwen2.5-1.5B (12 attention heads) cannot shard 8 ways, so TP=8 uses
+Qwen2.5-3B-Instruct (16 q / 2 kv heads) baked into rebuilt images. Two findings
+at TP=8, neither a C/R regression:
+
+1. **vLLM TP=8 with custom all-reduce enabled fails to resume**: each rank
+   holds 28 legacy cuIpcOpenMemHandle imports and 21 reopened at the wrong VA
+   (the API takes no address hint; the shim's hole-plug walk-back copes at
+   TP=2/4 scale but not 8x28). The shim refused loudly rather than corrupt
+   CUDA graphs. With `--disable-custom-all-reduce` (NVLS carries the
+   collectives) TP=8 passes. Known limitation: custom AR + TP=8.
+2. **SGLang TP=8 needed three environment accommodations**: its own JIT kernel
+   (`kernels/jit/csrc/distributed/ipc.cuh`, a tvm::ffi compile error at
+   world=8) is avoided by `--disable-custom-all-reduce`; its 8-rank
+   compile/autotune cold boot exceeds the bench's 600 s health window
+   (`HEALTH_TIMEOUT=1500`); and one TP=8 rank tracks >512 shim objects, which
+   tripped the interposer's sticky overflow guard exactly as designed --
+   fixed by raising MAXN to 4096.
 | vLLM | 2 | 0,1 -> 6,7 | -- | 3.70 s | 14.9 s | -- | **PASS** (after `72267d698`) |
 | vLLM | 4 | 0-3 -> 4-7 | -- | -- | 26.0 s | -- | **PASS** |
 | vLLM | 2 | same (regression) | -- | -- | 14.9 s | 14.6x | PASS |
