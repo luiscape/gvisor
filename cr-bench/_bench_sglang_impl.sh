@@ -219,6 +219,12 @@ LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cu13/lib"
     [[ -n "${MCSHIM_VERBOSE:-}" ]] && CB_ENV+=$'\n'"MCSHIM_VERBOSE=$MCSHIM_VERBOSE"
     [[ -n "${NCCL_DEBUG:-}" ]] && CB_ENV+=$'\n'"NCCL_DEBUG=$NCCL_DEBUG"
     [[ -n "${NCCL_DEBUG_SUBSYS:-}" ]] && CB_ENV+=$'\n'"NCCL_DEBUG_SUBSYS=$NCCL_DEBUG_SUBSYS"
+    # torch symmetric-memory backend selector. TORCH_SYMMMEM=NCCL matters for
+    # checkpointability: torch 2.11's default CUDA backend allocates with
+    # fabric handles through its statically linked runtime, which bypasses the
+    # interposer entirely, and one fabric object blocks every checkpoint.
+    [[ -n "${TORCH_SYMMMEM:-}" ]] && CB_ENV+=$'\n'"TORCH_SYMMMEM=$TORCH_SYMMMEM"
+    [[ -n "${NCCL_WIN_ENABLE:-}" ]] && CB_ENV+=$'\n'"NCCL_WIN_ENABLE=$NCCL_WIN_ENABLE"
     cb_write_bundle
 
     # ── cold boot ─────────────────────────────────────────────────────────
