@@ -161,6 +161,11 @@ Reproduced twice, before and after the deadlock fix below, failing at the same
 allocation index (164) on both ranks -- so it is a property of the workload's
 unicast peer sharing, not a timing artifact.
 
+And it is the whole path, not one allocation: rank 682's 50 imports occupy
+tracking indices 164-213, so **164 is the first import attempted**. The rebuild
+aborts on the very first unicast peer import rather than failing on some
+particular buffer, which is what the device-admission explanation predicts.
+
 **Status: same-GPU restore is fully working on R580 for vLLM and SGLang at TP=2
 and TP=4, with compile + CUDA graphs preserved. GPU relocation works for the
 multicast layer but not for a full inference engine, and needs R610.**
