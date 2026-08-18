@@ -214,6 +214,36 @@ type nvproxy struct {
 	devInfo                DeviceInfo
 	regularDevs            [nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1]*frontendDevice
 
+	// devTransMu guards the device translation state below. It is
+	// deliberately not fdsMu: afterLoad() calls frontendFD.load() while
+	// holding fdsMu, and load() records the translations, so reusing fdsMu
+	// would self-deadlock.
+	devTransMu sync.Mutex `state:"nosave"`
+
+	// devTransRecorded is whether recordDeviceTranslations ran during the
+	// current restore. It distinguishes "another restore hook already recorded
+	// this restore's remapping" from "the translations were loaded from the
+	// statefile", which non-nil maps alone cannot.
+	devTransRecorded bool `state:"nosave"`
+
+	// hostMinorByMinor translates a sandbox-visible regular device minor
+	// number to the host minor number backing it. It is empty until a restore
+	// remaps devices, and only contains entries for minors that moved; absent
+	// entries are identity. It exists because the application's device
+	// namespace must not change across restore: a process that opens
+	// /dev/nvidia0 after being restored onto a different GPU has to reach the
+	// GPU this sandbox is now entitled to, not the one the checkpoint was
+	// taken from. Read by frontendDevice.basename().
+	hostMinorByMinor map[uint32]uint32
+
+	// appDevInstByHostDevInst translates a host device instance number to the
+	// one the application saw before a restore remapped devices. RM reports
+	// device instances to userspace (e.g. in
+	// NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO), and libcuda resolves
+	// them against its own device table, which a restored process populated
+	// before the move.
+	appDevInstByHostDevInst map[uint32]uint32
+
 	fdsMu       fdsMutex `state:"nosave"`
 	frontendFDs map[*frontendFD]struct{}
 
@@ -253,6 +283,25 @@ type hasFrontendFDPtr[T any] interface {
 type hasStatusPtr[T any] interface {
 	marshalPtr[T]
 	nvgpu.HasStatus
+}
+
+// hasExportObjectInfoPtr is implemented by the versioned parameter structs of
+// NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO.
+type hasExportObjectInfoPtr[T any] interface {
+	marshalPtr[T]
+	nvgpu.HasFrontendFD
+	nvgpu.HasDeviceInstance
+}
+
+// appDeviceInstance translates a host device instance number to the one the
+// application knew before a restore that remapped devices, reporting whether a
+// translation applies. Values the application already agrees with, and
+// sandboxes that were never remapped, return ok == false.
+func (nvp *nvproxy) appDeviceInstance(hostDevInst uint32) (uint32, bool) {
+	nvp.devTransMu.Lock()
+	defer nvp.devTransMu.Unlock()
+	appDevInst, ok := nvp.appDevInstByHostDevInst[hostDevInst]
+	return appDevInst, ok
 }
 
 type hasFrontendFDAndStatusPtr[T any] interface {

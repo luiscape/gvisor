@@ -52,6 +52,13 @@ func rmControlInvoke[Params any](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS
 	if err != nil {
 		return n, err
 	}
+	// A control can succeed at the ioctl level and still be rejected by RM,
+	// which reports that in Status rather than errno. Without this, such a
+	// rejection is invisible in the logs and surfaces only as an opaque CUDA
+	// error in the application.
+	if ioctlParams.Status != nvgpu.NV_OK && log.IsLogging(log.Debug) {
+		fi.ctx.Debugf("nvproxy: control command %#x, object %#x returned status %#x", ioctlParams.Cmd, ioctlParams.HObject.Val, ioctlParams.Status)
+	}
 	if _, err := ioctlParams.CopyOut(fi.t, fi.ioctlParamsAddr); err != nil {
 		return n, err
 	}
