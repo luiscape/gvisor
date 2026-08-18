@@ -210,16 +210,21 @@ func (nvp *nvproxy) beforeSave() {
 func (nvp *nvproxy) initHostMinorsFromRemapping(dr *DeviceRemapping) {
 	nvp.hostMinorsMu.Lock()
 	defer nvp.hostMinorsMu.Unlock()
-	if nvp.hostMinorByMinor != nil {
+	if nvp.hostMinorByMinor != nil && nvp.appDevInstByHostDevInst != nil {
 		return
 	}
 	hostMinors := make(map[uint32]uint32)
+	appDevInsts := make(map[uint32]uint32)
 	for oldID, newID := range dr.NewDeviceByOld {
 		if oldID.Minor != newID.Minor {
 			hostMinors[oldID.Minor] = newID.Minor
 		}
+		if oldID.DeviceInstance != newID.DeviceInstance {
+			appDevInsts[newID.DeviceInstance] = oldID.DeviceInstance
+		}
 	}
 	nvp.hostMinorByMinor = hostMinors
+	nvp.appDevInstByHostDevInst = appDevInsts
 }
 
 // afterLoad is invoked by stateify.

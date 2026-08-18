@@ -201,6 +201,16 @@ func (p *NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS) GetFrontendFD() int3
 	return p.FD
 }
 
+// GetDeviceInstance implements HasDeviceInstance.GetDeviceInstance.
+func (p *NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS) GetDeviceInstance() uint32 {
+	return p.DeviceInstance
+}
+
+// SetDeviceInstance implements HasDeviceInstance.SetDeviceInstance.
+func (p *NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS) SetDeviceInstance(devInst uint32) {
+	p.DeviceInstance = devInst
+}
+
 // SetFrontendFD implements HasFrontendFD.SetFrontendFD.
 func (p *NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS) SetFrontendFD(fd int32) {
 	p.FD = fd
@@ -220,6 +230,16 @@ type NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS_V545 struct {
 // GetFrontendFD implements HasFrontendFD.GetFrontendFD.
 func (p *NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS_V545) GetFrontendFD() int32 {
 	return p.FD
+}
+
+// GetDeviceInstance implements HasDeviceInstance.GetDeviceInstance.
+func (p *NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS_V545) GetDeviceInstance() uint32 {
+	return p.DeviceInstance
+}
+
+// SetDeviceInstance implements HasDeviceInstance.SetDeviceInstance.
+func (p *NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS_V545) SetDeviceInstance(devInst uint32) {
+	p.DeviceInstance = devInst
 }
 
 // SetFrontendFD implements HasFrontendFD.SetFrontendFD.

@@ -1013,6 +1013,53 @@ func ctrlHasFrontendFD[Params any, PtrParams hasFrontendFDPtr[Params]](fi *front
 	return n, nil
 }
 
+// ctrlOSUnixGetExportObjectInfo handles
+// NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO, whose DeviceInstance output
+// tells the caller which device an exported object lives on. libcuda looks that
+// value up in its own device table, so after a restore onto different GPUs it
+// must be reported as the device instance the application knew before the
+// checkpoint, not the one now backing it.
+func ctrlOSUnixGetExportObjectInfo[Params any, PtrParams hasExportObjectInfoPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
+	var ctrlParamsValue Params
+	ctrlParams := PtrParams(&ctrlParamsValue)
+	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
+		return 0, linuxerr.EINVAL
+	}
+	if _, err := ctrlParams.CopyIn(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return 0, err
+	}
+
+	origFD := ctrlParams.GetFrontendFD()
+	ctlFileGeneric, _ := fi.t.FDTable().Get(origFD)
+	if ctlFileGeneric == nil {
+		return 0, linuxerr.EINVAL
+	}
+	defer ctlFileGeneric.DecRef(fi.ctx)
+	ctlFile, ok := ctlFileGeneric.Impl().(*frontendFD)
+	if !ok {
+		return 0, linuxerr.EINVAL
+	}
+
+	ctrlParams.SetFrontendFD(ctlFile.hostFD)
+	n, err := rmControlInvoke(fi, ioctlParams, ctrlParams)
+	ctrlParams.SetFrontendFD(origFD)
+	if err != nil {
+		return n, err
+	}
+	if appDevInst, ok := fi.fd.dev.nvp.appDeviceInstance(ctrlParams.GetDeviceInstance()); ok {
+		if log.IsLogging(log.Debug) {
+			fi.ctx.Debugf("nvproxy: GET_EXPORT_OBJECT_INFO: reporting device instance %d as %d", ctrlParams.GetDeviceInstance(), appDevInst)
+		}
+		ctrlParams.SetDeviceInstance(appDevInst)
+	} else if log.IsLogging(log.Debug) {
+		fi.ctx.Debugf("nvproxy: GET_EXPORT_OBJECT_INFO: device instance %d (untranslated)", ctrlParams.GetDeviceInstance())
+	}
+	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
 func ctrlMemoryMulticastFabricAttachGPU(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
 	var ctrlParams nvgpu.NV00FD_CTRL_ATTACH_GPU_PARAMS
 	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {

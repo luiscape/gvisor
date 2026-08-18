@@ -106,6 +106,8 @@ typedef unsigned long long CUdeviceptr;
 typedef unsigned long long CUmemGenericAllocationHandle;
 
 #define CUDA_SUCCESS 0
+/* Returned by an import when the process cannot address the exporting device. */
+#define CUDA_ERROR_INVALID_DEVICE 101
 
 typedef struct {
 	int type;
@@ -1751,6 +1753,30 @@ static int reimport(int gi, CUmemGenericAllocationHandle *out) {
 				      gi, g_alloc[gi].key_dev,
 				      g_alloc[gi].key_ino, attempt);
 			return 0;
+		}
+		/* Report the FIRST failure as it happens. Retrying silently for
+		 * 20s and only then reporting hides both the timing (which is
+		 * what correlates this against the sentry's ioctl log) and the
+		 * fact that the very first attempt already failed. */
+		if (attempt == 0) {
+			CUdevice cur = -1;
+			r_cuCtxGetDevice(&cur);
+			mclog("RESUME: re-import idx=%d key=%lx:%lx dev=%d "
+			      "rc=%d on first attempt",
+			      gi, g_alloc[gi].key_dev, g_alloc[gi].key_ino,
+			      cur, rc);
+		}
+		/* CUDA_ERROR_INVALID_DEVICE is never transient: the importing
+		 * process cannot address the exporter's device at all, which
+		 * retrying cannot change. Fail immediately instead of burning
+		 * the resume budget. */
+		if (rc == CUDA_ERROR_INVALID_DEVICE) {
+			mclog("RESUME: re-import idx=%d gave up: INVALID_DEVICE "
+			      "(the importer cannot address the exporting device; "
+			      "expected when restoring onto different GPUs on "
+			      "pre-R610 drivers)",
+			      gi);
+			return -1;
 		}
 		if (attempt >= 100) {
 			mclog("RESUME: re-import idx=%d rc=%d after %d attempts",
