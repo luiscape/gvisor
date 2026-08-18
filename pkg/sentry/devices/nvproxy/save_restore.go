@@ -208,8 +208,8 @@ func (nvp *nvproxy) beforeSave() {
 // composed, which requires the save side to record sandbox-visible minors
 // rather than host minors.
 func (nvp *nvproxy) initHostMinorsFromRemapping(dr *DeviceRemapping) {
-	nvp.fdsMu.Lock()
-	defer nvp.fdsMu.Unlock()
+	nvp.hostMinorsMu.Lock()
+	defer nvp.hostMinorsMu.Unlock()
 	if nvp.hostMinorByMinor != nil {
 		return
 	}

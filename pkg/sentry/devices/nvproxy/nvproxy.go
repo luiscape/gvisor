@@ -214,6 +214,11 @@ type nvproxy struct {
 	devInfo                DeviceInfo
 	regularDevs            [nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1]*frontendDevice
 
+	// hostMinorsMu guards hostMinorByMinor. It is deliberately not fdsMu:
+	// afterLoad() calls frontendFD.load() while holding fdsMu, and load()
+	// records the translation, so reusing fdsMu would self-deadlock.
+	hostMinorsMu sync.Mutex `state:"nosave"`
+
 	// hostMinorByMinor translates a sandbox-visible regular device minor
 	// number to the host minor number backing it. It is empty until a restore
 	// remaps devices, and only contains entries for minors that moved; absent
