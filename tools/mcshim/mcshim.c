@@ -1773,8 +1773,9 @@ static int reimport(int gi, CUmemGenericAllocationHandle *out) {
 		if (rc == CUDA_ERROR_INVALID_DEVICE) {
 			mclog("RESUME: re-import idx=%d gave up: INVALID_DEVICE "
 			      "(the importer cannot address the exporting device; "
-			      "expected when restoring onto different GPUs on "
-			      "pre-R610 drivers)",
+			      "after a restore onto different GPUs this means the "
+			      "sentry did not translate RM-reported device identity "
+			      "-- see nvproxy's GET_EXPORT_OBJECT_INFO handling)",
 			      gi);
 			return -1;
 		}

@@ -60,6 +60,8 @@ func (dev *frontendDevice) basename() string {
 // hostMinor returns the host device minor number backing dev, which differs
 // from dev.minor only after a restore that remapped this device to another GPU.
 func (dev *frontendDevice) hostMinor() uint32 {
+	dev.nvp.devTransMu.Lock()
+	defer dev.nvp.devTransMu.Unlock()
 	if hostMinor, ok := dev.nvp.hostMinorByMinor[dev.minor]; ok {
 		return hostMinor
 	}
@@ -1051,8 +1053,6 @@ func ctrlOSUnixGetExportObjectInfo[Params any, PtrParams hasExportObjectInfoPtr[
 			fi.ctx.Debugf("nvproxy: GET_EXPORT_OBJECT_INFO: reporting device instance %d as %d", ctrlParams.GetDeviceInstance(), appDevInst)
 		}
 		ctrlParams.SetDeviceInstance(appDevInst)
-	} else if log.IsLogging(log.Debug) {
-		fi.ctx.Debugf("nvproxy: GET_EXPORT_OBJECT_INFO: device instance %d (untranslated)", ctrlParams.GetDeviceInstance())
 	}
 	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
 		return n, err

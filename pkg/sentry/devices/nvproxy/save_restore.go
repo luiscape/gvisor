@@ -194,25 +194,30 @@ func (nvp *nvproxy) beforeSave() {
 	}
 }
 
-// initHostMinorsFromRemapping records the sandbox-minor => host-minor
-// translation implied by dr, so that device files opened after this restore
-// reach the GPUs this sandbox is now entitled to. The sandbox-visible minors
-// deliberately do not change: the application's device namespace must look the
-// same as it did before the checkpoint.
+// recordDeviceTranslations records the device translations implied by dr: the
+// sandbox-minor => host-minor translation that device file opens apply, and
+// the host => application device instance translation that RM-reported device
+// instances apply. The sandbox-visible values deliberately do not change
+// across restore: the application's view of its devices must look exactly as
+// it did before the checkpoint.
 //
-// Idempotent, and safe to call concurrently: it is invoked from both
-// nvproxy.afterLoad() and frontendFD.load(), which stateify does not order.
+// Idempotent within a restore, and safe to call concurrently: it is invoked
+// from both nvproxy.afterLoad() and frontendFD.load(), which stateify does not
+// order.
 //
-// Note this makes a single restore's remapping durable, not a chain of them: a
-// sandbox restored twice onto different GPUs would need the translations
-// composed, which requires the save side to record sandbox-visible minors
-// rather than host minors.
-func (nvp *nvproxy) initHostMinorsFromRemapping(dr *DeviceRemapping) {
-	nvp.hostMinorsMu.Lock()
-	defer nvp.hostMinorsMu.Unlock()
-	if nvp.hostMinorByMinor != nil && nvp.appDevInstByHostDevInst != nil {
+// The recorded translations survive further checkpoint/restore cycles, but
+// they cannot be COMPOSED: dr maps the previous run's host devices to this
+// run's, while the application's device namespace is that of the run the
+// ORIGINAL checkpoint was taken from. Restoring a sandbox that was already
+// restored onto different GPUs onto yet another set therefore panics, loudly,
+// rather than opening the wrong devices.
+func (nvp *nvproxy) recordDeviceTranslations(dr *DeviceRemapping) {
+	nvp.devTransMu.Lock()
+	defer nvp.devTransMu.Unlock()
+	if nvp.devTransRecorded {
 		return
 	}
+	nvp.devTransRecorded = true
 	hostMinors := make(map[uint32]uint32)
 	appDevInsts := make(map[uint32]uint32)
 	for oldID, newID := range dr.NewDeviceByOld {
@@ -222,6 +227,14 @@ func (nvp *nvproxy) initHostMinorsFromRemapping(dr *DeviceRemapping) {
 		if oldID.DeviceInstance != newID.DeviceInstance {
 			appDevInsts[newID.DeviceInstance] = oldID.DeviceInstance
 		}
+	}
+	if len(hostMinors) == 0 && len(appDevInsts) == 0 {
+		// This restore does not move devices; any translations recorded by an
+		// earlier restore remain exactly as correct as they were.
+		return
+	}
+	if len(nvp.hostMinorByMinor) != 0 || len(nvp.appDevInstByHostDevInst) != 0 {
+		panic(fmt.Sprintf("nvproxy: this sandbox was already restored onto different GPUs once; restoring it onto yet another set is not supported (existing minor translation %v, new remapping %v)", nvp.hostMinorByMinor, dr))
 	}
 	nvp.hostMinorByMinor = hostMinors
 	nvp.appDevInstByHostDevInst = appDevInsts
@@ -238,7 +251,7 @@ func (nvp *nvproxy) afterLoad(ctx goContext.Context) {
 	if dr := DeviceRemappingFromContext(ctx); dr != nil {
 		// Also done by frontendFD.load(), since stateify does not order it
 		// against this hook; this call covers a sandbox with no frontend FDs.
-		nvp.initHostMinorsFromRemapping(dr)
+		nvp.recordDeviceTranslations(dr)
 		// Remap objects to their new devices.
 		// Calls to CheckDevicesRemappable() already checked that all subdevice
 		// instances are 0, so we don't need to update any NV20_SUBDEVICE_0
@@ -351,7 +364,7 @@ func (fd *frontendFD) load(ctx goContext.Context) {
 	// it would just keep using the wrong device. nvproxy.afterLoad() does this
 	// too, but stateify does not order it against this hook.
 	if dr := DeviceRemappingFromContext(ctx); dr != nil {
-		fd.dev.nvp.initHostMinorsFromRemapping(dr)
+		fd.dev.nvp.recordDeviceTranslations(dr)
 	}
 	basename := fd.dev.basename()
 	fd.hostFD = openHostDevFileForRestore(ctx, basename, fd.dev.nvp.useDevGofer, fd.containerName, fd.vfsfd.StatusFlags())

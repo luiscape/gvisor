@@ -131,11 +131,21 @@ duration of the rebuild:
     persists through the ranks' imports, so the helper exits when the
     rebuild is done (and on EOF, so it can never be leaked).
 
-Known pre-R610 gap: restoring onto DIFFERENT GPUs. The rebuild's re-imports
-then fail with `CUDA_ERROR_INVALID_DEVICE` (the restored process cannot
-admit the new devices), and imports cannot be proxied -- the handles must
-live in the rank. Cross-GPU restore of multicast/VMM workloads requires
-R610+.
+Restoring onto DIFFERENT GPUs works, but only because the sentry keeps the
+move invisible; the interposer itself needs nothing special. Two sentry
+behaviors are load-bearing (both were once broken, and the failure mode was
+the rebuild's first re-import returning `CUDA_ERROR_INVALID_DEVICE`, which
+was long misread as a pre-R610 driver limitation):
+
+*   The sandbox's device namespace must not change: sandbox-visible minors
+    stay what they were before the checkpoint, and the sentry translates
+    them to the new host minors at open time. Anything less breaks freshly
+    exec'd processes -- including `mcshim-helper` -- which open devices by
+    name.
+*   Device identity reported by RM must match what the application's
+    restored libcuda remembers: in particular the `DeviceInstance` output of
+    `NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO`, which libcuda resolves
+    against the device table it built before the checkpoint.
 
 ## Design summary
 
