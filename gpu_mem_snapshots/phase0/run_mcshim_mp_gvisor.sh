@@ -44,7 +44,8 @@ UVM_MAJOR=$(awk '$2=="nvidia-uvm"{print $1}' /proc/devices)
 # MCSHIM_MC_PROXY / MCSHIM_HELPER / MCSHIM_IPC_REPLAY_FLOOR itself -- rather
 # than hand-preloading it from the container env.
 JOB_FLAG=(--cuda-checkpoint-path "$CUDA_CHECKPOINT"
-          --cuda-multicast-shim-path "$STAGE/mcshim.so")
+          --cuda-multicast-shim-path "$STAGE/mcshim.so"
+          --nvproxy-allowed-driver-capabilities=all,fabric-imex-mgmt)
 runsc(){
   local sub="$1"
   if [[ "$sub" == "run" || "$sub" == "restore" ]]; then

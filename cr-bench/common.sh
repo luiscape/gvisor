@@ -239,10 +239,16 @@ cb_runsc_flags() {
     # userspace is baked into the rootfs by cb_prepare_rootfs, so the
     # nvidia-container-cli hook isn't needed.
     if [[ "$CB_GPU" = "1" ]]; then
+        # fabric-imex-mgmt is privileged and deliberately excluded from "all";
+        # requested by name so IMEX-dependent functionality (fabric handles at
+        # multi-node scale, IMEX daemon controls) is representative of prod.
+        # Note the C/R interaction: this does not make fabric-handle memory
+        # checkpointable -- workloads that allocate it are still refused by the
+        # blocker gate, by design. Opt out with CB_IMEX=0.
         RUNSC_FLAGS+=(
             --nvproxy
             --nvproxy-driver-version="$NVPROXY_DRIVER_VER"
-            --nvproxy-allowed-driver-capabilities=all
+            --nvproxy-allowed-driver-capabilities="all$([ "${CB_IMEX:-1}" = "1" ] && echo ,fabric-imex-mgmt)"
         )
         # Opt-in: group each GPU container's CUDA processes into a
         # cuda-checkpoint job (driver R610+) so CUDA IPC state can be
