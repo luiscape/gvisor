@@ -91,6 +91,73 @@ Evidence, checkpoint on GPUs 0,1 restored onto 6,7:
 | `nvidia-smi` attribution | GPUs 0,1 | GPUs 6,7 |
 | in-sandbox `cuDeviceGetUuid` | old UUIDs | new UUIDs |
 
+## Supported configurations (summary)
+
+What is known to work on this driver, from the runs recorded below. Everything
+assumes: the interposer (`--cuda-multicast-shim-path` + `mcshim-helper`),
+`MCSHIM_IPC_SUSPEND=1`, `NCCL_CUMEM_ENABLE=1`, `CUDA_CKPT_SEQUENTIAL=1`, the
+engine quiesced via its sleep/release API before checkpoint, and NO eager mode:
+torch.compile and CUDA graphs are preserved in every supported cell.
+
+| TP | Engine | Custom all-reduce | NVLS | Symmetric memory | Same-GPU C/R | Cross-GPU C/R |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2 | vLLM | ON | inactive at TP=2 (NCCL uses direct P2P) | ON | supported | supported |
+| 2 | SGLang | ON (default) | -- | -- | supported | supported |
+| 4 | vLLM | ON | ON | ON | supported | supported |
+| 4 | SGLang | ON (default) | see row below | see row below | supported | supported |
+| 4 | SGLang `--enable-nccl-nvls` | ON | ON | -- | supported | supported |
+| 4 | SGLang `--enable-torch-symm-mem` | -- | -- | torch 2.11 | **NOT checkpointable** (see below) | -- |
+| 8 | vLLM | **OFF (required)** | ON | ON | supported | n/a (uses all GPUs) |
+| 8 | SGLang | **OFF (required)** | -- | -- | supported | n/a (uses all GPUs) |
+
+The two TP=8 restrictions, precisely:
+
+*   **vLLM TP=8 + custom AR**: custom AR shares its buffers over legacy CUDA
+    IPC, whose imports scale as (TP-1) x 4 per rank: 4 at TP=2, 12 at TP=4, 28
+    at TP=8. `cuIpcOpenMemHandle` takes no address hint, so the interposer
+    reconstructs placement by reopening in original order and plugging arena
+    holes; that handles 4 and 12 with margin and collapses at 28 (the driver
+    abandons the low arena). The shim refuses to resume rather than let CUDA
+    graphs run against moved pointers. Custom AR's advantage (small-message
+    latency at small TP) is weakest at TP=8, where NVLS + symmetric memory
+    carry the collectives.
+*   **SGLang TP=8 + custom AR**: SGLang's own JIT kernel
+    (`kernels/jit/csrc/distributed/ipc.cuh`) fails to compile at world=8 in
+    this image -- an application-level bug unrelated to checkpoint/restore.
+
+### SGLang `--enable-torch-symm-mem`: not checkpointable on this stack
+
+torch 2.11's symmetric memory prefers **fabric handles** wherever the device
+advertises `CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED`, and every such
+allocation creates an `NV_MEMORY_FABRIC` (00f8) object at allocation time that
+cuda-checkpoint cannot serialize. The blocker gate refuses the checkpoint (one
+fabric object per rank), exactly as designed.
+
+The interposer cannot fix this one: torch reaches the driver through its
+statically linked CUDA runtime, which resolves entry points by a path that
+bypasses dlsym/cuGetProcAddress interposition entirely. Measured directly: a
+run where the shim's new fabric-stripping `cuMemCreate` wrapper fired 4 times
+still produced **680** fabric allocations at the sentry -- torch's calls never
+pass through the shim. (The stripping wrapper and the
+`HANDLE_TYPE_FABRIC_SUPPORTED` mask stay in the shim: they close the same hole
+for every dynamically-resolving component, NCCL included, and cost nothing.)
+
+Alternatives tried: `TORCH_SYMMMEM=NCCL` (route symm-mem through NCCL windows,
+which resolve dynamically and use fds) -- rejected by SGLang's own usage:
+`NCCLSymmetricMemoryAllocator::alloc must not be called with a group_name`,
+scheduler crash at startup. So on this SGLang+torch combination the option is
+simply unsupported for C/R; use `--enable-nccl-nvls` (validated, including
+cross-GPU) without `--enable-torch-symm-mem`. Note vLLM's symmetric-memory
+all-reduce (`VLLM_ALLREDUCE_USE_SYMM_MEM=1`) remains fully supported -- its
+torch build allocates through interposable paths with fd handles.
+
+Not validated (no claims): FlashInfer backends (benches pin triton attention +
+pytorch sampling), SGLang mscclpp, flashinfer all-reduce fusion, pipeline
+parallelism, MoE/EP, quantized paths, models beyond Qwen2.5 1.5B/3B.
+Out of scope by design: chained cross-GPU restores (panics loudly), R610
+(deferred; its cuda-checkpoint job would remove the legacy-IPC teardown
+entirely and with it the TP=8 custom-AR restriction).
+
 ## Results
 
 ### Interposer-level (phase0 harnesses)
@@ -121,6 +188,9 @@ wake_up lifecycle.
 | SGLang | 2 | same | 560.2 s | 9.51 s | 22.5 s | **24.9x** | PASS |
 | SGLang | 4 | same | 627.5 s | 17.03 s | 45.2 s | **13.9x** | PASS |
 | SGLang | 2 | 0,1 -> 6,7 | -- | -- | 22.5 s | -- | **PASS** |
+| SGLang `--enable-nccl-nvls` | 4 | same | 631.0 s | -- | 16.55 s | 47.5 s | **PASS** |
+| SGLang `--enable-nccl-nvls` | 4 | 0-3 -> 4-7 | -- | -- | 17.33 s | 48.7 s | **PASS**, placement verified |
+| SGLang `--enable-torch-symm-mem` | 4 | same | 625.7 s | -- | -- | -- | **BLOCKED by design** (fabric objects; see below) |
 | vLLM trials (n=3) | 2 | 0,1 -> 6,7 | -- | -- | -- | -- | **3/3 PASS, 0 toggle failures** (reviewed code) |
 | SGLang | 4 | 0-3 -> 4-7 | 628.4 s | 60.6 s | 16.84 s | 46.4 s | **PASS**, placement verified |
 | vLLM (full-cycle record) | 2 | 0,1 -> 6,7 | 216.4 s | 13.4 s / 9.5 G | 3.82 s | 14.8 s | **PASS**, 14.6x, placement verified |

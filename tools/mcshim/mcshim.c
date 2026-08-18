@@ -275,8 +275,10 @@ static CUresult (*r_cuIpcOpenMemHandle)(CUdeviceptr *, CUipcMemHandle,
                                         unsigned int);
 static CUresult (*r_cuIpcCloseMemHandle)(CUdeviceptr);
 static CUresult (*r_cuMemGetAddressRange)(CUdeviceptr *, size_t *, CUdeviceptr);
+static CUresult (*r_cuDeviceGetAttribute)(int *, int, CUdevice);
 
 #define CU_MEM_HANDLE_TYPE_POSIX_FD 0x1
+#define CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED 128
 
 static void resolve_reals(void) {
 	REAL(r_cuMemCreate, "cuMemCreate");
@@ -297,6 +299,7 @@ static void resolve_reals(void) {
 	REAL(r_cuCtxGetCurrent, "cuCtxGetCurrent");
 	REAL(r_cuCtxSetCurrent, "cuCtxSetCurrent");
 	REAL(r_cuCtxSynchronize, "cuCtxSynchronize");
+	REAL(r_cuDeviceGetAttribute, "cuDeviceGetAttribute");
 	REAL(r_cuIpcGetMemHandle, "cuIpcGetMemHandle");
 	/* cuda.h #defines cuIpcOpenMemHandle to the _v2 ABI; resolve that
 	 * first and fall back for drivers that only export the old name. */
@@ -687,9 +690,37 @@ CUresult cuInit(unsigned int flags) {
 	return real(flags);
 }
 
+#define CU_MEM_HANDLE_TYPE_FABRIC 0x8
+
 CUresult cuMemCreate(CUmemGenericAllocationHandle *h, size_t size,
                      const CUmemAllocationProp *prop, unsigned long long flags) {
 	resolve_reals();
+	/* Strip the fabric handle type: it creates an NV_MEMORY_FABRIC (00f8)
+	 * object at ALLOCATION time -- before any export -- which
+	 * cuda-checkpoint cannot serialize and this shim does not suspend, so
+	 * one such allocation blocks every checkpoint. Single-node, fabric
+	 * handles buy nothing over POSIX fds (the multicast/NVLS path is
+	 * identical), and frameworks request them merely because the device
+	 * advertises support (torch >= 2.11 symmetric memory does). Masking
+	 * the capability bit in cuDeviceGetAttribute is not sufficient:
+	 * statically linked CUDA runtimes reach the driver through paths this
+	 * shim cannot interpose, so the request itself must be rewritten. */
+	CUmemAllocationProp fixed;
+	if (prop && (prop->requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC) &&
+	    !getenv("MCSHIM_ALLOW_FABRIC")) {
+		fixed = *prop;
+		fixed.requestedHandleTypes &= ~CU_MEM_HANDLE_TYPE_FABRIC;
+		if (!fixed.requestedHandleTypes)
+			fixed.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FD;
+		prop = &fixed;
+		static int logged;
+		if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+			mclog("stripping CU_MEM_HANDLE_TYPE_FABRIC from "
+			      "cuMemCreate (-> handleTypes 0x%x): fabric-handle "
+			      "memory is not checkpointable; set "
+			      "MCSHIM_ALLOW_FABRIC=1 to keep it",
+			      fixed.requestedHandleTypes);
+	}
 	CUresult rc = r_cuMemCreate(h, size, prop, flags);
 	if (rc == CUDA_SUCCESS) {
 		pthread_mutex_lock(&g_lock);
@@ -778,6 +809,34 @@ CUresult cuMemImportFromShareableHandle(CUmemGenericAllocationHandle *h,
 			aka_purge(*h);
 		}
 		pthread_mutex_unlock(&g_lock);
+	}
+	return rc;
+}
+
+/* Hide fabric-handle support from the application unless explicitly allowed.
+ *
+ * Memory created with CU_MEM_HANDLE_TYPE_FABRIC becomes an NV_MEMORY_FABRIC
+ * (00f8) object that cuda-checkpoint cannot serialize and this shim does not
+ * suspend, so it blocks every checkpoint. Frameworks pick the handle type by
+ * querying this attribute (torch >= 2.11's symmetric memory prefers fabric
+ * handles wherever the device advertises them), and on a single node fabric
+ * handles buy nothing over POSIX fds: the multicast/NVLS performance path is
+ * identical. Masking the capability steers allocators to fds, which the shim
+ * fully supports. MCSHIM_ALLOW_FABRIC=1 restores truthful reporting (e.g.
+ * for multi-node, where checkpointing is out of scope anyway). */
+CUresult cuDeviceGetAttribute(int *pi, int attrib, CUdevice dev) {
+	resolve_reals();
+	CUresult rc = r_cuDeviceGetAttribute(pi, attrib, dev);
+	if (rc == CUDA_SUCCESS && pi &&
+	    attrib == CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED &&
+	    *pi != 0 && !getenv("MCSHIM_ALLOW_FABRIC")) {
+		static int logged;
+		if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+			mclog("masking HANDLE_TYPE_FABRIC_SUPPORTED=0 (dev %d): "
+			      "fabric-handle exports are not checkpointable; "
+			      "set MCSHIM_ALLOW_FABRIC=1 to report the truth",
+			      dev);
+		*pi = 0;
 	}
 	return rc;
 }
@@ -2975,6 +3034,7 @@ static const WrapEntry *wrap_table(void) {
 	     (void *)cuMemExportToShareableHandle, 0},
 	    {"cuMemImportFromShareableHandle",
 	     (void *)cuMemImportFromShareableHandle, 0},
+	    {"cuDeviceGetAttribute", (void *)cuDeviceGetAttribute, 0},
 
 	    {"cuIpcGetMemHandle", (void *)cuIpcGetMemHandle, 0},
 	    {"cuIpcOpenMemHandle", (void *)cuIpcOpenMemHandle_v2, 0},
