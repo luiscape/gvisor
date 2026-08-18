@@ -376,7 +376,13 @@ static CUdeviceptr ipc_replay_floor(void) {
 /* remove entries, so they drop out of the replay set automatically.  */
 /* ------------------------------------------------------------------ */
 
-#define MAXN 512
+/* Sized for the largest observed footprint with headroom: an SGLang TP=8
+ * rank tracks >512 objects (its per-peer buffers scale with world size),
+ * which overflowed the previous MAXN of 512 and disabled suspend. Static
+ * tables keep the interposer allocation-free on hot paths; at ~200 bytes per
+ * entry the four tables cost ~3 MB per process, which is noise next to a
+ * CUDA context. */
+#define MAXN 4096
 #define MAX_AKA 8
 #define MAX_DEV 16
 
