@@ -117,12 +117,16 @@ wake_up lifecycle.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | vLLM | 2 | same | 219.4 s | 4.09 s | 14.9 s | **14.7x** | PASS |
 | vLLM | 4 | same | 320.6 s | 6.05 s | 25.9 s | **12.4x** | PASS |
+| vLLM trials (n=3) | 4 | same | -- | -- | -- | -- | **3/3 PASS, 0 toggle failures** |
+| SGLang | 2 | same | 560.2 s | 9.51 s | 22.5 s | **24.9x** | PASS |
 | vLLM | 2 | 0,1 -> 6,7 | -- | 3.70 s | -- | -- | **FAIL** (see below) |
-| vLLM trials (n=3) | 4 | same | | | | | in progress |
-| SGLang | 2 | same | | | | | queued |
 
-vLLM TP=2 checkpoint: 13.3 s, image 9.5 G, all 3 verification queries correct.
-vLLM TP=4 checkpoint image: 15 G, all 3 verification queries correct.
+Checkpoint times / image sizes: vLLM TP=2 13.3 s / 9.5 G, TP=4 15 G, SGLang TP=2
+24.8 s / 24 G. All passing runs answered all 3 verification queries correctly.
+
+The vLLM TP=4 trial count matches the 580.126.20 reference (3/3, 0 toggle
+failures), and SGLang's 24.9x is the largest speedup measured, because its cold
+boot is the longest (560 s).
 
 ### Cross-GPU at the engine level: blocked on unicast peer imports
 
@@ -153,8 +157,29 @@ device-admission wall. If so `tools/mcshim/README.md`'s "pre-R610 gap" is
 correct after all, though for a narrower reason than stated (unicast VMM peer
 imports specifically, not imports in general).
 
-**Status: same-GPU cross-GPU-free restore is fully working on R580; GPU
-relocation of a full inference engine is not, and needs R610.**
+Reproduced twice, before and after the deadlock fix below, failing at the same
+allocation index (164) on both ranks -- so it is a property of the workload's
+unicast peer sharing, not a timing artifact.
+
+**Status: same-GPU restore is fully working on R580 for vLLM and SGLang at TP=2
+and TP=4, with compile + CUDA graphs preserved. GPU relocation works for the
+multicast layer but not for a full inference engine, and needs R610.**
+
+## Caution for reviewers: a restore-path deadlock, now fixed
+
+The first version of the device-namespace fix recorded the minor translation
+under `fdsMu`. `afterLoad()` calls `frontendFD.load()` for every FD *while
+holding* `fdsMu`, so that self-deadlocked the restore -- it hung after
+`All MemoryFile pages have been loaded` with no error, no timeout and no output.
+
+It did not reproduce on vLLM TP=2 or TP=4 (five successful restores) because
+whether it deadlocks depends on the FD count and which path records the
+translation first. SGLang TP=2 hung for 46 minutes, and only a `SIGQUIT` stack
+dump identified it. Fixed in `1a6cfb2d9` with a dedicated mutex.
+
+Two lessons worth carrying: a hang in this path produces no diagnostic at all,
+and passing vLLM runs are not sufficient evidence that a restore-path change is
+safe.
 
 ## Verification hygiene
 
