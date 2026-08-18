@@ -119,10 +119,12 @@ wake_up lifecycle.
 | vLLM | 4 | same | 320.6 s | 6.05 s | 25.9 s | **12.4x** | PASS |
 | vLLM trials (n=3) | 4 | same | -- | -- | -- | -- | **3/3 PASS, 0 toggle failures** |
 | SGLang | 2 | same | 560.2 s | 9.51 s | 22.5 s | **24.9x** | PASS |
+| SGLang | 4 | same | 627.5 s | 17.03 s | 45.2 s | **13.9x** | PASS |
 | vLLM | 2 | 0,1 -> 6,7 | -- | 3.70 s | -- | -- | **FAIL** (see below) |
 
 Checkpoint times / image sizes: vLLM TP=2 13.3 s / 9.5 G, TP=4 15 G, SGLang TP=2
-24.8 s / 24 G. All passing runs answered all 3 verification queries correctly.
+24.8 s / 24 G, SGLang TP=4 60.6 s / 44 G. All passing runs answered all 3
+verification queries correctly.
 
 The vLLM TP=4 trial count matches the 580.126.20 reference (3/3, 0 toggle
 failures), and SGLang's 24.9x is the largest speedup measured, because its cold
