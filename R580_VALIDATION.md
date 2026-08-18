@@ -142,6 +142,24 @@ pass through the shim. (The stripping wrapper and the
 `HANDLE_TYPE_FABRIC_SUPPORTED` mask stay in the shim: they close the same hole
 for every dynamically-resolving component, NCCL included, and cost nothing.)
 
+**Measured cost of losing it** (A/B on this box, plain docker/runc since the
+delta is GPU-side; SGLang TP=8, Qwen2.5-3B, `--disable-custom-all-reduce` in
+both arms, bench_serving random 128/256, seed 42):
+
+| Load | TPOT off | TPOT on | delta | throughput off -> on |
+| --- | --- | --- | --- | --- |
+| concurrency 1 | 2.60 ms | 2.19 ms | **-15.8%** | 370 -> 438 tok/s |
+| concurrency 8 | 2.88 ms | 2.31 ms | **-19.8%** | 2610 -> 3197 tok/s |
+
+Per-op that is ~6-8 us saved per all-reduce (72 per token on this model),
+matching the multimem-vs-NCCL-LL estimate. Caveats: a 3B model at TP=8 is
+maximally all-reduce-bound, so this is the upper end; the absolute ~0.4-0.6 ms
+per token transfers to larger models, where it lands at roughly 4-7% of a
+15-30 ms TPOT. Also note the eligibility conditions found while validating the
+A/B: this SGLang's symm-mem path engages only for **bfloat16** models (an
+earlier fp16 A/B produced identical arms because every tensor failed the dtype
+check) and only within the (sm, world) support table {sm90/sm100 x 2,4,6,8}.
+
 Alternatives tried: `TORCH_SYMMMEM=NCCL` (route symm-mem through NCCL windows,
 which resolve dynamically and use fds) -- rejected by SGLang's own usage:
 `NCCLSymmetricMemoryAllocator::alloc must not be called with a group_name`,
