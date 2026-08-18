@@ -373,6 +373,14 @@ sudo RUNSC=/usr/local/bin/runsc-r580 CUDA_MULTICAST_SHIM=1 \
   bash cr-bench/bench_4_vllm_multi.sh --gpus 0,1 --tp 2
 ```
 
+As of 2026-08-18 the harnesses request `fabric-imex-mgmt` by name
+(`--nvproxy-allowed-driver-capabilities=all,fabric-imex-mgmt`; opt out with
+`CB_IMEX=0`). The capability is privileged and excluded from `all`. Verified:
+runsc boots with it on this host, phase0 cross-GPU C/R passes, vLLM TP=2 passes
+at 14.5x. It does not change checkpointability either way: single-node
+fabric-handle allocation already worked without it, and fabric objects remain
+refused by the blocker gate.
+
 `REBUILD_ROOTFS=1` is needed only on the first run per image. Images
 (`cr-bench-vllm`, `cr-bench-sglang`) are built from `cr-bench/images/` and
 pre-download the Qwen models, so `HF_HUB_OFFLINE=1` at runtime is satisfied.
