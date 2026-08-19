@@ -307,6 +307,13 @@ func Init() {
 					// NOT equivalent: once the probe succeeds, libcuda treats FLA
 					// registration failure during FD export as fatal (measured: torch
 					// dies with "CUDA driver error: unknown error").
+					//
+					// Known cost: libcuda couples CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED
+					// to this probe, so without the capability NVLS multicast is
+					// reported (and is) unavailable even though NVSwitch multicast does
+					// not itself need IMEX. Frameworks fall back to their non-multicast
+					// paths (measured: torch symm-mem uses its two-shot kernel).
+					// POSIX-FD sharing and P2P are unaffected.
 					nvgpu.NV2080_CTRL_CMD_GET_GPU_FABRIC_PROBE_INFO:                        ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement),
 					nvgpu.NV2080_CTRL_CMD_FLA_GET_FABRIC_MEM_STATS:                         ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_GR_GET_ZCULL_INFO:                                ctrlHandler(rmControlSimple, nvconf.CapGraphics),

@@ -193,15 +193,33 @@ both ways on the final binary):
 
 | Workload | `CB_IMEX=0` (no fabric cap) | `CB_IMEX=1` (fabric cap granted) |
 | --- | --- | --- |
-| SGLang `--enable-torch-symm-mem` (bf16, no compile) | **PASS 3.6x** (two-shot kernel; multimem needs fabric) | blocked by gate (1 persistent FLA/rank, by design) |
+| SGLang `--enable-torch-symm-mem` TP=4 (bf16, no compile) | **PASS 3.6x**, 3 same-GPU runs + 1 cross-GPU (0-3 -> 4-7) | blocked by gate (1 persistent FLA/rank, by design) |
+| SGLang `--enable-torch-symm-mem` TP=8, Qwen2.5-3B (the A/B-winning config) | **PASS 1.9x** | blocked by gate |
+| vLLM TP=4 `VLLM_ALLREDUCE_USE_SYMM_MEM=1` | **PASS 9.8x** | untested |
 | SGLang `--enable-nccl-nvls` TP=4 | fails at boot: NCCL treats forced NVLS + denied fabric probe as fatal (`unhandled cuda error`) | **PASS 13.1x** (672 transient 00f8 bind companions, all shim-released) |
-| Everything else in the matrix (no fabric users) | PASS | PASS |
+| Everything else in the matrix (no fabric users) | PASS (vLLM TP=2 re-run: 14.5x) | PASS |
+
+**Honest accounting of what `CB_IMEX=0` costs:** libcuda couples
+`CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED` to the fabric probe, so denying
+the probe disables ALL multicast -- not just fabric handles. Measured: the
+raw 2-process multicast harness fails its attr-132 gate without the
+capability (the earlier "NVLS multicast unaffected" claim was wrong; the
+phase0 harness grants the capability). Framework fallbacks are graceful:
+torch symm-mem selects its two-shot kernel (still symm-mem P2P, still most
+of the win over pynccl), NCCL auto mode falls back to non-NVLS algorithms.
+Only *forced* NVLS crashes.
 
 Rules of thumb: leave `CB_IMEX=0` for checkpointable torch-symm-mem
-workloads and do not force `--enable-nccl-nvls` there (NCCL auto mode
-degrades gracefully); grant the capability for max-perf NVLS/multimem
-workloads, which remain checkpointable as long as fabric objects stay
-transient or shim-released.
+workloads and do not force `--enable-nccl-nvls` there; grant the capability
+for max-perf NVLS/multimem workloads, which remain checkpointable as long
+as fabric objects stay transient or shim-released (NCCL NVLS yes; torch
+symm-mem no -- its workspace keeps a persistent FLA registration).
+
+Known flake (1 occurrence in ~12 e2e runs, pre-existing save-path race,
+not introduced by these changes -- none of them touch mm/pma): checkpoint
+fails with `Can't save pma with non-MemoryFile of type
+*nvproxy.frontendFDMemmapFile`; the container unwinds cleanly and a retry
+passes. Signature recorded here for recognition.
 
 Remaining known-notworking: `--enable-torch-compile` + symm-mem is an
 app-level SGLang/torch inductor bug (its fused kernel passes
