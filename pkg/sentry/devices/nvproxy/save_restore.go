@@ -248,11 +248,18 @@ func (nvp *nvproxy) afterLoad(ctx goContext.Context) {
 		panic(fmt.Sprintf("driver version %q not found in abis map", nvp.version))
 	}
 	nvp.abi = abiEntry.cons()
-	// FLA registrations suspended for the checkpoint are replayable only
-	// while the process's other RM handles survive, which a true restore's
-	// cuda-checkpoint toggle does not preserve (it rebuilds the process's
-	// objects under fresh handles). libcuda re-registers lazily on the next
-	// export instead; see ReplayFLARegistrations.
+	// Drop FLA registrations suspended for the checkpoint: after a true
+	// restore they are not replayable and not replayed. Measured, in order
+	// of theory death: the cuda-checkpoint restore toggle rebuilds the
+	// application's client through privileged debugger paths nvproxy never
+	// sees (the post-toggle object graph contains only cuda-checkpoint's
+	// utility clients), no live fd is RM-associated with the restored
+	// client from the sentry side, and sentry-driven RM_ALLOC into it is
+	// refused with NV_ERR_INSUFFICIENT_PERMISSIONS regardless of carrier
+	// fd. libcuda re-registers lazily on the next export instead, which is
+	// sufficient for workloads that do not cache registration state
+	// (FlashInfer fusion passes e2e); see ReplayFLARegistrations for the
+	// flows where true replay does apply.
 	nvp.suspendedFLARegs = nil
 	if dr := DeviceRemappingFromContext(ctx); dr != nil {
 		// Also done by frontendFD.load(), since stateify does not order it

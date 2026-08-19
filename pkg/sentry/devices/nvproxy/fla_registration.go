@@ -216,15 +216,16 @@ func (nvp *nvproxy) suspendFLARegistrations() (int, error) {
 // ReplayFLARegistrations recreates the registrations freed by
 // SuspendFLARegistrations with their original handles and parameters, and
 // re-records them in the object graph. It applies only to flows where the
-// process's driver state survived: checkpoint-failure unwind and
-// resume-after-save. After a TRUE restore it must not (and does not) run:
-// nvproxy.afterLoad drops the suspended list, because the cuda-checkpoint
-// restore toggle rebuilds the process's RM objects under fresh handles
-// (measured: the covered vidmem's original handle appears nowhere in the
-// rebuilt graph), so the saved identities are unreplayable -- and
-// unnecessary: libcuda lazily re-registers FLA on the next export, exactly
-// as it did on first use (measured: the fusion workload's restore recreates
-// its registrations itself and passes end-to-end).
+// process's driver state survived in place: checkpoint-failure unwind and
+// resume-after-save. After a TRUE restore nvproxy.afterLoad drops the
+// record instead: sentry-driven allocation into the restored client is
+// impossible (measured exhaustively -- see the comment in afterLoad), and
+// libcuda re-registers lazily on the next export. The residual gap is
+// workloads whose userspace caches registration state across the export:
+// torch symm-mem's post-restore re-export retries EXPORT_OBJECT_TO_FD
+// against the stale registration handle into OBJECT_NOT_FOUND. That gap is
+// a userspace-bookkeeping/driver mismatch only NVIDIA can close (the
+// checkpointed image believes in an object that cannot be checkpointed).
 // It returns the number of registrations recreated.
 func ReplayFLARegistrations(vfsObj *vfs.VirtualFilesystem) (int, error) {
 	nvp := nvproxyFromVFS(vfsObj)
@@ -239,38 +240,45 @@ func (nvp *nvproxy) replayFLARegistrations() (int, error) {
 	regs := nvp.suspendedFLARegs
 	replayed := 0
 	ctx := context.Background()
+	// Candidate host fds for carrying the replays. RM's association rules
+	// are not documented and every clean theory measured false so far
+	// (foreign-rank fds: INVALID_CLIENT; the saved client-allocating fd:
+	// dead after restore; the post-toggle object graph: contains only
+	// cuda-checkpoint's utility clients, the application's client is
+	// restored through debugger paths nvproxy never sees). So: probe. The
+	// candidate set is every live control-capable frontendFD, saved
+	// clientFD first; failed probes are cheap (an errno or an RM status),
+	// and the first fd RM accepts carries the rest of that client's
+	// replays.
+	var candidates []*frontendFD
+	nvp.fdsMu.Lock()
+	for fd := range nvp.frontendFDs {
+		if fd.hostFD >= 0 {
+			candidates = append(candidates, fd)
+		}
+	}
+	nvp.fdsMu.Unlock()
 	for i := range regs {
 		rec := &regs[i]
-		// Fd selection. RM accepts operations on a client only from fds it
-		// associates with that client, and the fd that allocated the client
-		// may have been closed by the application since (its saved hostFD
-		// then dangles; measured as ENOTTY). The one fd that is both
-		// guaranteed live and guaranteed associated: whichever fd the
-		// application (or the cuda-checkpoint restore toggle, acting through
-		// the application's fds) most recently used to allocate the vidmem
-		// this registration covers -- it is in the current object graph.
-		fd := int32(-1)
-		nvp.clientsMu.RLock()
-		if client := nvp.clients[rec.clientH]; client != nil {
-			client.objsMu.Lock()
-			if vidmem, ok := client.resources[rec.hVidMem]; ok {
-				switch impl := vidmem.impl.(type) {
-				case *rmAllocObject:
-					fd = impl.params.fd.hostFD
-				case *osDescMem:
-					// Not expected for vidmem, but harmless to skip.
+		tried := 0
+		var err error
+		ordered := make([]*frontendFD, 0, len(candidates)+1)
+		if rec.clientFD != nil {
+			ordered = append(ordered, rec.clientFD)
+		}
+		ordered = append(ordered, candidates...)
+		err = fmt.Errorf("no live host fds to try")
+		for _, ffd := range ordered {
+			tried++
+			err = rec.params.restoreOnFD(ffd.hostFD)
+			if err == nil {
+				if tried > 1 {
+					log.Infof("nvproxy: FLA registration %v:%v replayed on candidate fd %d of %d", rec.clientH, rec.objectH, tried, len(ordered))
 				}
-			}
-			client.objsMu.Unlock()
-			if fd < 0 && client.params.fd != nil {
-				fd = client.params.fd.hostFD
+				break
 			}
 		}
-		nvp.clientsMu.RUnlock()
-		if fd < 0 && rec.clientFD != nil {
-			fd = rec.clientFD.hostFD
-		}
-		if err := rec.params.restoreOnFD(fd); err != nil {
+		if err != nil {
 			// Drop what was replayed; keep the rest recorded for another
 			// attempt or for diagnosis.
 			nvp.suspendedFLARegs = regs[replayed:]
