@@ -301,7 +301,7 @@ impossible (and unnecessary).
 | Config (all `CB_IMEX=1`, fabric granted) | Before | After |
 | --- | --- | --- |
 | SGLang TP=4 `--flashinfer-allreduce-fusion-backend trtllm` | checkpoint refused (1 fabric/rank) | **PASS end-to-end** (fusion re-engages post-restore) |
-| SGLang TP=4 `--enable-torch-symm-mem` (multimem) | checkpoint refused | checkpoint + FLA suspend pass; **restore still fails** in the interposer's re-export of torch's workspace (rc=1) -- a separate, pre-existing issue (torch caches export state the fusion path does not) |
+| SGLang TP=4 `--enable-torch-symm-mem` (multimem) | checkpoint refused | checkpoint + FLA suspend pass; **restore fails, root-caused as NVIDIA-side**: torch's userspace caches the FLA registration handle across exports, so its post-restore re-export retries EXPORT_OBJECT_TO_FD against the stale handle into OBJECT_NOT_FOUND. Sentry-side recreation is impossible (toggle rebuilds the client via debugger paths invisible to nvproxy; sentry RM_ALLOC into it fails NV_ERR_INSUFFICIENT_PERMISSIONS regardless of carrier fd -- probed exhaustively). Fix requires cuda-checkpoint to serialize or reconcile FLA registrations. Workaround unchanged: run torch symm-mem under `CB_IMEX=0` (two-shot kernel, PASS) |
 | phase0 harness + no-fabric matrix | PASS | PASS (unaffected) |
 
 Not validated (no claims): SGLang mscclpp, pipeline parallelism, MoE/EP,
