@@ -255,9 +255,38 @@ cross-GPU) without `--enable-torch-symm-mem`. Note vLLM's symmetric-memory
 all-reduce (`VLLM_ALLREDUCE_USE_SYMM_MEM=1`) remains fully supported -- its
 torch build allocates through interposable paths with fd handles.
 
-Not validated (no claims): FlashInfer backends (benches pin triton attention +
-pytorch sampling), SGLang mscclpp, flashinfer all-reduce fusion, pipeline
-parallelism, MoE/EP, quantized paths, models beyond Qwen2.5 1.5B/3B.
+### FlashInfer validation ladder (2026-08-19)
+
+All runs: stock SGLang flags, no torch.compile, `MCSHIM_IPC_SUSPEND=1`.
+
+| Stage | Config | Verdict |
+| --- | --- | --- |
+| S1 | TP=4 same-GPU, `--attention-backend flashinfer --sampling-backend flashinfer`, `CB_IMEX=0` | **PASS 7.0x** (cold boot 299.6s, checkpoint 61.7s, first inference 42.5s) |
+| S2 | S1 + cross-GPU restore 0-3 -> 4-7 | **PASS** |
+| S3 | S1 + `--enable-flashinfer-allreduce-fusion` | **PASS, but fusion vacuous** -- flag is a deprecated alias; the workspace preflight (`cuMulticastGetGranularity`) gets NOT_SUPPORTED under `CB_IMEX=0` and SGLang logs "Skipping allreduce fusion" and falls back cleanly |
+| S4 | S3 at TP=8 (Qwen2.5-3B, custom-AR off) | **PASS, fusion vacuous** (same graceful skip) |
+| S5 | TP=4, `--flashinfer-allreduce-fusion-backend trtllm`, `CB_IMEX=1` -- fusion **engaged** (workspace MC group tracked) | **checkpoint refused**: 1 fabric object per rank survives shim suspend (252 f8 created, 248 released, 4 live) |
+| S6 | S5 at TP=8 | **checkpoint refused**: same signature (632 created, 624 released, 8 live -- exactly 1/rank) |
+
+Key findings:
+
+1. **FlashInfer attention + sampling are fully supported** under C/R,
+   same-GPU and cross-GPU. The old "needs nvcc at runtime" concern is moot
+   on this image (flashinfer 0.6.15, sm90 AOT kernels).
+2. **This SGLang lineage's all-reduce-fusion workspace is multicast/VMM,
+   not legacy IPC** (`cuMulticastGetGranularity` preflight; the shim tracks
+   its MC group like any other). The feared TP=8 legacy-IPC reopen collapse
+   does not apply to it.
+3. Fusion under `CB_IMEX=0` **declines gracefully** -- correct fallback, no
+   crash (unlike forced NVLS). A checkpointable deployment can simply leave
+   fusion requested; it self-disables.
+4. Engaged fusion is blocked by **exactly the torch-multimem blocker**: one
+   persistent owner-side NV_MEMORY_FABRIC FLA registration per rank over
+   the fusion workspace, surviving the shim's group/bind/import teardown.
+   Both remaining gaps are the same object class with the same fix surface.
+
+Not validated (no claims): SGLang mscclpp, pipeline parallelism, MoE/EP,
+quantized paths, models beyond Qwen2.5 1.5B/3B.
 Out of scope by design: chained cross-GPU restores (panics loudly), R610
 (deferred; its cuda-checkpoint job would remove the legacy-IPC teardown
 entirely and with it the TP=8 custom-AR restriction).
