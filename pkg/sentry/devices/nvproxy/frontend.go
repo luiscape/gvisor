@@ -1366,6 +1366,21 @@ func addSimpleObjDepParentLocked[Params any](fi *frontendIoctlState, client *roo
 	fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), ioctlParams.HObjectParent)
 }
 
+// rmAllocMemoryFabric is rmAllocSimple for NV_MEMORY_FABRIC (00f8) with
+// diagnostic logging of the allocation parameters: fabric objects block CUDA
+// checkpoints, and attributing one to the VMM allocation it covers (by
+// AllocSize) is what makes such a blocker debuggable.
+func rmAllocMemoryFabric(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
+	return rmAllocSimpleParams[nvgpu.NV00F8_ALLOCATION_PARAMETERS](fi, ioctlParams, isNVOS64,
+		func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV00F8_ALLOCATION_PARAMETERS) {
+			if allocParams != nil {
+				fi.ctx.Debugf("nvproxy: NV_MEMORY_FABRIC alloc: allocSize=%#x pageSize=%#x alignment=%#x allocFlags=%#x map.hVidMem=%#x map.flags=%#x",
+					allocParams.AllocSize, allocParams.PageSize, allocParams.Alignment, allocParams.AllocFlags, allocParams.Map.HVidMem.Val, allocParams.Map.Flags)
+			}
+			addSimpleObjDepParentLocked(fi, client, ioctlParams, rightsRequested, allocParams)
+		})
+}
+
 func rmAllocSimpleParams[Params any, PtrParams marshalPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool, objAddLocked func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *Params)) (uintptr, error) {
 	if ioctlParams.PAllocParms == 0 {
 		return rmAllocInvoke[Params](fi, ioctlParams, nil, isNVOS64, objAddLocked)

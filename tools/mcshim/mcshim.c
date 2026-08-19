@@ -328,6 +328,17 @@ static int mcverbose(void) {
 	return v;
 }
 
+/* Identify the module a wrapped call came from (verbose diagnostics for
+ * fabric-request attribution: "which .so asked for fabric handles?"). */
+static const char *caller_module(const void *retaddr) {
+	Dl_info di;
+	if (retaddr && dladdr(retaddr, &di) && di.dli_fname) {
+		const char *base = strrchr(di.dli_fname, '/');
+		return base ? base + 1 : di.dli_fname;
+	}
+	return "?";
+}
+
 /* Whether to tear legacy CUDA IPC imports down at all -- OFF by default.
  *
  * R610's job mode (`cuda-checkpoint --launch-job`) is documented to support
@@ -711,6 +722,9 @@ CUresult cuMemCreate(CUmemGenericAllocationHandle *h, size_t size,
 	 * the capability bit in cuDeviceGetAttribute is not sufficient:
 	 * statically linked CUDA runtimes reach the driver through paths this
 	 * shim cannot interpose, so the request itself must be rewritten. */
+	mcvlog("CALL cuMemCreate(size=0x%zx, handleTypes=0x%x) caller %s", size,
+	       prop ? prop->requestedHandleTypes : 0,
+	       caller_module(__builtin_return_address(0)));
 	CUmemAllocationProp fixed;
 	if (prop && (prop->requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC) &&
 	    !getenv("MCSHIM_ALLOW_FABRIC")) {
@@ -726,6 +740,8 @@ CUresult cuMemCreate(CUmemGenericAllocationHandle *h, size_t size,
 			      "memory is not checkpointable; set "
 			      "MCSHIM_ALLOW_FABRIC=1 to keep it",
 			      fixed.requestedHandleTypes);
+		mcvlog("cuMemCreate(FABRIC) stripped; caller %s",
+		       caller_module(__builtin_return_address(0)));
 	}
 	CUresult rc = r_cuMemCreate(h, size, prop, flags);
 	if (rc == CUDA_SUCCESS) {
@@ -749,6 +765,33 @@ CUresult cuMemCreate(CUmemGenericAllocationHandle *h, size_t size,
 CUresult cuMulticastCreate(CUmemGenericAllocationHandle *h,
                            const CUmulticastObjectProp *prop) {
 	resolve_reals();
+	/* Same strip as cuMemCreate: a multicast group created with the
+	 * FABRIC handle type gets a companion NV_MEMORY_FABRIC (00f8) object
+	 * that cuda-checkpoint cannot serialize and that outlives the shim's
+	 * multicast teardown (it belongs to the group's fabric export, not to
+	 * the binds). torch 2.11 requests FD|FABRIC unconditionally on
+	 * fabric-attached systems; single-node, FD-only is equivalent. */
+	CUmulticastObjectProp mfixed;
+	if (prop && (prop->handleTypes & CU_MEM_HANDLE_TYPE_FABRIC) &&
+	    !getenv("MCSHIM_ALLOW_FABRIC")) {
+		mfixed = *prop;
+		mfixed.handleTypes &= ~(unsigned long long)CU_MEM_HANDLE_TYPE_FABRIC;
+		if (!mfixed.handleTypes)
+			mfixed.handleTypes = CU_MEM_HANDLE_TYPE_POSIX_FD;
+		prop = &mfixed;
+		static int logged;
+		if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+			mclog("stripping CU_MEM_HANDLE_TYPE_FABRIC from "
+			      "cuMulticastCreate (-> handleTypes 0x%llx): "
+			      "fabric-handle multicast is not checkpointable; "
+			      "set MCSHIM_ALLOW_FABRIC=1 to keep it",
+			      mfixed.handleTypes);
+		mcvlog("cuMulticastCreate(FABRIC) stripped; caller %s",
+		       caller_module(__builtin_return_address(0)));
+	}
+	mcvlog("CALL cuMulticastCreate(size=0x%zx, handleTypes=0x%llx) caller %s",
+	       prop ? prop->size : 0, prop ? prop->handleTypes : 0,
+	       caller_module(__builtin_return_address(0)));
 	CUresult rc = r_cuMulticastCreate(h, prop);
 	if (rc == CUDA_SUCCESS) {
 		pthread_mutex_lock(&g_lock);
@@ -769,11 +812,34 @@ CUresult cuMulticastCreate(CUmemGenericAllocationHandle *h,
 	return rc;
 }
 
+#define CUDA_ERROR_NOT_SUPPORTED 801
+
 CUresult cuMemExportToShareableHandle(void *shHandle,
                                       CUmemGenericAllocationHandle h, int type,
                                       unsigned long long flags) {
 	resolve_reals();
+	/* Refuse fabric-typed exports: THIS is the call that creates the
+	 * un-serializable NV_MEMORY_FABRIC (00f8) object. Stripping the
+	 * handle type at cuMemCreate is not enough -- the driver happily
+	 * fabric-exports memory that never requested fabric handles, so
+	 * torch 2.11's empirical isFabricSupported probe (create, then
+	 * export-as-FABRIC) still succeeds and symm-mem then fabric-exports
+	 * every pool chunk. Failing the export makes the probe conclude
+	 * fabric is unavailable and fall back to POSIX fds, which the shim
+	 * fully supports; on a single node that costs nothing. */
+	if (type == CU_MEM_HANDLE_TYPE_FABRIC && !getenv("MCSHIM_ALLOW_FABRIC")) {
+		static int logged;
+		if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+			mclog("refusing fabric-typed cuMemExportToShareableHandle:"
+			      " fabric exports are not checkpointable; set "
+			      "MCSHIM_ALLOW_FABRIC=1 to permit them");
+		mcvlog("cuMemExportToShareableHandle(FABRIC) refused; caller %s",
+		       caller_module(__builtin_return_address(0)));
+		return CUDA_ERROR_NOT_SUPPORTED;
+	}
 	CUmemGenericAllocationHandle real_h = xlate_locked(h);
+	mcvlog("CALL cuMemExportToShareableHandle(type=%d) caller %s", type,
+	       caller_module(__builtin_return_address(0)));
 	CUresult rc = r_cuMemExportToShareableHandle(shHandle, real_h, type, flags);
 	if (rc == CUDA_SUCCESS && type == CU_MEM_HANDLE_TYPE_POSIX_FD && shHandle) {
 		pthread_mutex_lock(&g_lock);
@@ -797,6 +863,19 @@ CUresult cuMemExportToShareableHandle(void *shHandle,
 CUresult cuMemImportFromShareableHandle(CUmemGenericAllocationHandle *h,
                                         void *osHandle, int type) {
 	resolve_reals();
+	/* Mirror of the export-side refusal: an imported fabric ref is an
+	 * NV_MEMORY_FABRIC_IMPORTED_REF (00fb) object, equally
+	 * un-serializable. Unreachable when exports are refused too (peers
+	 * then never see a fabric handle); kept for defense in depth. */
+	if (type == CU_MEM_HANDLE_TYPE_FABRIC && !getenv("MCSHIM_ALLOW_FABRIC")) {
+		static int logged;
+		if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+			mclog("refusing fabric-typed cuMemImportFromShareableHandle"
+			      " (see export-side message)");
+		return CUDA_ERROR_NOT_SUPPORTED;
+	}
+	mcvlog("CALL cuMemImportFromShareableHandle(type=%d) caller %s", type,
+	       caller_module(__builtin_return_address(0)));
 	CUresult rc = r_cuMemImportFromShareableHandle(h, osHandle, type);
 	if (rc == CUDA_SUCCESS && type == CU_MEM_HANDLE_TYPE_POSIX_FD && h) {
 		pthread_mutex_lock(&g_lock);
@@ -817,6 +896,61 @@ CUresult cuMemImportFromShareableHandle(CUmemGenericAllocationHandle *h,
 		pthread_mutex_unlock(&g_lock);
 	}
 	return rc;
+}
+
+/* NVML fabric-info smoothing.
+ *
+ * torch >= 2.11's isFabricSupported() TORCH_CHECKs that
+ * nvmlDeviceGetGpuFabricInfoV returns NVML_SUCCESS and only then inspects
+ * fabricInfo.state -- an NVML error is a hard crash, not a fallback. When
+ * the sandbox denies the fabric probe (nvproxy without fabric-imex-mgmt
+ * returns NV_ERR_NOT_SUPPORTED, like a fabric-less host), NVML surfaces
+ * that as an error and torch dies at symm-mem init. Translate failure into
+ * what a fabric-less host reports: NVML_SUCCESS with
+ * state=NVML_GPU_FABRIC_STATE_NOT_SUPPORTED (0), which torch handles
+ * gracefully. The versioned-struct size travels in the version field's low
+ * 24 bits (NVML_STRUCT_VERSION), so the payload can be zeroed exactly.
+ * Opt out with MCSHIM_ALLOW_FABRIC=1. */
+static int nvml_fabric_info_smooth(void *info, int rc, const char *via) {
+	if (rc == 0 || !info || getenv("MCSHIM_ALLOW_FABRIC"))
+		return rc;
+	unsigned int version = *(unsigned int *)info;
+	unsigned int size = version & 0xffffffu;
+	if (size < sizeof(unsigned int) || size > 4096)
+		return rc; /* implausible; do not touch */
+	memset((char *)info + sizeof(unsigned int), 0,
+	       size - sizeof(unsigned int));
+	static int logged;
+	if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+		mclog("%s failed (rc=%d): reporting fabric NOT_SUPPORTED "
+		      "instead (fabric is denied in this sandbox); set "
+		      "MCSHIM_ALLOW_FABRIC=1 to pass errors through", via, rc);
+	return 0; /* NVML_SUCCESS */
+}
+
+static void *libnvml_sym(const char *name) {
+	init_real_dlsym();
+	if (!real_dlsym)
+		return NULL;
+	void *s = real_dlsym(RTLD_NEXT, name);
+	if (s)
+		return s;
+	static void *h;
+	if (!h)
+		h = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_NOLOAD);
+	return h ? real_dlsym(h, name) : NULL;
+}
+
+int nvmlDeviceGetGpuFabricInfoV(void *device, void *gpuFabricInfo);
+int nvmlDeviceGetGpuFabricInfoV(void *device, void *gpuFabricInfo) {
+	static int (*real)(void *, void *);
+	if (!real)
+		*(void **)(&real) = libnvml_sym("nvmlDeviceGetGpuFabricInfoV");
+	if (!real)
+		return 13; /* NVML_ERROR_FUNCTION_NOT_FOUND */
+	int rc = real(device, gpuFabricInfo);
+	return nvml_fabric_info_smooth(gpuFabricInfo, rc,
+	                               "nvmlDeviceGetGpuFabricInfoV");
 }
 
 /* Hide fabric-handle support from the application unless explicitly allowed.
@@ -1003,6 +1137,8 @@ CUresult cuIpcCloseMemHandle(CUdeviceptr dptr) {
 CUresult cuMulticastAddDevice(CUmemGenericAllocationHandle h, CUdevice dev) {
 	resolve_reals();
 	CUmemGenericAllocationHandle real_h = xlate_locked(h);
+	mcvlog("CALL cuMulticastAddDevice(dev=%d) caller %s", (int)dev,
+	       caller_module(__builtin_return_address(0)));
 	CUresult rc = r_cuMulticastAddDevice(real_h, dev);
 	if (rc == CUDA_SUCCESS) {
 		pthread_mutex_lock(&g_lock);
@@ -1078,6 +1214,8 @@ CUresult cuMulticastBindMem(CUmemGenericAllocationHandle mc, size_t mcOffset,
 	 * record the translated value so dedupe and later unbind/rebind key on
 	 * the current handle. */
 	CUmemGenericAllocationHandle real_mem = xlate_locked(mem);
+	mcvlog("CALL cuMulticastBindMem(off=0x%zx) caller %s", mcOffset,
+	       caller_module(__builtin_return_address(0)));
 	CUresult rc = r_cuMulticastBindMem(real_mc, mcOffset, real_mem,
 	                                   memOffset, size, flags);
 	if (rc == CUDA_SUCCESS) {
@@ -3105,6 +3243,9 @@ static const WrapEntry *wrap_table(void) {
 	    {"cuMemFreeAsync", (void *)cuMemFreeAsync, 1},
 	    {"cuGetProcAddress", (void *)cuGetProcAddress, 0},
 	    {"cuGetProcAddress_v2", (void *)cuGetProcAddress_v2, 0},
+	    /* NVML fabric-info smoothing (see nvml_fabric_info_smooth). */
+	    {"nvmlDeviceGetGpuFabricInfoV",
+	     (void *)nvmlDeviceGetGpuFabricInfoV, 0},
 	    /* CUDA runtime resolvers: covers apps that dlsym them from a
 	     * dlopen'd libcudart rather than linking it. */
 	    {"cudaGetDriverEntryPoint", (void *)cudaGetDriverEntryPoint, 0},

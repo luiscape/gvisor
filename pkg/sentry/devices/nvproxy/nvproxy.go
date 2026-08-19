@@ -148,7 +148,17 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		nvp.devInfo.FabricIMEXManagementDevMinor = opts.HostSettings.FabricIMEXManagementDevMinor
 	}
 
-	if imexChannelCount := opts.HostSettings.IMEXChannelCount(); imexChannelCount != 0 {
+	// IMEX channel devices are part of the fabric/IMEX functionality and are
+	// only exposed together with the fabric-imex-mgmt capability. Exposing
+	// them unconditionally makes the CUDA stack (libcuda, NCCL >= 2.27, torch
+	// >= 2.11) conclude that fabric handles are usable and prefer them over
+	// POSIX-FD handles for VMM allocations -- silently, via internal support
+	// probes -- and fabric-handle memory objects (NV_MEMORY_FABRIC) cannot be
+	// serialized by cuda-checkpoint, so a single one blocks checkpoint.
+	// Native container runtimes only expose these nodes when fabric/IMEX is
+	// explicitly requested, so this also matches non-gVisor behavior.
+	if imexChannelCount := opts.HostSettings.IMEXChannelCount(); imexChannelCount != 0 &&
+		opts.DriverCaps&nvconf.CapFabricIMEXManagement != 0 {
 		capsIMEXChannelsDevMajor, err := vfsObj.GetDynamicCharDevMajor()
 		if err != nil {
 			return nil, fmt.Errorf("allocating device major number for nvidia-caps-imex-channels: %w", err)

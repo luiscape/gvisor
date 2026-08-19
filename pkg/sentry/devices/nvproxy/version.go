@@ -295,7 +295,19 @@ func Init() {
 					nvgpu.NV2080_CTRL_CMD_GPU_GET_PIDS:                                     ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_GPU_GET_PID_INFO:                                 ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_GPU_GET_COMPUTE_POLICY_CONFIG:                    ctrlHandler(rmControlSimple, compUtil),
-					nvgpu.NV2080_CTRL_CMD_GET_GPU_FABRIC_PROBE_INFO:                        ctrlHandler(rmControlSimple, compUtil),
+					// Gated on fabric-imex-mgmt: this probe is how the CUDA stack
+					// decides the GPU is attached to an IMEX fabric domain. When it
+					// succeeds, libcuda lazily creates driver-internal NV_MEMORY_FABRIC
+					// (00f8) FLA registrations over VMM allocations shared between
+					// processes -- objects that cuda-checkpoint checkpoints but cannot
+					// restore (the snapshot dies with OBJECT_NOT_FOUND storms after
+					// restore). Denying the probe (NV_ERR_NOT_SUPPORTED, exactly what a
+					// fabric-less host reports) keeps sandboxes without the capability
+					// fabric-free and checkpointable. Denying the 00f8 class itself is
+					// NOT equivalent: once the probe succeeds, libcuda treats FLA
+					// registration failure during FD export as fatal (measured: torch
+					// dies with "CUDA driver error: unknown error").
+					nvgpu.NV2080_CTRL_CMD_GET_GPU_FABRIC_PROBE_INFO:                        ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement),
 					nvgpu.NV2080_CTRL_CMD_FLA_GET_FABRIC_MEM_STATS:                         ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_GR_GET_ZCULL_INFO:                                ctrlHandler(rmControlSimple, nvconf.CapGraphics),
 					nvgpu.NV2080_CTRL_CMD_GR_CTXSW_ZCULL_BIND:                              ctrlHandler(rmControlSimple, nvconf.CapGraphics),
@@ -418,7 +430,7 @@ func Init() {
 					nvgpu.NV01_DEVICE_0:              allocHandler(rmAllocSimple[nvgpu.NV0080_ALLOC_PARAMETERS], compUtil),
 					nvgpu.NV_SEMAPHORE_SURFACE:       allocHandler(rmAllocSimple[nvgpu.NV_SEMAPHORE_SURFACE_ALLOC_PARAMETERS], nvconf.CapGraphics),
 					nvgpu.RM_USER_SHARED_DATA:        allocHandler(rmAllocSimple[nvgpu.NV00DE_ALLOC_PARAMETERS], compUtil),
-					nvgpu.NV_MEMORY_FABRIC:           allocHandler(rmAllocSimple[nvgpu.NV00F8_ALLOCATION_PARAMETERS], compUtil),
+					nvgpu.NV_MEMORY_FABRIC:           allocHandler(rmAllocMemoryFabric, compUtil),
 					nvgpu.NV_MEMORY_MULTICAST_FABRIC: allocHandler(rmAllocMulticastFabric[nvgpu.NV00FD_ALLOCATION_PARAMETERS], compUtil),
 					nvgpu.NV_MEMORY_MAPPER:           allocHandler(rmAllocSimple[nvgpu.NV_MEMORY_MAPPER_ALLOCATION_PARAMS], nvconf.CapGraphics),
 					nvgpu.NV20_SUBDEVICE_0:           allocHandler(rmAllocSimple[nvgpu.NV2080_ALLOC_PARAMETERS], compUtil),

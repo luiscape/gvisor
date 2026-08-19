@@ -105,12 +105,12 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	// hangs or corrupts the snapshot. Poll (the app may be tearing them down)
 	// and fail loudly with a per-client attribution if they persist.
 	//
-	// Multicast objects are exempt when the LD_PRELOADed interposer is
+	// Multicast/fabric objects are exempt when the LD_PRELOADed interposer is
 	// present: checkpointCudaProcs drives it to release them between the
 	// cuda-checkpoint lock and checkpoint phases (see state_cuda_shim.go).
-	// All other fabric/exported-fd blockers always gate.
+	// All other blockers (e.g. exported fds) always gate.
 	shimDir := cudaShimDir(k, cudaProcs)
-	if err := waitForCudaCheckpointBlockers(k, o.CudaBlockerTimeout, shimDir != "" /* multicastWillBeReleased */); err != nil {
+	if err := waitForCudaCheckpointBlockers(k, o.CudaBlockerTimeout, shimDir != "" /* shimWillRelease */); err != nil {
 		if wasPaused {
 			k.Pause()
 		}
@@ -155,17 +155,24 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 // elapses, in which case it returns an error attributing the blockers to
 // their owning clients/tasks.
 //
-// When multicastWillBeReleased is true, blockers of kind "multicast" are NOT
-// waited for: the interposer releases them between the cuda-checkpoint lock
-// and checkpoint phases and rebuilds them after the post-restore toggle, so
-// the application need not release them itself.
-func waitForCudaCheckpointBlockers(k *kernel.Kernel, timeout time.Duration, multicastWillBeReleased bool) error {
+// When shimWillRelease is true, blockers the interposer's suspend releases
+// are NOT waited for: multicast objects (unbound + released between the
+// cuda-checkpoint lock and checkpoint phases, rebuilt after the post-restore
+// toggle) and the fabric / fabric-import companion objects of VMM
+// exports/imports (the driver allocates an NV_MEMORY_FABRIC object for a
+// POSIX-FD cuMemExportToShareableHandle on fabric-attached GPUs; it is
+// released along with the export/import state the interposer tears down).
+// The application need not release these itself. A second, strict gate runs
+// after the interposer's suspend and before cuda-checkpoint, so an object
+// this exemption mispredicts still fails the checkpoint loudly rather than
+// hanging cuda-checkpoint.
+func waitForCudaCheckpointBlockers(k *kernel.Kernel, timeout time.Duration, shimWillRelease bool) error {
 	if timeout <= 0 {
 		timeout = DefaultCudaBlockerTimeout
 	}
 	deadline := time.Now().Add(timeout)
 	var lastLog time.Time
-	blockers := gatedBlockers(nvproxy.CheckpointBlockers(k.VFS()), multicastWillBeReleased)
+	blockers := gatedBlockers(nvproxy.CheckpointBlockers(k.VFS()), shimWillRelease)
 	for len(blockers) != 0 {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("cuda-checkpoint cannot proceed: %d resource(s) it cannot serialize are still live after %s: %s",
@@ -178,21 +185,26 @@ func waitForCudaCheckpointBlockers(k *kernel.Kernel, timeout time.Duration, mult
 			log.Infof("Waiting for CUDA checkpoint blockers to be released: %s", nvproxy.FormatBlockersByClient(blockers))
 		}
 		time.Sleep(cudaBlockerPollInterval)
-		blockers = gatedBlockers(nvproxy.CheckpointBlockers(k.VFS()), multicastWillBeReleased)
+		blockers = gatedBlockers(nvproxy.CheckpointBlockers(k.VFS()), shimWillRelease)
 	}
 	return nil
 }
 
 // gatedBlockers returns the blockers that must gate the checkpoint. When
-// multicastWillBeReleased is true, multicast objects are released later in the
-// checkpoint sequence and are not gated; all other blockers always gate.
-func gatedBlockers(blockers []nvproxy.CheckpointBlocker, multicastWillBeReleased bool) []nvproxy.CheckpointBlocker {
-	if !multicastWillBeReleased {
+// shimWillRelease is true, the kinds the interposer's suspend releases later
+// in the checkpoint sequence (multicast objects and fabric / fabric-import
+// companions of VMM exports and imports) are not gated; all other blockers
+// always gate.
+func gatedBlockers(blockers []nvproxy.CheckpointBlocker, shimWillRelease bool) []nvproxy.CheckpointBlocker {
+	if !shimWillRelease {
 		return blockers
 	}
 	var out []nvproxy.CheckpointBlocker
 	for _, b := range blockers {
-		if b.Kind != nvproxy.BlockerKindMulticast {
+		switch b.Kind {
+		case nvproxy.BlockerKindMulticast, nvproxy.BlockerKindFabric, nvproxy.BlockerKindFabricImport:
+			// Released by the interposer's suspend.
+		default:
 			out = append(out, b)
 		}
 	}
@@ -653,7 +665,7 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 		// does not by itself prove the process is serializable. Re-run the
 		// gate with nothing exempt, so anything left unreleased fails here
 		// instead of becoming a snapshot that only misbehaves after restore.
-		if err := waitForCudaCheckpointBlockers(k, blockerTimeout, false /* multicastWillBeReleased */); err != nil {
+		if err := waitForCudaCheckpointBlockers(k, blockerTimeout, false /* shimWillRelease */); err != nil {
 			undo(nil)
 			return fmt.Errorf("multicast interposer suspended but resources remain: %w", err)
 		}
