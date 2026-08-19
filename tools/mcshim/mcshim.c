@@ -73,6 +73,12 @@
  * interposition. So the shim ALSO interposes dlsym itself (resolving the
  * real dlsym via dlvsym, which we do not wrap) and cuGetProcAddress/_v2,
  * redirecting lookups of the tracked entry points to the shim's wrappers.
+ * A third resolution path exists: the CUDA *runtime*'s public
+ * cudaGetDriverEntryPoint[ByVersion] exports (torch >= 2.11 resolves its
+ * entire c10 DriverAPI table this way), which reach libcuda through
+ * libcudart's internal dlvsym/export-table bootstrap that neither hook
+ * sees. The torch->libcudart hop is a normal cross-DSO call, though, so
+ * the shim interposes those four cudart exports as well.
  *
  * Build:  ./build.sh   (toolkit-free: CUDA types are declared locally)
  */
@@ -3005,6 +3011,15 @@ GATED(cuMemAllocPitch_v2,
 CUresult cuGetProcAddress(const char *, void **, int, unsigned long long);
 CUresult cuGetProcAddress_v2(const char *, void **, int, unsigned long long,
                              int *);
+/* CUDA runtime resolvers (cudaError_t and the query-result enum are plain
+ * ints in this toolkit-free build; 0 is success for both). */
+int cudaGetDriverEntryPoint(const char *, void **, unsigned long long, int *);
+int cudaGetDriverEntryPoint_ptsz(const char *, void **, unsigned long long,
+                                 int *);
+int cudaGetDriverEntryPointByVersion(const char *, void **, unsigned int,
+                                     unsigned long long, int *);
+int cudaGetDriverEntryPointByVersion_ptsz(const char *, void **, unsigned int,
+                                          unsigned long long, int *);
 
 typedef struct {
 	const char *name;
@@ -3090,6 +3105,15 @@ static const WrapEntry *wrap_table(void) {
 	    {"cuMemFreeAsync", (void *)cuMemFreeAsync, 1},
 	    {"cuGetProcAddress", (void *)cuGetProcAddress, 0},
 	    {"cuGetProcAddress_v2", (void *)cuGetProcAddress_v2, 0},
+	    /* CUDA runtime resolvers: covers apps that dlsym them from a
+	     * dlopen'd libcudart rather than linking it. */
+	    {"cudaGetDriverEntryPoint", (void *)cudaGetDriverEntryPoint, 0},
+	    {"cudaGetDriverEntryPoint_ptsz",
+	     (void *)cudaGetDriverEntryPoint_ptsz, 0},
+	    {"cudaGetDriverEntryPointByVersion",
+	     (void *)cudaGetDriverEntryPointByVersion, 0},
+	    {"cudaGetDriverEntryPointByVersion_ptsz",
+	     (void *)cudaGetDriverEntryPointByVersion_ptsz, 0},
 	    {NULL, NULL, 0},
 	};
 	return t;
@@ -3199,6 +3223,138 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
 		      cudaVersion);
 		*pfn = w;
 	}
+	return rc;
+}
+
+/* Interposed CUDA *runtime* driver-entry-point resolvers.
+ *
+ * torch >= 2.11 resolves its entire c10 DriverAPI table -- cuMemCreate,
+ * cuMulticastCreate, cuMemExportToShareableHandle, ... -- through
+ * cudaGetDriverEntryPointByVersion (a public libcudart export). libcudart
+ * reaches libcuda through an internal dlvsym/cuGetExportTable bootstrap that
+ * neither the dlsym hook nor the cuGetProcAddress wrappers ever see, so
+ * every symbol resolved this way was invisible to the shim. The
+ * torch->libcudart hop itself is an ordinary cross-DSO binding, which
+ * LD_PRELOAD wins: interpose the resolver, let the real runtime do the
+ * lookup, then post-process the result exactly like cuGetProcAddress.
+ *
+ * The runtime's cudaEnable{Default,LegacyStream,PerThreadDefaultStream}
+ * flag values (0, 1, 2) coincide numerically with the driver's
+ * CU_GET_PROC_ADDRESS_* bits, so gpa_redirect's PTDS decline logic applies
+ * unchanged -- except in the _ptsz variants, where cudaEnableDefault means
+ * PTDS (the caller was compiled with per-thread default streams), so the
+ * effective flags for the redirect decision are mapped first.
+ *
+ * The real functions live in libcudart, not libcuda: resolve via RTLD_NEXT
+ * (app linked cudart into the global scope), then by soname against an
+ * already-loaded copy (torch dlopens its bundled cudart RTLD_LOCAL). Never
+ * force-load: if no cudart is loaded, no one can be calling us. If two
+ * different-major cudarts are loaded, the newest wins the forward; their
+ * resolvers differ only in the default-version mapping of the unversioned
+ * variants, and no supported image ships two. */
+
+#define CUDA_ERROR_RT_SYMBOL_NOT_FOUND 500 /* cudaErrorSymbolNotFound */
+
+static void *libcudart_sym(const char *name) {
+	init_real_dlsym();
+	if (!real_dlsym)
+		return NULL;
+	void *s = real_dlsym(RTLD_NEXT, name);
+	if (s)
+		return s;
+	static void *h;
+	if (!h) {
+		static const char *const sonames[] = {
+		    "libcudart.so.13", "libcudart.so.12", "libcudart.so.11.0",
+		    "libcudart.so", NULL};
+		for (int i = 0; !h && sonames[i]; i++)
+			h = dlopen(sonames[i], RTLD_NOW | RTLD_NOLOAD);
+	}
+	return h ? real_dlsym(h, name) : NULL;
+}
+
+#define RTREAL(var, name)                                                      \
+	do {                                                                   \
+		if (!(var))                                                    \
+			*(void **)(&(var)) = libcudart_sym(name);              \
+	} while (0)
+
+/* cudaEnableDefault in a _ptsz resolver means PTDS. */
+static unsigned long long rt_eff_flags(unsigned long long flags, int ptsz) {
+	if (ptsz && flags == 0)
+		return CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM;
+	return flags;
+}
+
+/* The unversioned resolver returns entry points matching the runtime's own
+ * ABI generation; every cudart >= 12.0 (the supported floor) maps to the
+ * v2-era driver ABI, hence version 12000 for the redirect decision. */
+static void rt_gpa_post(const char *symbol, void **pfn, int cudaVersion,
+                        unsigned long long flags, const char *via) {
+	void *w;
+	if (pfn && *pfn && (w = gpa_redirect(symbol, cudaVersion, flags))) {
+		mcvlog("%s(%s, ver=%d) -> shim wrapper", via, symbol,
+		       cudaVersion);
+		*pfn = w;
+	}
+}
+
+int cudaGetDriverEntryPoint(const char *symbol, void **pfn,
+                            unsigned long long flags, int *driverStatus) {
+	static int (*real)(const char *, void **, unsigned long long, int *);
+	RTREAL(real, "cudaGetDriverEntryPoint");
+	if (!real)
+		return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
+	int rc = real(symbol, pfn, flags, driverStatus);
+	if (rc == 0)
+		rt_gpa_post(symbol, pfn, 12000, rt_eff_flags(flags, 0),
+		            "cudaGetDriverEntryPoint");
+	return rc;
+}
+
+int cudaGetDriverEntryPoint_ptsz(const char *symbol, void **pfn,
+                                 unsigned long long flags,
+                                 int *driverStatus) {
+	static int (*real)(const char *, void **, unsigned long long, int *);
+	RTREAL(real, "cudaGetDriverEntryPoint_ptsz");
+	if (!real)
+		return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
+	int rc = real(symbol, pfn, flags, driverStatus);
+	if (rc == 0)
+		rt_gpa_post(symbol, pfn, 12000, rt_eff_flags(flags, 1),
+		            "cudaGetDriverEntryPoint_ptsz");
+	return rc;
+}
+
+int cudaGetDriverEntryPointByVersion(const char *symbol, void **pfn,
+                                     unsigned int cudaVersion,
+                                     unsigned long long flags,
+                                     int *driverStatus) {
+	static int (*real)(const char *, void **, unsigned int,
+	                   unsigned long long, int *);
+	RTREAL(real, "cudaGetDriverEntryPointByVersion");
+	if (!real)
+		return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
+	int rc = real(symbol, pfn, cudaVersion, flags, driverStatus);
+	if (rc == 0)
+		rt_gpa_post(symbol, pfn, (int)cudaVersion, rt_eff_flags(flags, 0),
+		            "cudaGetDriverEntryPointByVersion");
+	return rc;
+}
+
+int cudaGetDriverEntryPointByVersion_ptsz(const char *symbol, void **pfn,
+                                          unsigned int cudaVersion,
+                                          unsigned long long flags,
+                                          int *driverStatus) {
+	static int (*real)(const char *, void **, unsigned int,
+	                   unsigned long long, int *);
+	RTREAL(real, "cudaGetDriverEntryPointByVersion_ptsz");
+	if (!real)
+		return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
+	int rc = real(symbol, pfn, cudaVersion, flags, driverStatus);
+	if (rc == 0)
+		rt_gpa_post(symbol, pfn, (int)cudaVersion, rt_eff_flags(flags, 1),
+		            "cudaGetDriverEntryPointByVersion_ptsz");
 	return rc;
 }
 
