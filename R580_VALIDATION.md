@@ -163,9 +163,52 @@ entry point resolves to a shim wrapper via
 `cudaGetDriverEntryPointByVersion`, the fabric strip fires on torch's probe,
 the multicast group is tracked (`track MC group`), and the multimem
 all-reduce still produces correct results with a live `multicast_ptr`.
-gVisor e2e acceptance (SGLang TP=4 `--enable-torch-symm-mem --dtype bfloat16`
-with C/R; acceptance = 0 fabric allocs in the sentry log + blocker gate
-passes + post-restore inference matches): **pending, next run**.
+
+**gVisor e2e acceptance: PASS** (commit `06fbdce69`). SGLang TP=4
+`--enable-torch-symm-mem --dtype bfloat16 --disable-custom-all-reduce`,
+no torch.compile, `CB_IMEX=0`: checkpoint 45 s, restore + first inference
+37.7 s (**3.6x**), post-restore answer EXACT MATCH, **0 fabric allocations**
+in the sentry log, reproduced twice (plus once on the final binary).
+
+Getting there surfaced a second, deeper blocker beyond shim invisibility:
+on fabric-attached GPUs libcuda lazily creates **driver-internal
+NV_MEMORY_FABRIC (00f8) FLA registrations** over VMM allocations shared
+between processes (torch's symm-mem workspace; `map.hVidMem` identifies the
+covered vidmem) even when the app requested plain POSIX-FD handles.
+cuda-checkpoint *checkpoints* these but cannot *restore* them: the restored
+process dies with `NV_ERR_OBJECT_NOT_FOUND` storms (measured; the strict
+post-suspend gate now exists precisely to refuse such snapshots). The
+trigger is `NV2080_CTRL_CMD_GET_GPU_FABRIC_PROBE_INFO` succeeding, so
+nvproxy now gates that control (and the `nvidia-caps-imex-channels`
+devices) on `fabric-imex-mgmt`. Denying the 00f8 class instead does NOT
+work: after a successful probe, libcuda treats FLA-registration failure
+during FD export as fatal (`CUDA driver error: unknown error`, measured).
+Also fixed on the way: torch's `isFabricSupported` TORCH_CHECKs the
+`nvmlDeviceGetGpuFabricInfoV` status and crashes on NVML error instead of
+falling back -- the shim now smooths that into SUCCESS +
+`state=NOT_SUPPORTED`, which torch handles.
+
+**The `fabric-imex-mgmt` capability is now the operator's knob** (validated
+both ways on the final binary):
+
+| Workload | `CB_IMEX=0` (no fabric cap) | `CB_IMEX=1` (fabric cap granted) |
+| --- | --- | --- |
+| SGLang `--enable-torch-symm-mem` (bf16, no compile) | **PASS 3.6x** (two-shot kernel; multimem needs fabric) | blocked by gate (1 persistent FLA/rank, by design) |
+| SGLang `--enable-nccl-nvls` TP=4 | fails at boot: NCCL treats forced NVLS + denied fabric probe as fatal (`unhandled cuda error`) | **PASS 13.1x** (672 transient 00f8 bind companions, all shim-released) |
+| Everything else in the matrix (no fabric users) | PASS | PASS |
+
+Rules of thumb: leave `CB_IMEX=0` for checkpointable torch-symm-mem
+workloads and do not force `--enable-nccl-nvls` there (NCCL auto mode
+degrades gracefully); grant the capability for max-perf NVLS/multimem
+workloads, which remain checkpointable as long as fabric objects stay
+transient or shim-released.
+
+Remaining known-notworking: `--enable-torch-compile` + symm-mem is an
+app-level SGLang/torch inductor bug (its fused kernel passes
+`multicast_ptr` as a plain int, dynamo cannot trace it: `'int' object has
+no attribute 'to'` -> inductor `xreplace` fatal during CUDA graph capture;
+**reproduced natively without gVisor/shim**). The validated symm-mem
+recipe matches the TP=8 A/B: no torch.compile.
 
 **Measured cost of losing it** (A/B on this box, plain docker/runc since the
 delta is GPU-side; SGLang TP=8, Qwen2.5-3B, `--disable-custom-all-reduce` in
