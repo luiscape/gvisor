@@ -224,6 +224,15 @@ type nvproxy struct {
 	devInfo                DeviceInfo
 	regularDevs            [nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1]*frontendDevice
 
+	// suspendedFLARegs records FLA registrations host-freed for an
+	// in-progress checkpoint, for replay after the cuda-checkpoint restore
+	// toggle. It lives here rather than in the object graph because
+	// cuda-checkpoint's checkpoint phase frees the process's RM objects
+	// through nvproxy, cascading graph entries away before the sandbox state
+	// is saved. Accessed only from checkpoint/restore control paths, which
+	// are serialized; no lock needed.
+	suspendedFLARegs []suspendedFLARegistration
+
 	// devTransMu guards the device translation state below. It is
 	// deliberately not fdsMu: afterLoad() calls frontendFD.load() while
 	// holding fdsMu, and load() records the translations, so reusing fdsMu

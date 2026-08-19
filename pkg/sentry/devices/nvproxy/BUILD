@@ -44,6 +44,8 @@ go_library(
     srcs = [
         "checkpoint_blockers.go",
         "fds_mutex.go",
+        "fla_registration.go",
+        "fla_registration_unsafe.go",
         "frontend.go",
         "frontend_mmap.go",
         "frontend_mmap_mutex.go",

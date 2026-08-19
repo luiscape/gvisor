@@ -290,6 +290,21 @@ func postResumeCuda(k *kernel.Kernel, timeline *timing.Timeline) error {
 		tg.SigsegvUnlock()
 	}
 
+	// Recreate host-freed FLA registrations. Only the resume-after-save path
+	// needs this (the registrations were freed for the checkpoint and
+	// cuda-checkpoint's restore knows nothing about them); after a true
+	// restore this is a no-op, because the afterLoad object replay already
+	// recreated them. Ordering: after the toggle (the covered vidmem must
+	// exist again), before the interposer resume (whose re-exports assume
+	// exporter-side state is whole).
+	if err == nil {
+		if n, rerr := nvproxy.ReplayFLARegistrations(k.VFS()); rerr != nil {
+			err = fmt.Errorf("replaying FLA registrations: %w", rerr)
+		} else if n > 0 {
+			log.Infof("nvproxy: replayed %d FLA registrations after resume", n)
+		}
+	}
+
 	// Rebuild the interposer's multicast objects and CUDA IPC imports.
 	//
 	// Ordering here is doubly constrained. It must run after the restore
@@ -640,6 +655,12 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 		// happened with everything already unlocked, where a blanket unlock
 		// would only produce misleading "unlock failed" warnings).
 		undo := func(stillLocked []*kernel.ThreadGroup) {
+			// Recreate host-freed FLA registrations FIRST (sentry-driven, so
+			// process lock state is irrelevant): once the application runs
+			// again, libcuda may reference their handles.
+			if n, rerr := nvproxy.ReplayFLARegistrations(k.VFS()); rerr != nil {
+				log.Warningf("replaying FLA registrations during checkpoint unwind failed after %d: %v", n, rerr)
+			}
 			if len(stillLocked) != 0 {
 				if _, uerr := runCudaAction(sctx, k, cudaCheckpointPath, stillLocked, []string{"--action", "unlock"}, true, nullFD); uerr != nil {
 					log.Warningf("cuda-checkpoint unlock during checkpoint unwind failed: %v", uerr)
@@ -660,6 +681,19 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 		if err := suspendCudaMulticastShim(sctx, k, locked, shimDir); err != nil {
 			undo(nil)
 			return err
+		}
+		// Host-free driver-internal FLA registrations (NV_MEMORY_FABRIC
+		// objects covering peer-shared VMM allocations). The interposer
+		// cannot release these -- no CUDA API frees them -- and
+		// cuda-checkpoint checkpoints them but cannot restore them. They
+		// stay in the object graph marked hostFreed; the afterLoad object
+		// replay recreates them (after the vidmem they cover, via a
+		// restore-ordering dependency) before the post-restore toggle.
+		if n, err := nvproxy.SuspendFLARegistrations(k.VFS()); err != nil {
+			undo(nil)
+			return fmt.Errorf("suspending FLA registrations: %w", err)
+		} else if n > 0 {
+			log.Infof("nvproxy: host-freed %d FLA registrations for checkpoint", n)
 		}
 		// Verify rather than trust: the interposer acknowledging its suspend
 		// does not by itself prove the process is serializable. Re-run the
@@ -682,6 +716,11 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 		// Best-effort undo: restore then unlock, returning the app to running.
 		if _, rerr := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "restore"}, !sequential, nullFD); rerr != nil {
 			log.Warningf("cuda-checkpoint restore after checkpoint-phase failure also failed: %v", rerr)
+		}
+		// Recreate host-freed FLA registrations before the app runs again
+		// (no-op when none were freed, e.g. the shimless path).
+		if n, rerr := nvproxy.ReplayFLARegistrations(k.VFS()); rerr != nil {
+			log.Warningf("replaying FLA registrations after checkpoint-phase failure failed after %d: %v", n, rerr)
 		}
 		if _, uerr := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "unlock"}, true, nullFD); uerr != nil {
 			log.Warningf("cuda-checkpoint unlock after checkpoint-phase failure also failed: %v", uerr)

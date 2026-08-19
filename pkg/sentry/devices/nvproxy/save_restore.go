@@ -248,6 +248,12 @@ func (nvp *nvproxy) afterLoad(ctx goContext.Context) {
 		panic(fmt.Sprintf("driver version %q not found in abis map", nvp.version))
 	}
 	nvp.abi = abiEntry.cons()
+	// FLA registrations suspended for the checkpoint are replayable only
+	// while the process's other RM handles survive, which a true restore's
+	// cuda-checkpoint toggle does not preserve (it rebuilds the process's
+	// objects under fresh handles). libcuda re-registers lazily on the next
+	// export instead; see ReplayFLARegistrations.
+	nvp.suspendedFLARegs = nil
 	if dr := DeviceRemappingFromContext(ctx); dr != nil {
 		// Also done by frontendFD.load(), since stateify does not order it
 		// against this hook; this call covers a sandbox with no frontend FDs.
