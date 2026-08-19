@@ -125,7 +125,7 @@ The two TP=8 restrictions, precisely:
     (`kernels/jit/csrc/distributed/ipc.cuh`) fails to compile at world=8 in
     this image -- an application-level bug unrelated to checkpoint/restore.
 
-### SGLang `--enable-torch-symm-mem`: not checkpointable on this stack
+### SGLang `--enable-torch-symm-mem`: FIXED (runtime-resolver interposition)
 
 torch 2.11's symmetric memory prefers **fabric handles** wherever the device
 advertises `CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED`, and every such
@@ -133,14 +133,39 @@ allocation creates an `NV_MEMORY_FABRIC` (00f8) object at allocation time that
 cuda-checkpoint cannot serialize. The blocker gate refuses the checkpoint (one
 fabric object per rank), exactly as designed.
 
-The interposer cannot fix this one: torch reaches the driver through its
-statically linked CUDA runtime, which resolves entry points by a path that
-bypasses dlsym/cuGetProcAddress interposition entirely. Measured directly: a
-run where the shim's new fabric-stripping `cuMemCreate` wrapper fired 4 times
-still produced **680** fabric allocations at the sentry -- torch's calls never
-pass through the shim. (The stripping wrapper and the
-`HANDLE_TYPE_FABRIC_SUPPORTED` mask stay in the shim: they close the same hole
-for every dynamically-resolving component, NCCL included, and cost nothing.)
+**Root cause of the shim invisibility (found, fixed).** The earlier diagnosis
+("statically linked runtime, unfixable") was wrong. torch 2.11 resolves its
+entire c10 `DriverAPI` table -- `cuMemCreate`, `cuMulticast*`,
+`cuMemExport/ImportFromShareableHandle`, `cuDeviceGetAttribute`, ... --
+through `cudaGetDriverEntryPointByVersion`, a **public export of its bundled
+`libcudart.so.13`** (`torch/include/c10/cuda/driver_api.h` pins per-symbol
+versions, e.g. `(cuMemCreate, 12000)`, `(cuMulticastCreate, 12030)`).
+libcudart then reaches libcuda through an internal dlvsym/`cuGetExportTable`
+bootstrap that neither the `dlsym` hook nor the `cuGetProcAddress` wrappers
+ever see -- hence 680 invisible fabric allocs while the strip fired only on
+NCCL's path. But the torch->libcudart hop is an ordinary cross-DSO binding,
+which LD_PRELOAD wins: the shim now interposes all four resolver exports
+(`cudaGetDriverEntryPoint[ByVersion][_ptsz]`), forwards to the real runtime,
+and post-processes results through the same `gpa_redirect` as
+`cuGetProcAddress` (runtime stream-flag values coincide with the driver's
+bits; in the `_ptsz` variants `cudaEnableDefault` itself means PTDS).
+
+Better still, disassembly of `libc10_cuda.so` shows torch's
+`isFabricSupported()` is an **empirical probe**: `cuMemCreate` +
+`cuMemExportToShareableHandle(type=FABRIC)` on a scratch allocation. With the
+resolver interposed, the existing `cuMemCreate` fabric strip makes that probe
+fail cleanly, so torch itself concludes fabric is unavailable and falls back
+to POSIX-FD symm-mem -- the exact path the shim already suspends/resumes.
+
+Native verification (cr-bench-sglang image, torch 2.11, 2 ranks, bf16
+`symm_mem.empty` + `rendezvous` + `multimem_all_reduce_`): every tracked
+entry point resolves to a shim wrapper via
+`cudaGetDriverEntryPointByVersion`, the fabric strip fires on torch's probe,
+the multicast group is tracked (`track MC group`), and the multimem
+all-reduce still produces correct results with a live `multicast_ptr`.
+gVisor e2e acceptance (SGLang TP=4 `--enable-torch-symm-mem --dtype bfloat16`
+with C/R; acceptance = 0 fabric allocs in the sentry log + blocker gate
+passes + post-restore inference matches): **pending, next run**.
 
 **Measured cost of losing it** (A/B on this box, plain docker/runc since the
 delta is GPU-side; SGLang TP=8, Qwen2.5-3B, `--disable-custom-all-reduce` in
