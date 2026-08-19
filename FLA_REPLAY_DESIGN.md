@@ -1,8 +1,26 @@
 # Design: suspend/replay of persistent FLA registrations (NV_MEMORY_FABRIC 00f8)
 
-Status: designed, not implemented. This is the single remaining blocker class
-for checkpointing engaged multicast features (torch symm-mem multimem,
-FlashInfer all-reduce fusion) under `fabric-imex-mgmt`.
+Status: **IMPLEMENTED** (`pkg/sentry/devices/nvproxy/fla_registration.go` +
+`state_cuda.go` wiring; see the commit "nvproxy: suspend FLA registrations
+around cuda-checkpoint"). The implementation diverges from the sketch below
+in two ways, both forced by measurement -- read the commit message and
+`R580_VALIDATION.md` before trusting details here:
+
+1. Replay bookkeeping lives on `nvproxy.suspendedFLARegs`, NOT on graph
+   objects: cuda-checkpoint's checkpoint phase frees the process's RM
+   objects through nvproxy and cascades graph entries away before
+   state.Save.
+2. There is no post-toggle replay after a TRUE restore: the toggle rebuilds
+   the process's RM objects under fresh handles, so identity replay is
+   impossible -- and unnecessary, because libcuda lazily re-registers on the
+   next export. Replay applies only to checkpoint-failure unwind and
+   resume-after-save.
+
+Outcome: FlashInfer allreduce fusion (trtllm backend) under fabric-imex-mgmt
+now passes checkpoint/restore end-to-end. torch symm-mem multimem advances
+to a distinct, pre-existing restore failure (interposer re-export of torch's
+workspace returns rc=1; torch caches export state the fusion path does not)
+-- the open item for the next session.
 
 ## Problem (fully characterized, 2026-08-19)
 
