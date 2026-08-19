@@ -818,15 +818,19 @@ CUresult cuMemExportToShareableHandle(void *shHandle,
                                       CUmemGenericAllocationHandle h, int type,
                                       unsigned long long flags) {
 	resolve_reals();
-	/* Refuse fabric-typed exports: THIS is the call that creates the
-	 * un-serializable NV_MEMORY_FABRIC (00f8) object. Stripping the
-	 * handle type at cuMemCreate is not enough -- the driver happily
-	 * fabric-exports memory that never requested fabric handles, so
-	 * torch 2.11's empirical isFabricSupported probe (create, then
-	 * export-as-FABRIC) still succeeds and symm-mem then fabric-exports
-	 * every pool chunk. Failing the export makes the probe conclude
-	 * fabric is unavailable and fall back to POSIX fds, which the shim
-	 * fully supports; on a single node that costs nothing. */
+	/* Refuse fabric-typed exports. Stripping the handle type at
+	 * cuMemCreate is not enough: the driver happily fabric-exports
+	 * memory that never requested fabric handles, so torch 2.11's
+	 * empirical isFabricSupported probe (create, then export-as-FABRIC)
+	 * still succeeds and symm-mem then exchanges CUmemFabricHandles --
+	 * one un-serializable NV_MEMORY_FABRIC (00f8) object per pool chunk.
+	 * Failing the export makes the probe conclude fabric is unavailable
+	 * and fall back to POSIX fds, which the shim fully supports; on a
+	 * single node that costs nothing. (Not sufficient by itself: on
+	 * fabric-attached systems libcuda also creates driver-internal 00f8
+	 * FLA registrations over FD-shared memory once the RM fabric probe
+	 * has succeeded -- suppressing those is nvproxy's job, by gating
+	 * NV2080_CTRL_CMD_GET_GPU_FABRIC_PROBE_INFO on fabric-imex-mgmt.) */
 	if (type == CU_MEM_HANDLE_TYPE_FABRIC && !getenv("MCSHIM_ALLOW_FABRIC")) {
 		static int logged;
 		if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
