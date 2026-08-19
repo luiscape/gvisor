@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
@@ -34,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 var _ vfs.FilesystemImplSaveRestoreExtension = (*filesystem)(nil)
@@ -280,13 +282,25 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	fs.inoByKey = make(map[inoKey]uint64)
 	fs.inodeByKey = make(map[inoKey]*inode)
 
+	// Restoring a dentry opens up to two long-lived host FDs. Reserve FD
+	// table space for all of them up front; see reserveFDTable.
+	levels := fs.root.descendantsByDepth()
+	numDentries := 0
+	for _, level := range levels {
+		numDentries += len(level)
+	}
+	reserveFDTable(fd, 2*numDentries)
+
 	if err := fs.restoreRoot(ctx, &opts); err != nil {
 		return vfs.PrependErrMsg("failed to restore root", err)
 	}
 
-	// Restore remaining dentries.
-	if err := fs.root.restoreDescendantsRecursive(ctx, &opts); err != nil {
-		return err
+	// Restore remaining dentries, one depth at a time; restoring a dentry
+	// requires that its parent is already restored.
+	for _, level := range levels {
+		if err := restoreFilesParallel(ctx, level, &opts); err != nil {
+			return err
+		}
 	}
 
 	// Restore deleted files which are still accessible via open application FDs.
@@ -357,25 +371,119 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	return nil
 }
 
-// Preconditions: d is not synthetic.
-func (d *dentry) restoreDescendantsRecursive(ctx context.Context, opts *vfs.CompleteRestoreOptions) error {
-	d.childrenMu.Lock()
-	defer d.childrenMu.Unlock()
-	for _, child := range d.children {
-		if child == nil {
-			continue
+// descendantsByDepth returns all non-synthetic descendants of d, grouped and
+// ordered by depth. It performs no I/O.
+//
+// Hard-linked dentries share inodes, and each inode must only be restored
+// once (dentry.restoreFile()'s idempotence check is not safe under concurrent
+// restores), so all but one dentry per shared inode are omitted. Only
+// non-directory inodes may be shared (see filesystem.inodeByKey), so this
+// never omits a dentry's children.
+func (d *dentry) descendantsByDepth() [][]*dentry {
+	var levels [][]*dentry
+	inodes := make(map[*inode]struct{})
+	level := []*dentry{d}
+	for len(level) > 0 {
+		var next []*dentry
+		for _, parent := range level {
+			parent.childrenMu.Lock()
+			for _, child := range parent.children {
+				if child == nil || child.inode.isSynthetic() {
+					continue
+				}
+				if !child.isDir() {
+					if _, ok := inodes[child.inode]; ok {
+						continue
+					}
+					inodes[child.inode] = struct{}{}
+				}
+				next = append(next, child)
+			}
+			parent.childrenMu.Unlock()
 		}
-		if child.inode.isSynthetic() {
-			continue
+		if len(next) > 0 {
+			levels = append(levels, next)
 		}
-		if err := child.restoreFile(ctx, opts); err != nil {
-			return err
-		}
-		if err := child.restoreDescendantsRecursive(ctx, opts); err != nil {
-			return err
+		level = next
+	}
+	return levels
+}
+
+// reserveFDTable ensures that the calling process's FD table has room for at
+// least n more FDs without expansion. fd may be any valid FD. Failures are
+// ignored; this only affects performance.
+//
+// The kernel grows a process's FD table by repeated doubling, copying the
+// whole table and, for multithreaded processes, waiting for an RCU grace
+// period per expansion (Linux: fs/file.c:expand_fdtable()). Opening thousands
+// of FDs this way takes hundreds of milliseconds; a single allocation at a
+// high FD number performs all of the growth at once. The kernel never shrinks
+// the table, so the reservation outlives the reserved FD's closure.
+func reserveFDTable(fd, n int) {
+	if n <= 0 {
+		return
+	}
+	// dup(2) allocates the lowest unused FD, a lower bound on the in-use FD
+	// space.
+	probe, err := unix.Dup(fd)
+	if err != nil {
+		return
+	}
+	unix.Close(probe)
+	for target := probe + n; target > probe; target /= 2 {
+		// F_DUPFD_CLOEXEC allocates the lowest unused FD >= target, growing
+		// the table as needed; unlike dup3(2), it cannot replace an in-use
+		// FD. It fails with EINVAL or EMFILE if target exceeds RLIMIT_NOFILE,
+		// which cannot be read under the sentry's seccomp filters, so retry
+		// smaller.
+		if reserved, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, target); err == nil {
+			unix.Close(reserved)
+			return
 		}
 	}
-	return nil
+}
+
+// maxDentryRestoreConcurrency is the maximum number of concurrent
+// dentry.restoreFile() calls during CompleteRestore(). Each call is one gofer
+// round trip (lisafs) or an openat(2)+statx(2) pair (directfs), so this work
+// is I/O-latency-bound and need not scale with CPU count.
+const maxDentryRestoreConcurrency = 32
+
+// restoreFilesParallel calls restoreFile() on each dentry in ds using a
+// bounded number of goroutines, and returns one of the errors if any occur.
+func restoreFilesParallel(ctx context.Context, ds []*dentry, opts *vfs.CompleteRestoreOptions) error {
+	if len(ds) == 1 {
+		return ds[0].restoreFile(ctx, opts)
+	}
+	var (
+		nextIdx atomicbitops.Int64
+		failed  atomicbitops.Bool
+		err     error
+		wg      sync.WaitGroup
+	)
+	workers := min(maxDentryRestoreConcurrency, len(ds))
+	wg.Add(workers)
+	for range workers {
+		go func() { // S/R-SAFE: joined below, before restore completes.
+			defer wg.Done()
+			for !failed.Load() {
+				i := int(nextIdx.Add(1)) - 1
+				if i >= len(ds) {
+					return
+				}
+				if rerr := ds[i].restoreFile(ctx, opts); rerr != nil {
+					// The CAS winner is the only writer of err; wg.Wait()
+					// orders the write before the read.
+					if failed.CompareAndSwap(false, true) {
+						err = rerr
+					}
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return err
 }
 
 // restoreDeleted restores a deleted dentry for a directory or regular file.

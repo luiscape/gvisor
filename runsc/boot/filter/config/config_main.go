@@ -60,6 +60,14 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 			seccomp.AnyValue{},
 			seccomp.EqualTo(unix.F_GETFD),
 		},
+		// F_DUPFD_CLOEXEC is used by gofer restore to reserve FD table space
+		// (see pkg/sentry/fsimpl/gofer.reserveFDTable). It grants nothing
+		// beyond the unconditionally-allowed dup(2)/dup3(2) above; unlike
+		// dup3(2), it cannot even replace an existing descriptor.
+		seccomp.PerArg{
+			seccomp.AnyValue{},
+			seccomp.EqualTo(unix.F_DUPFD_CLOEXEC),
+		},
 	},
 	unix.SYS_FSTAT: seccomp.MatchAll{},
 	unix.SYS_FSTATFS: seccomp.PerArg{
