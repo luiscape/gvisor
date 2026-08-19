@@ -285,6 +285,25 @@ Key findings:
    the fusion workspace, surviving the shim's group/bind/import teardown.
    Both remaining gaps are the same object class with the same fix surface.
 
+### FLA registration suspend/replay (implemented same day)
+
+nvproxy now host-frees FLA registrations inside the cuda-checkpoint suspend
+window and replays them where the process's driver state survives (unwind /
+resume-after-save); after a true restore libcuda lazily re-registers on the
+next export (measured), so afterLoad drops the record. Iteration history
+that matters for future work -- each variant was run e2e and failed for a
+measured reason: replay bookkeeping attached to graph objects is cascaded
+away by cuda-checkpoint's own frees before state.Save; foreign-fd RM calls
+fail INVALID_CLIENT; app-closed fds fail ENOTTY/EBADF; post-toggle the
+rebuilt graph uses FRESH handles, so identity replay after true restore is
+impossible (and unnecessary).
+
+| Config (all `CB_IMEX=1`, fabric granted) | Before | After |
+| --- | --- | --- |
+| SGLang TP=4 `--flashinfer-allreduce-fusion-backend trtllm` | checkpoint refused (1 fabric/rank) | **PASS end-to-end** (fusion re-engages post-restore) |
+| SGLang TP=4 `--enable-torch-symm-mem` (multimem) | checkpoint refused | checkpoint + FLA suspend pass; **restore still fails** in the interposer's re-export of torch's workspace (rc=1) -- a separate, pre-existing issue (torch caches export state the fusion path does not) |
+| phase0 harness + no-fabric matrix | PASS | PASS (unaffected) |
+
 Not validated (no claims): SGLang mscclpp, pipeline parallelism, MoE/EP,
 quantized paths, models beyond Qwen2.5 1.5B/3B.
 Out of scope by design: chained cross-GPU restores (panics loudly), R610
