@@ -148,15 +148,14 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		nvp.devInfo.FabricIMEXManagementDevMinor = opts.HostSettings.FabricIMEXManagementDevMinor
 	}
 
-	// IMEX channel devices are part of the fabric/IMEX functionality and are
-	// only exposed together with the fabric-imex-mgmt capability. Exposing
-	// them unconditionally makes the CUDA stack (libcuda, NCCL >= 2.27, torch
-	// >= 2.11) conclude that fabric handles are usable and prefer them over
-	// POSIX-FD handles for VMM allocations -- silently, via internal support
-	// probes -- and fabric-handle memory objects (NV_MEMORY_FABRIC) cannot be
-	// serialized by cuda-checkpoint, so a single one blocks checkpoint.
-	// Native container runtimes only expose these nodes when fabric/IMEX is
-	// explicitly requested, so this also matches non-gVisor behavior.
+	// IMEX channel devices are exposed only together with the
+	// fabric-imex-mgmt capability: IMEX is multi-node (MNNVL) memory-sharing
+	// functionality, the capability that grants its management interface is
+	// deliberately privileged, and native container runtimes only expose
+	// these nodes when IMEX is explicitly requested. (Note that hiding them
+	// does NOT hide the fabric domain from libcuda -- that is signaled by
+	// the RM fabric probe, which stays available to default sandboxes so
+	// single-node NVLS multicast keeps working; see version.go.)
 	if imexChannelCount := opts.HostSettings.IMEXChannelCount(); imexChannelCount != 0 &&
 		opts.DriverCaps&nvconf.CapFabricIMEXManagement != 0 {
 		capsIMEXChannelsDevMajor, err := vfsObj.GetDynamicCharDevMajor()

@@ -98,11 +98,10 @@ type suspendedFLARegistration struct {
 	parentH nvgpu.Handle
 	hVidMem nvgpu.Handle
 	params  capturedRmAllocParams
-	// clientFD is the frontendFD that allocated the root client. RM binds
-	// clients to their allocating fd (frees or allocs on behalf of the
-	// client via any other fd fail with NV_ERR_INVALID_CLIENT, measured), so
-	// the replay must ride this fd. The pointer survives the state
-	// round-trip; frontendFD.load() gives it a fresh hostFD at restore.
+	// clientFD is the frontendFD that allocated the root client -- the one
+	// carrier known-good for sentry-driven RM calls on this client
+	// (another process's fd fails with NV_ERR_INVALID_CLIENT, measured).
+	// The pointer survives the state round-trip.
 	clientFD *frontendFD
 }
 
@@ -204,6 +203,9 @@ func (nvp *nvproxy) suspendFLARegistrations() (int, error) {
 		for _, f := range cleanup {
 			f()
 		}
+		// Append, never reset: records left by an earlier failed unwind
+		// are still-freed registrations that the next replay opportunity
+		// must also cover.
 		nvp.suspendedFLARegs = append(nvp.suspendedFLARegs, rec)
 		freed++
 		log.Debugf("nvproxy: host-freed FLA registration %v:%v for checkpoint", t.client.handle, t.obj.handle)
@@ -232,7 +234,6 @@ func ReplayFLARegistrations(vfsObj *vfs.VirtualFilesystem) (int, error) {
 	}
 	return nvp.replayFLARegistrations()
 }
-
 
 func (nvp *nvproxy) replayFLARegistrations() (int, error) {
 	regs := nvp.suspendedFLARegs

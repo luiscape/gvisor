@@ -906,15 +906,14 @@ CUresult cuMemImportFromShareableHandle(CUmemGenericAllocationHandle *h,
  *
  * torch >= 2.11's isFabricSupported() TORCH_CHECKs that
  * nvmlDeviceGetGpuFabricInfoV returns NVML_SUCCESS and only then inspects
- * fabricInfo.state -- an NVML error is a hard crash, not a fallback. When
- * the sandbox denies the fabric probe (nvproxy without fabric-imex-mgmt
- * returns NV_ERR_NOT_SUPPORTED, like a fabric-less host), NVML surfaces
- * that as an error and torch dies at symm-mem init. Translate failure into
- * what a fabric-less host reports: NVML_SUCCESS with
- * state=NVML_GPU_FABRIC_STATE_NOT_SUPPORTED (0), which torch handles
- * gracefully. The versioned-struct size travels in the version field's low
- * 24 bits (NVML_STRUCT_VERSION), so the payload can be zeroed exactly.
- * Opt out with MCSHIM_ALLOW_FABRIC=1. */
+ * fabricInfo.state -- an NVML error is a hard crash, not a fallback. On any
+ * stack where the query errors (measured on a sandbox that denied the RM
+ * fabric probe; host/driver variance can produce the same), torch dies at
+ * symm-mem init. Translate failure into what a fabric-less host reports:
+ * NVML_SUCCESS with state=NVML_GPU_FABRIC_STATE_NOT_SUPPORTED (0), which
+ * torch handles gracefully. The versioned-struct size travels in the
+ * version field's low 24 bits (NVML_STRUCT_VERSION), so the payload can be
+ * zeroed exactly. Opt out with MCSHIM_ALLOW_FABRIC=1. */
 static int nvml_fabric_info_smooth(void *info, int rc, const char *via) {
 	if (rc == 0 || !info || getenv("MCSHIM_ALLOW_FABRIC"))
 		return rc;
@@ -927,8 +926,8 @@ static int nvml_fabric_info_smooth(void *info, int rc, const char *via) {
 	static int logged;
 	if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
 		mclog("%s failed (rc=%d): reporting fabric NOT_SUPPORTED "
-		      "instead (fabric is denied in this sandbox); set "
-		      "MCSHIM_ALLOW_FABRIC=1 to pass errors through", via, rc);
+		      "instead; set MCSHIM_ALLOW_FABRIC=1 to pass errors "
+		      "through", via, rc);
 	return 0; /* NVML_SUCCESS */
 }
 

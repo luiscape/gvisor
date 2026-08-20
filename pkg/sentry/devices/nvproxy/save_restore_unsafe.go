@@ -164,7 +164,7 @@ func (c *capturedRmAllocParams) restore() error {
 // allocation time dies with the application fd; the RM client does not).
 func (c *capturedRmAllocParams) restoreOnFD(hostFD int32) error {
 	if hostFD < 0 {
-		return fmt.Errorf("no live host control fd")
+		return fmt.Errorf("no live host fd to carry the replay")
 	}
 	// Copy all parameters that might be driver-mutated to avoid modifying c.
 	ioctlParams := c.ioctlParams
