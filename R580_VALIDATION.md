@@ -356,6 +356,18 @@ Gate findings worth keeping:
    torn down by cuda-checkpoint (client-identity check; errno probing is
    unreliable because the restore toggle recycles fd numbers).
 
+### Post-rebase minimization regate (2026-08-20 evening)
+
+After rebasing onto master, dropping R610 job support, and cutting the
+sentry-side multicast attach record/replay layer (-961 lines; unreachable
+behind the blocker gate, superseded by the interposer's own
+teardown/rebuild), the full gate was rerun on the final binary: phase0
+PASS, vllm_tp4 PASS, vllm_tp2_xgpu PASS, sglang_tp4_nvls PASS,
+sglang_tp4_fusion PASS (4/4 + phase0). The phase0 harness now fails
+loudly if `tools/mcshim/mcshim.so` is missing instead of silently running
+a stale fallback shim (that fallback misdirected a real debugging
+session).
+
 ## Results
 
 ### Interposer-level (phase0 harnesses)
