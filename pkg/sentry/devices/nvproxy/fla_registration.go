@@ -43,11 +43,13 @@ import (
 // nvproxy.suspendedFLARegs, so cuda-checkpoint never sees one. What happens
 // afterwards depends on the fate of the process's driver state:
 //
-//   - Checkpoint-failure unwind (driver state survived in place):
-//     ReplayFLARegistrations recreates each registration with identical
-//     client/handle/params before the application runs again.
-//   - Resume-after-save: out of scope (single-pass checkpoint->restore
-//     only); postResumeCuda fails loudly if any registration is pending.
+//   - Checkpoint-failure unwind, including resume after a FAILED save
+//     (driver state survived in place): ReplayFLARegistrations recreates
+//     each registration with identical client/handle/params before the
+//     application runs again.
+//   - Resume after a SUCCESSFUL save: out of scope (single-pass
+//     checkpoint->restore only); postResumeCuda fails loudly if any
+//     registration is pending.
 //   - True restore: replay is impossible and unnecessary; see the comment
 //     in nvproxy.afterLoad, which drops the record. libcuda lazily
 //     re-registers on the next export.
@@ -99,6 +101,12 @@ type suspendedFLARegistration struct {
 	parentH nvgpu.Handle
 	hVidMem nvgpu.Handle
 	params  capturedRmAllocParams
+	// client is the rootClient the registration belonged to, by IDENTITY:
+	// replay is valid only while nvp.clients[clientH] is still this exact
+	// object. If cuda-checkpoint's teardown freed the client (and the
+	// restore toggle rebuilt one under the same handle), the record is
+	// stale and must be dropped instead -- see replayFLARegistrations.
+	client *rootClient
 	// clientFD is the frontendFD that allocated the root client -- the one
 	// carrier known-good for sentry-driven RM calls on this client
 	// (another process's fd fails with NV_ERR_INVALID_CLIENT, measured).
@@ -193,6 +201,7 @@ func (nvp *nvproxy) suspendFLARegistrations() (int, error) {
 			parentH:  t.obj.parent,
 			hVidMem:  allocParams.Map.HVidMem,
 			params:   t.obj.params,
+			client:   t.client,
 			clientFD: clientFD,
 		}
 		// Drop the graph entry: the driver-side object no longer exists, and
@@ -216,9 +225,12 @@ func (nvp *nvproxy) suspendFLARegistrations() (int, error) {
 
 // ReplayFLARegistrations recreates the registrations freed by
 // SuspendFLARegistrations with their original handles and parameters, and
-// re-records them in the object graph. It is the checkpoint-failure unwind:
-// the application must keep running (or be re-checkpointed) with its driver
-// state whole. After a TRUE restore nvproxy.afterLoad drops the record
+// re-records them in the object graph. It serves the checkpoint-failure
+// paths: the application must keep running (or be re-checkpointed) with its
+// driver state whole. Records whose client was torn down by cuda-checkpoint
+// (failures past the checkpoint action) are dropped instead of replayed --
+// for those the restore toggle rebuilt driver state fresh and libcuda
+// re-registers lazily, exactly as after a true restore. After a TRUE restore nvproxy.afterLoad drops the record
 // instead: sentry-driven allocation into the restored client is impossible
 // (measured exhaustively -- see the comment in afterLoad), and libcuda
 // re-registers lazily on the next export. The residual gap is workloads
@@ -256,31 +268,46 @@ func (nvp *nvproxy) replayFLARegistrations() (int, error) {
 	ctx := context.Background()
 	for i := range regs {
 		rec := &regs[i]
-		// The replay rides the same fd that carried the suspend-time free
-		// moments earlier: the application has been frozen since the free
-		// (this only runs on the checkpoint-failure unwind), so the fd is
-		// necessarily still open. (A true restore never reaches here; see
-		// afterLoad.)
-		err := rec.params.restoreOnFD(rec.clientFD.hostFD)
-		if err != nil {
-			// Drop what was replayed; keep the rest recorded for another
-			// attempt or for diagnosis.
-			nvp.suspendedFLARegs = regs[replayed:]
-			return replayed, fmt.Errorf("replaying FLA registration %v:%v failed: %w", rec.clientH, rec.objectH, err)
-		}
-		// Re-record in the object graph so a later checkpoint sees the truth.
+		// Which failure geometry is this record in? Decided structurally, by
+		// client identity in the sentry's own object graph -- errno probing
+		// is unreliable here because the restore toggle recycles fd numbers:
+		//
+		//   - Failure BEFORE the cuda-checkpoint checkpoint action: the
+		//     application was frozen the whole time, so the client that
+		//     allocated the registration is still live and IS
+		//     nvp.clients[clientH]. Its allocating fd is open by RM
+		//     invariant (RM frees the client when its fd closes), and the
+		//     replay must recreate the registration on it.
+		//   - Failure AFTER the checkpoint action (e.g. the save failed in
+		//     encoding): the checkpoint action freed the client through
+		//     nvproxy (removing it from nvp.clients), and the restore toggle
+		//     rebuilt driver state fresh -- possibly a NEW client under the
+		//     same handle. That is the same geometry as a true restore,
+		//     where identity replay is impossible and unnecessary (measured;
+		//     see afterLoad): libcuda re-registers lazily on the next
+		//     export. Drop the record instead of failing the resume.
+		// rootClient.Release removes the client from nvp.clients under
+		// clientsMu, so identity under that lock is exact: same pointer =>
+		// never released.
 		nvp.clientsMu.RLock()
 		client := nvp.clients[rec.clientH]
 		nvp.clientsMu.RUnlock()
-		if client != nil {
-			impl := &memoryFabricObject{params: rec.params}
-			client.objsMu.Lock()
-			nvp.objAdd(ctx, client, rec.objectH, nvgpu.NV_MEMORY_FABRIC, impl, rec.parentH)
-			client.objAddRestoreDep(rec.objectH, rec.hVidMem)
-			client.objsMu.Unlock()
-		} else {
-			log.Warningf("nvproxy: replayed FLA registration %v:%v, but its client is gone from the object graph", rec.clientH, rec.objectH)
+		if client != rec.client {
+			log.Infof("nvproxy: dropped FLA registration %v:%v (client torn down by cuda-checkpoint); libcuda re-registers lazily on next export", rec.clientH, rec.objectH)
+			continue
 		}
+		if err := rec.params.restoreOnFD(rec.clientFD.hostFD); err != nil {
+			// Keep this record and everything unprocessed for another
+			// attempt or for diagnosis; drop what was already handled.
+			nvp.suspendedFLARegs = append([]suspendedFLARegistration{}, regs[i:]...)
+			return replayed, fmt.Errorf("replaying FLA registration %v:%v failed: %w", rec.clientH, rec.objectH, err)
+		}
+		// Re-record in the object graph so a later checkpoint sees the truth.
+		impl := &memoryFabricObject{params: rec.params}
+		client.objsMu.Lock()
+		nvp.objAdd(ctx, client, rec.objectH, nvgpu.NV_MEMORY_FABRIC, impl, rec.parentH)
+		client.objAddRestoreDep(rec.objectH, rec.hVidMem)
+		client.objsMu.Unlock()
 		replayed++
 	}
 	nvp.suspendedFLARegs = nil

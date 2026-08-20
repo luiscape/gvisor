@@ -47,6 +47,13 @@ const (
 	// cuda-checkpoint sequentially.
 	cudaCheckpointSequentialKey = "cuda-checkpoint-sequential"
 
+	// cudaSaveFailedKey marks that the save failed after preSaveCuda ran, so
+	// the next postResumeCuda is failure RECOVERY (the driver state survived
+	// in place and host-freed FLA registrations must be replayed) rather than
+	// resume-after-successful-save (out of scope for fabric users; see the
+	// PendingFLARegistrations guard in postResumeCuda).
+	cudaSaveFailedKey = "cuda-save-failed"
+
 	// cudaLockTimeoutMS is how long (in milliseconds) each `cuda-checkpoint
 	// --action lock` invocation waits for a process to reach a lockable state.
 	// NCCL/CUDA-IPC-coupled processes only become lockable once every job
@@ -290,15 +297,26 @@ func postResumeCuda(k *kernel.Kernel, timeline *timing.Timeline) error {
 		tg.SigsegvUnlock()
 	}
 
-	// Single-pass scope check: FLA registrations still pending here mean the
-	// sandbox kept running past a successful save (save-and-resume) with
-	// fabric users, or a checkpoint-failure unwind could not replay them.
-	// Either way the application would dereference host-freed registrations;
-	// fail loudly instead of letting it run. After a true restore this is
-	// always zero (nvproxy.afterLoad drops the record; libcuda re-registers
-	// lazily -- see fla_registration.go).
+	saveFailed := k.PopCheckpointState(cudaSaveFailedKey) != nil
 	if err == nil {
-		if n := nvproxy.PendingFLARegistrations(k.VFS()); n > 0 {
+		if saveFailed {
+			// Failure recovery: the save failed after the cuda sequence (e.g.
+			// during encoding), so the driver state survived in place and the
+			// FLA registrations host-freed for the checkpoint must be
+			// recreated before the application runs again.
+			if n, rerr := nvproxy.ReplayFLARegistrations(k.VFS()); rerr != nil {
+				err = fmt.Errorf("replaying FLA registrations after failed save: %w", rerr)
+			} else if n > 0 {
+				log.Infof("nvproxy: replayed %d FLA registrations after failed save", n)
+			}
+		} else if n := nvproxy.PendingFLARegistrations(k.VFS()); n > 0 {
+			// Single-pass scope check: pending registrations after a
+			// SUCCESSFUL save mean the sandbox is resuming past its
+			// checkpoint with fabric users -- out of scope, and the
+			// application would dereference host-freed registrations; fail
+			// loudly instead of letting it run. After a true restore this is
+			// always zero (nvproxy.afterLoad drops the record; libcuda
+			// re-registers lazily -- see fla_registration.go).
 			err = fmt.Errorf("%d FLA registrations pending after resume: save-and-resume with fabric users is out of scope (single-pass checkpoint->restore only)", n)
 		}
 	}

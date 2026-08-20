@@ -45,8 +45,9 @@ nvproxy, cascading graph entries away before `state.Save`.
 
 | Path | Driver state | Action |
 | --- | --- | --- |
-| Checkpoint-failure unwind | survived in place | `ReplayFLARegistrations`: host RM_ALLOC with identical client/handle/params, on the same fd that carried the free (app frozen since; fd necessarily open) |
-| Resume-after-save | survived in place | out of scope (single-pass checkpoint->restore only): `postResumeCuda` fails loudly if any registration is pending |
+| Checkpoint-failure unwind BEFORE the checkpoint action | survived in place | `ReplayFLARegistrations`: host RM_ALLOC with identical client/handle/params, on the same fd that carried the free (app frozen since; fd still open) |
+| Checkpoint-failure unwind AFTER the checkpoint action (e.g. save fails in encoding; `--leave-running`) | torn down by the checkpoint action, rebuilt fresh by the restore toggle | same geometry as a true restore: replay drops the record (carrier fd dead = the teardown signature); libcuda re-registers lazily on the next export |
+| Resume after a SUCCESSFUL save | survived in place | out of scope (single-pass checkpoint->restore only): `postResumeCuda` fails loudly if any registration is pending |
 | True restore | rebuilt by cuda-checkpoint | `afterLoad` drops the record; libcuda lazily re-registers on the next export |
 
 ## Measured dead ends (do not re-walk)
