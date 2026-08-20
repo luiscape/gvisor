@@ -188,8 +188,20 @@ Also fixed on the way: torch's `isFabricSupported` TORCH_CHECKs the
 falling back -- the shim now smooths that into SUCCESS +
 `state=NOT_SUPPORTED`, which torch handles.
 
-**The `fabric-imex-mgmt` capability is now the operator's knob** (validated
-both ways on the final binary):
+**SUPERSEDED (2026-08-19 evening): IMEX is out of the picture entirely.**
+The fabric-probe gating described below was reverted: the probe is back to
+compUtil (upstream behavior), so **single-node NVLS, multimem, and engaged
+FlashInfer fusion all work in DEFAULT sandboxes and all checkpoint/restore**
+(FLA registrations are suspended by nvproxy at checkpoint,
+capability-independent). `fabric-imex-mgmt` now gates only real IMEX
+(multi-node channel devices) -- out of scope. `CB_IMEX` no longer affects
+any validated behavior. Validated under default caps, TP=4, full C/R:
+forced `--enable-nccl-nvls` PASS; fusion `trtllm` ENGAGED PASS; torch
+symm-mem two-shot via the new opt-in `MCSHIM_HIDE_MULTICAST=1` PASS (the
+opt-in exists because torch *multimem* remains the one un-checkpointable
+multicast path -- the NVIDIA-side FLA-caching gap).
+
+Historical record of the interim capability-knob design (superseded):
 
 | Workload | `CB_IMEX=0` (no fabric cap) | `CB_IMEX=1` (fabric cap granted) |
 | --- | --- | --- |
