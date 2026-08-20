@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1458,69 +1457,6 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	return nil
 }
 
-// setupCudaCheckpointJob groups a GPU container's CUDA processes into a
-// cuda-checkpoint job (when --cuda-checkpoint-path is set, nvproxy is enabled,
-// and the driver is R610+) so that CUDA IPC state (cuIpcGetMemHandle) can be
-// checkpointed/restored coherently.
-//
-// It works by prepending `cuda-checkpoint --launch-job` to the container's
-// command. See https://github.com/NVIDIA/cuda-checkpoint#610-features.
-func (l *Loader) setupCudaCheckpointJob(info *containerInfo) error {
-	if info.conf.CUDACheckpointPath == "" || !specutils.NVProxyEnabled(info.spec, info.conf) {
-		return nil
-	}
-	// `cuda-checkpoint --launch-job` is only recommended (and CUDA IPC job
-	// support only exists) on driver R610+. On older drivers, leave the command
-	// unwrapped; wrapping it would provide no benefit.
-	if major := l.k.NvidiaDriverVersion.Major(); major < 610 {
-		log.Warningf("--cuda-checkpoint-path is set but driver R%d is older than R610; not wrapping container %q in a cuda-checkpoint job", major, info.containerName)
-		return nil
-	}
-	if len(info.procArgs.Argv) == 0 {
-		return fmt.Errorf("container has no command to wrap")
-	}
-	// With the exec-FD entrypoint dropped below, kernel.CreateProcess
-	// resolves Argv[0] literally in the container's mount namespace: it must
-	// be an absolute path (no PATH search), and it must exist. Validate now
-	// and degrade to an unwrapped command on failure -- a missing or relative
-	// path must cost the job wrap, not the container boot (the flag is
-	// runtime-wide, and a GPU sidecar image may simply not carry the binary).
-	if !filepath.IsAbs(info.conf.CUDACheckpointPath) {
-		log.Warningf("--cuda-checkpoint-path %q is not absolute; not wrapping container %q in a cuda-checkpoint job", info.conf.CUDACheckpointPath, info.containerName)
-		return nil
-	}
-	if mntns := info.procArgs.MountNamespace; mntns != nil {
-		ctx := info.procArgs.NewContext(l.k)
-		creds := auth.NewRootCredentials(l.k.RootUserNamespace())
-		root := mntns.Root(ctx)
-		pop := &vfs.PathOperation{
-			Root:               root,
-			Start:              root,
-			Path:               fspath.Parse(info.conf.CUDACheckpointPath),
-			FollowFinalSymlink: true,
-		}
-		_, err := root.Mount().Filesystem().VirtualFilesystem().StatAt(ctx, creds, pop, &vfs.StatOptions{})
-		root.DecRef(ctx)
-		if err != nil {
-			log.Warningf("--cuda-checkpoint-path %q not found in container %q (%v); not wrapping its command in a cuda-checkpoint job", info.conf.CUDACheckpointPath, info.containerName, err)
-			return nil
-		}
-	}
-	origArgv := info.procArgs.Argv
-	// If the entrypoint was provided as a host FD (the `runsc run` fast path),
-	// drop it so that cuda-checkpoint is resolved from the container rootfs and
-	// the original argv is resolved by cuda-checkpoint's exec. By this point
-	// createContainerProcess has already consumed info.execFD into
-	// info.procArgs.File, so that is what must be cleared (the deferred DecRef
-	// in createContainerProcess still releases the host FD); with both File
-	// and Filename empty, kernel.CreateProcess resolves Argv[0].
-	info.procArgs.File = nil
-	info.procArgs.Filename = ""
-	info.procArgs.Argv = append([]string{info.conf.CUDACheckpointPath, "--launch-job"}, origArgv...)
-	log.Infof("Wrapped container %q command in a cuda-checkpoint job", info.containerName)
-	return nil
-}
-
 // setupCudaMulticastShim LD_PRELOADs the multicast suspend/resume interposer
 // into a GPU container (when --cuda-multicast-shim-path is set, nvproxy is
 // enabled, and the driver is R550+, cuda-checkpoint's minimum).
@@ -1531,11 +1467,10 @@ func (l *Loader) setupCudaCheckpointJob(info *containerInfo) error {
 // byte-identical VAs afterwards; control/state_cuda.go drives both transitions
 // around the cuda-checkpoint phases via the marker directory exported here.
 //
-// Unlike the cuda-checkpoint job wrap (setupCudaCheckpointJob, R610+), the
-// interposer is useful on pre-R610 drivers: drivers without job support
-// cannot carry ANY cross-process CUDA state across a checkpoint, and the
-// interposer's teardown is precisely what empties that state per process
-// before the (job-less, per-process) checkpoints run.
+// The interposer is what makes cross-process CUDA state survive at all on
+// these drivers: without job support (an R610+ feature, unsupported here),
+// cuda-checkpoint checkpoints processes individually, and the interposer's
+// teardown is precisely what empties the cross-process state beforehand.
 func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	if info.conf.CUDAMulticastShimPath == "" || !specutils.NVProxyEnabled(info.spec, info.conf) {
 		return nil
@@ -1576,22 +1511,19 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 		shimDir = control.DefaultCudaMulticastShimDir
 		env = append(env, control.CudaMulticastShimDirEnv+"="+shimDir)
 	}
-	// Pre-R610 drivers block a cuda-checkpoint-restored process from
+	// These drivers block a cuda-checkpoint-restored process from
 	// cuMulticastCreate/cuMulticastAddDevice (CUDA_ERROR_INVALID_DEVICE) and
-	// have no job support to carry live CUDA IPC imports across a
-	// checkpoint. Configure the interposer accordingly, unless the user
-	// already chose: MCSHIM_MC_PROXY has it rebuild multicast through a
-	// fresh helper process (mcshim-helper, expected next to the interposer
-	// library), and MCSHIM_IPC_REPLAY_FLOOR=0 has it close and replay EVERY
-	// legacy IPC import (a live one fails the per-process restore toggle
-	// with "invalid argument").
-	if l.k.NvidiaDriverVersion.Major() < 610 {
-		env = appendEnvIfAbsent(env, "MCSHIM_MC_PROXY", "1")
-		env = appendEnvIfAbsent(env, "MCSHIM_IPC_REPLAY_FLOOR", "0")
-		env = appendEnvIfAbsent(env, "MCSHIM_HELPER",
-			path.Join(path.Dir(info.conf.CUDAMulticastShimPath), "mcshim-helper"))
-		log.Infof("Driver R%d < R610: multicast interposer configured for proxy rebuild and full legacy-IPC replay in container %q", l.k.NvidiaDriverVersion.Major(), info.containerName)
-	}
+	// cannot carry live CUDA IPC imports across a checkpoint. Configure the
+	// interposer accordingly, unless the user already chose: MCSHIM_MC_PROXY
+	// has it rebuild multicast through a fresh helper process (mcshim-helper,
+	// expected next to the interposer library), and MCSHIM_IPC_REPLAY_FLOOR=0
+	// has it close and replay EVERY legacy IPC import (a live one fails the
+	// per-process restore toggle with "invalid argument").
+	env = appendEnvIfAbsent(env, "MCSHIM_MC_PROXY", "1")
+	env = appendEnvIfAbsent(env, "MCSHIM_IPC_SUSPEND", "1")
+	env = appendEnvIfAbsent(env, "MCSHIM_IPC_REPLAY_FLOOR", "0")
+	env = appendEnvIfAbsent(env, "MCSHIM_HELPER",
+		path.Join(path.Dir(info.conf.CUDAMulticastShimPath), "mcshim-helper"))
 	info.procArgs.Envv = env
 
 	// The env append above only covers processes that inherit the initial
@@ -1832,13 +1764,10 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	}
 	info.procArgs.StartupTimeline.Reached("exec user home resolved")
 
-	// If configured, wrap the container's command in a cuda-checkpoint job so
-	// that its CUDA IPC state can be checkpointed/restored coherently. Failure
-	// is non-fatal: the container still boots, but CUDA IPC checkpoint/restore
-	// may not work.
-	if err := l.setupCudaCheckpointJob(info); err != nil {
-		log.Warningf("Failed to set up cuda-checkpoint job for container %q: %v", info.containerName, err)
-	}
+	// If configured, preload the multicast suspend/resume interposer into the
+	// container so that its multicast/IPC state can be checkpointed/restored.
+	// Failure is non-fatal: the container still boots, but checkpoint/restore
+	// of that state may not work.
 	if err := l.setupCudaMulticastShim(info); err != nil {
 		log.Warningf("Failed to set up multicast interposer for container %q: %v", info.containerName, err)
 	}

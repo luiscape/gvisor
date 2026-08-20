@@ -339,19 +339,17 @@ static const char *caller_module(const void *retaddr) {
 	return "?";
 }
 
-/* Whether to tear legacy CUDA IPC imports down at all -- OFF by default.
+/* Whether to tear legacy CUDA IPC imports down across the checkpoint.
  *
- * R610's job mode (`cuda-checkpoint --launch-job`) is documented to support
- * CUDA IPC, and measurement agrees: with the interposer ignoring legacy IPC
- * entirely, vLLM at NCCL_CUMEM_ENABLE=0 with custom all-reduce on -- 58 live
- * legacy imports per worker -- checkpointed and restored. So the driver
- * handles these, and touching them is not merely unnecessary but harmful:
- * cuIpcOpenMemHandle has no address hint, so anything the interposer closes
- * it cannot put back where it was (measured: 0 of 58 returned).
- *
- * Kept behind a flag rather than deleted because the teardown is correct and
- * useful where the driver does NOT cover IPC -- standalone (non-job) mode, or
- * pre-R610 drivers -- and because it is the only way to A/B the question. */
+ * On the supported drivers cuda-checkpoint checkpoints processes
+ * individually and cannot carry a live legacy IPC import across the
+ * per-process restore toggle, so the teardown is required; gVisor sets
+ * MCSHIM_IPC_SUSPEND=1 when it preloads the interposer. It stays an env
+ * gate (rather than unconditional) because on driver modes where IPC IS
+ * covered by cuda-checkpoint itself, touching the imports would be harmful
+ * -- cuIpcOpenMemHandle has no address hint, so anything the interposer
+ * closes it cannot put back at the same VA (measured: 0 of 58 returned)
+ * -- and because the gate is the only way to A/B the question. */
 static int ipc_suspend_enabled(void) {
 	static int v = -1;
 	if (v < 0)
