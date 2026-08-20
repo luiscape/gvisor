@@ -968,6 +968,8 @@ int nvmlDeviceGetGpuFabricInfoV(void *device, void *gpuFabricInfo) {
  * identical. Masking the capability steers allocators to fds, which the shim
  * fully supports. MCSHIM_ALLOW_FABRIC=1 restores truthful reporting (e.g.
  * for multi-node, where checkpointing is out of scope anyway). */
+#define CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED 132
+
 CUresult cuDeviceGetAttribute(int *pi, int attrib, CUdevice dev) {
 	resolve_reals();
 	CUresult rc = r_cuDeviceGetAttribute(pi, attrib, dev);
@@ -980,6 +982,25 @@ CUresult cuDeviceGetAttribute(int *pi, int attrib, CUdevice dev) {
 			      "fabric-handle exports are not checkpointable; "
 			      "set MCSHIM_ALLOW_FABRIC=1 to report the truth",
 			      dev);
+		*pi = 0;
+	}
+	/* Opt-in multicast hiding (MCSHIM_HIDE_MULTICAST=1) for workloads whose
+	 * multicast path cannot survive restore. Today that is exactly torch
+	 * symm-mem multimem: its userspace caches the FLA registration handle
+	 * of the covered workspace across exports, the registration cannot be
+	 * checkpointed or recreated (NVIDIA-side gap; see nvproxy
+	 * fla_registration.go), so its post-restore re-export fails. Masking
+	 * this attribute makes torch select its two-shot symm-mem kernel,
+	 * which round-trips checkpoints. Do NOT set this for NCCL-NVLS or
+	 * FlashInfer-fusion workloads: their multicast state is fully
+	 * suspend/resumable and the mask would only cost performance. */
+	if (rc == CUDA_SUCCESS && pi &&
+	    attrib == CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED && *pi != 0 &&
+	    getenv("MCSHIM_HIDE_MULTICAST")) {
+		static int logged;
+		if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+			mclog("masking MULTICAST_SUPPORTED=0 (dev %d) per "
+			      "MCSHIM_HIDE_MULTICAST=1", dev);
 		*pi = 0;
 	}
 	return rc;

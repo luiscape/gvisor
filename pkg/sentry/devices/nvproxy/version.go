@@ -295,26 +295,19 @@ func Init() {
 					nvgpu.NV2080_CTRL_CMD_GPU_GET_PIDS:                                     ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_GPU_GET_PID_INFO:                                 ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_GPU_GET_COMPUTE_POLICY_CONFIG:                    ctrlHandler(rmControlSimple, compUtil),
-					// Gated on fabric-imex-mgmt: this probe is how the CUDA stack
-					// decides the GPU is attached to an IMEX fabric domain. When it
-					// succeeds, libcuda lazily creates driver-internal NV_MEMORY_FABRIC
-					// (00f8) FLA registrations over VMM allocations shared between
-					// processes -- objects that cuda-checkpoint checkpoints but cannot
-					// restore (the snapshot dies with OBJECT_NOT_FOUND storms after
-					// restore). Denying the probe (NV_ERR_NOT_SUPPORTED, exactly what a
-					// fabric-less host reports) keeps sandboxes without the capability
-					// fabric-free and checkpointable. Denying the 00f8 class itself is
-					// NOT equivalent: once the probe succeeds, libcuda treats FLA
-					// registration failure during FD export as fatal (measured: torch
-					// dies with "CUDA driver error: unknown error").
-					//
-					// Known cost: libcuda couples CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED
-					// to this probe, so without the capability NVLS multicast is
-					// reported (and is) unavailable even though NVSwitch multicast does
-					// not itself need IMEX. Frameworks fall back to their non-multicast
-					// paths (measured: torch symm-mem uses its two-shot kernel).
-					// POSIX-FD sharing and P2P are unaffected.
-					nvgpu.NV2080_CTRL_CMD_GET_GPU_FABRIC_PROBE_INFO:                        ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement),
+					// Deliberately compUtil, not fabric-imex-mgmt: libcuda couples
+					// CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED to this probe, so denying
+					// it silently disables single-node NVLS multicast in default
+					// sandboxes (measured), which does not itself need IMEX. The
+					// checkpoint-hostile side effect of an allowed probe -- libcuda's
+					// lazy NV_MEMORY_FABRIC FLA registrations over peer-shared VMM
+					// allocations, which cuda-checkpoint checkpoints but cannot restore
+					// -- is handled by SuspendFLARegistrations instead (see
+					// fla_registration.go). Denying the 00f8 class is NOT a substitute:
+					// once the probe succeeds, libcuda treats FLA-registration failure
+					// during FD export as fatal (measured: "CUDA driver error: unknown
+					// error").
+					nvgpu.NV2080_CTRL_CMD_GET_GPU_FABRIC_PROBE_INFO:                        ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_FLA_GET_FABRIC_MEM_STATS:                         ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_GR_GET_ZCULL_INFO:                                ctrlHandler(rmControlSimple, nvconf.CapGraphics),
 					nvgpu.NV2080_CTRL_CMD_GR_CTXSW_ZCULL_BIND:                              ctrlHandler(rmControlSimple, nvconf.CapGraphics),
