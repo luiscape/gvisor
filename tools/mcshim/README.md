@@ -1,8 +1,8 @@
 # mcshim: CUDA multicast suspend/resume interposer
 
 `mcshim.so` is an `LD_PRELOAD` interposer that gVisor injects into CUDA
-processes so that `cuda-checkpoint` (NVIDIA driver R610+) can checkpoint and
-restore workloads it otherwise refuses:
+processes so that `cuda-checkpoint` (NVIDIA driver R550+, validated on R580)
+can checkpoint and restore workloads it otherwise refuses:
 
 *   **Multicast (NVLS).** Processes holding live `NV_MEMORY_MULTICAST_FABRIC`
     (0x00fd) objects -- created by NCCL NVLS and torch `_symmetric_memory` --
@@ -13,10 +13,13 @@ restore workloads it otherwise refuses:
 *   **VMM imports.** Live `cuMemImportFromShareableHandle` imports (NCCL P2P
     buffers) cannot be restored either; the shim releases and re-imports them
     the same way, re-fetching the re-exported fd from the exporting rank.
-*   **Legacy CUDA IPC imports** (`cuIpcOpenMemHandle`) are only checkpointable
-    in the driver's job mode, and only reliably when closed before the
-    checkpoint and replayed after it. That teardown is implemented but opt-in
-    (`MCSHIM_IPC_SUSPEND`), because the driver carries most of them itself.
+*   **Legacy CUDA IPC imports** (`cuIpcOpenMemHandle`) cannot cross the
+    per-process restore toggle live on these drivers; the shim closes them
+    before the checkpoint and replays them after it. The teardown is gated by
+    `MCSHIM_IPC_SUSPEND` (which the gVisor loader sets) because on driver
+    modes where `cuda-checkpoint` carries IPC itself, touching the imports
+    would be harmful -- a closed import cannot be re-placed at its old VA
+    without the walk described below.
 
 Build with `./build.sh` (toolkit-free; runs in a pinned ubuntu:22.04 container
 by default so the result loads under older glibc).
@@ -24,14 +27,15 @@ by default so the result loads under older glibc).
 ## How it gets into a container
 
 With `runsc --cuda-multicast-shim-path=/path/to/mcshim.so` (plus nvproxy and a
-R610+ driver), `Loader.setupCudaMulticastShim` (`runsc/boot/loader.go`):
+R550+ driver), `Loader.setupCudaMulticastShim` (`runsc/boot/loader.go`):
 
 *   prepends the shim to the container's `LD_PRELOAD` **and** appends it to
     `/etc/ld.so.preload` through the container's VFS (launchers like SGLang's
     `torch_memory_saver` rewrite `LD_PRELOAD` for exactly the worker processes
     that matter; `ld.so.preload` is immune),
 *   sets `MCSHIM_DIR` in the container environment (default `/tmp/mcshim`)
-    unless the container chose its own,
+    unless the container chose its own, plus `MCSHIM_MC_PROXY`,
+    `MCSHIM_IPC_SUSPEND` and `MCSHIM_IPC_REPLAY_FLOOR=0` (see below),
 *   records `GVISOR_CUDA_MULTICAST_SHIM_DIR` in the container *spec*, which is
     how the sentry (`pkg/sentry/control/state_cuda_shim.go`) later discovers
     that it owns an interposer in this container.
@@ -92,34 +96,33 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 | :----------------------- | :-------------- | :---------------------------------------------------------------- |
 | `MCSHIM_DIR`             | `/tmp/mcshim`   | control/rendezvous directory (the sentry normally sets it)        |
 | `MCSHIM_LOG`             | stderr          | append log to this path instead of stderr                         |
-| `MCSHIM_VERBOSE`         | unset           | per-symbol/interposition tracing (very chatty)                    |
+| `MCSHIM_VERBOSE`         | unset           | per-entry suspend/resume diagnostics (chatty across ranks)        |
 | `MCSHIM_DISABLE`         | unset           | silent: no control thread, acks, or gate (interposition/tracking stay active) |
-| `MCSHIM_IPC_SUSPEND`     | unset           | opt-in legacy-IPC close+replay across the checkpoint              |
-| `MCSHIM_IPC_REPLAY_FLOOR`| `0x40000000000` | hex VA; imports whose range base is below it are left live        |
-| `MCSHIM_MC_PROXY`        | unset           | pre-R610: rebuild multicast via the mcshim-helper process         |
-| `MCSHIM_HELPER`          | next to the .so | path to mcshim-helper (the loader sets it on pre-R610 drivers)    |
+| `MCSHIM_IPC_SUSPEND`     | unset           | legacy-IPC close+replay across the checkpoint (the loader sets it) |
+| `MCSHIM_IPC_REPLAY_FLOOR`| `0x40000000000` | hex VA; imports whose range base is below it are left live (the loader sets 0) |
+| `MCSHIM_MC_PROXY`        | unset           | rebuild multicast via the mcshim-helper process (the loader sets it) |
+| `MCSHIM_HELPER`          | next to the .so | path to mcshim-helper (the loader sets it)                        |
 | `MCSHIM_HOST_BUILD`      | unset           | build.sh: build with the host toolchain instead of docker         |
 | `MCSHIM_BUILD_IMAGE`     | pinned 22.04    | build.sh: alternative base image                                  |
 
 `MCSHIM_IPC_REPLAY_FLOOR` is a classifier, not a tuning knob: unreplayable
 legacy imports sit in low driver-owned regions the driver places once per
 process and never repeats; replayable ones sit in the high per-mapping area.
-Low-region imports are left live for the driver's job-mode support to carry.
-On pre-R610 drivers no job exists and a live import fails the per-process
-restore toggle, so the gVisor loader sets the floor to 0 there (close and
-replay everything).
+A live import fails the per-process restore toggle on these drivers, so the
+gVisor loader sets the floor to 0 (close and replay everything); the nonzero
+default only applies to standalone use on driver modes whose job support can
+carry live imports.
 
-## Pre-R610 drivers: the multicast proxy
+## The multicast proxy (mcshim-helper)
 
-R610 is not required. On R580 (measured on 580.126.20), a
-cuda-checkpoint-restored process can import a multicast group fd, bind its
-memory into the group, and map the multicast VA -- but `cuMulticastCreate`
-and `cuMulticastAddDevice` fail with `CUDA_ERROR_INVALID_DEVICE` (and
-`cuCtxCreate` with OOM): the restore blocks fresh device admission at the
-process level. With `MCSHIM_MC_PROXY` set (the gVisor loader sets it
-automatically on pre-R610 drivers), the rebuild routes exactly those two
-calls through `mcshim-helper`, a never-checkpointed process exec'd for the
-duration of the rebuild:
+On these drivers (measured on 580.126.20), a cuda-checkpoint-restored
+process can import a multicast group fd, bind its memory into the group, and
+map the multicast VA -- but `cuMulticastCreate` and `cuMulticastAddDevice`
+fail with `CUDA_ERROR_INVALID_DEVICE` (and `cuCtxCreate` with OOM): the
+restore blocks fresh device admission at the process level. With
+`MCSHIM_MC_PROXY` set (the gVisor loader sets it), the rebuild routes
+exactly those two calls through `mcshim-helper`, a never-checkpointed
+process exec'd for the duration of the rebuild:
 
 *   Creators send `CREATE` (the recorded group properties) and `ADDDEV` (their
     recorded ordinals) to the helper, import the group fd it returns, and
@@ -149,7 +152,7 @@ was long misread as a pre-R610 driver limitation):
 
 ## Design summary
 
-*   **Tracking tables.** Fixed-size (`MAXN` = 512 each): allocations/groups
+*   **Tracking tables.** Fixed-size (`MAXN` = 4096 each): allocations/groups
     (`g_alloc`, with per-object `torn_down`), mappings (`g_map`, per-mapping
     `suspended`), multicast binds (`g_bind`, per-bind `unbound`), legacy IPC
     participation (`g_ipc`). This is live state: app-initiated frees drop
@@ -226,11 +229,12 @@ inside the container's trust domain, not gVisor's:
     rebuilt, so a retried suspend/resume edge converges once the underlying
     cause clears; until then the orchestrator must treat the workload as
     unhealthy.
-*   **Fixed table sizes.** `MAXN` = 512 entries per table, with loud + sticky
-    refusal on overflow rather than silent partial tracking.
-*   **TP=8 low-arena legacy imports** (vLLM custom all-reduce signal pads)
-    are unreplayable by construction and left live; the driver's job-mode
-    support carries them, which is intermittent.
+*   **Fixed table sizes.** `MAXN` = 4096 entries per table, with loud +
+    sticky refusal on overflow rather than silent partial tracking.
+*   **Low-arena legacy imports** (e.g. custom all-reduce signal pads at
+    TP=8) sit in driver-owned regions where no replay can place them, so
+    they cannot cross a checkpoint on these drivers at all; run such
+    workloads with the engine's custom all-reduce disabled.
 *   **Multicast slot contention on restore** manifests as a re-bind timeout
     (binds are the cross-rank barrier, so one rank failing to join blocks
     the rest until the deadline).

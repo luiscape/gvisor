@@ -317,26 +317,14 @@ static void resolve_reals(void) {
 }
 
 
-/* Symbol-resolution tracing is only useful when debugging interposition itself.
- * It is per-symbol and per-process, so left on it floods the application's
- * stderr (thousands of lines interleaved across ranks, which is what made a
- * failing vLLM run hard to read). Opt in with MCSHIM_VERBOSE=1. */
+/* MCSHIM_VERBOSE=1 opts into per-entry suspend/resume diagnostics (which
+ * import moved where, reservation outcomes). Off by default: per-entry
+ * output across ranks floods the application's stderr. */
 static int mcverbose(void) {
 	static int v = -1;
 	if (v < 0)
 		v = getenv("MCSHIM_VERBOSE") != NULL;
 	return v;
-}
-
-/* Identify the module a wrapped call came from (verbose diagnostics for
- * fabric-request attribution: "which .so asked for fabric handles?"). */
-static const char *caller_module(const void *retaddr) {
-	Dl_info di;
-	if (retaddr && dladdr(retaddr, &di) && di.dli_fname) {
-		const char *base = strrchr(di.dli_fname, '/');
-		return base ? base + 1 : di.dli_fname;
-	}
-	return "?";
 }
 
 /* Whether to tear legacy CUDA IPC imports down across the checkpoint.
@@ -720,9 +708,6 @@ CUresult cuMemCreate(CUmemGenericAllocationHandle *h, size_t size,
 	 * the capability bit in cuDeviceGetAttribute is not sufficient:
 	 * statically linked CUDA runtimes reach the driver through paths this
 	 * shim cannot interpose, so the request itself must be rewritten. */
-	mcvlog("CALL cuMemCreate(size=0x%zx, handleTypes=0x%x) caller %s", size,
-	       prop ? prop->requestedHandleTypes : 0,
-	       caller_module(__builtin_return_address(0)));
 	CUmemAllocationProp fixed;
 	if (prop && (prop->requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC) &&
 	    !getenv("MCSHIM_ALLOW_FABRIC")) {
@@ -738,8 +723,6 @@ CUresult cuMemCreate(CUmemGenericAllocationHandle *h, size_t size,
 			      "memory is not checkpointable; set "
 			      "MCSHIM_ALLOW_FABRIC=1 to keep it",
 			      fixed.requestedHandleTypes);
-		mcvlog("cuMemCreate(FABRIC) stripped; caller %s",
-		       caller_module(__builtin_return_address(0)));
 	}
 	CUresult rc = r_cuMemCreate(h, size, prop, flags);
 	if (rc == CUDA_SUCCESS) {
@@ -784,12 +767,7 @@ CUresult cuMulticastCreate(CUmemGenericAllocationHandle *h,
 			      "fabric-handle multicast is not checkpointable; "
 			      "set MCSHIM_ALLOW_FABRIC=1 to keep it",
 			      mfixed.handleTypes);
-		mcvlog("cuMulticastCreate(FABRIC) stripped; caller %s",
-		       caller_module(__builtin_return_address(0)));
 	}
-	mcvlog("CALL cuMulticastCreate(size=0x%zx, handleTypes=0x%llx) caller %s",
-	       prop ? prop->size : 0, prop ? prop->handleTypes : 0,
-	       caller_module(__builtin_return_address(0)));
 	CUresult rc = r_cuMulticastCreate(h, prop);
 	if (rc == CUDA_SUCCESS) {
 		pthread_mutex_lock(&g_lock);
@@ -835,13 +813,9 @@ CUresult cuMemExportToShareableHandle(void *shHandle,
 			mclog("refusing fabric-typed cuMemExportToShareableHandle:"
 			      " fabric exports are not checkpointable; set "
 			      "MCSHIM_ALLOW_FABRIC=1 to permit them");
-		mcvlog("cuMemExportToShareableHandle(FABRIC) refused; caller %s",
-		       caller_module(__builtin_return_address(0)));
 		return CUDA_ERROR_NOT_SUPPORTED;
 	}
 	CUmemGenericAllocationHandle real_h = xlate_locked(h);
-	mcvlog("CALL cuMemExportToShareableHandle(type=%d) caller %s", type,
-	       caller_module(__builtin_return_address(0)));
 	CUresult rc = r_cuMemExportToShareableHandle(shHandle, real_h, type, flags);
 	if (rc == CUDA_SUCCESS && type == CU_MEM_HANDLE_TYPE_POSIX_FD && shHandle) {
 		pthread_mutex_lock(&g_lock);
@@ -876,8 +850,7 @@ CUresult cuMemImportFromShareableHandle(CUmemGenericAllocationHandle *h,
 			      " (see export-side message)");
 		return CUDA_ERROR_NOT_SUPPORTED;
 	}
-	mcvlog("CALL cuMemImportFromShareableHandle(type=%d) caller %s", type,
-	       caller_module(__builtin_return_address(0)));
+
 	CUresult rc = r_cuMemImportFromShareableHandle(h, osHandle, type);
 	if (rc == CUDA_SUCCESS && type == CU_MEM_HANDLE_TYPE_POSIX_FD && h) {
 		pthread_mutex_lock(&g_lock);
@@ -1159,8 +1132,7 @@ CUresult cuIpcCloseMemHandle(CUdeviceptr dptr) {
 CUresult cuMulticastAddDevice(CUmemGenericAllocationHandle h, CUdevice dev) {
 	resolve_reals();
 	CUmemGenericAllocationHandle real_h = xlate_locked(h);
-	mcvlog("CALL cuMulticastAddDevice(dev=%d) caller %s", (int)dev,
-	       caller_module(__builtin_return_address(0)));
+
 	CUresult rc = r_cuMulticastAddDevice(real_h, dev);
 	if (rc == CUDA_SUCCESS) {
 		pthread_mutex_lock(&g_lock);
@@ -1236,8 +1208,7 @@ CUresult cuMulticastBindMem(CUmemGenericAllocationHandle mc, size_t mcOffset,
 	 * record the translated value so dedupe and later unbind/rebind key on
 	 * the current handle. */
 	CUmemGenericAllocationHandle real_mem = xlate_locked(mem);
-	mcvlog("CALL cuMulticastBindMem(off=0x%zx) caller %s", mcOffset,
-	       caller_module(__builtin_return_address(0)));
+
 	CUresult rc = r_cuMulticastBindMem(real_mc, mcOffset, real_mem,
 	                                   memOffset, size, flags);
 	if (rc == CUDA_SUCCESS) {
@@ -2320,8 +2291,7 @@ static int do_suspend(void) {
 /* exactly create+attach on the rank's behalf; the group persists     */
 /* once the rank holds its own import (measured:                      */
 /* native_mc_proxy_restore.py), so the helper exits right after the   */
-/* rebuild. Enabled by MCSHIM_MC_PROXY (the gVisor loader sets it on  */
-/* pre-R610 drivers).                                                 */
+/* rebuild. Enabled by MCSHIM_MC_PROXY (the gVisor loader sets it).   */
 /* ------------------------------------------------------------------ */
 
 static int g_helper_sock = -1;
@@ -3309,10 +3279,8 @@ void *dlsym(void *handle, const char *symbol) {
 		/* Only redirect if the real library actually has the symbol
 		 * (so feature probes against old drivers still behave). */
 		void *r = real_dlsym(handle, symbol);
-		if (r) {
-			mcvlog("dlsym(%s) -> shim wrapper", symbol);
+		if (r)
 			return w;
-		}
 		return r;
 	}
 	return real_dlsym(handle, symbol);
@@ -3364,8 +3332,6 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion,
 	void *w;
 	if (rc == CUDA_SUCCESS && pfn && *pfn &&
 	    (w = gpa_redirect(symbol, cudaVersion, flags))) {
-		mcvlog("cuGetProcAddress(%s, ver=%d) -> shim wrapper", symbol,
-		      cudaVersion);
 		*pfn = w;
 	}
 	return rc;
@@ -3382,8 +3348,6 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
 	void *w;
 	if (rc == CUDA_SUCCESS && pfn && *pfn &&
 	    (w = gpa_redirect(symbol, cudaVersion, flags))) {
-		mcvlog("cuGetProcAddress_v2(%s, ver=%d) -> shim wrapper", symbol,
-		      cudaVersion);
 		*pfn = w;
 	}
 	return rc;
@@ -3453,13 +3417,10 @@ static unsigned long long rt_eff_flags(unsigned long long flags, int ptsz) {
  * ABI generation; every cudart >= 12.0 (the supported floor) maps to the
  * v2-era driver ABI, hence version 12000 for the redirect decision. */
 static void rt_gpa_post(const char *symbol, void **pfn, int cudaVersion,
-                        unsigned long long flags, const char *via) {
+                        unsigned long long flags) {
 	void *w;
-	if (pfn && *pfn && (w = gpa_redirect(symbol, cudaVersion, flags))) {
-		mcvlog("%s(%s, ver=%d) -> shim wrapper", via, symbol,
-		       cudaVersion);
+	if (pfn && *pfn && (w = gpa_redirect(symbol, cudaVersion, flags)))
 		*pfn = w;
-	}
 }
 
 int cudaGetDriverEntryPoint(const char *symbol, void **pfn,
@@ -3470,8 +3431,7 @@ int cudaGetDriverEntryPoint(const char *symbol, void **pfn,
 		return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
 	int rc = real(symbol, pfn, flags, driverStatus);
 	if (rc == 0)
-		rt_gpa_post(symbol, pfn, 12000, rt_eff_flags(flags, 0),
-		            "cudaGetDriverEntryPoint");
+		rt_gpa_post(symbol, pfn, 12000, rt_eff_flags(flags, 0));
 	return rc;
 }
 
@@ -3484,8 +3444,7 @@ int cudaGetDriverEntryPoint_ptsz(const char *symbol, void **pfn,
 		return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
 	int rc = real(symbol, pfn, flags, driverStatus);
 	if (rc == 0)
-		rt_gpa_post(symbol, pfn, 12000, rt_eff_flags(flags, 1),
-		            "cudaGetDriverEntryPoint_ptsz");
+		rt_gpa_post(symbol, pfn, 12000, rt_eff_flags(flags, 1));
 	return rc;
 }
 
@@ -3500,8 +3459,7 @@ int cudaGetDriverEntryPointByVersion(const char *symbol, void **pfn,
 		return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
 	int rc = real(symbol, pfn, cudaVersion, flags, driverStatus);
 	if (rc == 0)
-		rt_gpa_post(symbol, pfn, (int)cudaVersion, rt_eff_flags(flags, 0),
-		            "cudaGetDriverEntryPointByVersion");
+		rt_gpa_post(symbol, pfn, (int)cudaVersion, rt_eff_flags(flags, 0));
 	return rc;
 }
 
@@ -3516,8 +3474,7 @@ int cudaGetDriverEntryPointByVersion_ptsz(const char *symbol, void **pfn,
 		return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
 	int rc = real(symbol, pfn, cudaVersion, flags, driverStatus);
 	if (rc == 0)
-		rt_gpa_post(symbol, pfn, (int)cudaVersion, rt_eff_flags(flags, 1),
-		            "cudaGetDriverEntryPointByVersion_ptsz");
+		rt_gpa_post(symbol, pfn, (int)cudaVersion, rt_eff_flags(flags, 1));
 	return rc;
 }
 

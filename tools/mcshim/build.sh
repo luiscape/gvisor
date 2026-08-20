@@ -14,9 +14,8 @@
 # limitations under the License.
 
 # Build the multicast interposer (mcshim.so) and its create/attach proxy
-# helper (mcshim-helper, used on pre-R610 drivers). Toolkit-free: no
-# cuda.h / nvcc required (CUDA types are declared locally), so it builds on
-# a bare driver install.
+# helper (mcshim-helper). Toolkit-free: no cuda.h / nvcc required (CUDA
+# types are declared locally), so it builds on a bare driver install.
 #
 # By default the build runs inside ubuntu:22.04 so the result is loadable in
 # container images with older glibc than the host. A host toolchain links
