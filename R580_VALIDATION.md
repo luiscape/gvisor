@@ -300,9 +300,10 @@ Key findings:
 ### FLA registration suspend/replay (implemented same day)
 
 nvproxy now host-frees FLA registrations inside the cuda-checkpoint suspend
-window and replays them where the process's driver state survives (unwind /
-resume-after-save); after a true restore libcuda lazily re-registers on the
-next export (measured), so afterLoad drops the record. Iteration history
+window and replays them where the process's driver state survives (the
+checkpoint-failure unwind; resume-after-save is out of scope and fails
+loudly); after a true restore libcuda lazily re-registers on the next
+export (measured), so afterLoad drops the record. Iteration history
 that matters for future work -- each variant was run e2e and failed for a
 measured reason: replay bookkeeping attached to graph objects is cascaded
 away by cuda-checkpoint's own frees before state.Save; foreign-fd RM calls

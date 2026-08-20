@@ -43,10 +43,11 @@ import (
 // nvproxy.suspendedFLARegs, so cuda-checkpoint never sees one. What happens
 // afterwards depends on the fate of the process's driver state:
 //
-//   - Checkpoint-failure unwind and resume-after-save (driver state
-//     survived in place): ReplayFLARegistrations recreates each
-//     registration with identical client/handle/params before the
-//     application runs again.
+//   - Checkpoint-failure unwind (driver state survived in place):
+//     ReplayFLARegistrations recreates each registration with identical
+//     client/handle/params before the application runs again.
+//   - Resume-after-save: out of scope (single-pass checkpoint->restore
+//     only); postResumeCuda fails loudly if any registration is pending.
 //   - True restore: replay is impossible and unnecessary; see the comment
 //     in nvproxy.afterLoad, which drops the record. libcuda lazily
 //     re-registers on the next export.
@@ -215,16 +216,16 @@ func (nvp *nvproxy) suspendFLARegistrations() (int, error) {
 
 // ReplayFLARegistrations recreates the registrations freed by
 // SuspendFLARegistrations with their original handles and parameters, and
-// re-records them in the object graph. It applies only to flows where the
-// process's driver state survived in place: checkpoint-failure unwind and
-// resume-after-save. After a TRUE restore nvproxy.afterLoad drops the
-// record instead: sentry-driven allocation into the restored client is
-// impossible (measured exhaustively -- see the comment in afterLoad), and
-// libcuda re-registers lazily on the next export. The residual gap is
-// workloads whose userspace caches registration state across the export:
-// torch symm-mem's post-restore re-export retries EXPORT_OBJECT_TO_FD
-// against the stale registration handle into OBJECT_NOT_FOUND. That gap is
-// a userspace-bookkeeping/driver mismatch only NVIDIA can close (the
+// re-records them in the object graph. It is the checkpoint-failure unwind:
+// the application must keep running (or be re-checkpointed) with its driver
+// state whole. After a TRUE restore nvproxy.afterLoad drops the record
+// instead: sentry-driven allocation into the restored client is impossible
+// (measured exhaustively -- see the comment in afterLoad), and libcuda
+// re-registers lazily on the next export. The residual gap is workloads
+// whose userspace caches registration state across the export: torch
+// symm-mem's post-restore re-export retries EXPORT_OBJECT_TO_FD against the
+// stale registration handle into OBJECT_NOT_FOUND. That gap is a
+// userspace-bookkeeping/driver mismatch only NVIDIA can close (the
 // checkpointed image believes in an object that cannot be checkpointed).
 // It returns the number of registrations recreated.
 func ReplayFLARegistrations(vfsObj *vfs.VirtualFilesystem) (int, error) {
@@ -235,6 +236,20 @@ func ReplayFLARegistrations(vfsObj *vfs.VirtualFilesystem) (int, error) {
 	return nvp.replayFLARegistrations()
 }
 
+// PendingFLARegistrations returns the number of FLA registrations that were
+// host-freed for a checkpoint and not yet recreated. Nonzero outside the
+// checkpoint sequence means the sandbox kept running past a successful save
+// (save-and-resume) with fabric users -- a flow that is out of scope
+// (single-pass checkpoint->restore only) and must fail loudly rather than
+// let the application dereference freed registrations.
+func PendingFLARegistrations(vfsObj *vfs.VirtualFilesystem) int {
+	nvp := nvproxyFromVFS(vfsObj)
+	if nvp == nil {
+		return 0
+	}
+	return len(nvp.suspendedFLARegs)
+}
+
 func (nvp *nvproxy) replayFLARegistrations() (int, error) {
 	regs := nvp.suspendedFLARegs
 	replayed := 0
@@ -242,11 +257,10 @@ func (nvp *nvproxy) replayFLARegistrations() (int, error) {
 	for i := range regs {
 		rec := &regs[i]
 		// The replay rides the same fd that carried the suspend-time free
-		// moments earlier: RM binds clients to their allocating fd, and on
-		// both paths that reach here (checkpoint-failure unwind,
-		// resume-after-save) the application has been frozen since the free,
-		// so the fd is necessarily still open. (A true restore never reaches
-		// here; see afterLoad.)
+		// moments earlier: the application has been frozen since the free
+		// (this only runs on the checkpoint-failure unwind), so the fd is
+		// necessarily still open. (A true restore never reaches here; see
+		// afterLoad.)
 		err := rec.params.restoreOnFD(rec.clientFD.hostFD)
 		if err != nil {
 			// Drop what was replayed; keep the rest recorded for another

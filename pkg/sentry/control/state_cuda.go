@@ -290,18 +290,16 @@ func postResumeCuda(k *kernel.Kernel, timeline *timing.Timeline) error {
 		tg.SigsegvUnlock()
 	}
 
-	// Recreate host-freed FLA registrations. Only the resume-after-save path
-	// needs this (the registrations were freed for the checkpoint and
-	// cuda-checkpoint's restore knows nothing about them); after a true
-	// restore this is a no-op because nvproxy.afterLoad dropped the record
-	// (see fla_registration.go). Ordering: after the toggle (the covered
-	// vidmem must exist again), before the interposer resume (whose
-	// re-exports assume exporter-side state is whole).
+	// Single-pass scope check: FLA registrations still pending here mean the
+	// sandbox kept running past a successful save (save-and-resume) with
+	// fabric users, or a checkpoint-failure unwind could not replay them.
+	// Either way the application would dereference host-freed registrations;
+	// fail loudly instead of letting it run. After a true restore this is
+	// always zero (nvproxy.afterLoad drops the record; libcuda re-registers
+	// lazily -- see fla_registration.go).
 	if err == nil {
-		if n, rerr := nvproxy.ReplayFLARegistrations(k.VFS()); rerr != nil {
-			err = fmt.Errorf("replaying FLA registrations: %w", rerr)
-		} else if n > 0 {
-			log.Infof("nvproxy: replayed %d FLA registrations after resume", n)
+		if n := nvproxy.PendingFLARegistrations(k.VFS()); n > 0 {
+			err = fmt.Errorf("%d FLA registrations pending after resume: save-and-resume with fabric users is out of scope (single-pass checkpoint->restore only)", n)
 		}
 	}
 
