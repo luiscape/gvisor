@@ -323,6 +323,39 @@ Out of scope by design: chained cross-GPU restores (panics loudly), R610
 (deferred; its cuda-checkpoint job would remove the legacy-IPC teardown
 entirely and with it the TP=8 custom-AR restriction).
 
+### Pre-PR e2e gate (2026-08-20, final binary)
+
+`e2e_gate.sh` + `e2e_gate_t5/t6/t7.sh`; logs under `/data/e2e_gate_20260820_*`.
+Run on the exact commit folded into the PR branch:
+
+| Trial | Config | Verdict |
+| --- | --- | --- |
+| vllm_tp4 | vLLM TP=4 same-GPU, stock | **PASS** |
+| vllm_tp2_xgpu | vLLM TP=2 cross-GPU 0,1 -> 4,5 | **PASS** |
+| sglang_tp4_nvls | SGLang TP=4 forced `--enable-nccl-nvls` | **PASS** |
+| sglang_tp4_fusion | SGLang TP=4 fusion `trtllm` ENGAGED (all 4 ranks) | **PASS** |
+| sglang_tp4_symm | SGLang TP=4 torch symm-mem two-shot (bf16, `MCSHIM_HIDE_MULTICAST=1`) | **PASS** |
+| sglang_tp4_recovery | failed-save recovery: fusion + pause-quiesce (FLAs LIVE at ckpt, n>0 suspend), `--leave-running` save fails in encoding (pre-existing pma limitation), original container recovers + serves | **PASS** |
+| phase0 sanity | 2-proc multicast W=2 | **PASS** |
+
+Gate findings worth keeping:
+
+1. With the default `release` quiesce (sleep workflow), engines free ALL f8
+   registrations app-side before the checkpoint window (248/248 observed),
+   so nvproxy FLA suspend correctly finds n=0. The n>0 path only engages
+   when GPU memory stays resident (pause quiesce) -- covered by the
+   recovery trial.
+2. Pause-quiesce checkpoints of 60GB-resident engines hit the pre-existing
+   `frontendFDMemmapFile` pma save limitation DETERMINISTICALLY (2/2, not
+   the ~1/12 flake seen with release quiesce). Sleep-based workflows are
+   unaffected.
+3. The failed-save geometry exposed and fixed two enforcement defects (see
+   commit "nvproxy: correct FLA recovery semantics after failed saves"):
+   resume-after-FAILED-save is now routed to recovery via a
+   cudaSaveFailedKey marker, and replay drops records whose client was
+   torn down by cuda-checkpoint (client-identity check; errno probing is
+   unreliable because the restore toggle recycles fd numbers).
+
 ## Results
 
 ### Interposer-level (phase0 harnesses)
