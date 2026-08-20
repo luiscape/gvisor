@@ -47,6 +47,13 @@ const (
 	// cuda-checkpoint sequentially.
 	cudaCheckpointSequentialKey = "cuda-checkpoint-sequential"
 
+	// cudaSaveFailedKey marks that the save failed after preSaveCuda ran, so
+	// the next postResumeCuda is failure RECOVERY (the driver state survived
+	// in place and host-freed FLA registrations must be replayed) rather than
+	// resume-after-successful-save (out of scope for fabric users; see the
+	// PendingFLARegistrations guard in postResumeCuda).
+	cudaSaveFailedKey = "cuda-save-failed"
+
 	// cudaLockTimeoutMS is how long (in milliseconds) each `cuda-checkpoint
 	// --action lock` invocation waits for a process to reach a lockable state.
 	// NCCL/CUDA-IPC-coupled processes only become lockable once every job
@@ -105,12 +112,12 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	// hangs or corrupts the snapshot. Poll (the app may be tearing them down)
 	// and fail loudly with a per-client attribution if they persist.
 	//
-	// Multicast objects are exempt when the LD_PRELOADed interposer is
+	// Multicast/fabric objects are exempt when the LD_PRELOADed interposer is
 	// present: checkpointCudaProcs drives it to release them between the
 	// cuda-checkpoint lock and checkpoint phases (see state_cuda_shim.go).
-	// All other fabric/exported-fd blockers always gate.
+	// All other blockers (e.g. exported fds) always gate.
 	shimDir := cudaShimDir(k, cudaProcs)
-	if err := waitForCudaCheckpointBlockers(k, o.CudaBlockerTimeout, shimDir != "" /* multicastWillBeReleased */); err != nil {
+	if err := waitForCudaCheckpointBlockers(k, o.CudaBlockerTimeout, shimDir != "" /* shimWillRelease */); err != nil {
 		if wasPaused {
 			k.Pause()
 		}
@@ -155,17 +162,24 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 // elapses, in which case it returns an error attributing the blockers to
 // their owning clients/tasks.
 //
-// When multicastWillBeReleased is true, blockers of kind "multicast" are NOT
-// waited for: the interposer releases them between the cuda-checkpoint lock
-// and checkpoint phases and rebuilds them after the post-restore toggle, so
-// the application need not release them itself.
-func waitForCudaCheckpointBlockers(k *kernel.Kernel, timeout time.Duration, multicastWillBeReleased bool) error {
+// When shimWillRelease is true, blockers the interposer's suspend releases
+// are NOT waited for: multicast objects (unbound + released between the
+// cuda-checkpoint lock and checkpoint phases, rebuilt after the post-restore
+// toggle) and the fabric / fabric-import companion objects of VMM
+// exports/imports (the driver allocates an NV_MEMORY_FABRIC object for a
+// POSIX-FD cuMemExportToShareableHandle on fabric-attached GPUs; it is
+// released along with the export/import state the interposer tears down).
+// The application need not release these itself. A second, strict gate runs
+// after the interposer's suspend and before cuda-checkpoint, so an object
+// this exemption mispredicts still fails the checkpoint loudly rather than
+// hanging cuda-checkpoint.
+func waitForCudaCheckpointBlockers(k *kernel.Kernel, timeout time.Duration, shimWillRelease bool) error {
 	if timeout <= 0 {
 		timeout = DefaultCudaBlockerTimeout
 	}
 	deadline := time.Now().Add(timeout)
 	var lastLog time.Time
-	blockers := gatedBlockers(nvproxy.CheckpointBlockers(k.VFS()), multicastWillBeReleased)
+	blockers := gatedBlockers(nvproxy.CheckpointBlockers(k.VFS()), shimWillRelease)
 	for len(blockers) != 0 {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("cuda-checkpoint cannot proceed: %d resource(s) it cannot serialize are still live after %s: %s",
@@ -178,21 +192,26 @@ func waitForCudaCheckpointBlockers(k *kernel.Kernel, timeout time.Duration, mult
 			log.Infof("Waiting for CUDA checkpoint blockers to be released: %s", nvproxy.FormatBlockersByClient(blockers))
 		}
 		time.Sleep(cudaBlockerPollInterval)
-		blockers = gatedBlockers(nvproxy.CheckpointBlockers(k.VFS()), multicastWillBeReleased)
+		blockers = gatedBlockers(nvproxy.CheckpointBlockers(k.VFS()), shimWillRelease)
 	}
 	return nil
 }
 
 // gatedBlockers returns the blockers that must gate the checkpoint. When
-// multicastWillBeReleased is true, multicast objects are released later in the
-// checkpoint sequence and are not gated; all other blockers always gate.
-func gatedBlockers(blockers []nvproxy.CheckpointBlocker, multicastWillBeReleased bool) []nvproxy.CheckpointBlocker {
-	if !multicastWillBeReleased {
+// shimWillRelease is true, the kinds the interposer's suspend releases later
+// in the checkpoint sequence (multicast objects and fabric / fabric-import
+// companions of VMM exports and imports) are not gated; all other blockers
+// always gate.
+func gatedBlockers(blockers []nvproxy.CheckpointBlocker, shimWillRelease bool) []nvproxy.CheckpointBlocker {
+	if !shimWillRelease {
 		return blockers
 	}
 	var out []nvproxy.CheckpointBlocker
 	for _, b := range blockers {
-		if b.Kind != nvproxy.BlockerKindMulticast {
+		switch b.Kind {
+		case nvproxy.BlockerKindMulticast, nvproxy.BlockerKindFabric, nvproxy.BlockerKindFabricImport:
+			// Released by the interposer's suspend.
+		default:
 			out = append(out, b)
 		}
 	}
@@ -276,6 +295,30 @@ func postResumeCuda(k *kernel.Kernel, timeline *timing.Timeline) error {
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {
 		tg.SigsegvUnlock()
+	}
+
+	saveFailed := k.PopCheckpointState(cudaSaveFailedKey) != nil
+	if err == nil {
+		if saveFailed {
+			// Failure recovery: the save failed after the cuda sequence (e.g.
+			// during encoding), so the driver state survived in place and the
+			// FLA registrations host-freed for the checkpoint must be
+			// recreated before the application runs again.
+			if n, rerr := nvproxy.ReplayFLARegistrations(k.VFS()); rerr != nil {
+				err = fmt.Errorf("replaying FLA registrations after failed save: %w", rerr)
+			} else if n > 0 {
+				log.Infof("nvproxy: replayed %d FLA registrations after failed save", n)
+			}
+		} else if n := nvproxy.PendingFLARegistrations(k.VFS()); n > 0 {
+			// Single-pass scope check: pending registrations after a
+			// SUCCESSFUL save mean the sandbox is resuming past its
+			// checkpoint with fabric users -- out of scope, and the
+			// application would dereference host-freed registrations; fail
+			// loudly instead of letting it run. After a true restore this is
+			// always zero (nvproxy.afterLoad drops the record; libcuda
+			// re-registers lazily -- see fla_registration.go).
+			err = fmt.Errorf("%d FLA registrations pending after resume: save-and-resume with fabric users is out of scope (single-pass checkpoint->restore only)", n)
+		}
 	}
 
 	// Rebuild the interposer's multicast objects and CUDA IPC imports.
@@ -628,6 +671,12 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 		// happened with everything already unlocked, where a blanket unlock
 		// would only produce misleading "unlock failed" warnings).
 		undo := func(stillLocked []*kernel.ThreadGroup) {
+			// Recreate host-freed FLA registrations FIRST (sentry-driven, so
+			// process lock state is irrelevant): once the application runs
+			// again, libcuda may reference their handles.
+			if n, rerr := nvproxy.ReplayFLARegistrations(k.VFS()); rerr != nil {
+				log.Warningf("replaying FLA registrations during checkpoint unwind failed after %d: %v", n, rerr)
+			}
 			if len(stillLocked) != 0 {
 				if _, uerr := runCudaAction(sctx, k, cudaCheckpointPath, stillLocked, []string{"--action", "unlock"}, true, nullFD); uerr != nil {
 					log.Warningf("cuda-checkpoint unlock during checkpoint unwind failed: %v", uerr)
@@ -649,11 +698,22 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 			undo(nil)
 			return err
 		}
+		// Host-free driver-internal FLA registrations (NV_MEMORY_FABRIC
+		// objects covering peer-shared VMM allocations). The interposer
+		// cannot release these -- no CUDA API frees them -- and
+		// cuda-checkpoint checkpoints them but cannot restore them. See
+		// nvproxy/fla_registration.go for what recreates them on each path.
+		if n, err := nvproxy.SuspendFLARegistrations(k.VFS()); err != nil {
+			undo(nil)
+			return fmt.Errorf("suspending FLA registrations: %w", err)
+		} else if n > 0 {
+			log.Infof("nvproxy: host-freed %d FLA registrations for checkpoint", n)
+		}
 		// Verify rather than trust: the interposer acknowledging its suspend
 		// does not by itself prove the process is serializable. Re-run the
 		// gate with nothing exempt, so anything left unreleased fails here
 		// instead of becoming a snapshot that only misbehaves after restore.
-		if err := waitForCudaCheckpointBlockers(k, blockerTimeout, false /* multicastWillBeReleased */); err != nil {
+		if err := waitForCudaCheckpointBlockers(k, blockerTimeout, false /* shimWillRelease */); err != nil {
 			undo(nil)
 			return fmt.Errorf("multicast interposer suspended but resources remain: %w", err)
 		}
@@ -670,6 +730,11 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 		// Best-effort undo: restore then unlock, returning the app to running.
 		if _, rerr := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "restore"}, !sequential, nullFD); rerr != nil {
 			log.Warningf("cuda-checkpoint restore after checkpoint-phase failure also failed: %v", rerr)
+		}
+		// Recreate host-freed FLA registrations before the app runs again
+		// (no-op when none were freed, e.g. the shimless path).
+		if n, rerr := nvproxy.ReplayFLARegistrations(k.VFS()); rerr != nil {
+			log.Warningf("replaying FLA registrations after checkpoint-phase failure failed after %d: %v", n, rerr)
 		}
 		if _, uerr := runCudaAction(sctx, k, cudaCheckpointPath, locked, []string{"--action", "unlock"}, true, nullFD); uerr != nil {
 			log.Warningf("cuda-checkpoint unlock after checkpoint-phase failure also failed: %v", uerr)

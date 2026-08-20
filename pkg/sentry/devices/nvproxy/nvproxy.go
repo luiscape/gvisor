@@ -148,7 +148,16 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		nvp.devInfo.FabricIMEXManagementDevMinor = opts.HostSettings.FabricIMEXManagementDevMinor
 	}
 
-	if imexChannelCount := opts.HostSettings.IMEXChannelCount(); imexChannelCount != 0 {
+	// IMEX channel devices are exposed only together with the
+	// fabric-imex-mgmt capability: IMEX is multi-node (MNNVL) memory-sharing
+	// functionality, the capability that grants its management interface is
+	// deliberately privileged, and native container runtimes only expose
+	// these nodes when IMEX is explicitly requested. (Note that hiding them
+	// does NOT hide the fabric domain from libcuda -- that is signaled by
+	// the RM fabric probe, which stays available to default sandboxes so
+	// single-node NVLS multicast keeps working; see version.go.)
+	if imexChannelCount := opts.HostSettings.IMEXChannelCount(); imexChannelCount != 0 &&
+		opts.DriverCaps&nvconf.CapFabricIMEXManagement != 0 {
 		capsIMEXChannelsDevMajor, err := vfsObj.GetDynamicCharDevMajor()
 		if err != nil {
 			return nil, fmt.Errorf("allocating device major number for nvidia-caps-imex-channels: %w", err)
@@ -213,6 +222,15 @@ type nvproxy struct {
 	procDriverNvidiaParams string
 	devInfo                DeviceInfo
 	regularDevs            [nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1]*frontendDevice
+
+	// suspendedFLARegs records FLA registrations host-freed for an
+	// in-progress checkpoint, for replay after the cuda-checkpoint restore
+	// toggle. It lives here rather than in the object graph because
+	// cuda-checkpoint's checkpoint phase frees the process's RM objects
+	// through nvproxy, cascading graph entries away before the sandbox state
+	// is saved. Accessed only from checkpoint/restore control paths, which
+	// are serialized; no lock needed.
+	suspendedFLARegs []suspendedFLARegistration
 
 	// devTransMu guards the device translation state below. It is
 	// deliberately not fdsMu: afterLoad() calls frontendFD.load() while

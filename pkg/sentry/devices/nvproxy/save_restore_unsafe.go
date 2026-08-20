@@ -155,6 +155,17 @@ func FillDeviceRemapIDsFromMinor(ctx context.Context, ctlDevClient *devutil.Gofe
 }
 
 func (c *capturedRmAllocParams) restore() error {
+	return c.restoreOnFD(c.fd.hostFD)
+}
+
+// restoreOnFD is restore() carried by an explicit host control fd. RM ioctls
+// are client-scoped, not fd-scoped, so any live control fd can replay an
+// allocation whose original fd has been closed (the fd captured at
+// allocation time dies with the application fd; the RM client does not).
+func (c *capturedRmAllocParams) restoreOnFD(hostFD int32) error {
+	if hostFD < 0 {
+		return fmt.Errorf("no live host fd to carry the replay")
+	}
 	// Copy all parameters that might be driver-mutated to avoid modifying c.
 	ioctlParams := c.ioctlParams
 	rightsRequested := c.rightsRequested
@@ -171,7 +182,7 @@ func (c *capturedRmAllocParams) restore() error {
 	}
 
 	h := ioctlParams.HObjectNew
-	if _, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(c.fd.hostFD), frontendIoctlCmd(nvgpu.NV_ESC_RM_ALLOC, nvgpu.SizeofNVOS64Parameters), uintptr(unsafe.Pointer(&ioctlParams))); errno != 0 {
+	if _, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(hostFD), frontendIoctlCmd(nvgpu.NV_ESC_RM_ALLOC, nvgpu.SizeofNVOS64Parameters), uintptr(unsafe.Pointer(&ioctlParams))); errno != 0 {
 		return errno
 	}
 	if ioctlParams.Status != 0 {

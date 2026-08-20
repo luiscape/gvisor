@@ -606,9 +606,9 @@ type NV00DE_ALLOC_PARAMETERS_V545 struct {
 // +marshal
 type nv00f8Map struct {
 	_       structs.HostLayout
-	offset  uint64
-	hVidMem Handle
-	flags   uint32
+	Offset  uint64
+	HVidMem Handle
+	Flags   uint32
 }
 
 // From src/common/sdk/nvidia/inc/class/cl00e0.h:
