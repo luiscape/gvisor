@@ -1,119 +1,90 @@
-# Design: suspend/replay of persistent FLA registrations (NV_MEMORY_FABRIC 00f8)
+# FLA registrations (NV_MEMORY_FABRIC 00f8) and checkpoint/restore
 
-Status: **IMPLEMENTED** (`pkg/sentry/devices/nvproxy/fla_registration.go` +
-`state_cuda.go` wiring; see the commit "nvproxy: suspend FLA registrations
-around cuda-checkpoint"). The implementation diverges from the sketch below
-in two ways, both forced by measurement -- read the commit message and
-`R580_VALIDATION.md` before trusting details here:
+Status: implemented and validated. Code: `pkg/sentry/devices/nvproxy/`
+`fla_registration.go` (+ `_unsafe.go`), wired in
+`pkg/sentry/control/state_cuda.go`. This document is the mechanism summary
+and the record of measured dead ends, so nobody re-walks them.
 
-1. Replay bookkeeping lives on `nvproxy.suspendedFLARegs`, NOT on graph
-   objects: cuda-checkpoint's checkpoint phase frees the process's RM
-   objects through nvproxy and cascades graph entries away before
-   state.Save.
-2. There is no post-toggle replay after a TRUE restore: the toggle rebuilds
-   the process's RM objects under fresh handles, so identity replay is
-   impossible -- and unnecessary, because libcuda lazily re-registers on the
-   next export. Replay applies only to checkpoint-failure unwind and
-   resume-after-save.
+## The object
 
-Outcome: FlashInfer allreduce fusion (trtllm backend) under fabric-imex-mgmt
-now passes checkpoint/restore end-to-end. torch symm-mem multimem advances
-to a distinct, pre-existing restore failure (interposer re-export of torch's
-workspace returns rc=1; torch caches export state the fusion path does not)
--- the open item for the next session.
+On fabric-attached GPUs (NVSwitch + fabric manager; the RM fabric probe
+succeeds in default sandboxes), libcuda lazily allocates one
+`NV_MEMORY_FABRIC` (00f8) object per VMM allocation shared between
+processes: an FLA *registration*, identified by alloc params with
+`Map.HVidMem != 0` (naming the covered vidmem). Properties, all measured:
 
-## Problem (fully characterized, 2026-08-19)
+- Created by libcuda internally; the covered `cuMemCreate` asked for plain
+  POSIX-FD handles. Not application-requested, not application-freeable,
+  no CUDA API touches it.
+- Lives as long as the covered allocation.
+- cuda-checkpoint *checkpoints* it but cannot *restore* it: the restored
+  process dies in `NV_ERR_OBJECT_NOT_FOUND` storms. (This is why the
+  checkpoint blocker gate refuses fabric objects.)
+- Importer-side and bind-time 00f8 companions are transient and already
+  released by the multicast interposer's suspend; only the exporter-side
+  registration persists.
 
-On fabric-attached GPUs with the RM fabric probe allowed, libcuda lazily
-creates one driver-internal `NV_MEMORY_FABRIC` (00f8) object per
-exporter-side VMM allocation that peers import: an FLA *registration* whose
-alloc params carry `Map.HVidMem != 0` pointing at the covered vidmem. It is
-metadata over content that lives elsewhere; nothing in userspace ever frees
-it while the allocation lives.
+Affected workloads: anything that keeps peer-shared VMM allocations across
+a checkpoint under an NVSwitch fabric -- torch symm-mem's workspace,
+FlashInfer's all-reduce-fusion workspace.
 
-Evidence chain:
-- torch symm-mem workspace: 1 live 00f8/rank at gate time (57/rank in pause
-  mode), `allocSize=0x20200000 map.hVidMem=0x5c000328` (the workspace).
-- FlashInfer `--flashinfer-allreduce-fusion-backend trtllm`: identical
-  signature, 1 live/rank at TP=4 (252 created / 248 shim-released) and TP=8
-  (632 / 624).
-- cuda-checkpoint *checkpoints* a live 00f8 but cannot *restore* it: with the
-  gate bypassed (arm_d6 experiment), checkpoint succeeded and the restored
-  process died in `NV_ERR_OBJECT_NOT_FOUND` (0x57) storms; the restore boot
-  log contains **zero** 00f8 allocations (cuda-checkpoint never recreated it,
-  libcuda's restored bookkeeping still references its handle).
-- Importer-side/transient 00f8s are already released by the interposer's
-  suspend (imports + unbinds); only the exporter-side registration survives.
-- No CUDA API frees it. Only nvproxy has the handle and the saved params.
+## The mechanism
 
-## Fix shape: nvproxy frees before checkpoint, replays after the toggle
+**Checkpoint** (between the cuda-checkpoint suspend window's teardown and
+the checkpoint phase): `SuspendFLARegistrations` host-frees every live
+registration via the owning client's allocating fd, and records
+(client, handle, parent, hVidMem, params, fd) on
+`nvproxy.suspendedFLARegs`. The strict blocker gate then sees the truth
+(zero fabric objects) and cuda-checkpoint never meets one.
 
-Mirrors the interposer's philosophy (tear down before cuda-checkpoint,
-rebuild after), but at the RM level where this object lives. Invariant
-preserved: identical client + handle + parent + params at replay, so
-libcuda's restored bookkeeping never notices (same argument as TASK.md).
+The record lives on `nvproxy`, NOT in the object graph: cuda-checkpoint's
+own checkpoint phase frees the process's remaining RM objects through
+nvproxy, cascading graph entries away before `state.Save`.
 
-### Checkpoint side (state_cuda.go, checkpointCudaProcs, shim path only)
+**Afterwards**, by fate of the process's driver state:
 
-Sequence today: lock -> unlock -> shim suspend -> strict gate -> re-lock ->
-checkpoint. Insert between re-lock and checkpoint (procs locked, GPU
-quiesced, transient 00f8s already gone):
+| Path | Driver state | Action |
+| --- | --- | --- |
+| Checkpoint-failure unwind | survived in place | `ReplayFLARegistrations`: host RM_ALLOC with identical client/handle/params, on the same fd that carried the free (app frozen since; fd necessarily open) |
+| Resume-after-save | survived in place | same replay, after the restore toggle |
+| True restore | rebuilt by cuda-checkpoint | `afterLoad` drops the record; libcuda lazily re-registers on the next export |
 
-1. `nvproxy.SuspendFabricRegistrations(vfsObj)`:
-   - Walk `nvp.clients[*].resources` for live 00f8 objects whose saved
-     alloc params (`rmAllocObject`, already retained) have `Map.HVidMem != 0`
-     (the registration flavor -- never free content-bearing fabric memory,
-     which only exists under `MCSHIM_ALLOW_FABRIC=1`).
-   - Host `NV_ESC_RM_FREE` each via the owning frontendFD's hostFD (new
-     small helper next to the existing host-invoke helpers in
-     `save_restore_unsafe.go` / `multicast_unsafe.go`).
-   - Do NOT objFree from the graph: mark the object `hostFreed=true`
-     (new field, savable). The graph entry carries everything replay needs.
-2. Re-verify zero blockers (gate must skip `hostFreed` objects), then
-   checkpoint.
-3. Unwind path (checkpoint fails afterwards): immediately re-alloc the freed
-   registrations via the replay helper and clear `hostFreed`, before the
-   restore-toggle/unlock unwind.
+## Measured dead ends (do not re-walk)
 
-### Restore side (postRestoreCuda)
+1. **Replay bookkeeping on graph objects** (`hostFreed` flag): cascaded
+   away by cuda-checkpoint's checkpoint-phase frees before `state.Save`.
+2. **Denying the 00f8 class instead of suspending**: once the fabric probe
+   has succeeded, libcuda treats FLA-registration failure during FD export
+   as fatal (`CUDA driver error: unknown error`).
+3. **Denying the fabric probe** (gating on `fabric-imex-mgmt`): kills
+   single-node NVLS/multicast entirely -- libcuda couples
+   `MULTICAST_SUPPORTED` to the probe. Reverted; the probe is default-
+   allowed and IMEX is out of the C/R picture.
+4. **Replaying after a true restore**: the toggle rebuilds the app's client
+   through privileged debugger paths nvproxy never sees (the post-toggle
+   graph contains only cuda-checkpoint's utility clients); no sentry-held
+   fd is RM-associated with the restored client (foreign fds:
+   `INVALID_CLIENT`; saved fds: dead); sentry RM_ALLOC into it fails
+   `NV_ERR_INSUFFICIENT_PERMISSIONS` regardless of carrier (probed across
+   every live frontendFD).
 
-Sequence today: afterLoad (nvproxy object replay) -> cuda toggle
-(cuda-checkpoint recreates process GPU state, incl. the vidmem handles the
-registrations reference) -> shim resume. Changes:
+## The residual gap (NVIDIA-side)
 
-1. afterLoad's topological restore SKIPS `hostFreed` objects (their
-   dependencies -- subdevice parent, hVidMem -- do not exist until the
-   toggle).
-2. After `restoreCudaProcs` (toggle) and before the shim resume: new
-   `nvproxy.ReplayDeferredObjects(ctx)` -- host `NV_ESC_RM_ALLOC` with the
-   saved hObjectNew/parent/params on each owning client's hostFD (the
-   existing rmAllocObject replay path, invoked post-toggle instead of in
-   afterLoad), then clear `hostFreed`.
+Userspace that *caches* the registration handle across exports cannot
+survive a true restore: torch symm-mem multimem's post-restore re-export
+retries `EXPORT_OBJECT_TO_FD` against the stale handle into
+`OBJECT_NOT_FOUND`. The checkpointed image believes in an object that
+cannot be checkpointed; only cuda-checkpoint can reconcile that. Until
+then, torch symm-mem workloads should set `MCSHIM_HIDE_MULTICAST=1`
+(interposer masks `MULTICAST_SUPPORTED`; torch selects its two-shot
+symm-mem kernel, which round-trips checkpoints -- validated). FlashInfer
+fusion does not cache and passes end-to-end without the mask.
 
-### Gate change
+## Validation (8x H100, R580, default caps, no IMEX)
 
-`checkpointBlockers()` skips objects with `hostFreed=true`. No new exemption
-kinds; the strict gate stays strict.
-
-## Empirical unknowns to verify first (cheap, in order)
-
-1. Host RM_FREE of a 00f8 on a locked process's client: accepted by RM?
-   (Expected yes -- RM ioctls are client-scoped, not process-scoped.)
-2. Post-toggle RM_ALLOC of 00f8 with the original hObjectNew: does the
-   toggle restore the referenced vidmem under the same handle (it must --
-   cuda-checkpoint's contract with libcuda), and does RM accept the alloc
-   from the sentry-held fd? Probe with a 2-rank torch symm-mem multimem run
-   under CB_IMEX=1.
-3. Ordering vs. shim resume: the fusion/symm-mem multicast groups are
-   rebuilt by the shim AFTER this replay; the registration does not
-   reference them (only hVidMem), so no cycle. Verify empirically.
-
-## Acceptance
-
-- SGLang TP=4/TP=8 `--flashinfer-allreduce-fusion-backend trtllm` under
-  `CB_IMEX=1`: checkpoint proceeds (0 blockers), restore passes, fusion
-  engaged post-restore (no "Skipping allreduce fusion"), inference matches.
-- torch symm-mem multimem (bf16, no compile) under `CB_IMEX=1`: same, with
-  `multimem_all_reduce_` correctness.
-- Existing matrix unchanged (no-fabric runs never enter the new path:
-  zero live 00f8 at that point).
+| Config | Result |
+| --- | --- |
+| SGLang TP=4 forced `--enable-nccl-nvls` | PASS, full C/R |
+| SGLang TP=4 `--flashinfer-allreduce-fusion-backend trtllm`, fusion engaged | PASS, full C/R (FLA registrations host-freed at checkpoint, re-registered lazily post-restore) |
+| SGLang TP=4 torch symm-mem bf16 + `MCSHIM_HIDE_MULTICAST=1` | PASS, two-shot |
+| phase0 multicast harness, no-fabric matrix, nvproxy/control unit tests | PASS, unaffected |

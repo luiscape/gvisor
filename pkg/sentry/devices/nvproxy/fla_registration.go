@@ -27,36 +27,34 @@ import (
 // This file implements suspend/replay of NV_MEMORY_FABRIC (00f8) objects
 // around cuda-checkpoint.
 //
-// On fabric-attached GPUs with the RM fabric probe allowed
-// (fabric-imex-mgmt), libcuda lazily allocates one 00f8 object per VMM
-// allocation that is shared between processes: an FLA *registration* whose
-// alloc params carry Map.HVidMem != 0, naming the covered vidmem object. It
-// is metadata over content that lives elsewhere; nothing in userspace frees
-// it while the covered allocation lives, and no CUDA API can. cuda-checkpoint
-// checkpoints a live 00f8 but cannot restore it: the restored process dies in
-// NV_ERR_OBJECT_NOT_FOUND storms (measured; see the blocker gate, which
-// exists to refuse such snapshots).
+// On fabric-attached GPUs (NVSwitch with the fabric manager running -- the
+// RM fabric probe succeeds in default sandboxes), libcuda lazily allocates
+// one 00f8 object per VMM allocation that is shared between processes: an
+// FLA *registration* whose alloc params carry Map.HVidMem != 0, naming the
+// covered vidmem object. It is metadata over content that lives elsewhere;
+// nothing in userspace frees it while the covered allocation lives, and no
+// CUDA API can. cuda-checkpoint checkpoints a live 00f8 but cannot restore
+// it: the restored process dies in NV_ERR_OBJECT_NOT_FOUND storms
+// (measured; the blocker gate exists to refuse such snapshots).
 //
 // nvproxy is the only layer holding both the handle and the original alloc
-// params, so it owns the fix:
+// params, so it owns the fix: SuspendFLARegistrations host-frees each
+// registration inside the cuda-checkpoint suspend window and records it on
+// nvproxy.suspendedFLARegs, so cuda-checkpoint never sees one. What happens
+// afterwards depends on the fate of the process's driver state:
 //
-//   - Checkpoint: SuspendFLARegistrations host-frees each registration and
-//     records it on nvproxy.suspendedFLARegs. cuda-checkpoint then never
-//     sees one.
-//   - Restore/resume: ReplayFLARegistrations recreates each with identical
-//     client/handle/params, after the cuda-checkpoint toggle has rebuilt
-//     the vidmem it covers (under its original handle -- that identity is
-//     cuda-checkpoint's contract with libcuda's restored bookkeeping) and
-//     before the multicast interposer's resume, whose re-exports make
-//     libcuda reference the registration handle again (measured: re-export
-//     fails with OBJECT_NOT_FOUND if the replay is skipped).
+//   - Checkpoint-failure unwind and resume-after-save (driver state
+//     survived in place): ReplayFLARegistrations recreates each
+//     registration with identical client/handle/params before the
+//     application runs again.
+//   - True restore: replay is impossible and unnecessary; see the comment
+//     in nvproxy.afterLoad, which drops the record. libcuda lazily
+//     re-registers on the next export.
 //
 // The record deliberately lives OUTSIDE the object graph: cuda-checkpoint's
 // checkpoint phase frees the process's remaining RM objects through nvproxy,
 // cascading graph entries away before the sandbox state is saved, so replay
 // bookkeeping attached to graph objects would be gone exactly when needed.
-// nvproxy.suspendedFLARegs survives both the checkpoint phase and the state
-// round-trip.
 
 // memoryFabricObject is an objectImpl tracking an NV_MEMORY_FABRIC (00f8)
 // allocation.
@@ -240,44 +238,15 @@ func (nvp *nvproxy) replayFLARegistrations() (int, error) {
 	regs := nvp.suspendedFLARegs
 	replayed := 0
 	ctx := context.Background()
-	// Candidate host fds for carrying the replays. RM's association rules
-	// are not documented and every clean theory measured false so far
-	// (foreign-rank fds: INVALID_CLIENT; the saved client-allocating fd:
-	// dead after restore; the post-toggle object graph: contains only
-	// cuda-checkpoint's utility clients, the application's client is
-	// restored through debugger paths nvproxy never sees). So: probe. The
-	// candidate set is every live control-capable frontendFD, saved
-	// clientFD first; failed probes are cheap (an errno or an RM status),
-	// and the first fd RM accepts carries the rest of that client's
-	// replays.
-	var candidates []*frontendFD
-	nvp.fdsMu.Lock()
-	for fd := range nvp.frontendFDs {
-		if fd.hostFD >= 0 {
-			candidates = append(candidates, fd)
-		}
-	}
-	nvp.fdsMu.Unlock()
 	for i := range regs {
 		rec := &regs[i]
-		tried := 0
-		var err error
-		ordered := make([]*frontendFD, 0, len(candidates)+1)
-		if rec.clientFD != nil {
-			ordered = append(ordered, rec.clientFD)
-		}
-		ordered = append(ordered, candidates...)
-		err = fmt.Errorf("no live host fds to try")
-		for _, ffd := range ordered {
-			tried++
-			err = rec.params.restoreOnFD(ffd.hostFD)
-			if err == nil {
-				if tried > 1 {
-					log.Infof("nvproxy: FLA registration %v:%v replayed on candidate fd %d of %d", rec.clientH, rec.objectH, tried, len(ordered))
-				}
-				break
-			}
-		}
+		// The replay rides the same fd that carried the suspend-time free
+		// moments earlier: RM binds clients to their allocating fd, and on
+		// both paths that reach here (checkpoint-failure unwind,
+		// resume-after-save) the application has been frozen since the free,
+		// so the fd is necessarily still open. (A true restore never reaches
+		// here; see afterLoad.)
+		err := rec.params.restoreOnFD(rec.clientFD.hostFD)
 		if err != nil {
 			// Drop what was replayed; keep the rest recorded for another
 			// attempt or for diagnosis.

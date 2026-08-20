@@ -293,10 +293,10 @@ func postResumeCuda(k *kernel.Kernel, timeline *timing.Timeline) error {
 	// Recreate host-freed FLA registrations. Only the resume-after-save path
 	// needs this (the registrations were freed for the checkpoint and
 	// cuda-checkpoint's restore knows nothing about them); after a true
-	// restore this is a no-op, because the afterLoad object replay already
-	// recreated them. Ordering: after the toggle (the covered vidmem must
-	// exist again), before the interposer resume (whose re-exports assume
-	// exporter-side state is whole).
+	// restore this is a no-op because nvproxy.afterLoad dropped the record
+	// (see fla_registration.go). Ordering: after the toggle (the covered
+	// vidmem must exist again), before the interposer resume (whose
+	// re-exports assume exporter-side state is whole).
 	if err == nil {
 		if n, rerr := nvproxy.ReplayFLARegistrations(k.VFS()); rerr != nil {
 			err = fmt.Errorf("replaying FLA registrations: %w", rerr)
@@ -685,10 +685,8 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 		// Host-free driver-internal FLA registrations (NV_MEMORY_FABRIC
 		// objects covering peer-shared VMM allocations). The interposer
 		// cannot release these -- no CUDA API frees them -- and
-		// cuda-checkpoint checkpoints them but cannot restore them. They
-		// stay in the object graph marked hostFreed; the afterLoad object
-		// replay recreates them (after the vidmem they cover, via a
-		// restore-ordering dependency) before the post-restore toggle.
+		// cuda-checkpoint checkpoints them but cannot restore them. See
+		// nvproxy/fla_registration.go for what recreates them on each path.
 		if n, err := nvproxy.SuspendFLARegistrations(k.VFS()); err != nil {
 			undo(nil)
 			return fmt.Errorf("suspending FLA registrations: %w", err)
