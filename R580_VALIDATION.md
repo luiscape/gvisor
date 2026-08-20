@@ -368,6 +368,14 @@ loudly if `tools/mcshim/mcshim.so` is missing instead of silently running
 a stale fallback shim (that fallback misdirected a real debugging
 session).
 
+A final trim pass then retired mcshim's debug tracing (CALL/resolver
+logs, caller attribution; MCSHIM_VERBOSE now gates only per-entry
+suspend/resume diagnostics) and fixed stale docs (R550+ framing, MAXN
+4096, floor=0 semantics). Regated: phase0 + 4/4 PASS. Comment audit of
+state_cuda.go / state_cuda_shim.go / fla_registration.go found the
+remaining large blocks to be load-bearing invariants (gate/lock
+interplay, resume ordering, failure geometry) -- kept.
+
 ## Results
 
 ### Interposer-level (phase0 harnesses)
