@@ -48,16 +48,6 @@ type object struct {
 	// protected by client.objsMu.
 	deps  map[*object]struct{} // objects that this object depends on
 	rdeps map[*object]struct{} // objects that depend on this object
-
-	// restoreDeps and restoreRdeps record restore-ordering-only dependencies:
-	// this object must be restored after every object in restoreDeps, but
-	// unlike deps/rdeps, freeing an object in restoreDeps does NOT free this
-	// object. Used where the driver holds its own internal reference (e.g. a
-	// multicast object's ATTACH_MEM dups hMemory inside the driver, so the
-	// application may legally free hMemory while the attachment lives on).
-	// These fields are protected by client.objsMu.
-	restoreDeps  map[*object]struct{}
-	restoreRdeps map[*object]struct{}
 	objectFreeEntry
 }
 
@@ -167,60 +157,6 @@ func objDep(o1, o2 *object) {
 		o2.rdeps = make(map[*object]struct{})
 	}
 	o2.rdeps[o1] = struct{}{}
-}
-
-// objAddRestoreDep records a restore-ordering-only dependency of the existing
-// object with handle h1 on the existing object with handle h2: h1 is restored
-// after h2, but freeing h2 does not free h1 (see object.restoreDeps). Both h1
-// and h2 are handles in the client c.
-//
-// Callers must not create cycles (through restore edges alone or combined
-// with deps edges): the combined graph is topologically sorted at restore
-// time, and a cycle panics the restore. Current edges only ever point from a
-// multicast object to sibling memory/subdevice objects, which cannot close a
-// cycle with the child->parent deps edges.
-//
-// Precondition: c.objsMu must be locked.
-func (c *rootClient) objAddRestoreDep(h1, h2 nvgpu.Handle) {
-	if h1.Val == 0 || h2.Val == 0 {
-		return
-	}
-	o1, ok := c.resources[h1]
-	if !ok {
-		log.Traceback("nvproxy: invalid handle %v:%v", c.handle, h1)
-		return
-	}
-	o2, ok := c.resources[h2]
-	if !ok {
-		log.Traceback("nvproxy: invalid handle %v:%v", c.handle, h2)
-		return
-	}
-	if o1.restoreDeps == nil {
-		o1.restoreDeps = make(map[*object]struct{})
-	}
-	o1.restoreDeps[o2] = struct{}{}
-	if o2.restoreRdeps == nil {
-		o2.restoreRdeps = make(map[*object]struct{})
-	}
-	o2.restoreRdeps[o1] = struct{}{}
-}
-
-// objRemoveRestoreDep removes a restore-ordering-only dependency recorded by
-// objAddRestoreDep. It is a no-op if either handle does not resolve or no
-// such dependency exists.
-//
-// Precondition: c.objsMu must be locked.
-func (c *rootClient) objRemoveRestoreDep(h1, h2 nvgpu.Handle) {
-	o1, ok := c.resources[h1]
-	if !ok {
-		return
-	}
-	o2, ok := c.resources[h2]
-	if !ok {
-		return
-	}
-	delete(o1.restoreDeps, o2)
-	delete(o2.restoreRdeps, o1)
 }
 
 // objDup records the duplication of the driver object with handle srcH in the
@@ -347,14 +283,6 @@ func (nvp *nvproxy) objFree(ctx context.Context, client *rootClient, h nvgpu.Han
 		}
 		for o3 := range o2.deps {
 			delete(o3.rdeps, o2)
-		}
-		// Restore-ordering-only edges do not cascade frees, so survivors on
-		// either side must drop their references to the freed object.
-		for o3 := range o2.restoreDeps {
-			delete(o3.restoreRdeps, o2)
-		}
-		for o3 := range o2.restoreRdeps {
-			delete(o3.restoreDeps, o2)
 		}
 		delete(o2.client.resources, o2.handle)
 		client.objsFreeList.Remove(o2)

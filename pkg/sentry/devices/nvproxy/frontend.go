@@ -1083,19 +1083,6 @@ func ctrlMemoryMulticastFabricAttachGPU(fi *frontendIoctlState, ioctlParams *nvg
 	ctrlParams.DevDescriptor = uint64(devDesc.hostFD)
 	n, err := rmControlInvoke(fi, ioctlParams, &ctrlParams)
 	ctrlParams.DevDescriptor = origDevDescriptor
-	if err == nil && ioctlParams.Status == nvgpu.NV_OK {
-		// Record the successful attach on the multicast object for replay at
-		// restore time. The device descriptor FD number is meaningless at
-		// replay; record the device minor instead. The restore-ordering-only
-		// dependency makes the replay find the subdevice already restored
-		// without tying the multicast object's lifetime to it.
-		nvp := fi.fd.dev.nvp
-		if mcObj, unlock := nvp.getMulticastObjectWithLock(fi.ctx, ioctlParams.HClient, ioctlParams.HObject); mcObj != nil {
-			mcObj.recordAttachGPU(ctrlParams, devDesc.dev.minor)
-			mcObj.client.objAddRestoreDep(ioctlParams.HObject, ctrlParams.HSubDevice)
-			unlock()
-		}
-	}
 	// Note that ctrlParams.CopyOut() is not called here because
 	// NV00FD_CTRL_ATTACH_GPU_PARAMS is an input-only parameter.
 	return n, err
@@ -1617,13 +1604,7 @@ func rmAllocMulticastFabric[Params any, PtrParams hasPOsEventPtr[Params]](fi *fr
 		allocParams.SetPOsEvent(nvgpu.P64(uint64(eventFile.hostFD)))
 	}
 
-	n, err := rmAllocInvoke(fi, ioctlParams, allocParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, ap *Params) {
-		// Capture the alloc params with pOsEvent zeroed: at this point it holds
-		// a translated host event FD, which would be stale at replay time, and
-		// the event is optional (the driver has already consumed it here).
-		PtrParams(ap).SetPOsEvent(0)
-		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, newMulticastFabricObject(fi.fd, ioctlParams, rightsRequested, ap), ioctlParams.HObjectParent)
-	})
+	n, err := rmAllocInvoke(fi, ioctlParams, allocParams, isNVOS64, addSimpleObjDepParentLocked)
 	if err != nil {
 		return n, err
 	}

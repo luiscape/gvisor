@@ -52,8 +52,7 @@ go_library(
         "frontend_mmap_unsafe.go",
         "frontend_unsafe.go",
         "handlers.go",
-        "multicast.go",
-        "multicast_unsafe.go",
+
         "nvproxy.go",
         "nvproxy_unsafe.go",
         "object.go",
@@ -108,7 +107,7 @@ go_library(
 go_test(
     name = "nvproxy_test",
     srcs = [
-        "multicast_test.go",
+
         "nvproxy_test.go",
     ],
     library = ":nvproxy",

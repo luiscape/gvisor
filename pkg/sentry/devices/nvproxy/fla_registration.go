@@ -99,7 +99,6 @@ type suspendedFLARegistration struct {
 	clientH nvgpu.Handle
 	objectH nvgpu.Handle
 	parentH nvgpu.Handle
-	hVidMem nvgpu.Handle
 	params  capturedRmAllocParams
 	// client is the rootClient the registration belonged to, by IDENTITY:
 	// replay is valid only while nvp.clients[clientH] is still this exact
@@ -117,10 +116,8 @@ type suspendedFLARegistration struct {
 // rmAllocMemoryFabric is the NV_ESC_RM_ALLOC handler for NV_MEMORY_FABRIC
 // (00f8): rmAllocSimple plus diagnostic logging of the allocation parameters
 // (fabric objects block CUDA checkpoints, and attributing one to the VMM
-// allocation it covers is what makes such a blocker debuggable), a
-// suspendable object implementation, and a restore-ordering dependency on
-// the covered vidmem object so that, in flows where the afterLoad object
-// replay runs, the registration is recreated only after the memory it maps.
+// allocation it covers is what makes such a blocker debuggable) and a
+// suspendable object implementation.
 func rmAllocMemoryFabric(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
 	return rmAllocSimpleParams[nvgpu.NV00F8_ALLOCATION_PARAMETERS](fi, ioctlParams, isNVOS64,
 		func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV00F8_ALLOCATION_PARAMETERS) {
@@ -132,12 +129,6 @@ func rmAllocMemoryFabric(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAM
 				params: captureRmAllocParams(fi.fd, ioctlParams, rightsRequested, allocParams),
 			}
 			fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, impl, ioctlParams.HObjectParent)
-			if allocParams != nil && allocParams.Map.HVidMem.Val != 0 {
-				// Restore-ordering only: freeing the covered vidmem does not
-				// free the registration in the driver's model, so a hard
-				// deps edge would over-free.
-				client.objAddRestoreDep(ioctlParams.HObjectNew, allocParams.Map.HVidMem)
-			}
 		})
 }
 
@@ -193,13 +184,10 @@ func (nvp *nvproxy) suspendFLARegistrations() (int, error) {
 		if status != nvgpu.NV_OK {
 			return freed, fmt.Errorf("host RM_FREE of FLA registration %v:%v failed: status=%#x", t.client.handle, t.obj.handle, status)
 		}
-		var allocParams nvgpu.NV00F8_ALLOCATION_PARAMETERS
-		allocParams.UnmarshalBytes(t.obj.params.allocParams[:allocParams.SizeBytes()])
 		rec := suspendedFLARegistration{
 			clientH:  t.client.handle,
 			objectH:  t.obj.handle,
 			parentH:  t.obj.parent,
-			hVidMem:  allocParams.Map.HVidMem,
 			params:   t.obj.params,
 			client:   t.client,
 			clientFD: clientFD,
@@ -306,7 +294,6 @@ func (nvp *nvproxy) replayFLARegistrations() (int, error) {
 		impl := &memoryFabricObject{params: rec.params}
 		client.objsMu.Lock()
 		nvp.objAdd(ctx, client, rec.objectH, nvgpu.NV_MEMORY_FABRIC, impl, rec.parentH)
-		client.objAddRestoreDep(rec.objectH, rec.hVidMem)
 		client.objsMu.Unlock()
 		replayed++
 	}
