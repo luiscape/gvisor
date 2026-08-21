@@ -13,10 +13,11 @@
 // limitations under the License.
 
 /*
- * mcshim-helper: multicast create/attach proxy for pre-R610 drivers.
+ * mcshim-helper: multicast create/attach proxy for the interposer.
  *
- * On R580, a cuda-checkpoint-restored process can import multicast group
- * fds, bind memory to them, and map multicast VAs -- but cuMulticastCreate
+ * On the supported drivers (measured on R580), a cuda-checkpoint-restored
+ * process can import multicast group fds, bind memory to them, and map
+ * multicast VAs -- but cuMulticastCreate
  * and cuMulticastAddDevice fail with CUDA_ERROR_INVALID_DEVICE (and
  * cuCtxCreate with OOM): the restore blocks fresh device admission at the
  * process level. This helper is exec'd by mcshim.so during its rebuild as a

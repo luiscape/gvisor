@@ -2295,7 +2295,7 @@ static int do_suspend(void) {
 /* ------------------------------------------------------------------ */
 
 /* ------------------------------------------------------------------ */
-/* Multicast proxy (pre-R610 drivers).                                */
+/* Multicast proxy.                                                   */
 /*                                                                    */
 /* On R580, a cuda-checkpoint-restored process can IMPORT a multicast */
 /* group fd, BIND its memory to it, and MAP the multicast VA -- but   */
