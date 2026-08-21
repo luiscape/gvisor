@@ -382,6 +382,33 @@ Coverage gap closed on the final binary: SGLang TP=4 forced
 validated same-GPU config now has its cross-GPU counterpart validated at
 TP<=4 on this exact binary.
 
+### Final pre-PR correctness audit (2026-08-21)
+
+Two real gaps found and fixed (commit "audit: close two correctness gaps
+found in pre-PR review"):
+
+1. **Stale `cudaSaveFailedKey` leak** -- a failed attempt's marker could
+   survive into a later successful image (docker-paused flow has no
+   intermediate resume), misrouting that image's restore into the
+   failed-save recovery branch and silently skipping the single-pass scope
+   guard. Marker now stamped only for CUDA saves and cleared at the start
+   of every preSaveCuda.
+2. **Ungated tracked mutators (TOCTOU)** -- the interposer gated
+   submissions and cuMemAlloc but not cuMemCreate / multicast / exports /
+   imports / cuIpc / map / unmap / release; a thread reaching one in the
+   unlocked teardown window could mint fresh blockers AFTER the strict
+   gate verified zero. All 15 tracked mutators now gate_wait(); the
+   transition machinery only calls the r_ reals, so no self-deadlock.
+
+Audited clean: reverted regions byte-match upstream intent; blocker-
+timeout flag, .gitignore artifact coverage, deterministic proc ordering,
+exported-fd clearing, restore-side marker-env re-injection scoping,
+cudaShimDirKey add/pop symmetry, FLA record client-identity check
+(nil-safe), suspendedFLARegs serialization of released-client references
+(harmless garbage, dropped by afterLoad). Known accepted gap documented:
+cuMemAddressReserve/Free are not interposed. Regated on the fixed
+binary+shim: phase0 PASS + gate 4/4 PASS.
+
 ## Results
 
 ### Interposer-level (phase0 harnesses)
