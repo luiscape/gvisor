@@ -166,6 +166,7 @@ static pthread_mutex_t g_loglock = PTHREAD_MUTEX_INITIALIZER;
 /* Defined with the control thread below; started lazily from cuInit so
  * only real CUDA consumers poll for control markers. */
 static void ensure_control_thread(void);
+static void gate_wait(void);
 
 static void mclog(const char *fmt, ...) {
 	pthread_mutex_lock(&g_loglock);
@@ -698,6 +699,7 @@ CUresult cuInit(unsigned int flags) {
 CUresult cuMemCreate(CUmemGenericAllocationHandle *h, size_t size,
                      const CUmemAllocationProp *prop, unsigned long long flags) {
 	resolve_reals();
+	gate_wait();
 	/* Strip the fabric handle type: it creates an NV_MEMORY_FABRIC (00f8)
 	 * object at ALLOCATION time -- before any export -- which
 	 * cuda-checkpoint cannot serialize and this shim does not suspend, so
@@ -746,6 +748,7 @@ CUresult cuMemCreate(CUmemGenericAllocationHandle *h, size_t size,
 CUresult cuMulticastCreate(CUmemGenericAllocationHandle *h,
                            const CUmulticastObjectProp *prop) {
 	resolve_reals();
+	gate_wait();
 	/* Same strip as cuMemCreate: a multicast group created with the
 	 * FABRIC handle type gets a companion NV_MEMORY_FABRIC (00f8) object
 	 * that cuda-checkpoint cannot serialize and that outlives the shim's
@@ -794,6 +797,7 @@ CUresult cuMemExportToShareableHandle(void *shHandle,
                                       CUmemGenericAllocationHandle h, int type,
                                       unsigned long long flags) {
 	resolve_reals();
+	gate_wait();
 	/* Refuse fabric-typed exports. Stripping the handle type at
 	 * cuMemCreate is not enough: the driver happily fabric-exports
 	 * memory that never requested fabric handles, so torch 2.11's
@@ -839,6 +843,7 @@ CUresult cuMemExportToShareableHandle(void *shHandle,
 CUresult cuMemImportFromShareableHandle(CUmemGenericAllocationHandle *h,
                                         void *osHandle, int type) {
 	resolve_reals();
+	gate_wait();
 	/* Mirror of the export-side refusal: an imported fabric ref is an
 	 * NV_MEMORY_FABRIC_IMPORTED_REF (00fb) object, equally
 	 * un-serializable. Unreachable when exports are refused too (peers
@@ -1020,6 +1025,7 @@ static unsigned long blob_key(const CUipcMemHandle *b) {
 
 CUresult cuIpcGetMemHandle(CUipcMemHandle *handle, CUdeviceptr dptr) {
 	resolve_reals();
+	gate_wait();
 	CUresult rc = r_cuIpcGetMemHandle(handle, dptr);
 	if (rc != CUDA_SUCCESS || !handle)
 		return rc;
@@ -1054,6 +1060,7 @@ CUresult cuIpcGetMemHandle(CUipcMemHandle *handle, CUdeviceptr dptr) {
 CUresult cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle,
                             unsigned int flags) {
 	resolve_reals();
+	gate_wait();
 	CUresult rc = r_cuIpcOpenMemHandle(pdptr, handle, flags);
 	if (rc != CUDA_SUCCESS || !pdptr)
 		return rc;
@@ -1115,6 +1122,7 @@ CUresult cuIpcOpenMemHandle_v2(CUdeviceptr *pdptr, CUipcMemHandle handle,
 
 CUresult cuIpcCloseMemHandle(CUdeviceptr dptr) {
 	resolve_reals();
+	gate_wait();
 	CUresult rc = r_cuIpcCloseMemHandle(dptr);
 	if (rc == CUDA_SUCCESS) {
 		pthread_mutex_lock(&g_lock);
@@ -1131,6 +1139,7 @@ CUresult cuIpcCloseMemHandle(CUdeviceptr dptr) {
 
 CUresult cuMulticastAddDevice(CUmemGenericAllocationHandle h, CUdevice dev) {
 	resolve_reals();
+	gate_wait();
 	CUmemGenericAllocationHandle real_h = xlate_locked(h);
 
 	CUresult rc = r_cuMulticastAddDevice(real_h, dev);
@@ -1202,6 +1211,7 @@ CUresult cuMulticastBindMem(CUmemGenericAllocationHandle mc, size_t mcOffset,
                             CUmemGenericAllocationHandle mem, size_t memOffset,
                             size_t size, unsigned long long flags) {
 	resolve_reals();
+	gate_wait();
 	CUmemGenericAllocationHandle real_mc = xlate_locked(mc);
 	/* The bound memory may itself be referenced by a stale handle (an
 	 * import whose handle rotated across a rebuild); translate it too, and
@@ -1230,6 +1240,7 @@ CUresult cuMulticastBindAddr(CUmemGenericAllocationHandle mc, size_t mcOffset,
                              CUdeviceptr memptr, size_t size,
                              unsigned long long flags) {
 	resolve_reals();
+	gate_wait();
 	CUmemGenericAllocationHandle real_mc = xlate_locked(mc);
 	CUresult rc = r_cuMulticastBindAddr(real_mc, mcOffset, memptr, size, flags);
 	if (rc == CUDA_SUCCESS) {
@@ -1248,6 +1259,7 @@ CUresult cuMulticastBindAddr(CUmemGenericAllocationHandle mc, size_t mcOffset,
 CUresult cuMulticastUnbind(CUmemGenericAllocationHandle mc, CUdevice dev,
                            size_t mcOffset, size_t size) {
 	resolve_reals();
+	gate_wait();
 	CUmemGenericAllocationHandle real_mc = xlate_locked(mc);
 	CUresult rc = r_cuMulticastUnbind(real_mc, dev, mcOffset, size);
 	/* App-initiated: drop this device's recorded bind so it leaves the
@@ -1270,6 +1282,7 @@ CUresult cuMulticastUnbind(CUmemGenericAllocationHandle mc, CUdevice dev,
 CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
                   CUmemGenericAllocationHandle handle, unsigned long long flags) {
 	resolve_reals();
+	gate_wait();
 	CUmemGenericAllocationHandle real_h = xlate_locked(handle);
 	CUresult rc = r_cuMemMap(ptr, size, offset, real_h, flags);
 	if (rc == CUDA_SUCCESS && !__atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST)) {
@@ -1306,6 +1319,7 @@ CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
 
 CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) {
 	resolve_reals();
+	gate_wait();
 	CUresult rc = r_cuMemUnmap(ptr, size);
 	/* App-initiated: forget the mapping. */
 	if (rc == CUDA_SUCCESS && !__atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST)) {
@@ -1321,6 +1335,7 @@ CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) {
 CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size,
                         const CUmemAccessDesc *desc, size_t count) {
 	resolve_reals();
+	gate_wait();
 	CUresult rc = r_cuMemSetAccess(ptr, size, desc, count);
 	if (rc == CUDA_SUCCESS && desc && count >= 1) {
 		if (count > 1)
@@ -1360,6 +1375,7 @@ static void alloc_forget(int i) {
 
 CUresult cuMemRelease(CUmemGenericAllocationHandle handle) {
 	resolve_reals();
+	gate_wait();
 	CUmemGenericAllocationHandle real_h = xlate_locked(handle);
 	CUresult rc = r_cuMemRelease(real_h);
 	/* App-initiated: forget the alloc and its dependents. */
@@ -3059,7 +3075,15 @@ static void gate_wait(void) {
 }
 
 /* Entry points through which the application submits GPU work or waits on
- * it. Each one blocks while suspended, then forwards unchanged. */
+ * it. Each one blocks while suspended, then forwards unchanged. The tracked
+ * mutators above (cuMemCreate, the cuMulticast and cuIpc families, exports,
+ * imports, map/unmap, release) call gate_wait() directly for the same
+ * reason plus one more: a thread reaching them in the unlocked teardown
+ * window would create or free shared state AFTER the strict blocker gate
+ * verified there was none, yielding a snapshot that hangs the checkpoint or
+ * only fails at restore. The suspend/resume machinery itself always calls
+ * the r_ reals, never these wrappers, so gating them cannot deadlock the
+ * transition. */
 #define GATED(name, proto, args)                                               \
 	static CUresult (*r_##name) proto;                                     \
 	CUresult name proto;                                                   \

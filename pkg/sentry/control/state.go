@@ -266,8 +266,12 @@ func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *SaveRestoreExec
 		// exec'd cuda-checkpoint processes would be born frozen and hang this
 		// RPC. The keys -- including the failure marker -- survive, and
 		// docker's eventual unpause runs the same inverse via Resume ->
-		// PostResume.
-		s.Kernel.AddStateToCheckpoint(cudaSaveFailedKey, true)
+		// PostResume. (preSaveCuda clears a stale marker at the start of the
+		// next attempt, so a failure here cannot leak into a later successful
+		// image and misroute its restore into the recovery branch.)
+		if saveOpts.CudaCheckpointPath != "" {
+			s.Kernel.AddStateToCheckpoint(cudaSaveFailedKey, true)
+		}
 		if saveOpts.Resume && !s.Kernel.IsPaused() {
 			if rerr := postResumeCuda(s.Kernel, nil); rerr != nil {
 				log.Warningf("Failed to resume CUDA processes after failed save: %v", rerr)

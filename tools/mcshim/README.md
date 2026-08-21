@@ -183,10 +183,14 @@ was long misread as a pre-R610 driver limitation):
 *   **The gate.** While suspended, interposed submission entry points
     (launch/memcpy/memset/stream, plus the `cuMemAlloc*` family, whose
     allocations would shift the IPC reopen walk) block on a condvar instead
-    of touching unmapped VAs and faulting the context. The shim's own
-    teardown/rebuild calls the real entry points and is never gated. While
-    teardown state is outstanding (a resume failed partway), the shim
-    refuses to release the gate even if the `gate` marker is removed.
+    of touching unmapped VAs and faulting the context. All tracked mutators
+    (`cuMemCreate`, `cuMulticast*`, export/import, `cuIpc*`, map/unmap,
+    release) are gated too: a thread reaching one in the unlocked teardown
+    window would create or free shared state after the strict blocker gate
+    verified there was none. The shim's own teardown/rebuild calls the real
+    entry points and is never gated. While teardown state is outstanding (a
+    resume failed partway), the shim refuses to release the gate even if
+    the `gate` marker is removed.
 *   **Handle aliasing.** Rebuilds rotate opaque handles; every handle an
     object ever had is kept in an alias list and stale references are
     translated (`xlate`). Because the driver reuses handle values, a newly
@@ -238,3 +242,7 @@ inside the container's trust domain, not gVisor's:
 *   **Multicast slot contention on restore** manifests as a re-bind timeout
     (binds are the cross-rank barrier, so one rank failing to join blocks
     the rest until the deadline).
+*   **`cuMemAddressReserve`/`cuMemAddressFree` are not interposed** (they
+    create no checkpoint blockers), so an application thread freeing its own
+    VA reservation during the suspend window would go unnoticed; the
+    identical-VA rebuild would then fail loudly at re-map time.

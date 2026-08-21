@@ -88,6 +88,13 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	if o.CudaCheckpointPath == "" {
 		return nil
 	}
+	// Each save attempt starts clean: a cudaSaveFailedKey stamped by an
+	// earlier failed attempt and never consumed (e.g. the docker flow, where
+	// the failure-path resume is deferred to unpause) must not be serialized
+	// into THIS attempt's image, where it would misroute the eventual
+	// restore into the failed-save recovery branch and skip the single-pass
+	// scope guard.
+	k.PopCheckpointState(cudaSaveFailedKey)
 
 	wasPaused := k.IsPaused()
 	if wasPaused {
