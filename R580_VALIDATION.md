@@ -376,6 +376,12 @@ state_cuda.go / state_cuda_shim.go / fla_registration.go found the
 remaining large blocks to be load-bearing invariants (gate/lock
 interplay, resume ordering, failure geometry) -- kept.
 
+Coverage gap closed on the final binary: SGLang TP=4 forced
+`--enable-nccl-nvls` with CROSS-GPU restore 0-3 -> 4-7 -- **PASS 13.4x**
+(cold boot 622s, checkpoint 60.6s, placement verified on 4,5,6,7). Every
+validated same-GPU config now has its cross-GPU counterpart validated at
+TP<=4 on this exact binary.
+
 ## Results
 
 ### Interposer-level (phase0 harnesses)
