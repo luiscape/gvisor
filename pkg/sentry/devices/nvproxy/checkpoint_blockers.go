@@ -280,7 +280,15 @@ func ctrlExportToFDInvoke[Params any, PtrParams hasFrontendFDPtr[Params]](fi *fr
 // until closed.
 func ctrlClientExportObjectsToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
 	return ctrlExportToFDInvoke(fi, ioctlParams, func(ctrlParams *nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECTS_TO_FD_PARAMS, ctlFile *frontendFD) {
-		if ioctlParams.Status != nvgpu.NV_OK || ctrlParams.NumObjects == 0 {
+		if ioctlParams.Status != nvgpu.NV_OK {
+			n := int(ctrlParams.NumObjects)
+			if n > len(ctrlParams.Objects) {
+				n = len(ctrlParams.Objects)
+			}
+			fi.ctx.Debugf("nvproxy: EXPORT_OBJECTS_TO_FD failed: client %v objects %v index %d status %#x", ioctlParams.HClient, ctrlParams.Objects[:n], ctrlParams.Index, ioctlParams.Status)
+			return
+		}
+		if ctrlParams.NumObjects == 0 {
 			return
 		}
 		// Batch semantics (see ctrl0000unix.h): each call (re)writes NumObjects
@@ -348,6 +356,14 @@ func markExportedObjFD(fi *frontendIoctlState, fd *frontendFD, clientH, objectH 
 func ctrlClientExportObjectToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
 	return ctrlExportToFDInvoke(fi, ioctlParams, func(ctrlParams *nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS, ctlFile *frontendFD) {
 		if ioctlParams.Status != nvgpu.NV_OK {
+			// A failed export is the signature of userspace presenting a
+			// stale object handle (e.g. a cached fabric registration after
+			// a restore); log the handle so the failure is attributable.
+			var objectH nvgpu.Handle
+			if ctrlParams.Object.Type == nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM {
+				objectH.Val = binary.LittleEndian.Uint32(ctrlParams.Object.Data[8:12])
+			}
+			fi.ctx.Debugf("nvproxy: EXPORT_OBJECT_TO_FD failed: client %v object %v flags %#x status %#x", ioctlParams.HClient, objectH, ctrlParams.Flags, ioctlParams.Status)
 			return
 		}
 		// With EMPTY_FD the export succeeds but associates no object with the
