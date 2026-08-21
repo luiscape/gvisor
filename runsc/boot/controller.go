@@ -36,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
@@ -565,6 +566,14 @@ type RestoreOpts struct {
 	HaveDeviceFile bool
 	Background     bool
 
+	// If PagesFileTrace is true, the order in which pages are first accessed
+	// after restore is recorded, and pages are only loaded from the pages
+	// file when accessed. If the sandbox is subsequently checkpointed, its
+	// pages file is written in the recorded access order, accelerating
+	// future restores of the resulting checkpoint. PagesFileTrace implies
+	// Background, since loading only completes on demand.
+	PagesFileTrace bool
+
 	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
 	// domain socket connected to a URPC server implementing
 	// stateipc.AsyncFileServer and providing checkpoint files. In this case,
@@ -620,8 +629,10 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 	timer.Reached("got restore readers")
 
 	cm.restorer = &restorer{
-		cm:         cm,
-		background: o.Background,
+		cm: cm,
+		// With PagesFileTrace, pages are only loaded when accessed, so the
+		// restorer must not wait for load completion.
+		background: o.Background || o.PagesFileTrace,
 		timer:      timer,
 	}
 
@@ -634,10 +645,15 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 
 	if o.HavePagesFile {
 		// This immediately starts loading the main MemoryFile asynchronously.
-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
+		loadOpts := pgalloc.AsyncPagesFileLoadOpts{
+			TraceAccess: o.PagesFileTrace,
+		}
+		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader"), loadOpts) // transfers ownership
 		pagesMetadata = nil
 		pagesFile = nil
 		timer.Reached("created async MF loader")
+	} else if o.PagesFileTrace {
+		return fmt.Errorf("pages file access tracing requires a checkpoint with a pages file (created with compression disabled)")
 	}
 
 	cm.restorer.stateFile, cm.restorer.metadata, err = state.NewStatefileReader(stateFile /* transfers ownership on success */, nil)

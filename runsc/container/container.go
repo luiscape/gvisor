@@ -442,11 +442,17 @@ func (c *Container) Start(conf *config.Config) error {
 
 // Restore takes a container and replaces its kernel and file system
 // to restore a container from its state file.
-func (c *Container) Restore(conf *config.Config, imagePath string, direct, background bool, networkArgs *boot.CreateLinksAndRoutesArgs) error {
+//
+// If pagesTrace is true, the order in which memory pages are first accessed
+// after restore is recorded, and pages are only loaded from the checkpoint's
+// pages file when accessed; a subsequent checkpoint of this container will
+// write its pages file in the recorded access order, accelerating future
+// restores of the resulting checkpoint.
+func (c *Container) Restore(conf *config.Config, imagePath string, direct, background, pagesTrace bool, networkArgs *boot.CreateLinksAndRoutesArgs) error {
 	log.Debugf("Restore container, cid: %s", c.ID)
 
 	restore := func(conf *config.Config, spec *specs.Spec) error {
-		return c.Sandbox.Restore(conf, spec, c.ID, imagePath, direct, background, networkArgs)
+		return c.Sandbox.Restore(conf, spec, c.ID, imagePath, direct, background, pagesTrace, networkArgs)
 	}
 	return c.startImpl(conf, "restore", restore, c.Sandbox.RestoreSubcontainer)
 }

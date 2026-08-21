@@ -203,6 +203,17 @@ type MemoryFile struct {
 	// failed async page loading.
 	asyncPageLoad atomic.Pointer[asyncMemoryFileLoad]
 
+	// restoreAccessTrace records, in first-access order, ranges of this
+	// MemoryFile that were demanded (via asyncMemoryFileLoad.awaitLoad())
+	// during asynchronous page loading with access tracing enabled
+	// (AsyncPagesFileLoadOpts.TraceAccess). Entries are mutually disjoint;
+	// see asyncMemoryFileLoad.recordAccessLocked().
+	//
+	// restoreAccessTrace is appended to with asyncPageLoad's
+	// AsyncPagesFileLoad.mu locked, and is read by SaveTo() after
+	// AwaitLoadAll() has ensured that no further appends can occur.
+	restoreAccessTrace []memmap.FileRange
+
 	// file is the backing file. The file pointer is immutable.
 	file *os.File
 

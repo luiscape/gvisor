@@ -57,6 +57,15 @@ type Restore struct {
 	// uncompressed for background to work; if the checkpoint is compressed,
 	// background has no effect.
 	background bool
+
+	// If pagesTrace is true, the order in which memory pages are first
+	// accessed after restore is recorded, and pages are only loaded from the
+	// checkpoint's pages file when accessed (implying background). A
+	// subsequent checkpoint of this container will write its pages file in
+	// the recorded access order, so that future restores of the resulting
+	// checkpoint load pages approximately in the order in which the
+	// application will access them.
+	pagesTrace bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -81,6 +90,7 @@ func (r *Restore) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&r.detach, "detach", false, "detach from the container's process")
 	f.BoolVar(&r.direct, "direct", false, "use O_DIRECT for reading checkpoint pages file")
 	f.BoolVar(&r.background, "background", false, "allow image loading to continue after restore exits (requires uncompressed checkpoint)")
+	f.BoolVar(&r.pagesTrace, "pages-trace", false, "EXPERIMENTAL: record the order in which memory pages are first accessed after restore, and only load pages on demand (implies --background; requires uncompressed checkpoint). A subsequent checkpoint of this container writes its pages file in the recorded access order, accelerating future restores of the resulting checkpoint.")
 
 	// Unimplemented flags necessary for compatibility with docker.
 
@@ -183,8 +193,13 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 		runArgs.Spec = c.Spec
 	}
 
+	if r.pagesTrace && !r.background {
+		log.Infof("Restore: --pages-trace implies --background")
+		r.background = true
+	}
+
 	log.Debugf("Restore: %v", r.imagePath)
-	err = c.Restore(conf, r.imagePath, r.direct, r.background, nil /* networkArgs */)
+	err = c.Restore(conf, r.imagePath, r.direct, r.background, r.pagesTrace, nil /* networkArgs */)
 	if err != nil {
 		return util.Errorf("starting container: %v", err)
 	}

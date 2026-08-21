@@ -22,6 +22,7 @@ import (
 	"io"
 	"math"
 	"runtime"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -122,9 +123,25 @@ func (f *MemoryFile) exportMetadataProto() *pgallocpb.MemoryFileMetadataProto {
 	return pb
 }
 
+// Supported MemoryFileMetadataProto versions:
+const (
+	// memoryFileMetadataVersion is the default metadata version.
+	memoryFileMetadataVersion = 1
+
+	// memoryFileMetadataVersionReordered is used for metadata containing
+	// MemoryFileMetadataProto.pages_file_ranges, i.e. when page contents in
+	// the pages file have been reordered relative to their MemoryFile
+	// offsets. Implementations predating pages file reordering reject this
+	// version rather than silently misinterpreting pages file offsets.
+	memoryFileMetadataVersionReordered = 2
+)
+
 func (f *MemoryFile) importMetadataProto(pb *pgallocpb.MemoryFileMetadataProto) error {
-	if pb.Version != 1 {
+	if pb.Version != memoryFileMetadataVersion && pb.Version != memoryFileMetadataVersionReordered {
 		return fmt.Errorf("unsupported MemoryFileMetadataProto version %d", pb.Version)
+	}
+	if pb.Version == memoryFileMetadataVersionReordered && len(pb.PagesFileRanges) == 0 {
+		return fmt.Errorf("MemoryFileMetadataProto version %d requires pages_file_ranges", pb.Version)
 	}
 	f.subreleased = make(map[uint64]uint64, len(pb.Subreleased))
 	for k, v := range pb.Subreleased {
@@ -246,19 +263,27 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		alreadyUncommittedBytes uint64
 		newUncommittedBytes     uint64
 	)
+	// If a page access trace was recorded by a previous traced restore
+	// (AsyncPagesFileLoadOpts.TraceAccess), defer pages file writes until
+	// after scanning so that they can be emitted in the recorded access order
+	// rather than in scan (MemoryFile offset) order. f.restoreAccessTrace is
+	// safe to read here since f.AwaitLoadAll() above guarantees that no
+	// further appends can occur.
+	orderPagesFileByTrace := amfs != nil && len(f.restoreAccessTrace) > 0
+	asyncWritePagesNow := func(fr memmap.FileRange) {
+		amount := fr.Length()
+		amfs.pf.mu.Lock()
+		amfs.pf.unsaved.PushBack(apsRange{
+			amfs:      amfs,
+			FileRange: fr,
+		})
+		amfs.pf.saveOff += amount
+		amfs.pf.mu.Unlock()
+		amfs.pf.stStatus.Notify(apsSTPending)
+	}
 	asyncWritePages := func(fr memmap.FileRange) {}
-	if amfs != nil {
-		asyncWritePages = func(fr memmap.FileRange) {
-			amount := fr.Length()
-			amfs.pf.mu.Lock()
-			amfs.pf.unsaved.PushBack(apsRange{
-				amfs:      amfs,
-				FileRange: fr,
-			})
-			amfs.pf.saveOff += amount
-			amfs.pf.mu.Unlock()
-			amfs.pf.stStatus.Notify(apsSTPending)
-		}
+	if amfs != nil && !orderPagesFileByTrace {
+		asyncWritePages = asyncWritePagesNow
 	}
 
 	// Reading an uncommitted page to determine if it is zero-filled will cause
@@ -473,9 +498,41 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		newCommittedBytes,
 		opts.ExcludeCommittedZeroPages)
 
+	// If ordering the pages file by access trace, emit all pages file writes
+	// now (they were deferred during scanning above). This must happen before
+	// the metadata is saved so that the resulting order can be included in
+	// the metadata.
+	var pagesFileOrder []memmap.FileRange
+	if orderPagesFileByTrace {
+		pagesFileOrder = f.pagesFileOrderLocked()
+		if pagesFileOrder != nil {
+			log.Infof("MemoryFile(%p): writing pages file in traced access order (%d ranges)", f, len(pagesFileOrder))
+			for _, fr := range pagesFileOrder {
+				asyncWritePagesNow(fr)
+			}
+		} else {
+			// Fall back to MemoryFile offset order.
+			for maseg := f.memAcct.FirstSegment(); maseg.Ok(); maseg = maseg.NextSegment() {
+				if maseg.ValuePtr().knownCommitted {
+					asyncWritePagesNow(maseg.Range())
+				}
+			}
+		}
+	}
+
 	// Save metadata.
 	timeMetadataStart := gohacks.Nanotime()
 	pb := f.exportMetadataProto()
+	if pagesFileOrder != nil {
+		pb.Version = memoryFileMetadataVersionReordered
+		pb.PagesFileRanges = make([]*pgallocpb.FileRangeProto, len(pagesFileOrder))
+		for i, fr := range pagesFileOrder {
+			pb.PagesFileRanges[i] = &pgallocpb.FileRangeProto{
+				Start: fr.Start,
+				End:   fr.End,
+			}
+		}
+	}
 	data, err := proto.Marshal(pb)
 	if err != nil {
 		return fmt.Errorf("failed to marshal metadata: %w", err)
@@ -521,6 +578,101 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	}
 
 	return nil
+}
+
+// pagesFileOrderLocked returns the order in which committed pages should be
+// written to the pages file: pages in f.restoreAccessTrace first, in access
+// order, followed by all remaining committed pages in ascending MemoryFile
+// offset order. Consequently, sequential reads of the resulting pages file
+// return pages approximately in the order in which the application is
+// expected to touch them after restore. Ranges in the trace that are no
+// longer committed are skipped. pagesFileOrderLocked returns nil if the
+// trace is unusable, in which case the caller should fall back to emitting
+// pages in MemoryFile offset order.
+//
+// Preconditions:
+//   - f.mu must be locked.
+//   - The save scan must have completed, so that knownCommitted state in
+//     f.memAcct is final.
+func (f *MemoryFile) pagesFileOrderLocked() []memmap.FileRange {
+	if len(f.restoreAccessTrace) == 0 {
+		return nil
+	}
+	var order []memmap.FileRange
+	// orderedBytes counts every emitted byte (including any erroneously
+	// duplicated ones), so the final comparison against knownCommittedBytes
+	// detects any trace defect that would misplace pages in the pages file.
+	orderedBytes := uint64(0)
+	appendOrder := func(fr memmap.FileRange) {
+		orderedBytes += fr.Length()
+		if n := len(order); n > 0 && order[n-1].End == fr.Start {
+			order[n-1].End = fr.End
+			return
+		}
+		order = append(order, fr)
+	}
+
+	// Emit traced pages in access order, clipped to currently-committed
+	// ranges.
+	for _, tfr := range f.restoreAccessTrace {
+		for maseg := f.memAcct.LowerBoundSegment(tfr.Start); maseg.Ok() && maseg.Start() < tfr.End; maseg = maseg.NextSegment() {
+			if !maseg.ValuePtr().knownCommitted {
+				continue
+			}
+			if fr := maseg.Range().Intersect(tfr); fr.Length() != 0 {
+				appendOrder(fr)
+			}
+		}
+	}
+
+	// Entries in f.restoreAccessTrace are mutually disjoint (see
+	// asyncMemoryFileLoad.recordAccessLocked()), so the clipped ranges
+	// emitted above are as well. Since a violation of this invariant would
+	// corrupt the checkpoint (by writing some pages to the pages file more
+	// than once, desynchronizing subsequent pages file offsets between save
+	// and load), verify it defensively while sorting a copy for use below.
+	traced := make([]memmap.FileRange, len(order))
+	copy(traced, order)
+	sort.Slice(traced, func(i, j int) bool { return traced[i].Start < traced[j].Start })
+	for i := 1; i < len(traced); i++ {
+		if traced[i].Start < traced[i-1].End {
+			log.Warningf("MemoryFile(%p): restore access trace contains overlapping ranges %v and %v; falling back to offset-ordered pages file", f, traced[i-1], traced[i])
+			return nil
+		}
+	}
+
+	// Emit all remaining committed pages (committed ranges minus traced
+	// ranges) in ascending MemoryFile offset order.
+	i := 0
+	for maseg := f.memAcct.FirstSegment(); maseg.Ok(); maseg = maseg.NextSegment() {
+		if !maseg.ValuePtr().knownCommitted {
+			continue
+		}
+		maFR := maseg.Range()
+		start := maFR.Start
+		for start < maFR.End {
+			for i < len(traced) && traced[i].End <= start {
+				i++
+			}
+			end := maFR.End
+			if i < len(traced) && traced[i].Start < end {
+				if traced[i].Start <= start {
+					// [start, traced[i].End) was already emitted above.
+					start = traced[i].End
+					continue
+				}
+				end = traced[i].Start
+			}
+			appendOrder(memmap.FileRange{start, end})
+			start = end
+		}
+	}
+
+	if orderedBytes != f.knownCommittedBytes {
+		log.Warningf("MemoryFile(%p): traced pages file ordering covers %d bytes, expected %d; falling back to offset-ordered pages file", f, orderedBytes, f.knownCommittedBytes)
+		return nil
+	}
+	return order
 }
 
 // AsyncPagesFileSave holds async page saving state for a single pages file.
@@ -1042,6 +1194,23 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	if err := f.importMetadataProto(&pb); err != nil {
 		return fmt.Errorf("failed to import metadata: %w", err)
 	}
+	// If the pages file was written in an explicit (possibly access-ordered)
+	// range order rather than in ascending MemoryFile offset order, then
+	// pages file offsets must be assigned in that order below.
+	var pagesFileRanges []memmap.FileRange
+	if len(pb.PagesFileRanges) != 0 {
+		if opts.PagesFile == nil {
+			return fmt.Errorf("MemoryFile checkpoint with reordered pages requires a pages file")
+		}
+		pagesFileRanges = make([]memmap.FileRange, len(pb.PagesFileRanges))
+		for i, frpb := range pb.PagesFileRanges {
+			fr := memmap.FileRange{Start: frpb.Start, End: frpb.End}
+			if fr.Start >= fr.End || fr.Start%hostarch.PageSize != 0 || fr.End%hostarch.PageSize != 0 {
+				return fmt.Errorf("metadata contains invalid pages file range %v", fr)
+			}
+			pagesFileRanges[i] = fr
+		}
+	}
 	chunks := f.chunksLoad()
 	mfTimeline.Reached("metadata loaded")
 	log.Infof("MemoryFile(%p): loaded metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
@@ -1106,6 +1275,7 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 			f:            f,
 			pf:           opts.PagesFile,
 			df:           df,
+			orderedLoad:  len(pagesFileRanges) != 0,
 			doneCallback: opts.DoneCallback,
 			timeline:     mfTimeline.Transfer(),
 		}
@@ -1153,23 +1323,29 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		}
 		maFR := maseg.Range()
 		amount := maFR.Length()
-		// Wait for all chunks spanned by this segment to be madvised.
-		for madviseEnd.Load() < maFR.End {
-			<-madviseChan
+		if pagesFileRanges == nil {
+			// Wait for all chunks spanned by this segment to be madvised.
+			for madviseEnd.Load() < maFR.End {
+				<-madviseChan
+			}
 		}
 		if amfl != nil {
-			// Record where to read data.
 			if !minUnloadedInit {
 				minUnloadedInit = true
 				amfl.minUnloaded.Store(maFR.Start)
 			}
-			amfl.pf.mu.Lock()
-			amfl.unloaded.InsertRange(maFR, aplUnloadedInfo{
-				off: opts.PagesFileOffset,
-			})
-			amfl.pf.mu.Unlock()
-			opts.PagesFileOffset += amount
-			amfl.pf.lfStatus.Notify(aplLFPending)
+			if pagesFileRanges == nil {
+				// Record where to read data.
+				amfl.pf.mu.Lock()
+				amfl.unloaded.InsertRange(maFR, aplUnloadedInfo{
+					off: opts.PagesFileOffset,
+				})
+				amfl.pf.mu.Unlock()
+				opts.PagesFileOffset += amount
+				amfl.pf.lfStatus.Notify(aplLFPending)
+			}
+			// Otherwise, unloaded ranges are inserted after this loop, in
+			// pages file order.
 		} else {
 			// Verify header.
 			length, object, err := state.ReadHeader(&wr)
@@ -1203,6 +1379,43 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		f.knownCommittedBytes += amount
 		if !f.opts.DisableMemoryAccounting {
 			usage.MemoryAccounting.Inc(amount, maseg.ValuePtr().kind, maseg.ValuePtr().memCgID)
+		}
+	}
+	if pagesFileRanges != nil {
+		// Insert unloaded ranges in pages file order. amfl.loadOrder ensures
+		// that background loading also processes ranges in pages file order,
+		// both maximizing sequential I/O and delivering pages approximately
+		// in expected access order.
+		totalBytes := uint64(0)
+		for _, fr := range pagesFileRanges {
+			// Verify that fr is entirely committed, since loading into
+			// uncommitted (possibly free) pages would be unsound.
+			c := fr.Start
+			for maseg := f.memAcct.LowerBoundSegment(fr.Start); maseg.Ok() && c < fr.End && maseg.Start() <= c; maseg = maseg.NextSegment() {
+				if !maseg.ValuePtr().knownCommitted {
+					break
+				}
+				c = maseg.End()
+			}
+			if c < fr.End {
+				return fmt.Errorf("pages file range %v contains uncommitted pages", fr)
+			}
+			// Wait for all chunks spanned by fr to be madvised.
+			for madviseEnd.Load() < fr.End {
+				<-madviseChan
+			}
+			amfl.pf.mu.Lock()
+			amfl.unloaded.InsertRange(fr, aplUnloadedInfo{
+				off: opts.PagesFileOffset,
+			})
+			amfl.loadOrder = append(amfl.loadOrder, fr)
+			amfl.pf.mu.Unlock()
+			opts.PagesFileOffset += fr.Length()
+			totalBytes += fr.Length()
+			amfl.pf.lfStatus.Notify(aplLFPending)
+		}
+		if totalBytes != f.knownCommittedBytes {
+			return fmt.Errorf("pages file ranges cover %d bytes, expected %d", totalBytes, f.knownCommittedBytes)
 		}
 	}
 	durPages := time.Duration(gohacks.Nanotime() - timePagesStart)
@@ -1296,6 +1509,32 @@ type AsyncPagesFileLoad struct {
 
 	// ops stores all aplOps.
 	ops []aplOp
+
+	// traceAccess is true if page access tracing is enabled
+	// (AsyncPagesFileLoadOpts.TraceAccess). traceAccess is immutable.
+	traceAccess bool
+}
+
+// AsyncPagesFileLoadOpts provides options to StartAsyncPagesFileLoad.
+type AsyncPagesFileLoadOpts struct {
+	// If TraceAccess is true:
+	//
+	// - The order in which pages are demanded (via awaitLoad) is recorded to
+	// each MemoryFile's restoreAccessTrace. If the MemoryFile is subsequently
+	// saved with a pages file, its pages are written in recorded access order
+	// rather than in MemoryFile offset order, and future restores of the
+	// resulting checkpoint will load pages in that order.
+	//
+	// - Loading of pages with no waiters is suppressed; pages are only loaded
+	// when demanded. This makes the recorded trace a complete first-touch
+	// trace, at the cost of making restore lazy: pages that are never
+	// demanded are only loaded when a subsequent save (via
+	// MemoryFile.AwaitLoadAll()) forces them to be, and the async page loader
+	// goroutine correspondingly persists until then. Consequently,
+	// TraceAccess is only appropriate for offline profiling runs (which are
+	// expected to end in a checkpoint), and callers must not wait for load
+	// completion before allowing the workload to execute.
+	TraceAccess bool
 }
 
 // Possible events in AsyncPagesFileLoad.lfStatus:
@@ -1322,6 +1561,7 @@ type asyncMemoryFileLoad struct {
 	f            *MemoryFile
 	pf           *AsyncPagesFileLoad
 	df           stateio.DestinationFile
+	orderedLoad  bool // pages are loaded in explicit pages file order (loadOrder)
 	doneCallback func(error)
 	timeline     *timing.Timeline
 
@@ -1340,12 +1580,46 @@ type asyncMemoryFileLoad struct {
 	// is protected by pf.amflsMu.
 	asyncMemoryFileLoadEntry
 
+	// loadOrder, if non-empty, contains the MemoryFile ranges of all pages
+	// initially inserted into unloaded, in ascending pages file offset order
+	// (which may differ from MemoryFile offset order). It is populated by
+	// MemoryFile.LoadFrom() when the checkpoint specifies an explicit pages
+	// file order, and directs the order in which the async page loader
+	// goroutine loads pages with no waiters. loadOrder is protected by pf.mu.
+	loadOrder []memmap.FileRange
+
+	// loadOrderIdx is the index of the first entry in loadOrder that may
+	// contain unstarted pages; loadOrder[loadOrderIdx].Start is advanced past
+	// started pages. loadOrderIdx is protected by pf.mu.
+	loadOrderIdx int
+
 	// Padding before state exclusive to the async page loader goroutine:
 	_ [hostarch.CacheLineSize]byte
 
 	// minUnstarted is the lowest offset that may map to a segment in unloaded
-	// for which aplUnloadedInfo.started == false.
+	// for which aplUnloadedInfo.started == false. minUnstarted is only used
+	// when loadOrder is empty.
 	minUnstarted uint64
+}
+
+// recordAccessLocked records fr, a range being demanded for the first time,
+// in amfl.f.restoreAccessTrace.
+//
+// Entries in restoreAccessTrace are mutually disjoint: recordAccessLocked is
+// only called for segments in amfl.unloaded gaining their first waiter.
+// Segments are inserted into amfl.unloaded exactly once (by
+// MemoryFile.LoadFrom()), segments with waiters are never merged, splitting
+// preserves waiters in both halves, and loaded segments are removed; so no
+// byte of the MemoryFile can gain a "first waiter" twice.
+//
+// Preconditions: amfl.pf.mu must be locked.
+func (amfl *asyncMemoryFileLoad) recordAccessLocked(fr memmap.FileRange) {
+	f := amfl.f
+	if n := len(f.restoreAccessTrace); n > 0 && f.restoreAccessTrace[n-1].End == fr.Start {
+		f.restoreAccessTrace[n-1].End = fr.End
+		return
+	}
+	f.restoreAccessTrace = append(f.restoreAccessTrace, fr)
 }
 
 // aplUnloadedInfo is the value type of asyncMemoryFileLoad.unloaded.
@@ -1414,7 +1688,7 @@ func (op *aplOp) off() int64 {
 
 // StartAsyncPagesFileLoad constructs asynchronous loading state for the pages
 // file ar. It takes ownership of ar, even if it returns a non-nil error.
-func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), timeline *timing.Timeline) (*AsyncPagesFileLoad, error) {
+func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), timeline *timing.Timeline, opts AsyncPagesFileLoadOpts) (*AsyncPagesFileLoad, error) {
 	maxReadBytes := hostarch.PageRoundDown(ar.MaxReadBytes())
 	if maxReadBytes <= 0 {
 		ar.Close()
@@ -1431,6 +1705,10 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		qavail:           maxParallel,
 		opsBusy:          bitmap.New(uint32(maxParallel)),
 		ops:              make([]aplOp, maxParallel),
+		traceAccess:      opts.TraceAccess,
+	}
+	if opts.TraceAccess {
+		log.Infof("Async page loading: access tracing enabled; pages will only be loaded on demand")
 	}
 	// Mark ops in opsBusy that don't actually exist as permanently busy.
 	for i, n := maxParallel, apfl.opsBusy.Size(); i < n; i++ {
@@ -1459,6 +1737,53 @@ func (apfl *AsyncPagesFileLoad) MemoryFilesDone() {
 // failed permanently.
 func (f *MemoryFile) IsAsyncLoading() bool {
 	return f.asyncPageLoad.Load() != nil
+}
+
+// AsyncLoadFineGrained returns true if async page loading is in progress and
+// callers should prefer to await loading of only the pages they immediately
+// require, rather than opportunistically awaiting larger ranges. This is the
+// case if pages are being loaded in expected access order (so awaited loads
+// are likely to be contiguous in the pages file and hence not sacrifice I/O
+// throughput) or if page accesses are being traced (so that the recorded
+// trace reflects fine-grained first-touch order).
+func (f *MemoryFile) AsyncLoadFineGrained() bool {
+	amfl := f.asyncPageLoad.Load()
+	if amfl == nil {
+		return false
+	}
+	return amfl.pf.traceAccess || amfl.orderedLoad
+}
+
+// AsyncLoadedSpan returns the largest contiguous range of file offsets
+// containing fr for which no pages are still being asynchronously loaded,
+// i.e. such that mapping the returned range will not need to wait for async
+// page loading. If any page in fr has not finished loading, AsyncLoadedSpan
+// returns an empty range. If async page loading is not in progress, all
+// offsets are loaded and AsyncLoadedSpan returns the maximal range.
+//
+// Note that the returned range may include offsets beyond those that are
+// committed or even allocated in the MemoryFile; callers are expected to
+// limit their use of the returned range to offsets that they know to be
+// valid.
+func (f *MemoryFile) AsyncLoadedSpan(fr memmap.FileRange) memmap.FileRange {
+	maxFR := memmap.FileRange{0, hostarch.PageRoundDown(uint64(math.MaxUint64))}
+	amfl := f.asyncPageLoad.Load()
+	if amfl == nil {
+		return maxFR
+	}
+	// Lockless fast path:
+	if minUnloaded := amfl.minUnloaded.Load(); fr.End <= minUnloaded {
+		return memmap.FileRange{0, minUnloaded}.Intersect(maxFR)
+	}
+	apfl := amfl.pf
+	apfl.mu.Lock()
+	defer apfl.mu.Unlock()
+	gap := amfl.unloaded.FindGap(fr.Start)
+	if !gap.Ok() || gap.End() < fr.End {
+		// Some pages in fr are still being loaded.
+		return memmap.FileRange{}
+	}
+	return gap.Range().Intersect(maxFR)
 }
 
 // AwaitLoadAll blocks until async page loading has completed. If async page
@@ -1501,14 +1826,19 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 	defer aplWaiterPool.Put(w)
 	w.fr = fr
 	w.pending = 0
+	pushedPriority := false
 	amfl.unloaded.MutateRange(fr, func(ulseg aplUnloadedIterator) bool {
 		ul := ulseg.ValuePtr()
 		ulFR := ulseg.Range()
 		ullen := ulFR.Length()
 		if len(ul.waiters) == 0 {
 			apfl.bytesWaited += ullen
+			if apfl.traceAccess {
+				amfl.recordAccessLocked(ulFR)
+			}
 			if !ul.started {
 				apfl.priority.PushBack(aplFileRange{amfl, ulFR})
+				pushedPriority = true
 			}
 			if logAwaitedLoads {
 				log.Infof("MemoryFile(%p): prioritize %v", amfl.f, ulFR)
@@ -1528,6 +1858,12 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 		apfl.totalWaiters++
 	}
 	apfl.mu.Unlock()
+	if pushedPriority {
+		// Ensure that the async page loader goroutine observes the new
+		// priority ranges even if it is otherwise idle, which is possible if
+		// loading of pages with no waiters is suppressed (apfl.traceAccess).
+		apfl.lfStatus.Notify(aplLFPending)
+	}
 	if pending {
 		if logAwaitedLoads {
 			log.Infof("MemoryFile(%p): awaitLoad goid %d start: %v (%d bytes)", amfl.f, goid.Get(), fr, fr.Length())
@@ -1787,6 +2123,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}()
 	}
 
+	// lfDone is true if MemoryFilesDone() has been called, i.e. no new
+	// unloaded ranges will be inserted by MemoryFile.LoadFrom().
+	lfDone := false
 	for {
 		// Enqueue as many reads as possible.
 		if !apfl.canEnqueue() {
@@ -1836,8 +2175,10 @@ func (apfl *AsyncPagesFileLoad) main() {
 			}
 		}
 		apfl.mu.Unlock()
-		// Fill remaining queue with reads for pages with no waiters.
-		if apfl.canEnqueue() {
+		// Fill remaining queue with reads for pages with no waiters, unless
+		// access tracing is enabled, in which case pages are only loaded when
+		// demanded so that the trace is a complete first-touch trace.
+		if apfl.canEnqueue() && !apfl.traceAccess {
 			apfl.amflsMu.Lock()
 			// Unawaited loads from earlier MemoryFiles are prioritized over
 			// unawaited loads from later MemoryFiles. Callers of
@@ -1849,42 +2190,10 @@ func (apfl *AsyncPagesFileLoad) main() {
 			// significantly lower than disk latency, so applications are
 			// likely to be more sensitive to elevated memory latency due to
 			// awaited loads vs. elevated disk latency.
-		amflsLoop:
 			for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {
-				amfl.f.mu.Lock()
-				apfl.mu.Lock()
-				ulseg := amfl.unloaded.LowerBoundSegment(amfl.minUnstarted)
-				for ulseg.Ok() {
-					ul := ulseg.ValuePtr()
-					ulFR := ulseg.Range()
-					if ul.started {
-						amfl.minUnstarted = ulFR.End
-						ulseg = ulseg.NextSegment()
-						continue
-					}
-					// We need to take page references during reading to
-					// prevent pages from becoming waste due to concurrent
-					// dropping of the last reference.
-					n := apfl.enqueueRange(amfl, ulFR, ul.off, true /* tempRef */)
-					if n == 0 {
-						apfl.mu.Unlock()
-						amfl.f.mu.Unlock()
-						break amflsLoop
-					}
-					ulFR.End = ulFR.Start + n
-					ulseg = amfl.unloaded.SplitAfter(ulseg, ulFR.End)
-					ulseg.ValuePtr().started = true
-					amfl.minUnstarted = ulFR.End
-					amfl.f.incRefLocked(ulFR)
-					if !apfl.canEnqueue() {
-						apfl.mu.Unlock()
-						amfl.f.mu.Unlock()
-						break amflsLoop
-					}
-					ulseg = ulseg.NextSegment()
+				if full := apfl.enqueueUnawaited(amfl); full {
+					break
 				}
-				apfl.mu.Unlock()
-				amfl.f.mu.Unlock()
 			}
 			apfl.amflsMu.Unlock()
 		}
@@ -1895,20 +2204,38 @@ func (apfl *AsyncPagesFileLoad) main() {
 
 		if apfl.qavail == maxParallel {
 			// We are out of work to do.
+			if lfDone {
+				apfl.amflsMu.Lock()
+				drained := apfl.amfls.Empty()
+				apfl.amflsMu.Unlock()
+				if drained {
+					// Successfully completed all loading for all MemoryFiles.
+					durTotal := time.Duration(gohacks.Nanotime() - timeStart)
+					apfl.mu.Lock()
+					log.Infof("Async page loading completed in %s (%d bytes, %.3f MB/s); %d waiters waited %v~%v for %d bytes", durTotal.Round(time.Millisecond), apfl.bytesLoaded, float64(apfl.bytesLoaded)*1e-6/durTotal.Seconds(), apfl.totalWaiters, apfl.durWaitedOne.Round(time.Millisecond), apfl.durWaitedTotal.Round(time.Millisecond), apfl.bytesWaited)
+					apfl.mu.Unlock()
+					return
+				}
+				// Some pages remain unloaded, which is only possible if
+				// unawaited loads are suppressed (apfl.traceAccess). Wait for
+				// aplLFPending, which awaitLoad() notifies when it enqueues
+				// priority work.
+			}
 			ev := apfl.lfStatus.Wait()
 			if ev&aplLFPending != 0 {
 				// We may have raced with MemoryFile.LoadFrom() inserting into
-				// asyncMemoryFileLoad.unloaded.
+				// asyncMemoryFileLoad.unloaded, or with awaitLoad() enqueueing
+				// priority work.
 				apfl.lfStatus.Ack(aplLFPending)
 				continue
 			}
 			if ev&aplLFDone != 0 {
-				// Successfully completed all loading for all MemoryFiles.
-				durTotal := time.Duration(gohacks.Nanotime() - timeStart)
-				apfl.mu.Lock()
-				log.Infof("Async page loading completed in %s (%d bytes, %.3f MB/s); %d waiters waited %v~%v for %d bytes", durTotal.Round(time.Millisecond), apfl.bytesLoaded, float64(apfl.bytesLoaded)*1e-6/durTotal.Seconds(), apfl.totalWaiters, apfl.durWaitedOne.Round(time.Millisecond), apfl.durWaitedTotal.Round(time.Millisecond), apfl.bytesWaited)
-				apfl.mu.Unlock()
-				return
+				// All MemoryFile.LoadFrom() calls have completed, so no new
+				// unloaded ranges will be inserted; loading is complete when
+				// all MemoryFiles have drained.
+				apfl.lfStatus.Ack(aplLFDone)
+				lfDone = true
+				continue
 			}
 			panic(fmt.Sprintf("unknown events in lfStatus: %#x", ev))
 		}
@@ -2012,6 +2339,91 @@ func (apfl *AsyncPagesFileLoad) main() {
 		wakeups = wakeups[:0]
 		dropDelayedDecRefs()
 	}
+}
+
+// enqueueUnawaited enqueues reads for unstarted pages in amfl with no
+// waiters. It returns true if it stopped because the I/O queue is full, and
+// false if it stopped because all such pages have been started.
+//
+// Preconditions: apfl.amflsMu must be locked.
+func (apfl *AsyncPagesFileLoad) enqueueUnawaited(amfl *asyncMemoryFileLoad) bool {
+	// We need to take page references during reading to prevent pages from
+	// becoming waste due to concurrent dropping of the last reference, hence
+	// amfl.f.mu.
+	amfl.f.mu.Lock()
+	defer amfl.f.mu.Unlock()
+	apfl.mu.Lock()
+	defer apfl.mu.Unlock()
+	if amfl.orderedLoad {
+		return apfl.enqueueUnawaitedInLoadOrderLocked(amfl)
+	}
+	ulseg := amfl.unloaded.LowerBoundSegment(amfl.minUnstarted)
+	for ulseg.Ok() {
+		ul := ulseg.ValuePtr()
+		ulFR := ulseg.Range()
+		if ul.started {
+			amfl.minUnstarted = ulFR.End
+			ulseg = ulseg.NextSegment()
+			continue
+		}
+		n := apfl.enqueueRange(amfl, ulFR, ul.off, true /* tempRef */)
+		if n == 0 {
+			return true
+		}
+		ulFR.End = ulFR.Start + n
+		ulseg = amfl.unloaded.SplitAfter(ulseg, ulFR.End)
+		ulseg.ValuePtr().started = true
+		amfl.minUnstarted = ulFR.End
+		amfl.f.incRefLocked(ulFR)
+		if !apfl.canEnqueue() {
+			return true
+		}
+		ulseg = ulseg.NextSegment()
+	}
+	return false
+}
+
+// enqueueUnawaitedInLoadOrderLocked is the equivalent of the
+// minUnstarted-based walk in enqueueUnawaited, but processes unloaded ranges
+// in amfl.loadOrder order, i.e. in ascending pages file offset order. This
+// both allows reads of pages that are contiguous in the pages file (but not
+// in the MemoryFile) to be combined into larger sequential reads, and loads
+// pages approximately in expected post-restore access order when the pages
+// file was written in traced access order.
+//
+// Preconditions: amfl.f.mu and apfl.mu must be locked.
+func (apfl *AsyncPagesFileLoad) enqueueUnawaitedInLoadOrderLocked(amfl *asyncMemoryFileLoad) bool {
+	for amfl.loadOrderIdx < len(amfl.loadOrder) {
+		fr := amfl.loadOrder[amfl.loadOrderIdx]
+		ulseg := amfl.unloaded.LowerBoundSegment(fr.Start)
+		for ulseg.Ok() && ulseg.Start() < fr.End {
+			if ulseg.ValuePtr().started {
+				ulseg = ulseg.NextSegment()
+				continue
+			}
+			// The segment may extend outside of fr (e.g. if adjacent ranges
+			// merged in unloaded); restrict to the part within fr, which is
+			// non-empty given the loop conditions.
+			ulFR := ulseg.Range().Intersect(fr)
+			ulseg = amfl.unloaded.Isolate(ulseg, ulFR)
+			n := apfl.enqueueRange(amfl, ulFR, ulseg.ValuePtr().off, true /* tempRef */)
+			if n == 0 {
+				amfl.loadOrder[amfl.loadOrderIdx].Start = ulFR.Start
+				return true
+			}
+			startedFR := memmap.FileRange{Start: ulFR.Start, End: ulFR.Start + n}
+			ulseg = amfl.unloaded.SplitAfter(ulseg, startedFR.End)
+			ulseg.ValuePtr().started = true
+			amfl.f.incRefLocked(startedFR)
+			if !apfl.canEnqueue() {
+				amfl.loadOrder[amfl.loadOrderIdx].Start = startedFR.End
+				return true
+			}
+			ulseg = ulseg.NextSegment()
+		}
+		amfl.loadOrderIdx++
+	}
+	return false
 }
 
 // Preconditions:

@@ -48,4 +48,20 @@ message MemoryFileMetadataProto {
   repeated FileRangeProto unwaste_small = 6;
   repeated FileRangeProto unwaste_huge = 7;
   map<uint64, uint64> subreleased = 8;
+
+  // pages_file_ranges, if non-empty, is the order in which committed page
+  // ranges were written to the pages file. Page contents for each range are
+  // stored contiguously in the pages file, in the order in which ranges
+  // appear in this list (so each range's pages file offset is the cumulative
+  // length of all preceding ranges). If empty, committed page ranges are
+  // stored in ascending order of MemoryFile offset (i.e. mem_acct order).
+  //
+  // This exists to support storing pages in expected post-restore access
+  // order rather than MemoryFile offset order, so that both demand loading
+  // and sequential background loading of the pages file deliver pages
+  // approximately in the order in which the application will touch them.
+  //
+  // Metadata containing pages_file_ranges uses version = 2 so that it is
+  // rejected, rather than misinterpreted, by older implementations.
+  repeated FileRangeProto pages_file_ranges = 9;
 }

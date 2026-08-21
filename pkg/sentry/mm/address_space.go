@@ -49,6 +49,7 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 	// By default, map entire pmas at a time, under the assumption that there
 	// is no cost to mapping more of a pma than necessary.
 	mapAR := hostarch.AddrRange{0, ^hostarch.Addr(hostarch.PageSize - 1)}
+	asyncLoadFineGrained := false
 	setMapUnit := func(mapUnit uint64) {
 		mapMask := hostarch.Addr(mapUnit - 1)
 		mapAR.Start = ar.Start &^ mapMask
@@ -67,11 +68,24 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 		// Limit the range we map to ar, aligned to mapUnit.
 		setMapUnit(mapUnit)
 	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.IsAsyncLoading() {
-		// Impose an arbitrary mapUnit in order to avoid calling
-		// platform.AddressSpace.MapFile() => mf.DataFD() or mf.MapInternal()
-		// with unnecessarily large ranges, resulting in unnecessarily long
-		// waits.
-		setMapUnit(32 << 20)
+		if mf.AsyncLoadFineGrained() {
+			// Pages are being loaded in expected access order (or accesses
+			// are being traced to establish that order), so only wait for the
+			// pages that are actually required: awaiting extra pages provides
+			// no prefetch benefit (expected-soon pages are already inflight
+			// in access order) and serializes the faulting thread behind
+			// pages it may never touch. Pages that have already been loaded
+			// are still opportunistically mapped (without waiting) below, to
+			// avoid taking faults on them later.
+			asyncLoadFineGrained = true
+			setMapUnit(64 << 10)
+		} else {
+			// Impose an arbitrary mapUnit in order to avoid calling
+			// platform.AddressSpace.MapFile() => mf.DataFD() or
+			// mf.MapInternal() with unnecessarily large ranges, resulting in
+			// unnecessarily long waits.
+			setMapUnit(32 << 20)
+		}
 	}
 	if checkInvariants {
 		if !mapAR.IsSupersetOf(ar) {
@@ -85,6 +99,23 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 		pma := pseg.ValuePtr()
 		pmaAR := pseg.Range()
 		pmaMapAR := pmaAR.Intersect(mapAR)
+		if asyncLoadFineGrained {
+			// If all pages that we must map have already been loaded, expand
+			// the mapping to the contiguous span of already-loaded pages
+			// within this pma: mapping loaded pages doesn't wait, and doing
+			// so avoids taking faults on them later.
+			if mf, ok := pma.file.(*pgalloc.MemoryFile); ok {
+				if span := mf.AsyncLoadedSpan(pseg.fileRangeOf(pmaMapAR)); span.Length() != 0 {
+					pmaFR := pseg.fileRangeOf(pmaAR)
+					lo := max(span.Start, pmaFR.Start)
+					hi := min(span.End, pmaFR.End)
+					pmaMapAR = hostarch.AddrRange{
+						pmaAR.Start + hostarch.Addr(lo-pmaFR.Start),
+						pmaAR.Start + hostarch.Addr(hi-pmaFR.Start),
+					}
+				}
+			}
+		}
 		perms := pma.effectivePerms
 		if pma.needCOW {
 			perms.Write = false
