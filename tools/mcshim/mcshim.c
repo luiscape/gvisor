@@ -282,6 +282,8 @@ static CUresult (*r_cuIpcOpenMemHandle)(CUdeviceptr *, CUipcMemHandle,
                                         unsigned int);
 static CUresult (*r_cuIpcCloseMemHandle)(CUdeviceptr);
 static CUresult (*r_cuMemGetAddressRange)(CUdeviceptr *, size_t *, CUdeviceptr);
+static CUresult (*r_cuMemcpyDtoH)(void *, CUdeviceptr, size_t);
+static CUresult (*r_cuMemcpyHtoD)(CUdeviceptr, const void *, size_t);
 static CUresult (*r_cuDeviceGetAttribute)(int *, int, CUdevice);
 
 #define CU_MEM_HANDLE_TYPE_POSIX_FD 0x1
@@ -315,6 +317,8 @@ static void resolve_reals(void) {
 	REAL(r_cuIpcCloseMemHandle, "cuIpcCloseMemHandle");
 	REAL(r_cuMemGetAddressRange, "cuMemGetAddressRange_v2");
 	REAL(r_cuMemGetAddressRange, "cuMemGetAddressRange");
+	REAL(r_cuMemcpyDtoH, "cuMemcpyDtoH_v2");
+	REAL(r_cuMemcpyHtoD, "cuMemcpyHtoD_v2");
 }
 
 
@@ -370,6 +374,30 @@ static CUdeviceptr ipc_replay_floor(void) {
 
 
 
+/* MCSHIM_FREE_UC_EXPORTS=1: free multicast-participating UC exporter
+ * allocations across the checkpoint (contents preserved through process
+ * memory) instead of leaving them resident for cuda-checkpoint.
+ *
+ * Why: on fabric-attached systems libcuda keeps an internal fabric
+ * registration (NV_MEMORY_FABRIC, 0x00f8) over a peer-shared allocation and
+ * caches its handle in the allocation's bookkeeping. The registration cannot
+ * be checkpointed; it is freed before the save. A RESIDENT allocation then
+ * comes back with the stale cached handle, and libcuda's next export of it
+ * presents the dead pair [hVidMem, hFabricReg] to the driver and fails with
+ * OBJECT_NOT_FOUND instead of re-registering (measured; torch
+ * _symmetric_memory multimem is the known caller that keeps such an
+ * allocation both fabric-registered and resident at checkpoint time).
+ * Freeing the allocation through libcuda tears that bookkeeping down
+ * consistently, and the recreate on resume re-registers lazily and freshly.
+ * Off by default: it costs a device->host->device copy of every affected
+ * allocation and grows the checkpoint by the same amount. */
+static int free_uc_exports_enabled(void) {
+	static int v = -1;
+	if (v < 0)
+		v = getenv("MCSHIM_FREE_UC_EXPORTS") != NULL;
+	return v;
+}
+
 #define mcvlog(...)                                                            \
 	do {                                                                   \
 		if (mcverbose())                                               \
@@ -423,6 +451,11 @@ typedef struct {
 	int serve_sock;
 	char serve_path[104]; /* must fit sockaddr_un.sun_path (108) */
 	int serving;
+	/* KIND_UC exporters freed across the checkpoint (see
+	 * MCSHIM_FREE_UC_EXPORTS): device contents saved into process memory
+	 * (which the checkpoint carries) for restoration after the recreate.
+	 * NULL when no backup is held. */
+	void *uc_content;
 	/* Set by do_suspend once this object is fully torn down (released on
 	 * the device); do_resume rebuilds only objects with this set, so a
 	 * resume after a PARTIAL suspend failure unwinds exactly what was torn
@@ -2012,6 +2045,28 @@ static int reimport(int gi, CUmemGenericAllocationHandle *out) {
 /* ------------------------------------------------------------------ */
 
 /* Must hold g_lock. */
+/* Must hold g_lock. Whether alloc gi's memory is bound into any tracked
+ * multicast group (by handle; cuMulticastBindAddr participation is matched
+ * by its mapping VA instead, since no handle crosses that call). */
+static int uc_is_mc_bound(int gi) {
+	for (int b = 0; b < MAXN; b++) {
+		if (!g_bind[b].used)
+			continue;
+		if (!g_bind[b].by_addr) {
+			for (int k = 0; k < g_alloc[gi].naka; k++)
+				if (g_bind[b].mem == g_alloc[gi].aka[k])
+					return 1;
+		} else {
+			for (int m = 0; m < MAXN; m++)
+				if (g_map[m].used && g_map[m].allocIdx == gi &&
+				    g_bind[b].va >= g_map[m].va &&
+				    g_bind[b].va < g_map[m].va + g_map[m].size)
+					return 1;
+		}
+	}
+	return 0;
+}
+
 static int do_suspend(void) {
 	int groups = 0, imports = 0, unmapped = 0, unbound = 0, released = 0;
 	CUcontext saved = NULL;
@@ -2079,6 +2134,75 @@ static int do_suspend(void) {
 		released++;
 		mclog("SUSPEND: released MC group idx=%d handle=0x%llx", gi,
 		      (unsigned long long)g_alloc[gi].handle);
+	}
+
+	/* Multicast-participating UC exporter allocations (opt-in, see
+	 * free_uc_exports_enabled): save contents into process memory, unmap
+	 * (reservations retained), and RELEASE the allocation, so libcuda
+	 * tears down its fabric-registration bookkeeping consistently instead
+	 * of carrying a soon-stale cached handle through the checkpoint. Runs
+	 * after the group teardown above so every bind referencing the memory
+	 * is already unbound. */
+	int uc_freed = 0;
+	for (int gi = 0; free_uc_exports_enabled() && gi < MAXN; gi++) {
+		if (g_alloc[gi].kind != KIND_UC || !g_alloc[gi].has_key)
+			continue;
+		if (g_alloc[gi].torn_down)
+			continue; /* fully done by an earlier attempt */
+		if (!uc_is_mc_bound(gi))
+			continue;
+		if (!g_alloc[gi].uc_content) {
+			void *buf = malloc(g_alloc[gi].size);
+			if (!buf) {
+				mclog("SUSPEND: no memory for UC-export backup "
+				      "(0x%zx bytes)", g_alloc[gi].size);
+				return -1;
+			}
+			int copied = 0;
+			for (int m = 0; m < MAXN; m++) {
+				if (!g_map[m].used || g_map[m].allocIdx != gi ||
+				    g_map[m].suspended)
+					continue;
+				if (g_map[m].ctx)
+					r_cuCtxSetCurrent(g_map[m].ctx);
+				CUresult rc = r_cuMemcpyDtoH(
+				    (char *)buf + g_map[m].offset, g_map[m].va,
+				    g_map[m].size);
+				if (rc != CUDA_SUCCESS) {
+					mclog("SUSPEND: UC-export backup copy "
+					      "(va=0x%llx size=0x%zx) rc=%d",
+					      (unsigned long long)g_map[m].va,
+					      g_map[m].size, rc);
+					free(buf);
+					return -1;
+				}
+				copied++;
+			}
+			if (!copied) {
+				/* No live mapping to copy from: leave the
+				 * allocation resident rather than lose its
+				 * contents. */
+				free(buf);
+				mclog("SUSPEND: UC-export idx=%d has no live "
+				      "mapping; leaving resident", gi);
+				continue;
+			}
+			g_alloc[gi].uc_content = buf;
+		}
+		if (unmap_alloc(gi, "UC-export", &unmapped) != 0)
+			return -1;
+		CUresult rc = r_cuMemRelease(g_alloc[gi].handle);
+		if (rc != CUDA_SUCCESS) {
+			mclog("SUSPEND: cuMemRelease(UC-export 0x%llx) rc=%d",
+			      (unsigned long long)g_alloc[gi].handle, rc);
+			return -1;
+		}
+		g_alloc[gi].torn_down = 1;
+		released++;
+		uc_freed++;
+		mclog("SUSPEND: freed UC exporter idx=%d handle=0x%llx "
+		      "size=0x%zx (content saved)", gi,
+		      (unsigned long long)g_alloc[gi].handle, g_alloc[gi].size);
 	}
 
 	/* UC imports (P2P peer buffers): unmap the views and release the
@@ -2277,10 +2401,10 @@ static int do_suspend(void) {
 		r_cuCtxSetCurrent(saved);
 	if (r_cuCtxSynchronize)
 		r_cuCtxSynchronize();
-	mclog("SUSPEND done: groups=%d imports=%d unmapped=%d unbound=%d "
-	      "released=%d ipc_closed=%d ipc_left_live=%d",
-	      groups, imports, unmapped, unbound, released, ipc_closed,
-	      ipc_live);
+	mclog("SUSPEND done: groups=%d imports=%d uc_freed=%d unmapped=%d "
+	      "unbound=%d released=%d ipc_closed=%d ipc_left_live=%d",
+	      groups, imports, uc_freed, unmapped, unbound, released,
+	      ipc_closed, ipc_live);
 	return 0;
 }
 
@@ -2591,6 +2715,67 @@ static int do_resume(void) {
 			p1_mc++;
 		} else if (g_alloc[gi].kind == KIND_UC) {
 			CUmemGenericAllocationHandle h = g_alloc[gi].handle;
+			if (g_alloc[gi].uc_content && full[gi]) {
+				/* Freed across the checkpoint (see
+				 * free_uc_exports_enabled): recreate with the
+				 * original properties -- a FRESH allocation, so
+				 * libcuda re-registers it lazily instead of
+				 * presenting its stale cached fabric
+				 * registration -- re-map at the identical VAs,
+				 * and restore the saved contents. Must precede
+				 * the re-export below and this rank's binds in
+				 * phase 3. */
+				if (g_alloc[gi].ctx)
+					r_cuCtxSetCurrent(g_alloc[gi].ctx);
+				CUmemGenericAllocationHandle nh = 0;
+				CUresult rc = r_cuMemCreate(
+				    &nh, g_alloc[gi].size, &g_alloc[gi].uprop, 0);
+				if (rc != CUDA_SUCCESS) {
+					mclog("RESUME: recreate UC-export idx=%d "
+					      "(size=0x%zx) rc=%d",
+					      gi, g_alloc[gi].size, rc);
+					return -1;
+				}
+				alloc_push_aka(&g_alloc[gi], nh);
+				g_alloc[gi].torn_down = 0;
+				h = nh;
+				if (remap_alloc(gi, nh, "UC-export",
+				                0 /* full */, &remapped) != 0)
+					return -1;
+				for (int m = 0; m < MAXN; m++) {
+					if (!g_map[m].used ||
+					    g_map[m].allocIdx != gi)
+						continue;
+					if (g_map[m].ctx)
+						r_cuCtxSetCurrent(g_map[m].ctx);
+					rc = r_cuMemcpyHtoD(
+					    g_map[m].va,
+					    (char *)g_alloc[gi].uc_content +
+					        g_map[m].offset,
+					    g_map[m].size);
+					if (rc != CUDA_SUCCESS) {
+						mclog("RESUME: UC-export content "
+						      "restore (va=0x%llx) rc=%d",
+						      (unsigned long long)
+						          g_map[m].va,
+						      rc);
+						return -1;
+					}
+				}
+				free(g_alloc[gi].uc_content);
+				g_alloc[gi].uc_content = NULL;
+			} else if (g_alloc[gi].uc_content) {
+				/* Partial suspend: the allocation is still live
+				 * on the device (release never ran), so the
+				 * device contents are authoritative; re-map
+				 * whatever the suspend unmapped and drop the
+				 * backup. */
+				if (remap_alloc(gi, h, "UC-export",
+				                1 /* partial */, &remapped) != 0)
+					return -1;
+				free(g_alloc[gi].uc_content);
+				g_alloc[gi].uc_content = NULL;
+			}
 			if (g_alloc[gi].has_key) {
 				if (g_alloc[gi].ctx)
 					r_cuCtxSetCurrent(g_alloc[gi].ctx);
@@ -3724,6 +3909,7 @@ static void mcshim_atfork_child(void) {
 			if (g_alloc[i].serve_fd >= 0)
 				close(g_alloc[i].serve_fd);
 		}
+		free(g_alloc[i].uc_content);
 		if (g_ipc[i].used && g_ipc[i].serve_sock >= 0)
 			close(g_ipc[i].serve_sock);
 	}

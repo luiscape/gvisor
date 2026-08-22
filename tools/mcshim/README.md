@@ -102,6 +102,7 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 | `MCSHIM_IPC_REPLAY_FLOOR`| `0x40000000000` | hex VA; imports whose range base is below it are left live (the loader sets 0) |
 | `MCSHIM_MC_PROXY`        | unset           | rebuild multicast via the mcshim-helper process (the loader sets it) |
 | `MCSHIM_HELPER`          | next to the .so | path to mcshim-helper (the loader sets it)                        |
+| `MCSHIM_FREE_UC_EXPORTS` | unset           | free multicast-bound UC exporter allocations across the checkpoint, contents preserved (needed by torch symm-mem *multimem*) |
 | `MCSHIM_HOST_BUILD`      | unset           | build.sh: build with the host toolchain instead of docker         |
 | `MCSHIM_BUILD_IMAGE`     | pinned 22.04    | build.sh: alternative base image                                  |
 
@@ -165,6 +166,18 @@ was long misread as a pre-R610 driver limitation):
     `cuMemAddressFree`, so the VA reservations survive the checkpoint; resume
     maps back into them (re-reserving at the fixed address if a reservation
     did not survive).
+*   **Freed UC exporters** (`MCSHIM_FREE_UC_EXPORTS=1`). On fabric-attached
+    systems libcuda keeps an internal fabric registration (0x00f8) over a
+    peer-shared allocation and caches its handle; the registration cannot be
+    checkpointed, and a RESIDENT allocation restored with the stale cache
+    fails its next export with OBJECT_NOT_FOUND instead of re-registering
+    (measured; torch `_symmetric_memory` multimem keeps exactly such an
+    allocation). With the flag, suspend saves the allocation's contents into
+    process memory (carried by the checkpoint), releases it through libcuda
+    (tearing the bookkeeping down consistently), and resume recreates it
+    fresh, re-maps at the identical VAs, restores contents, and re-exports --
+    which re-registers lazily. Scoped to multicast-bound exporters; costs a
+    device-host-device copy and checkpoint growth of the same size.
 *   **Three-phase cross-rank resume.** (1) every exporter re-creates its
     object, re-exports it and serves the fd on a unix socket keyed by the
     original export identity (nvproxy's fdinfo oracle, else `st_dev:st_ino`
