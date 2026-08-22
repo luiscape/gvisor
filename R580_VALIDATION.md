@@ -409,6 +409,38 @@ cudaShimDirKey add/pop symmetry, FLA record client-identity check
 cuMemAddressReserve/Free are not interposed. Regated on the fixed
 binary+shim: phase0 PASS + gate 4/4 PASS.
 
+### torch symm-mem MULTIMEM: probed, root-caused, and SUPPORTED (2026-08-22)
+
+The multimem probe (failure-path export logging + a deliberately failing
+trial) pinned the exact mechanism: libcuda keeps a fabric registration
+(00f8) over each peer-shared allocation and caches its handle in the
+allocation's bookkeeping; the registration is host-freed pre-save (it
+cannot be checkpointed), and a RESIDENT allocation restored with the
+stale cache fails its next export with the dead pair [hVidMem=0x..32a,
+hFabricReg=0x..32b] -> OBJECT_NOT_FOUND on every rank. The first caller
+to trip is the shim's own resume re-export -- the cache lives in libcuda,
+so no layer above it (torch included) can repair it. Fresh allocations
+never hit this (lazy re-registration works).
+
+Fix: `MCSHIM_FREE_UC_EXPORTS=1` (opt-in) -- suspend saves the contents of
+multicast-bound UC exporter allocations into process memory, releases
+them through libcuda (bookkeeping torn down consistently; the sentry's
+FLA suspend then finds ZERO live registrations), and resume recreates
+them fresh at the identical VAs, restores contents, and re-exports.
+
+| Trial (SGLang TP=4 `--enable-torch-symm-mem`, bf16, no compile, MULTIMEM) | Result |
+| --- | --- |
+| flag off (probe) | checkpoint OK; restore dies: 4x EXPORT_OBJECTS_TO_FD status 0x57 |
+| flag on | **PASS end-to-end**: 2 allocs freed/rank (0x20200000 + 0x2600000), 0 FLA suspends, 0 stale exports, checkpoint 40.2s, 5.4x to first inference |
+
+Regate on the multimem-capable shim (flag off, proving default-path
+inertness): phase0 PASS; gate vllm_tp4 / vllm_tp2_xgpu / sglang_tp4_nvls
+PASS; sglang_tp4_fusion hit the documented pre-existing pma save flake
+(`frontendFDMemmapFile`, second occurrence in ~20 gate runs) and PASSED
+on the identical-config retry. The gate's flake auto-retry now also
+checks the run dir's checkpoint log for the signature (the bench tail
+sometimes shows only the stack trace).
+
 ## Results
 
 ### Interposer-level (phase0 harnesses)

@@ -69,8 +69,14 @@ run_trial() {
         umount_strays
         gpu_settle
         if [ "$verdict" = PASS ]; then break; fi
-        # Retry only the known pre-existing pma save flake.
-        if ! grep -q "non-MemoryFile of type" "$OUT/$name.attempt$attempt.log"; then break; fi
+        # Retry only the known pre-existing pma save flake. The bench log
+        # tail sometimes shows only the stack trace, so also check the run
+        # dir's checkpoint log for the signature.
+        flake=0
+        grep -q "non-MemoryFile of type" "$OUT/$name.attempt$attempt.log" && flake=1
+        rd="$(newest_rundir "$engine")"
+        [ -n "$rd" ] && sudo grep -q "non-MemoryFile of type" "$rd/logs/runsc-checkpoint.log" 2>/dev/null && flake=1
+        if [ "$flake" = 0 ]; then break; fi
         note "TRIAL $name hit the known pma save flake; retrying once"
     done
     echo "$name $verdict" >>"$OUT/verdicts.txt"
