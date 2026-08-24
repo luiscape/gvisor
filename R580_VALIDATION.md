@@ -441,6 +441,23 @@ on the identical-config retry. The gate's flake auto-retry now also
 checks the run dir's checkpoint log for the signature (the bench tail
 sometimes shows only the stack trace).
 
+### Matrix completion (2026-08-24)
+
+All remaining cells closed on the shipping binary+shim:
+
+| Trial | Result |
+| --- | --- |
+| torch symm-mem MULTIMEM TP=4 cross-GPU 0-3 -> 4-7 (`MCSHIM_FREE_UC_EXPORTS=1`) | **PASS 5.4x**, placement verified (attempts 1-2 hit the pma save flake; identical config passed on attempt 3) |
+| torch symm-mem MULTIMEM TP=8 (Qwen2.5-3B, custom-AR off) | **PASS 2.2x**, uc_freed=2 on all 8 ranks |
+| vLLM symm-mem (`VLLM_ALLREDUCE_USE_SYMM_MEM=1`) TP=4 cross-GPU | **PASS 9.2x**, placement verified |
+
+Flake accounting: the `frontendFDMemmapFile` save race has now hit 4
+times in recent runs, three of them on symm-mem-style configs -- likely
+because those leave more resident device mappings at save time, widening
+the race surface. Still strictly save-time, pre-existing (mm/pma is
+untouched by this branch), and retry-recoverable; worth prioritizing in
+gVisor core independently of this work.
+
 ## Results
 
 ### Interposer-level (phase0 harnesses)
