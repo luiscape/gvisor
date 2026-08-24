@@ -34,6 +34,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -107,12 +108,22 @@ type frontendFD struct {
 	vfs.FileDescriptionDefaultImpl
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.NoLockFD
-	memmap.MappableNoTrackMappings
 
 	dev           *frontendDevice
 	containerName string
 	hostFD        int32
 	memmapFile    frontendFDMemmapFile
+
+	// Mappings must be tracked, unlike most device FDs
+	// (memmap.MappableNoTrackMappings): frontendFDMemmapFile is not a
+	// savable memmap.File, so every translation over it must be dropped by
+	// InvalidateUnsavable before a save, or encoding panics ("Can't save
+	// pma with non-MemoryFile"). cuda-checkpoint's checkpoint action makes
+	// the application unmap most device mappings before the save, which is
+	// why the panic was only ever seen for the mappings that survive it.
+	mapsMu sync.Mutex `state:"nosave"`
+	// +checklocks:mapsMu
+	mappings memmap.MappingSet
 
 	// The driver's implementation of poll() for these files,
 	// kernel-open/nvidia/nv.c:nvidia_poll(), unsets

@@ -17,9 +17,9 @@ timeout 2400 sudo env \
     SGLANG_EXTRA_ARGS="--flashinfer-allreduce-fusion-backend trtllm" \
     bash cr-bench/bench_6_sglang_multi.sh --gpus 0,1,2,3 --tp 4 \
     --no-torch-compile --quiesce pause \
-    >"$OUT/sglang_tp4_fusion_pause.attempt2.log" 2>&1
+    >"$OUT/sglang_tp4_fusion_pause.attempt-pmafix.log" 2>&1
 rc=$?
 v=FAIL
-grep -q "RESULT: PASS" "$OUT/sglang_tp4_fusion_pause.attempt2.log" && v=PASS
+grep -q "RESULT: PASS" "$OUT/sglang_tp4_fusion_pause.attempt-pmafix.log" && v=PASS
 echo "sglang_tp4_fusion_pause $v" >>"$OUT/verdicts.txt"
 echo "[gate-t6] rc=$rc verdict=$v" >>"$OUT/summary.txt"

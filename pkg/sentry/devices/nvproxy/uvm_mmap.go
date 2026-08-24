@@ -44,6 +44,38 @@ func (fd *uvmFD) Translate(ctx context.Context, required, optional memmap.Mappab
 	}, nil
 }
 
+// AddMapping implements memmap.Mappable.AddMapping.
+func (fd *uvmFD) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
+	fd.mapsMu.Lock()
+	fd.mappings.AddMapping(ms, ar, offset, writable)
+	fd.mapsMu.Unlock()
+	return nil
+}
+
+// RemoveMapping implements memmap.Mappable.RemoveMapping.
+func (fd *uvmFD) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
+	fd.mapsMu.Lock()
+	fd.mappings.RemoveMapping(ms, ar, offset, writable)
+	fd.mapsMu.Unlock()
+}
+
+// CopyMapping implements memmap.Mappable.CopyMapping.
+func (fd *uvmFD) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
+	return fd.AddMapping(ctx, ms, dstAR, offset, writable)
+}
+
+// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
+//
+// uvmFDMemmapFile is not a savable memmap.File, so every cached translation
+// over it must be dropped before a save; surviving vmas re-fault through
+// Translate against the restored host FD.
+func (fd *uvmFD) InvalidateUnsavable(ctx context.Context) error {
+	fd.mapsMu.Lock()
+	defer fd.mapsMu.Unlock()
+	fd.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
+	return nil
+}
+
 // uvmFDMemmapFile implements fsutil.MmapFile by extending
 // fsutil.MmapPreciseFile with fallback buffered I/O.
 //
