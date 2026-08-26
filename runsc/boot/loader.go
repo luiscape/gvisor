@@ -40,6 +40,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/metric"
+	"gvisor.dev/gvisor/pkg/pinring"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/refs"
@@ -47,6 +48,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/devices/rdmaproxy/cxproxy"
+	"gvisor.dev/gvisor/pkg/sentry/devices/rdmaproxy/efaproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/rdmaproxy/genericproxy"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
 	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs"
@@ -56,6 +58,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/version"
 	"gvisor.dev/gvisor/pkg/sentry/loader"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -285,8 +288,8 @@ type Loader struct {
 	sharedMounts map[string]*vfs.Mount
 
 	// cgroup2Mount is an internal mount of the cgroup2fs singleton used to
-	// manage per-container cgroups. It is only set when MountCgroupV2 is
-	// enabled.
+	// manage per-container cgroups. It is only set when InSandboxCgroup is
+	// InSandboxCgroupV2.
 	//
 	// +checklocks:mu
 	cgroup2Mount *vfs.Mount
@@ -343,6 +346,10 @@ type Loader struct {
 	// networkArgs contains the routes and links which were scraped from the
 	// host network namespace during sandbox creation.
 	networkArgs *CreateLinksAndRoutesArgs
+
+	// pinRing accumulates host FDs to pin before seccomp filters are
+	// installed.
+	pinRing pinring.PinRing
 
 	// fsSaveFDs are FDs used for user-triggered filesystem checkpoint saving.
 	fsSaveFDs []*fd.FD
@@ -410,6 +417,10 @@ type Args struct {
 	// ControllerFD is the FD to the URPC controller. The Loader takes ownership
 	// of this FD and may close it at any time.
 	ControllerFD int
+	// PinRingFD is the FD of the donated pin ring where the sentry registers
+	// its expensive-to-release files into. See `//pkg/pinring`.
+	// -1 if there is no ring.
+	PinRingFD int
 	// Device is an optional argument that is passed to the platform. The Loader
 	// takes ownership of this file and may close it at any time.
 	Device *fd.FD
@@ -549,6 +560,23 @@ func getRootCredentials(spec *specs.Spec, conf *config.Config, userNs *auth.User
 	return creds
 }
 
+// shouldEnableClockMonotonicRaw reports whether CLOCK_MONOTONIC_RAW should be
+// exposed as a distinct clock tracking the host's CLOCK_MONOTONIC_RAW, rather
+// than aliasing CLOCK_MONOTONIC as it does by default.
+//
+// This exists for GPU profiling: profilers such as Nsight Systems/CUPTI anchor
+// the GPU timeline in the host's CLOCK_MONOTONIC_RAW domain, which drifts from
+// CLOCK_MONOTONIC by NTP frequency adjustment. When nvproxy grants
+// CapProfiling, the sandbox must therefore serve a CLOCK_MONOTONIC_RAW in that
+// same (absolute, unadjusted) domain. It is enabled only in that case.
+func shouldEnableClockMonotonicRaw(spec *specs.Spec, conf *config.Config) bool {
+	if !specutils.NVProxyEnabled(spec, conf) {
+		return false
+	}
+	caps, err := specutils.NVProxyDriverCapsAllowed(conf)
+	return err == nil && caps&nvconf.CapProfiling != 0
+}
+
 // New initializes a new kernel loader configured by spec.
 // New also handles setting up a kernel for restoring a container.
 func New(args Args) (*Loader, error) {
@@ -580,7 +608,9 @@ func New(args Args) (*Loader, error) {
 	}
 	if specutils.RDMAEnabled(args.Spec, args.Conf) {
 		cxproxy.Init()
+		efaproxy.Init()
 		genericproxy.Init()
+		version.UseRDMARelease()
 		args.StartupTimer.Reached("RDMA proxy initialized")
 	}
 
@@ -700,7 +730,8 @@ func New(args Args) (*Loader, error) {
 	}
 
 	// Create kernel and platform.
-	p, err := createPlatform(args.Conf, args.NumCPU, args.Device, args.ID, args.StartupTimer)
+	l.pinRing.FD = args.PinRingFD
+	p, err := createPlatform(args.Conf, args.NumCPU, args.Device, args.ID, args.StartupTimer, &l.pinRing)
 	if err != nil {
 		return nil, fmt.Errorf("creating platform: %w", err)
 	}
@@ -737,7 +768,7 @@ func New(args Args) (*Loader, error) {
 	// Create timekeeper.
 	tk := kernel.NewTimekeeper()
 	params := kernel.NewVDSOParamPage(l.k.MemoryFile(), vdso.ParamPage.FileRange())
-	tk.SetClocks(time.NewCalibratedClocks(), params)
+	tk.SetClocks(time.NewCalibratedClocks(shouldEnableClockMonotonicRaw(args.Spec, args.Conf)), params)
 	args.StartupTimer.Reached("timekeeper configured")
 
 	if err := enableStrace(args.Conf); err != nil {
@@ -1056,7 +1087,7 @@ func (l *Loader) Destroy() {
 	refs.OnExit()
 }
 
-func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxID string, startupTimer *timing.Timer) (platform.Platform, error) {
+func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxID string, startupTimer *timing.Timer, pinRing *pinring.PinRing) (platform.Platform, error) {
 	platformName := conf.Platform
 	p, err := platform.Lookup(conf.Platform)
 	if err != nil {
@@ -1072,6 +1103,7 @@ func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxI
 		UseCPUNums:             platformName == "kvm" && conf.UseCPUNums,
 		SandboxID:              sandboxID,
 		StartupTimer:           startupTimer,
+		PinRing:                pinRing,
 	})
 }
 
@@ -1231,6 +1263,10 @@ func (l *Loader) run() error {
 				return err
 			}
 			l.startupTimer.Reached("network configured")
+		}
+
+		if err := l.pinRing.Finalize(); err != nil {
+			log.Warningf("Cannot pin files to the pin ring: %v. This slows down gVisor sandbox teardown.", err)
 		}
 
 		// Finally done with all configuration. Setup filters before user code
@@ -1806,7 +1842,7 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	l.startGoferMonitor(info)
 
 	if l.root.cid == l.sandboxID {
-		if l.root.conf.MountCgroupV2 {
+		if l.root.conf.InSandboxCgroup == config.InSandboxCgroupV2 {
 			if err := l.setupCgroup2(); err != nil {
 				return nil, nil, err
 			}
@@ -1817,7 +1853,7 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 			}
 		}
 	}
-	if l.root.conf.MountCgroupV2 {
+	if l.root.conf.InSandboxCgroup == config.InSandboxCgroupV2 {
 		// Create the container's cgroup and resolve its cgroup namespace
 		// before the container's mounts are set up, so that its
 		// /sys/fs/cgroup mount is rooted per the namespace.
@@ -1970,7 +2006,7 @@ func (l *Loader) destroySubcontainer(cid string) error {
 	// Cleanup the device gofer.
 	l.k.RemoveDevGofer(l.k.ContainerName(cid))
 
-	if l.root.conf.MountCgroupV2 {
+	if l.root.conf.InSandboxCgroup == config.InSandboxCgroupV2 {
 		l.removeContainerCgroup2(cid)
 	}
 
@@ -2017,7 +2053,7 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	}
 	args.PIDNamespace = tg.PIDNamespace()
 
-	if l.root.conf.MountCgroupV2 {
+	if l.root.conf.InSandboxCgroup == config.InSandboxCgroupV2 {
 		// Join the container's cgroup and cgroup namespace, like Linux's
 		// runc exec does.
 		leader := tg.Leader()

@@ -20,6 +20,7 @@ exports_files([
     "README.md",
     "SECURITY.md",
     "GOVERNANCE.md",
+    "MAINTAINERS.md",
 ])
 
 release_files(
