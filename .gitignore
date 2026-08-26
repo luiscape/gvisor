@@ -16,3 +16,7 @@
 /tools/mcshim/*.so
 # Built multicast interposer helper artifact.
 /tools/mcshim/mcshim-helper
+# Embedded-interposer inputs (generated into bazel-out by genrules; only
+# present here if someone copies them in for non-Bazel tooling).
+/runsc/mcshimbin/mcshim.so
+/runsc/mcshimbin/mcshim-helper.bin

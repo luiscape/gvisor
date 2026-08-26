@@ -222,7 +222,7 @@ runsc-plugin-stack:
 	@$(call build,-c opt $(PLUGIN_STACK_FLAGS) //runsc:runsc-plugin-stack)
 .PHONY: runsc-plugin-stack
 
-mcshim: ## Builds the CUDA multicast interposer (tools/mcshim/mcshim.so + mcshim-helper) needed for multi-GPU (NVLS) snapshots. Requires Docker, or gcc with MCSHIM_HOST_BUILD=1.
+mcshim: ## Builds the standalone CUDA multicast interposer (tools/mcshim/mcshim.so + mcshim-helper). Only needed for images that carry their own copy: 'make runsc' embeds these into runsc (--cuda-multicast-shim-embedded). Requires Docker, or gcc with MCSHIM_HOST_BUILD=1.
 	@$(call header,MCSHIM)
 	@tools/mcshim/build.sh
 .PHONY: mcshim

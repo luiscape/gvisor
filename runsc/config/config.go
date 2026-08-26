@@ -393,6 +393,20 @@ type Config struct {
 	// pkg/sentry/control/state_cuda.go.
 	CUDAMulticastShimPath string `flag:"cuda-multicast-shim-path"`
 
+	// CUDAMulticastShimEmbedded materializes the multicast interposer that is
+	// bundled inside the runsc binary (mcshim.so and mcshim-helper, built
+	// from tools/mcshim) into each GPU container's filesystem at container
+	// creation, at CUDAMulticastShimPath (or DefaultCUDAMulticastShimPath
+	// when no path is given), so the container image does not need to carry
+	// the interposer itself.
+	//
+	// The write goes through the container's VFS: with a rootfs overlay (the
+	// default --overlay2 configuration) the files land in the overlay, never
+	// in the user's rootfs on the host. They are therefore part of checkpoint
+	// images, so a restored process re-maps exactly the interposer bytes it
+	// had mapped at checkpoint time, even across runsc upgrades.
+	CUDAMulticastShimEmbedded bool `flag:"cuda-multicast-shim-embedded"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 
@@ -631,6 +645,25 @@ func (c *Config) GetOverlay2() Overlay2 {
 		return Overlay2{rootMount: true, subMounts: true, medium: "memory"}
 	}
 	return c.Overlay2
+}
+
+// DefaultCUDAMulticastShimPath is the in-container path at which
+// CUDAMulticastShimEmbedded materializes the multicast interposer when
+// CUDAMulticastShimPath does not name a path itself. mcshim-helper is
+// written next to it.
+const DefaultCUDAMulticastShimPath = "/usr/local/lib/mcshim.so"
+
+// CUDAMulticastShimContainerPath returns the in-container path of the
+// multicast suspend/resume interposer, or "" if the interposer is not
+// enabled.
+func (c *Config) CUDAMulticastShimContainerPath() string {
+	if c.CUDAMulticastShimPath != "" {
+		return c.CUDAMulticastShimPath
+	}
+	if c.CUDAMulticastShimEmbedded {
+		return DefaultCUDAMulticastShimPath
+	}
+	return ""
 }
 
 // Bundle is a set of flag name-value pairs.

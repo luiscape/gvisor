@@ -153,6 +153,7 @@ go_library(
         "//runsc/boot/pprof",
         "//runsc/boot/procfs",
         "//runsc/config",
+        "//runsc/mcshimbin",
         "//runsc/profile",
         "//runsc/specutils",
         "//runsc/specutils/seccomp",

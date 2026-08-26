@@ -223,14 +223,27 @@ releases this state before the checkpoint and rebuilds it at identical GPU
 virtual addresses after restore, so application pointers and captured CUDA
 graphs remain valid.
 
-To enable it, build `mcshim.so` (and its companion `mcshim-helper`), place
-them in the container image, and set the runtime `--cuda-multicast-shim-path`
-flag to the interposer's in-container path. gVisor then arranges for the
-container's processes to load the interposer (via the `LD_PRELOAD`
-environment variable *and* an entry appended to the container's
-`/etc/ld.so.preload`, which covers launchers that rewrite their children's
-environment) and drives it automatically during `runsc checkpoint` and
-`runsc restore`.
+To enable it, either:
+
+*   set the runtime `--cuda-multicast-shim-embedded` flag: `runsc` carries
+    `mcshim.so` and its companion `mcshim-helper` inside its own binary and
+    writes them into the container's filesystem at container creation (at
+    `--cuda-multicast-shim-path` if set, `/usr/local/lib/mcshim.so` by
+    default). The container image needs no changes, and because the write
+    lands in the container's filesystem (the rootfs overlay under the
+    default `--overlay2` configuration), the exact interposer bytes travel
+    inside checkpoint images — restores are immune to runsc version skew;
+    or
+*   build `mcshim.so` and `mcshim-helper` yourself (`tools/mcshim/build.sh`
+    or the `//tools/mcshim` Bazel targets), place them in the container
+    image, and set `--cuda-multicast-shim-path` to the interposer's
+    in-container path.
+
+In both modes gVisor then arranges for the container's processes to load the
+interposer (via the `LD_PRELOAD` environment variable *and* an entry appended
+to the container's `/etc/ld.so.preload`, which covers launchers that rewrite
+their children's environment) and drives it automatically during `runsc
+checkpoint` and `runsc restore`.
 
 This works on driver R580+ (validated on 580.173.02), including restoring
 onto *different* GPUs than the workload was checkpointed on. gVisor
@@ -250,8 +263,9 @@ must survive the restore.
 
 Restoring such a snapshot needs no extra flags. However, to take a *further*
 checkpoint of a restored container, the restoring runtime must also be
-configured with `--cuda-multicast-shim-path`: that is how gVisor re-discovers
-that the container carries the interposer.
+configured with `--cuda-multicast-shim-embedded` (or
+`--cuda-multicast-shim-path`): that is how gVisor re-discovers that the
+container carries the interposer.
 
 ### Limitation
 

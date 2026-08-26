@@ -364,7 +364,7 @@ func (r *restorer) restore(l *Loader) error {
 	// discovers the interposer (control's cudaShimDir reads SpecEnviron).
 	// No driver-version check is needed: a checkpoint can only contain a
 	// suspended interposer if the creation-time checks passed.
-	if l.root.conf.CUDAMulticastShimPath != "" {
+	if l.root.conf.CUDAMulticastShimContainerPath() != "" {
 		for name, spec := range l.GetContainerSpecs() {
 			if specutils.NVProxyEnabled(spec, l.root.conf) {
 				injectCudaShimMarkerEnv(spec)

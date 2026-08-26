@@ -22,12 +22,20 @@ can checkpoint and restore workloads it otherwise refuses:
     without the walk described below.
 
 Build with `./build.sh` (toolkit-free; runs in a pinned ubuntu:22.04 container
-by default so the result loads under older glibc).
+by default so the result loads under older glibc). The Bazel targets
+`//tools/mcshim:mcshim` and `//tools/mcshim:mcshim_helper` build the same
+artifacts, and `//runsc` embeds them (through `//runsc/mcshimbin`) so that a
+stock runsc binary can inject the interposer into containers whose images do
+not carry it (`--cuda-multicast-shim-embedded`).
 
 ## How it gets into a container
 
-With `runsc --cuda-multicast-shim-path=/path/to/mcshim.so` (plus nvproxy and a
-R550+ driver), `Loader.setupCudaMulticastShim` (`runsc/boot/loader.go`):
+With `runsc --cuda-multicast-shim-path=/path/to/mcshim.so` (plus nvproxy and
+a R550+ driver) -- or with `--cuda-multicast-shim-embedded`, in which case
+runsc first writes its embedded copies of `mcshim.so` and `mcshim-helper`
+into the container filesystem at that path (default
+`/usr/local/lib/mcshim.so`) -- `Loader.setupCudaMulticastShim`
+(`runsc/boot/loader.go`):
 
 *   prepends the shim to the container's `LD_PRELOAD` **and** appends it to
     `/etc/ld.so.preload` through the container's VFS (launchers like SGLang's
