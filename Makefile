@@ -199,6 +199,17 @@ dev: $(RUNTIME_BIN) ## Installs a set of local runtimes. Requires sudo.
 	@$(call reload_docker)
 .PHONY: dev
 
+governance-regen: ## Regenerates the files derived from governance/maintainers.yaml and governance/areas.yaml.
+	@$(call run,//governance/tools/maintainers:maintainers_gen,-input governance/maintainers.yaml -areas governance/areas.yaml -format reviewer.json -output .github/reviewer.json)
+	@$(call run,//governance/tools/maintainers:maintainers_gen,-input governance/maintainers.yaml -areas governance/areas.yaml -format MAINTAINERS.md -output MAINTAINERS.md)
+	@$(call run,//governance/tools/maintainers:maintainers_gen,-input governance/maintainers.yaml -areas governance/areas.yaml -format CODEOWNERS -output CODEOWNERS)
+.PHONY: governance-regen
+
+governance-check: governance-regen ## Checks that the files derived from governance/*.yaml are in sync. Can't be a bazel test because it requires visibility across the whole codebase to check for subdirectories' existence.
+	@git diff --exit-code -- CODEOWNERS MAINTAINERS.md .github/reviewer.json || \
+		(echo "Generated governance files are out of sync. Please run \`make governance-regen\`." >&2; exit 1)
+.PHONY: governance-check
+
 ##
 ## Canonical build and test targets.
 ##
@@ -261,7 +272,7 @@ integration-tests: do-tests kvm-tests containerd-tests-min
 integration-tests: sandbox-posture-tests
 .PHONY: integration-tests
 
-integration-test-images: load-image-test load-basic load-systemd-integ load-systemd-services
+integration-test-images: load-image-test load-basic load-systemd-integ load-systemd-services load-ubi10-init
 .PHONY: integration-test-images
 
 network-tests: ## Run all networking integration tests.
@@ -423,7 +434,7 @@ docker-tests: integration-test-images $(RUNTIME_BIN)
 	@$(call install_runtime_noreload,$(RUNTIME)-dcache,--fdlimit=2000 --dcache=100) # Used by TestDentryCacheLimit.
 	@$(call install_runtime_noreload,$(RUNTIME)-host-uds,--host-uds=all) # Used by TestHostSocketConnect.
 	@$(call install_runtime_noreload,$(RUNTIME)-overlay,--overlay2=all:self) # Used by TestOverlay*.
-	@$(call install_runtime,$(RUNTIME)-cgroupv2,--mount-cgroup-v2) # Used by TestSystemd* and TestPIDFDSelftests.
+	@$(call install_runtime,$(RUNTIME)-cgroupv2,--in-sandbox-cgroup=v2) # Used by TestSystemd* and TestPIDFDSelftests.
 	@$(call test_runtime_cached,$(RUNTIME),$(INTEGRATION_TARGETS) --test_env=TEST_SAVE_RESTORE_NETSTACK=true //test/e2e:integration_runtime_test //test/e2e:runtime_in_docker_test)
 .PHONY: docker-tests
 
@@ -472,19 +483,27 @@ iptables-tests: load-iptables $(RUNTIME_BIN)
 	@sudo modprobe iptable_nat
 	@sudo modprobe ip6table_nat
 	@# FIXME(b/218923513): Need to fix permissions issues.
-	@#$(call test,--test_env=RUNTIME=runc //test/iptables:iptables_test)
+	@#$(call test,--test_env=RUNTIME=runc -- //test/iptables:iptables_test)
 	@$(call install_runtime,$(RUNTIME),--net-raw)
-	@$(call test_runtime,$(RUNTIME),--test_env=TEST_NET_RAW=true //test/iptables:iptables_test)
+	@$(call test_runtime,$(RUNTIME),--test_env=TEST_NET_RAW=true -- //test/iptables:iptables_test)
 	@$(call install_runtime,$(RUNTIME)-nftables,--net-raw --reproduce-nftables)
-	@$(call test_runtime,$(RUNTIME)-nftables,--test_env=TEST_NET_RAW=true --test_output=all //test/iptables:nftables_test)
+	@$(call test_runtime,$(RUNTIME)-nftables,--test_env=TEST_NET_RAW=true --test_output=all -- //test/iptables:nftables_test)
 .PHONY: iptables-tests
+
+# Run iptables tests with iptables-nft client.
+iptables-nft-tests: load-iptables $(RUNTIME_BIN)
+	@sudo modprobe nfnetlink
+	@sudo modprobe nf_tables
+	@$(call install_runtime,$(RUNTIME)-nftables,--net-raw --TESTONLY-nftables)
+	@$(call test_runtime,$(RUNTIME)-nftables,--test_env=TEST_NET_RAW=true -- //test/iptables:iptables_nft_test)
+.PHONY: iptables-nft-tests
 
 nftables-tests: load-nftables $(RUNTIME_BIN)
 	@sudo modprobe nfnetlink
 	@sudo modprobe nf_tables
-	@$(call test,--test_env=RUNTIME=runc //test/nftables:nftables_test) # run with runc
+	@$(call test,--test_env=RUNTIME=runc -- //test/nftables:nftables_test) # run with runc
 	@$(call install_runtime,$(RUNTIME),--net-raw --TESTONLY-nftables)
-	@$(call test_runtime,$(RUNTIME),--test_env=TEST_NET_RAW=true //test/nftables:nftables_test) # run with runsc
+	@$(call test_runtime,$(RUNTIME),--test_env=TEST_NET_RAW=true -- //test/nftables:nftables_test) # run with runsc
 .PHONY: nftables-tests
 
 # Runs the socket_netlink_netfilter_test with runc as root user in a docker
@@ -628,6 +647,21 @@ benchmark-platforms: load-benchmarks $(RUNTIME_BIN) ## Runs benchmarks for runc 
 run-benchmark: load-benchmarks ## Runs single benchmark and optionally sends data to BigQuery.
 	@$(call run_benchmark,$(RUNTIME))
 .PHONY: run-benchmark
+
+# For benchmarking seccheck, use setup-seccheck and run-benchmark-seccheck.
+# Default seccheck benchmark config.
+SECCHECK_BENCH_CONFIG ?= $(CURDIR)/test/benchmarks/seccheck/null_bench_config.json
+
+# Installs seccheck instrumented runtime for benchmarking.
+setup-seccheck: $(RUNTIME_BIN)
+	@cp -f "$(SECCHECK_BENCH_CONFIG)" /tmp/seccheck_bench_config.json
+	@$(call configure,$(RUNTIME)-seccheck,--net-raw --pod-init-config="/tmp/seccheck_bench_config.json")
+.PHONY: setup-seccheck
+
+# Runs single benchmark using the seccheck instrumented runtime.
+run-benchmark-seccheck: load-benchmarks
+	@$(call run_benchmark,$(RUNTIME)-seccheck)
+.PHONY: run-benchmark-seccheck
 
 # The arguments passed to benchmarks when run for PGO profile collection.
 # This should *not* include the `-profile` or `-profile-cpu` arguments, as
@@ -836,9 +870,6 @@ $(RELEASE_KEY):
 
 $(RELEASE_ARTIFACTS)/%:
 	@mkdir -p $@
-	@$(call copy,//runsc:runsc,$@)
-	@$(call copy,//runsc/cmd/metricserver:runsc-metric-server,$@)
-	@$(call copy,//shim:containerd-shim-runsc-v1,$@)
 	@$(call copy,//debian:debian,$@)
 	@$(call copy,//debian:gvisor-release-tar,$@)
 
