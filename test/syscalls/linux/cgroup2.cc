@@ -26,6 +26,7 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -959,6 +960,57 @@ TEST_F(Cgroup2Test, PidsEnforcementLayered) {
   ASSERT_EQ(waitpid(pid2, &status, 0), pid2);
   EXPECT_TRUE(WIFEXITED(status));
   EXPECT_EQ(WEXITSTATUS(status), kCantForkSecondHalf);
+}
+
+// A task already in a cgroup when the pids controller is enabled over it must
+// be charged to the new controller, and migrating it away afterward must
+// drain pids.current to 0, not -1.
+TEST_F(Cgroup2Test, PidsChargesPreexistingTasksOnEnable) {
+  std::string controllers =
+      ASSERT_NO_ERRNO_AND_VALUE(c().ReadControlFile("cgroup.controllers"));
+  SKIP_IF(!absl::StrContains(controllers, "pids"));
+  ASSERT_NO_ERRNO(c().WriteControlFile("cgroup.subtree_control", "+pids"));
+
+  Cgroup parent = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("pids_pre"));
+  Cgroup child = ASSERT_NO_ERRNO_AND_VALUE(parent.CreateChild("child"));
+  Cgroup sibling = ASSERT_NO_ERRNO_AND_VALUE(parent.CreateChild("sibling"));
+
+  int fds[2];
+  ASSERT_THAT(pipe(fds), SyscallSucceeds());
+  FileDescriptor rfd(fds[0]);
+  FileDescriptor wfd(fds[1]);
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(wfd.get());
+    char token;
+    (void)read(rfd.get(), &token, 1);
+    _exit(0);
+  }
+  ASSERT_GT(pid, 0);
+  rfd.reset();
+
+  // The task enters child before child has a pids controller.
+  ASSERT_NO_ERRNO(child.Enter(pid));
+
+  // Enabling +pids must charge the pre-existing task to child's new
+  // controller.
+  ASSERT_NO_ERRNO(parent.WriteControlFile("cgroup.subtree_control", "+pids"));
+  EXPECT_THAT(child.ReadControlFile("pids.current"),
+              IsPosixErrorOkAndHolds("1\n"));
+  EXPECT_THAT(sibling.ReadControlFile("pids.current"),
+              IsPosixErrorOkAndHolds("0\n"));
+
+  // Migrating the task away must drain child to 0.
+  ASSERT_NO_ERRNO(sibling.Enter(pid));
+  EXPECT_THAT(child.ReadControlFile("pids.current"),
+              IsPosixErrorOkAndHolds("0\n"));
+  EXPECT_THAT(sibling.ReadControlFile("pids.current"),
+              IsPosixErrorOkAndHolds("1\n"));
+
+  wfd.reset();
+  int status;
+  ASSERT_EQ(waitpid(pid, &status, 0), pid);
+  EXPECT_TRUE(WIFEXITED(status));
 }
 
 TEST_F(Cgroup2Test, PidsMigrationAllowsBreaches) {
@@ -2069,6 +2121,54 @@ TEST_F(Cgroup2Test, CgroupNamespaceSetns) {
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+// Mounting cgroup2 requires CAP_SYS_ADMIN in the user namespace that owns
+// the mounting task's cgroup namespace. A task that unshares a new user
+// namespace while keeping its cgroup namespace lacks that capability, even
+// though it has CAP_SYS_ADMIN in the user namespace owning its new mount
+// namespace.
+TEST_F(Cgroup2Test, MountFromUnprivilegedUserNamespace) {
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string mntpoint = dir.path();
+
+  const pid_t pid = fork();
+  if (pid == 0) {
+    TEST_PCHECK(unshare(CLONE_NEWUSER | CLONE_NEWNS) == 0);
+    TEST_CHECK(mount("none", mntpoint.c_str(), "cgroup2", 0, nullptr) < 0);
+    TEST_CHECK_MSG(errno == EPERM, "mount did not fail with EPERM");
+    // The nsdelegate option makes no difference.
+    TEST_CHECK(mount("none", mntpoint.c_str(), "cgroup2", 0, "nsdelegate") < 0);
+    TEST_CHECK_MSG(errno == EPERM, "nsdelegate mount did not fail with EPERM");
+    _exit(0);
+  }
+  ASSERT_GT(pid, 0);
+
+  int status;
+  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceedsWithValue(pid));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+// A task that unshares its cgroup namespace together with the user
+// namespace owns the new cgroup namespace and may mount cgroup2.
+TEST_F(Cgroup2Test, MountFromOwnedCgroupNamespace) {
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string mntpoint = dir.path();
+
+  const pid_t pid = fork();
+  if (pid == 0) {
+    TEST_PCHECK(unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWCGROUP) == 0);
+    TEST_PCHECK(mount("none", mntpoint.c_str(), "cgroup2", 0, nullptr) == 0);
+    struct statfs st;
+    TEST_PCHECK(statfs(mntpoint.c_str(), &st) == 0);
+    TEST_CHECK(st.f_type == CGROUP2_SUPER_MAGIC);
+    _exit(0);
+  }
+  ASSERT_GT(pid, 0);
+
+  int status;
+  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceedsWithValue(pid));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 TEST_F(Cgroup2Test, CgroupNamespaceSetnsPidfd) {
   Cgroup cg = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("ns_pidfd"));
   const std::string procs = cg.Relpath("cgroup.procs");
@@ -2386,6 +2486,189 @@ TEST_F(Cgroup2Test, CpuStatMigration) {
   int64_t usage_a_final = ParseCpuUsageUsec(cg_a);
   EXPECT_GT(usage_b_final, usage_b_post_migration);
   EXPECT_EQ(usage_a_final, usage_a_post_migration);
+}
+
+// BurnCpuMs busy-loops, consuming CPU, for at least ms milliseconds of wall
+// time. The loop never blocks, so the CPU time consumed tracks wall time. Safe
+// to call in a forked child: it only touches CLOCK_MONOTONIC.
+void BurnCpuMs(int ms) {
+  struct timespec start;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  volatile uint64_t x = 0;
+  for (;;) {
+    for (int i = 0; i < 200000; ++i) x++;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t el_ms = (now.tv_sec - start.tv_sec) * 1000 +
+                    (now.tv_nsec - start.tv_nsec) / 1000000;
+    if (el_ms >= ms) break;
+  }
+}
+
+// cpu.stat of a cgroup must include live tasks residing in descendant cgroups
+// that have not enabled their own cpu controller.
+TEST_F(Cgroup2Test, CpuStatCountsControllerlessDescendants) {
+  DisableSave ds;  // clock involved.
+  std::string controllers =
+      ASSERT_NO_ERRNO_AND_VALUE(c().ReadControlFile("cgroup.controllers"));
+  SKIP_IF(!absl::StrContains(controllers, "cpu"));
+
+  ASSERT_NO_ERRNO(c().WriteControlFile("cgroup.subtree_control", "+cpu"));
+  Cgroup a = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("a"));
+  // a does not enable +cpu, so sub has no cpu controller of its own; a's
+  // controller is the nearest one.
+  Cgroup sub = ASSERT_NO_ERRNO_AND_VALUE(a.CreateChild("sub"));
+
+  int start[2], stop[2];
+  ASSERT_THAT(pipe(start), SyscallSucceeds());
+  ASSERT_THAT(pipe(stop), SyscallSucceeds());
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(start[1]);
+    close(stop[1]);
+    char ch;
+    if (read(start[0], &ch, 1) != 1) _exit(1);
+    int flags = fcntl(stop[0], F_GETFL);
+    fcntl(stop[0], F_SETFL, flags | O_NONBLOCK);
+    for (;;) {
+      BurnCpuMs(50);
+      if (read(stop[0], &ch, 1) == 0 || errno != EAGAIN) break;
+    }
+    _exit(0);
+  }
+  ASSERT_THAT(pid, SyscallSucceeds());
+  close(start[0]);
+  close(stop[0]);
+
+  ASSERT_NO_ERRNO(sub.Enter(pid));
+  char ch = 'g';
+  ASSERT_THAT(write(start[1], &ch, 1), SyscallSucceeds());
+
+  // a's cpu.stat must reflect the task burning in sub.
+  int64_t usage = PollCpuUsageUsecGreaterThan(a, 100000);
+  EXPECT_GT(usage, 100000);
+
+  close(stop[1]);
+  int status;
+  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceeds());
+}
+
+// Migrating a task between two cgroups that share the same nearest cpu
+// controller must not discard the CPU it burned before the migration.
+TEST_F(Cgroup2Test, CpuStatSameInstanceMigrationKeepsUsage) {
+  DisableSave ds;  // clock involved.
+  std::string controllers =
+      ASSERT_NO_ERRNO_AND_VALUE(c().ReadControlFile("cgroup.controllers"));
+  SKIP_IF(!absl::StrContains(controllers, "cpu"));
+
+  ASSERT_NO_ERRNO(c().WriteControlFile("cgroup.subtree_control", "+cpu"));
+  Cgroup a = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("a"));
+  // a does not enable +cpu, so x and y both resolve to a's controller.
+  Cgroup x = ASSERT_NO_ERRNO_AND_VALUE(a.CreateChild("x"));
+  Cgroup y = ASSERT_NO_ERRNO_AND_VALUE(a.CreateChild("y"));
+
+  int start[2], stop[2];
+  ASSERT_THAT(pipe(start), SyscallSucceeds());
+  ASSERT_THAT(pipe(stop), SyscallSucceeds());
+
+  // The child burns continuously so a's usage keeps growing while we poll; a
+  // frozen counter could stall exactly on the poll target and never exceed it.
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(start[1]);
+    close(stop[1]);
+    char ch;
+    if (read(start[0], &ch, 1) != 1) _exit(1);
+    int flags = fcntl(stop[0], F_GETFL);
+    fcntl(stop[0], F_SETFL, flags | O_NONBLOCK);
+    for (;;) {
+      BurnCpuMs(50);
+      if (read(stop[0], &ch, 1) == 0 || errno != EAGAIN) break;
+    }
+    _exit(0);
+  }
+  ASSERT_THAT(pid, SyscallSucceeds());
+  close(start[0]);
+  close(stop[0]);
+
+  ASSERT_NO_ERRNO(x.Enter(pid));
+  char ch = 'g';
+  ASSERT_THAT(write(start[1], &ch, 1), SyscallSucceeds());
+
+  int64_t usage_before = PollCpuUsageUsecGreaterThan(a, 100000);
+  EXPECT_GT(usage_before, 100000);
+
+  // Migrate to a sibling that shares a's controller.
+  ASSERT_NO_ERRNO(y.Enter(pid));
+
+  int64_t usage_after = ParseCpuUsageUsec(a);
+  EXPECT_GE(usage_after, usage_before);
+
+  close(stop[1]);
+  int status;
+  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceeds());
+}
+
+// Disabling +cpu on a cgroup must reparent the disabled controller's
+// accumulated usage to the parent, not discard it.
+TEST_F(Cgroup2Test, CpuStatDisableReparentsUsage) {
+  DisableSave ds;  // clock involved.
+  std::string controllers =
+      ASSERT_NO_ERRNO_AND_VALUE(c().ReadControlFile("cgroup.controllers"));
+  SKIP_IF(!absl::StrContains(controllers, "cpu"));
+
+  ASSERT_NO_ERRNO(c().WriteControlFile("cgroup.subtree_control", "+cpu"));
+  Cgroup a = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("a"));
+  ASSERT_NO_ERRNO(a.WriteControlFile("cgroup.subtree_control", "+cpu"));
+  Cgroup b = ASSERT_NO_ERRNO_AND_VALUE(a.CreateChild("b"));
+
+  int start[2], stop[2];
+  ASSERT_THAT(pipe(start), SyscallSucceeds());
+  ASSERT_THAT(pipe(stop), SyscallSucceeds());
+
+  // The child burns continuously so b's usage keeps growing while we poll; a
+  // frozen counter could stall exactly on the poll target and never exceed it.
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(start[1]);
+    close(stop[1]);
+    char ch;
+    if (read(start[0], &ch, 1) != 1) _exit(1);
+    int flags = fcntl(stop[0], F_GETFL);
+    fcntl(stop[0], F_SETFL, flags | O_NONBLOCK);
+    for (;;) {
+      BurnCpuMs(50);
+      if (read(stop[0], &ch, 1) == 0 || errno != EAGAIN) break;
+    }
+    _exit(0);
+  }
+  ASSERT_THAT(pid, SyscallSucceeds());
+  close(start[0]);
+  close(stop[0]);
+
+  ASSERT_NO_ERRNO(b.Enter(pid));
+  char ch = 'g';
+  ASSERT_THAT(write(start[1], &ch, 1), SyscallSucceeds());
+
+  // Confirm substantial usage on b's live, growing counter.
+  int64_t live = PollCpuUsageUsecGreaterThan(b, 100000);
+  EXPECT_GT(live, 100000);
+
+  // Stop and reap the child so its usage is committed to b's controller.
+  close(stop[1]);
+  int status;
+  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceeds());
+
+  // a's recursive cpu.stat includes b's committed usage.
+  int64_t usage_before = PollCpuUsageUsecGreaterThan(a, 0);
+  EXPECT_GT(usage_before, 0);
+
+  // Disabling +cpu destroys b's controller; its usage must survive on a.
+  ASSERT_NO_ERRNO(a.WriteControlFile("cgroup.subtree_control", "-cpu"));
+
+  int64_t usage_after = ParseCpuUsageUsec(a);
+  EXPECT_GE(usage_after, usage_before);
 }
 
 // With nsdelegate, cgroup namespace roots are delegation boundaries: only
@@ -2722,6 +3005,101 @@ TEST_F(Cgroup2Test, TrustedXattrWithoutCapSysAdmin) {
   EXPECT_THAT(listxattr(path, list, sizeof(list)), SyscallSucceedsWithValue(0));
 
   EXPECT_THAT(removexattr(path, name), SyscallFailsWithErrno(EPERM));
+}
+
+TEST_F(Cgroup2Test, DetachedMountBindFails) {
+  Mounter m(ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir()));
+  Cgroup c = ASSERT_NO_ERRNO_AND_VALUE(m.MountCgroup2fs());
+
+  // Hold an open fd on the mount so that it survives the lazy umount, then
+  // name it again through /proc/self/fd.
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(c.Path(), O_RDONLY | O_DIRECTORY));
+  ASSERT_THAT(umount2(c.Path().c_str(), MNT_DETACH), SyscallSucceeds());
+  m.release(c);
+
+  const TempPath target = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string fd_path = absl::StrFormat("/proc/self/fd/%d", fd.get());
+  EXPECT_THAT(mount(fd_path.c_str(), target.path().c_str(), "", MS_BIND, 0),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+// An ancestor's cgroup.events must report "populated 1" while any descendant
+// has a live task, even after a mid-level cgroup's own tasks all leave.
+// Regression test for ancestor counters being decremented when a mid-level
+// cgroup drained while its child was still populated; the child's later
+// drain then decremented again, leaving the counter permanently negative.
+TEST_F(Cgroup2Test, PopulatedAccountsForDescendantsWhenMidLevelDrains) {
+  Cgroup w = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("pop_w"));
+  Cgroup a = ASSERT_NO_ERRNO_AND_VALUE(w.CreateChild("pop_a"));
+  Cgroup b = ASSERT_NO_ERRNO_AND_VALUE(a.CreateChild("pop_b"));
+  Cgroup drain = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("pop_drain"));
+
+  // Two children block on a pipe: one in a, one in a's child b.
+  int go_fds[2];
+  ASSERT_THAT(pipe(go_fds), SyscallSucceeds());
+  FileDescriptor go_r(go_fds[0]);
+  FileDescriptor go_w(go_fds[1]);
+
+  pid_t t1 = fork();
+  if (t1 == 0) {
+    go_w.reset();
+    char token;
+    TEST_PCHECK(read(go_r.get(), &token, 1) >= 0);
+    _exit(0);
+  }
+  ASSERT_GT(t1, 0);
+  pid_t t2 = fork();
+  if (t2 == 0) {
+    go_w.reset();
+    char token;
+    TEST_PCHECK(read(go_r.get(), &token, 1) >= 0);
+    _exit(0);
+  }
+  ASSERT_GT(t2, 0);
+  go_r.reset();
+
+  ASSERT_NO_ERRNO(a.Enter(t1));
+  ASSERT_NO_ERRNO(b.Enter(t2));
+  EXPECT_THAT(w.ReadControlFile("cgroup.events"),
+              IsPosixErrorOkAndHolds(HasSubstr("populated 1")));
+  EXPECT_THAT(a.ReadControlFile("cgroup.events"),
+              IsPosixErrorOkAndHolds(HasSubstr("populated 1")));
+  EXPECT_THAT(b.ReadControlFile("cgroup.events"),
+              IsPosixErrorOkAndHolds(HasSubstr("populated 1")));
+
+  // Drain a; b's task keeps a's subtree populated.
+  ASSERT_NO_ERRNO(drain.Enter(t1));
+  EXPECT_THAT(a.ReadControlFile("cgroup.events"),
+              IsPosixErrorOkAndHolds(HasSubstr("populated 1")))
+      << "mid-level cgroup reports populated 0 while its child has a task";
+  EXPECT_THAT(w.ReadControlFile("cgroup.events"),
+              IsPosixErrorOkAndHolds(HasSubstr("populated 1")))
+      << "ancestor reports populated 0 while a descendant has a task";
+
+  // Drain b; the subtree is now empty.
+  ASSERT_NO_ERRNO(drain.Enter(t2));
+  EXPECT_THAT(a.ReadControlFile("cgroup.events"),
+              IsPosixErrorOkAndHolds(HasSubstr("populated 0")));
+  EXPECT_THAT(w.ReadControlFile("cgroup.events"),
+              IsPosixErrorOkAndHolds(HasSubstr("populated 0")));
+
+  // Repopulate a; w must flip back to 1 (catches a negative counter).
+  ASSERT_NO_ERRNO(a.Enter(t1));
+  EXPECT_THAT(a.ReadControlFile("cgroup.events"),
+              IsPosixErrorOkAndHolds(HasSubstr("populated 1")));
+  EXPECT_THAT(w.ReadControlFile("cgroup.events"),
+              IsPosixErrorOkAndHolds(HasSubstr("populated 1")))
+      << "ancestor stuck at populated 0: populated-children counter went "
+         "negative when the mid-level cgroup and its child drained";
+
+  // Release and reap the children.
+  go_w.reset();
+  int status;
+  ASSERT_EQ(waitpid(t1, &status, 0), t1);
+  EXPECT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(waitpid(t2, &status, 0), t2);
+  EXPECT_TRUE(WIFEXITED(status));
 }
 
 }  // namespace

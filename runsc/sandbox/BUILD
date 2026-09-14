@@ -29,6 +29,7 @@ go_library(
         "//pkg/hostos",
         "//pkg/log",
         "//pkg/metric:metric_go_proto",
+        "//pkg/pinring",
         "//pkg/prometheus",
         "//pkg/sentry/checkpoint",
         "//pkg/sentry/control",
@@ -72,6 +73,7 @@ go_test(
     size = "small",
     srcs = [
         "network_test.go",
+        "sandbox_test.go",
     ],
     library = ":sandbox",
     deps = [

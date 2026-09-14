@@ -277,6 +277,16 @@ func (c *HostSender) Recv(ctx context.Context, data [][]byte, args RecvArgs) (Re
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
+	if c.fd < 0 {
+		// The host fd was severed (e.g. disconnected on save), so no
+		// data will ever arrive: report EOF, as Linux does for a
+		// read-shutdown socket. Passing -1 to recvmsg(2) would leak
+		// EBADF to the application for an fd that it rightly considers
+		// valid. Keying on recvShutdown instead would be wrong: a live
+		// fd may still have host-queued data to drain after SHUT_RD.
+		return RecvOutput{}, false, syserr.ErrClosedForReceive
+	}
+
 	var cm unet.ControlMessage
 	if args.NumRights > 0 {
 		cm.EnableFDs(int(args.NumRights))
@@ -364,7 +374,7 @@ func (c *HostSender) HostReadiness(mask waiter.EventMask) waiter.EventMask {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.fd < 0 {
-		return 0
+		return (waiter.ReadableEvents | waiter.WritableEvents | waiter.EventHUp | waiter.EventRdHUp) & mask
 	}
 	return fdnotifier.NonBlockingPoll(int32(c.fd), mask)
 }
@@ -453,6 +463,9 @@ type SCMSender struct {
 func (e *SCMSender) beforeSave() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.fd < 0 {
+		return
+	}
 	fdnotifier.RemoveFD(int32(e.fd))
 	e.closeRecvLocked()
 	e.closeSendLocked()

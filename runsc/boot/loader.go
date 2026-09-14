@@ -275,6 +275,16 @@ type Loader struct {
 
 	hostTHP HostTHP
 
+	// saveMu serializes save operations. Saves can be requested concurrently:
+	// autosave in save-resume mode is triggered by any task executing the
+	// trigger syscall, and checkpoints may be requested concurrently via the
+	// control API. Overlapping saves race: post-save cleanup
+	// (Kernel.BeforeResume) runs outside Kernel.extMu, so save N's cleanup can
+	// clear state that save N+1's in-progress Kernel.SaveTo has just set up.
+	//
+	// Lock order: saveMu is taken before mu.
+	saveMu sync.Mutex
+
 	// mu guards the fields below.
 	mu sync.Mutex
 
@@ -847,6 +857,7 @@ func New(args Args) (*Loader, error) {
 		RootPIDNamespace:     kernel.NewRootPIDNamespace(creds.UserNamespace),
 		MaxFDLimit:           maxFDLimit,
 		Cgroup2FSInit:        cgroup2fs.NewFilesystem,
+		SignalUnkillable:     signalUnkillablePolicy(args.Conf.SignalUnkillablePolicy),
 	}); err != nil {
 		return nil, fmt.Errorf("initializing kernel: %w", err)
 	}
@@ -2690,9 +2701,9 @@ func (l *Loader) containerCount() int {
 
 func (l *Loader) pidsCount(cid string) (int, error) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if _, err := l.tryThreadGroupFromIDLocked(execID{cid: cid}); err != nil {
+	_, err := l.tryThreadGroupFromIDLocked(execID{cid: cid})
+	l.mu.Unlock()
+	if err != nil {
 		// Container doesn't exist.
 		return 0, err
 	}
@@ -2788,8 +2799,8 @@ func (l *Loader) containerRuntimeState(cid string) ContainerRuntimeState {
 		// Container has no thread group assigned, so it has not started yet.
 		return RuntimeStateCreating
 	}
-	if exec.tg.Leader().ExitState() == kernel.TaskExitNone {
-		// Init process is still running.
+	if exec.tg.HasNonExitingTasks() {
+		// Init process thread group is still running.
 		return RuntimeStateRunning
 	}
 	// Init process has stopped, but no one has called wait on it yet.
@@ -2801,4 +2812,17 @@ func (l *Loader) GetContainerSpecs() map[string]*specs.Spec {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.containerSpecs
+}
+
+// signalUnkillablePolicy maps the runsc config signal-unkillable policy
+// to the corresponding kernel policy.
+func signalUnkillablePolicy(p config.SignalUnkillablePolicy) kernel.SignalUnkillablePolicy {
+	switch p {
+	case config.SignalUnkillableLinux:
+		return kernel.SignalUnkillableLinux
+	case config.SignalUnkillableNone:
+		return kernel.SignalUnkillableNone
+	default:
+		return kernel.SignalUnkillableNone
+	}
 }

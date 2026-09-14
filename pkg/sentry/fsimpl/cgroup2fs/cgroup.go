@@ -312,6 +312,14 @@ func (c *cgroup) populated() bool {
 // its parent's populated child counters and triggers cgroup.events notifications.
 // +checklocks:c.fs.tasksMu
 func (c *cgroup) updatePopulated(ctx context.Context, populated bool) {
+	// c's own tasksCount just crossed the 0<->1 boundary (see callers). If
+	// c still has populated children, its populated() state did not change:
+	// notifying watchers or adjusting ancestor counters here would corrupt
+	// the accounting.
+	if c.nrPopulatedChildren.Load() > 0 {
+		return
+	}
+
 	diff := int64(-1)
 	if populated {
 		diff = 1
@@ -375,11 +383,19 @@ func (c *cgroup) rebuildCtrlsLocked(ctx context.Context, cTypes []kernel.Cgroup2
 			ctrl := c.newController(cType)
 			c.ctrls[cType] = ctrl
 			c.populateInterfaceFiles(ctx, ctrl)
+			if newPids, ok := ctrl.(*pids); ok {
+				c.chargePidsForExistingTasksLocked(newPids)
+			}
 		} else if !c.parent.subtreeCtrls[cType] && c.ctrls[cType] != nil { // +checklocksforce: c.fs.treeMu is locked
 			ctrl := c.ctrls[cType]
 			c.ctrls[cType] = nil
 			c.removeInterfaceFiles(ctx, ctrl)
 			ctrl.detach()
+			// Reparent the cpu controller's tasks and accumulated usage onto
+			// the parent so disabling +cpu does not discard them.
+			if oldCPU, ok := ctrl.(*cpu); ok {
+				c.reparentCPUOnDisableLocked(oldCPU)
+			}
 		}
 	}
 
@@ -403,6 +419,25 @@ func (c *cgroup) rebuildCtrlsLocked(ctx context.Context, cTypes []kernel.Cgroup2
 			c.fs.tasksMu.Unlock()
 		}
 	}
+}
+
+// chargePidsForExistingTasksLocked charges a newly instantiated pids
+// controller for the tasks already present in c's subtree. Those tasks were
+// charged to the controller's ancestors when they entered their cgroups, but
+// predate this controller, so nothing else accounts for them.
+// +checklocksread:c.fs.treeMu
+func (c *cgroup) chargePidsForExistingTasksLocked(p *pids) {
+	c.fs.tasksMu.RLock()
+	defer c.fs.tasksMu.RUnlock()
+	n := c.tasksCount.Load()
+	c.walkSubtreeLocked(func(child *cgroup) bool {
+		n += child.tasksCount.Load()
+		return true
+	})
+	if n == 0 {
+		return
+	}
+	p.charge(n)
 }
 
 // updateClosestCtrls updates the cached nearest active controller for the given types.
@@ -529,6 +564,7 @@ func (c *cgroup) CanCloneInto(ctx context.Context, creds *auth.Credentials, ns *
 	if err != nil {
 		return err
 	}
+	defer inode.DecRef(ctx)
 	if err := inode.CheckPermissions(ctx, creds, vfs.MayWrite); err != nil {
 		return err
 	}
@@ -647,6 +683,7 @@ func (c *cgroup) removeInterfaceFiles(ctx context.Context, ctrl controller) {
 	for _, name := range ctrl.interfaceFileNames() {
 		if inode, err := c.OrderedChildren.Lookup(ctx, name); err == nil {
 			c.OrderedChildren.Unlink(ctx, name, inode)
+			inode.DecRef(ctx)
 		}
 	}
 }
@@ -776,6 +813,7 @@ func (c *cgroup) checkMigrationPermsLocked(ctx context.Context, creds *auth.Cred
 	if err != nil {
 		return err
 	}
+	defer lcaProcs.DecRef(ctx)
 	if err := lcaProcs.CheckPermissions(ctx, creds, vfs.MayWrite); err != nil {
 		return err
 	}
@@ -808,7 +846,9 @@ func (c *cgroup) isDescendantOf(ancestor *cgroup) bool {
 // non-init namespace to non-delegatable interface files of the namespace
 // root cgroup are rejected.
 func (c *cgroup) checkNSDelegateWrite(ctx context.Context, fd *vfs.FileDescription) error {
-	if !c.fs.nsDelegate.Load() {
+	// If fd is nil (e.g. writes from outside the sandbox via WriteControl),
+	// there is no cgroup namespace delegation boundary to enforce.
+	if !c.fs.nsDelegate.Load() || fd == nil {
 		return nil
 	}
 	ifd, ok := fd.Impl().(*interfaceFD)
@@ -1091,6 +1131,9 @@ func (c *cgroup) returnController(ctx context.Context, cType kernel.Cgroup2Ctrl)
 	ctrl := c.newController(cType)
 	c.ctrls[cType] = ctrl
 	c.populateInterfaceFiles(ctx, ctrl)
+	if newPids, ok := ctrl.(*pids); ok {
+		c.chargePidsForExistingTasksLocked(newPids)
+	}
 
 	cTypes := []kernel.Cgroup2Ctrl{cType}
 	c.updateClosestCtrlsLocked(cTypes)
@@ -1125,6 +1168,7 @@ func (c *cgroup) ReadControl(ctx context.Context, name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("no such control file")
 	}
+	defer cfi.DecRef(ctx)
 	dbf, ok := cfi.(*cgroupInterfaceFile)
 	var data vfs.DynamicBytesSource
 	if ok {
@@ -1155,6 +1199,7 @@ func (c *cgroup) WriteControl(ctx context.Context, name string, val string) erro
 	if err != nil {
 		return fmt.Errorf("no such control file")
 	}
+	defer cfi.DecRef(ctx)
 	dbf, ok := cfi.(*cgroupInterfaceFile)
 	if !ok {
 		return fmt.Errorf("control file not writable")

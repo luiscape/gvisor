@@ -139,17 +139,17 @@ func (fs *filesystem) stepLocked(ctx context.Context, rp *vfs.ResolvingPath, d *
 		return d, d.topLookupLayer(), false, nil
 	}
 	if name == ".." {
+		parent := d.parent.Load()
 		if isRoot, err := rp.CheckRoot(ctx, &d.vfsd); err != nil {
 			return nil, lookupLayerNone, false, err
-		} else if isRoot || d.parent.Load() == nil {
+		} else if isRoot || parent == nil {
 			rp.Advance()
 			return d, d.topLookupLayer(), false, nil
 		}
-		if err := rp.CheckMount(ctx, &d.parent.Load().vfsd); err != nil {
+		if err := rp.CheckMount(ctx, &parent.vfsd); err != nil {
 			return nil, lookupLayerNone, false, err
 		}
 		rp.Advance()
-		parent := d.parent.Load()
 		return parent, parent.topLookupLayer(), false, nil
 	}
 	if uint64(len(name)) > fs.maxFilenameLen {
@@ -915,6 +915,13 @@ func (d *dentry) ensureOpenableLocked(ctx context.Context, rp *vfs.ResolvingPath
 	if !ats.MayWrite() {
 		return nil
 	}
+	// Reject writes to a file that is currently being executed, as Linux does
+	// in fs/namei.c:may_open() and fs/open.c:handle_truncate(). This must
+	// happen before copy-up, since copying up would otherwise create a fresh
+	// upper file with a zero write count and silently bypass the check.
+	if err := d.writeCount.CheckWrite(); err != nil {
+		return err
+	}
 	if !d.upperVD.Ok() && !d.canBeCopiedUp() {
 		return linuxerr.EPERM
 	}
@@ -1090,9 +1097,13 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return err
 	}
 
-	if opts.Flags&^linux.RENAME_NOREPLACE != 0 {
+	if opts.Flags&^(linux.RENAME_NOREPLACE|linux.RENAME_EXCHANGE) != 0 {
 		return linuxerr.EINVAL
 	}
+	if opts.Flags&(linux.RENAME_NOREPLACE|linux.RENAME_EXCHANGE) == linux.RENAME_NOREPLACE|linux.RENAME_EXCHANGE {
+		return linuxerr.EINVAL
+	}
+	exchange := opts.Flags&linux.RENAME_EXCHANGE != 0
 
 	newName := rp.Component()
 	if newName == "." || newName == ".." {
@@ -1142,7 +1153,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			}
 		}
 	} else {
-		if opts.MustBeDir || rp.MustBeDir() {
+		if !exchange && (opts.MustBeDir || rp.MustBeDir()) {
 			return linuxerr.ENOTDIR
 		}
 	}
@@ -1175,7 +1186,26 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			return err
 		}
 		replacedVFSD = &replaced.vfsd
-		if replaced.isDir() {
+		if exchange {
+			// The exchanged files may differ in type, and a directory being
+			// exchanged may be non-empty; but exchanging a file with an
+			// ancestor directory would disconnect the latter from the tree.
+			if genericIsAncestorDentry(fs, replaced, renamed) {
+				return linuxerr.EINVAL
+			}
+			if rp.MustBeDir() && !replaced.isDir() {
+				return linuxerr.ENOTDIR
+			}
+			if opts.MustBeDir && !renamed.isDir() {
+				return linuxerr.ENOTDIR
+			}
+			if oldParent != newParent && replaced.isDir() {
+				// Writability is needed to change replaced's "..".
+				if err := replaced.checkPermissions(creds, vfs.MayWrite); err != nil {
+					return err
+				}
+			}
+		} else if replaced.isDir() {
 			if !renamed.isDir() {
 				return linuxerr.EISDIR
 			}
@@ -1193,6 +1223,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 				return linuxerr.ENOTDIR
 			}
 		}
+	} else if exchange {
+		// RENAME_EXCHANGE requires that the target file exist.
+		return linuxerr.ENOENT
 	}
 
 	if oldParent == newParent && oldName == newName {
@@ -1216,10 +1249,24 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err := newParent.copyUpLocked(ctx); err != nil {
 		return err
 	}
-	// If replaced exists, it doesn't need to be copied-up, but we do need to
-	// serialize with copy-up. Holding renameMu for writing should be
-	// sufficient, but out of an abundance of caution...
-	if replaced != nil {
+	if exchange {
+		// replaced is also renamed on the upper layer, so it (and all of its
+		// descendants if it's a directory) must be copied-up too.
+		if err := replaced.copyUpLocked(ctx); err != nil {
+			return err
+		}
+		if replaced.isDir() {
+			replaced.dirMu.NestedLock(dirLockReplaced)
+			err := replaced.copyUpDescendantsLocked(ctx, &ds)
+			replaced.dirMu.NestedUnlock(dirLockReplaced)
+			if err != nil {
+				return err
+			}
+		}
+	} else if replaced != nil {
+		// replaced doesn't need to be copied-up, but we do need to serialize
+		// with copy-up. Holding renameMu for writing should be sufficient, but
+		// out of an abundance of caution...
 		replaced.copyMu.RLock()
 		defer replaced.copyMu.RUnlock()
 	}
@@ -1227,7 +1274,8 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	vfsObj := rp.VirtualFilesystem()
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)
-	if err := vfsObj.PrepareRenameDentry(mntns, &renamed.vfsd, replacedVFSD); err != nil {
+	handle, err := vfsObj.PrepareRenameDentry(mntns, &renamed.vfsd, replacedVFSD)
+	if err != nil {
 		return err
 	}
 
@@ -1255,7 +1303,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			}
 		}
 	}
-	if renamed.isDir() {
+	if !exchange && renamed.isDir() {
 		if replacedLayer == lookupLayerUpper {
 			// Remove whiteouts from the directory being replaced.
 			needRecreateWhiteouts = true
@@ -1268,7 +1316,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 					Start: replaced.upperVD,
 					Path:  fspath.Parse(whiteoutName),
 				}); err != nil {
-					vfsObj.AbortRenameDentry(&renamed.vfsd, replacedVFSD)
+					vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
 					cleanupRecreateWhiteouts()
 					return err
 				}
@@ -1277,7 +1325,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			// We need to explicitly remove the whiteout since otherwise rename
 			// on the upper layer will fail with ENOTDIR.
 			if err := vfsObj.UnlinkAt(ctx, fs.creds, &newpop); err != nil {
-				vfsObj.AbortRenameDentry(&renamed.vfsd, replacedVFSD)
+				vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
 				return err
 			}
 		}
@@ -1298,15 +1346,54 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		Path:  fspath.Parse(oldName),
 	}
 	if err := vfsObj.RenameAt(ctx, creds, &oldpop, &newpop, &opts); err != nil {
-		vfsObj.AbortRenameDentry(&renamed.vfsd, replacedVFSD)
+		vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
 		cleanupRecreateWhiteouts()
 		return err
+	}
+
+	if exchange {
+		// Below this point, renamed is at newpop and replaced is at oldpop.
+		// Commit the exchange, update the overlay filesystem tree, and abandon
+		// attempts to recover from errors.
+		vfsObj.RenameBegin(&handle)
+		genericSetParentAndName(fs, renamed, newParent, newName)
+		genericSetParentAndName(fs, replaced, oldParent, oldName)
+		// References held by renamed and replaced on their parents are
+		// exchanged as well; the counts on each parent are unchanged.
+		oldParent.children[oldName] = replaced
+		newParent.children[newName] = renamed
+		oldParent.dirents = nil
+		newParent.dirents = nil
+		vfsObj.CommitRenameExchangeDentry(&handle, &renamed.vfsd, replacedVFSD)
+
+		// An exchanged directory's contents can no longer be merged with
+		// lower layer directories at its new location.
+		if renamed.isDir() {
+			if err := vfsObj.SetXattrAt(ctx, fs.creds, &newpop, &vfs.SetXattrOptions{
+				Name:  fs.xattrOpaque,
+				Value: "y",
+			}); err != nil {
+				panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to make exchanged directory opaque: %v", err))
+			}
+		}
+		if replaced.isDir() {
+			if err := vfsObj.SetXattrAt(ctx, fs.creds, &oldpop, &vfs.SetXattrOptions{
+				Name:  fs.xattrOpaque,
+				Value: "y",
+			}); err != nil {
+				panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to make exchanged directory opaque: %v", err))
+			}
+		}
+
+		vfs.InotifyRename(ctx, &renamed.watches, &oldParent.watches, &newParent.watches, oldName, newName, renamed.isDir())
+		vfs.InotifyRename(ctx, &replaced.watches, &newParent.watches, &oldParent.watches, newName, oldName, replaced.isDir())
+		return nil
 	}
 
 	// Below this point, the renamed dentry is now at newpop, and anything we
 	// replaced is gone forever. Commit the rename, update the overlay
 	// filesystem tree, and abandon attempts to recover from errors.
-	toDecRef = vfsObj.CommitRenameReplaceDentry(ctx, &renamed.vfsd, replacedVFSD)
+	vfsObj.RenameBegin(&handle)
 	delete(oldParent.children, oldName)
 	if replaced != nil {
 		// Lower dentries of replaced are not reachable from the overlay anymore.
@@ -1331,6 +1418,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 	newParent.children[newName] = renamed
 	oldParent.dirents = nil
+	toDecRef = vfsObj.CommitRenameReplaceDentry(ctx, &handle, &renamed.vfsd, replacedVFSD)
 
 	if err := CreateWhiteout(ctx, vfsObj, fs.creds, &oldpop); err != nil {
 		panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to create whiteout at origin after RenameAt: %v", err))
@@ -1524,6 +1612,14 @@ func (d *dentry) setStatLocked(ctx context.Context, rp *vfs.ResolvingPath, opts 
 	mode := linux.FileMode(d.mode.Load())
 	if err := vfs.CheckSetStat(ctx, rp.Credentials(), &opts, mode, d.accessACL.Load(), auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load())); err != nil {
 		return err
+	}
+	if opts.NeedWritePerm {
+		// truncate(2), unlike ftruncate(2), acquires write access to the file
+		// and so fails with ETXTBSY if it is being executed. See
+		// fs/open.c:do_sys_truncate().
+		if err := d.writeCount.CheckWrite(); err != nil {
+			return err
+		}
 	}
 	mnt := rp.Mount()
 	if err := mnt.CheckBeginWrite(); err != nil {

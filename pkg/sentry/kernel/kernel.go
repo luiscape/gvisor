@@ -20,7 +20,6 @@
 //
 //	Kernel.extMu
 //	  TTY.mu
-//	  timekeeperTcpipTimer.mu
 //	  ThreadGroup.timerMu
 //	    Locks acquired by ktime.Timer methods
 //	      TaskSet.mu
@@ -185,6 +184,10 @@ type Kernel struct {
 	rootUTSNamespace     *UTSNamespace
 	rootIPCNamespace     *IPCNamespace
 	rootCgroupNamespace  *CgroupNamespace
+
+	// signalUnkillable controls protection of PID namespace init processes from
+	// signals under Linux SIGNAL_UNKILLABLE semantics (see SignalUnkillablePolicy).
+	signalUnkillable SignalUnkillablePolicy
 
 	// futexes is the "root" futex.Manager, from which all others are forked.
 	// This is necessary to ensure that shared futexes are coherent across all
@@ -452,6 +455,23 @@ type Kernel struct {
 	DomainNamePoller vfs.DynamicBytesPoller
 }
 
+// SignalUnkillablePolicy controls whether PID namespace init processes (PID 1)
+// are protected from signals under Linux SIGNAL_UNKILLABLE semantics.
+type SignalUnkillablePolicy int
+
+// SignalUnkillablePolicy values.
+const (
+	// SignalUnkillableNone disables the protection: init follows standard
+	// signal semantics and can be killed or stopped from within the sandbox.
+	SignalUnkillableNone SignalUnkillablePolicy = iota
+
+	// SignalUnkillableLinux implements Linux SIGNAL_UNKILLABLE semantics:
+	// unhandled default-fatal/stop signals from peers in the same PID namespace
+	// are discarded, handled signals run their handlers, and signals from
+	// outside the namespace take effect normally.
+	SignalUnkillableLinux
+)
+
 // InitKernelArgs holds arguments to Init.
 type InitKernelArgs struct {
 	// FeatureSet is the emulated CPU feature set.
@@ -505,6 +525,10 @@ type InitKernelArgs struct {
 
 	// Cgroup2FSInit initializes the cgroup2fs filesystem singleton.
 	Cgroup2FSInit func(ctx context.Context, k *Kernel, vfsObj *vfs.VirtualFilesystem) (*vfs.Filesystem, error)
+
+	// SignalUnkillable controls protection of PID namespace init processes from
+	// signals under Linux SIGNAL_UNKILLABLE semantics.
+	SignalUnkillable SignalUnkillablePolicy
 }
 
 // Init initialize the Kernel with no tasks.
@@ -526,6 +550,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	}
 
 	k.featureSet = args.FeatureSet
+	k.signalUnkillable = args.SignalUnkillable
 	k.timekeeper = args.Timekeeper
 	k.tasks = newTaskSet(args.RootPIDNamespace)
 	k.rootUserNamespace = args.RootUserNamespace
@@ -1229,9 +1254,7 @@ func (ctx *createProcessContext) Value(key any) any {
 		if ctx.args.CgroupNamespace == nil {
 			return nil
 		}
-		cgroupns := ctx.args.CgroupNamespace
-		cgroupns.IncRef()
-		return cgroupns
+		return ctx.args.CgroupNamespace
 	case CtxUTSNamespace:
 		utsns := ctx.args.UTSNamespace
 		utsns.IncRef()
@@ -1551,7 +1574,7 @@ func (k *Kernel) pauseTimeLocked(ctx context.Context) {
 			})
 		}
 	}
-	k.timekeeper.PauseUpdates()
+	k.timekeeper.Pause()
 }
 
 // resumeTimeLocked resumes all Timers and Timekeeper updates. If
@@ -1565,7 +1588,7 @@ func (k *Kernel) resumeTimeLocked(ctx context.Context) {
 	// The CPU clock ticker will automatically resume as task goroutines resume
 	// execution.
 
-	k.timekeeper.ResumeUpdates(k.vdsoParams)
+	k.timekeeper.Resume(k.vdsoParams)
 	for t := range k.tasks.Root.tids {
 		if t == t.tg.leader {
 			t.tg.itimerRealTimer.Resume()
@@ -1786,13 +1809,25 @@ func (k *Kernel) SendExternalSignal(info *linux.SignalInfo, context string) {
 	k.sendExternalSignal(info, context)
 }
 
+// maybeForceInitSignal marks external signals to the root-namespace init as
+// privileged (SI_KERNEL) so host/control-plane signals take effect under
+// SIGNAL_UNKILLABLE protection. The input info is not mutated.
+func (k *Kernel) maybeForceInitSignal(tg *ThreadGroup, info *linux.SignalInfo) *linux.SignalInfo {
+	if k.signalUnkillable == SignalUnkillableNone || tg != k.globalInit || info.Code != linux.SI_USER {
+		return info
+	}
+	forced := *info
+	forced.Code = linux.SI_KERNEL
+	return &forced
+}
+
 // SendExternalSignalThreadGroup injects a signal into an specific ThreadGroup.
 //
 // This function doesn't skip signals like SendExternalSignal does.
 func (k *Kernel) SendExternalSignalThreadGroup(tg *ThreadGroup, info *linux.SignalInfo) error {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
-	return tg.SendSignal(info)
+	return tg.SendSignal(k.maybeForceInitSignal(tg, info))
 }
 
 // SendExternalSignalProcessGroup sends a signal to all ThreadGroups in the
@@ -1809,7 +1844,7 @@ func (k *Kernel) SendExternalSignalProcessGroup(pg *ProcessGroup, info *linux.Si
 		if tg.ProcessGroup() != pg {
 			continue
 		}
-		if err := tg.SendSignal(info); err != nil && firstErr == nil {
+		if err := tg.SendSignal(k.maybeForceInitSignal(tg, info)); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -1828,7 +1863,7 @@ func (k *Kernel) SendContainerSignal(cid string, info *linux.SignalInfo) error {
 	for tg := range k.tasks.Root.tgids {
 		if tg.leader.ContainerID() == cid {
 			tg.signalHandlers.mu.Lock()
-			infoCopy := *info
+			infoCopy := *k.maybeForceInitSignal(tg, info)
 			if err := tg.leader.sendSignalLocked(&infoCopy, true /*group*/); err != nil {
 				lastErr = err
 			}
@@ -1913,6 +1948,14 @@ func (k *Kernel) GlobalInit() *ThreadGroup {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
 	return k.globalInit
+}
+
+// SetSignalUnkillablePolicy sets the SIGNAL_UNKILLABLE policy.
+//
+// This is typically called on the restore path to apply restore-time
+// configuration before the kernel is started.
+func (k *Kernel) SetSignalUnkillablePolicy(p SignalUnkillablePolicy) {
+	k.signalUnkillable = p
 }
 
 // TestOnlySetGlobalInit sets the thread group with ID 1 in the root PID namespace.

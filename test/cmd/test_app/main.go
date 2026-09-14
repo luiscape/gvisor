@@ -46,6 +46,7 @@ func main() {
 	subcommands.Register(subcommands.FlagsCommand(), "")
 	subcommands.Register(new(capability), "")
 	subcommands.Register(new(chardevCheck), "")
+	subcommands.Register(new(execFromThread), "")
 	subcommands.Register(new(fdReceiver), "")
 	subcommands.Register(new(fdSender), "")
 	subcommands.Register(new(forkBomb), "")
@@ -90,7 +91,7 @@ func (*fsTreeCreator) Name() string {
 	return "fsTreeCreate"
 }
 
-// Synopsis implements subcommands.Command.Synopsys.
+// Synopsis implements subcommands.Command.Synopsis.
 func (*fsTreeCreator) Synopsis() string {
 	return "creates a filesystem tree of a certain depth, with a certain number of files on each level and each file with a certain size and type, under a certain directory."
 }
@@ -170,7 +171,7 @@ func (*fsTreeVerify) Name() string {
 	return "fsTreeVerify"
 }
 
-// Synopsis implements subcommands.Command.Synopsys.
+// Synopsis implements subcommands.Command.Synopsis.
 func (*fsTreeVerify) Synopsis() string {
 	return "verifies a filesystem tree created by fsTreeCreate with the same arguments"
 }
@@ -241,9 +242,9 @@ func (*uds) Name() string {
 	return "uds"
 }
 
-// Synopsis implements subcommands.Command.Synopsys.
+// Synopsis implements subcommands.Command.Synopsis.
 func (*uds) Synopsis() string {
-	return "creates unix domain socket client and server. Client sends a contant flow of sequential numbers. Server prints them to --file"
+	return "creates unix domain socket client and server. Client sends a constant flow of sequential numbers. Server prints them to --file"
 }
 
 // Usage implements subcommands.Command.Usage.
@@ -387,7 +388,7 @@ func (*taskTreePGID) Name() string {
 	return "task-tree-pgid"
 }
 
-// Synopsis implements subcommands.Command.Synopsys.
+// Synopsis implements subcommands.Command.Synopsis.
 func (*taskTreePGID) Synopsis() string {
 	return "creates a child+grandchild in a new process group"
 }
@@ -446,7 +447,7 @@ func (*gvisorDetect) Name() string {
 	return "gvisor-detect"
 }
 
-// Synopsis implements subcommands.Command.Synopsys.
+// Synopsis implements subcommands.Command.Synopsis.
 func (*gvisorDetect) Synopsis() string {
 	return "checks if the process is running inside gVisor by checking for the marker file"
 }

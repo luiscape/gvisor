@@ -321,7 +321,7 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 	// current->signal->tty, which differs from the parent's under
 	// CLONE_PARENT.
 	if srcT != nil {
-		inhTTY = srcT.tg.GetTTY() // Takes a ref, balanced in defer, or transfered to tg.tty.
+		inhTTY = srcT.tg.GetTTY() // Takes a ref, balanced in defer, or transferred to tg.tty.
 	}
 
 	// For the standard, non-cloneIntoCgroup fork case, we have to do this
@@ -335,6 +335,9 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		} else if cfg.InitialCgroupV2 != nil {
 			// Container start or exec into an existing container.
 			cgroup2 = cfg.InitialCgroupV2
+		} else if cfg.CgroupNamespace != nil {
+			// Container start with dedicated cgroup namespace.
+			cgroup2 = cfg.CgroupNamespace.Root()
 		} else {
 			// Direct exec into the sandbox.
 			cgroup2 = cfg.Kernel.Cgroup2FS().RootCgroup()
@@ -411,7 +414,7 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		// New thread group.
 		tg.leader = t
 		if parentPG := tg.parentPG(); parentPG == nil {
-			tg.createSession()
+			tg.createSession() // +checklocksforce: ts.mu is tg.pidns.owner.mu.
 		} else {
 			// Inherit the process group and terminal.
 			parentPG.incRefWithParent(parentPG)

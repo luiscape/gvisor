@@ -42,14 +42,23 @@ export DEBIAN_FRONTEND=noninteractive
 # install_raw installs raw artifacts.
 install_raw() {
   for binary in "${binaries[@]}"; do
-    local arch name
+    local arch file_info name
     # Copy the raw file & generate a sha512sum, sorted by architecture.
-    if echo "${binary}" | grep -qF .tar.bz2; then
-      # Determine arch from the `runsc` within the tarball:
-      arch=$(tar -xjOf "${binary}" runsc | file - | cut -d',' -f2 | awk '{print $NF}' | tr '-' '_')
-    else
-      arch=$(file "${binary}" | cut -d',' -f2 | awk '{print $NF}' | tr '-' '_')
-    fi
+    # For tarballs, determine arch from the `runsc` within the tarball.
+    case "${binary}" in
+      *.tar.bz2)
+        arch=$(tar -xjOf "${binary}" runsc | file - | cut -d',' -f2 | awk '{print $NF}' | tr '-' '_')
+        ;;
+      *.tar.zstd)
+        arch=$(tar --zstd -xOf "${binary}" runsc | file - | cut -d',' -f2 | awk '{print $NF}' | tr '-' '_')
+        ;;
+      *.whl|*.tar.gz)
+        arch="python"
+        ;;
+      *)
+        arch=$(file "${binary}" | cut -d',' -f2 | awk '{print $NF}' | tr '-' '_')
+        ;;
+    esac
     name=$(basename "${binary}")
     mkdir -p "${root}/$1/${arch}"
     cp -f "${binary}" "${root}/$1/${arch}"
@@ -61,6 +70,8 @@ install_raw() {
 install_apt() {
   tools/make_apt.sh "${private_key}" "$1" "${root}" "${pkgs[@]}"
 }
+
+
 
 # If nightly, install only nightly artifacts.
 if [[ "${NIGHTLY:-false}" == "true" ]]; then
@@ -82,6 +93,10 @@ else
         continue
       fi
       # LINT.ThenChange(../.buildkite/hooks/pre-command)
+      # A staging tag names a release that is still being built.
+      if [[ "$tag" == release-*-staging ]]; then
+        continue
+      fi
       name=$(echo "${tag}" | cut -d'-' -f2)
       base=$(echo "${name}" | cut -d'.' -f1)
       # Install the "specific" release. This is the latest release with the
@@ -91,6 +106,7 @@ else
       # Install the "point release".
       # https://gvisor.dev/docs/user_guide/install/#point-release
       install_raw "release/${name}"
+      tools/make_python_release.sh upload-wheel "${root}/release/${name}/python"
       # Install the latest release.
       # https://gvisor.dev/docs/user_guide/install/#latest-release
       install_raw "release/latest"

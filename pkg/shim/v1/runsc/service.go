@@ -25,6 +25,8 @@ import (
 	"strings"
 	"sync"
 
+	"golang.org/x/sys/unix"
+
 	taskServer "gvisor.dev/gvisor/pkg/shim/v1/taskserver"
 	pb "gvisor.dev/gvisor/pkg/shim/v1/taskserver/task_server_go_proto"
 
@@ -602,7 +604,6 @@ func (s *runscService) checkProcesses(ctx context.Context, e proc.Exit) {
 		log.L.Debugf("Container init process exited, killing all container processes")
 		ip.KillAll(ctx)
 	}
-	p.SetExited(e.Status)
 	// On init process exit, synchronously check the cgroup for OOM kills
 	// before publishing the exit event. The async OOM notification via
 	// EventChan (cgroups v2) can lose the race against the container exit
@@ -611,7 +612,17 @@ func (s *runscService) checkProcesses(ctx context.Context, e proc.Exit) {
 	// exec processes share the sandbox cgroup and would produce spurious
 	// events.
 	// Use the per-container id for TaskOOM routing.
-	if isInit && s.oomPoller.isOOM(containerID) {
+	isOOM := isInit && s.oomPoller.isOOM(containerID)
+	// When the memcg kill lands on the sentry itself, `runsc wait` cannot
+	// recover the real signal status and the shim substitutes the generic
+	// InternalErrorCode. Since the cgroup confirms an OOM kill, report the
+	// status tooling expects for SIGKILL (137). A real status reported by
+	// runsc is never overridden.
+	if isOOM && e.Status == proc.InternalErrorCode {
+		e.Status = 128 + int(unix.SIGKILL)
+	}
+	p.SetExited(e.Status)
+	if isOOM {
 		s.send(&events.TaskOOM{ContainerID: containerID})
 	}
 	s.send(&events.TaskExit{
@@ -654,22 +665,22 @@ func (s *runscService) getContainerPids(ctx context.Context, c *Container) ([]ui
 	return pids, nil
 }
 
+// publishFailureIsFatal reports whether a failure to publish an event is fatal.
+// An empty TTRPC_ADDRESS means no event sink is configured (as under CRI-O), so
+// the publisher can never connect and publish errors are expected.
+func publishFailureIsFatal() bool {
+	return os.Getenv("TTRPC_ADDRESS") != ""
+}
+
 func (s *runscService) forward(ctx context.Context, publisher shim.Publisher) {
-	// An empty TTRPC_ADDRESS means no containerd event sink is configured, so
-	// the publisher can never connect and publish errors are expected and
-	// non-fatal. This is how CRI-O launches the shim, but the check is not
-	// CRI-O specific: any caller that omits TTRPC_ADDRESS gets the same lenient
-	// handling. When TTRPC_ADDRESS is set (e.g. under containerd) a publish
-	// failure is unexpected and remains fatal.
-	isEmptyTTRPCAddress := os.Getenv("TTRPC_ADDRESS") == ""
+	isFatal := publishFailureIsFatal()
 	for e := range s.events {
 		if err := publisher.Publish(ctx, getTopic(e), e); err != nil {
-			if isEmptyTTRPCAddress {
-				log.L.Warningf("Failed to post event (no containerd event sink): %v", err)
-				continue
+			if isFatal {
+				// Should not happen when an event sink is configured.
+				panic(fmt.Errorf("post event: %w", err))
 			}
-			// Should not happen when an event sink is configured.
-			panic(fmt.Errorf("post event: %w", err))
+			log.L.Warningf("Failed to post event (no containerd event sink): %v", err)
 		}
 	}
 }
@@ -733,6 +744,12 @@ func newInit(workDir, namespace string, platform stdio.Platform, r *proc.CreateC
 	p.IoGID = int(options.IoGID)
 	p.Sandbox = specutils.SpecContainerType(spec) == specutils.ContainerTypeSandbox
 	p.UserLog = utils.UserLogPath(spec)
+	if uid, err := utils.PodUID(spec, r.Bundle); err == nil {
+		p.K8sPodUID = uid
+	}
+	// Enable FUSE connection abort on teardown if the annotation is set on the
+	// spec or the pod sandbox spec.
+	p.FuseAbort = utils.FuseAbortOnTeardown(spec, r.Bundle)
 	p.Monitor = reaper.Default
 	return p, nil
 }

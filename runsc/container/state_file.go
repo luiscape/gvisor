@@ -50,7 +50,7 @@ type LoadOpts struct {
 	// Exact tells whether the search should be exact. See Load() for more.
 	Exact bool
 
-	// SkipCheck tells Load() to skip checking if container is runnning.
+	// SkipCheck tells Load() to skip checking if container is running.
 	SkipCheck bool
 
 	// TryLock tells Load() to fail if the container state file cannot be locked,
@@ -382,7 +382,13 @@ func (s *StateFile) load(v any, opts LoadOpts) error {
 		return err
 	}
 	defer s.UnlockOrDie()
+	return s.loadLocked(v)
+}
 
+// loadLocked reads and decodes the state file into v.
+//
+// Preconditions: lock(*) must have been called.
+func (s *StateFile) loadLocked(v any) error {
 	path := s.statePath()
 	metaBytes, err := os.ReadFile(path)
 	if err != nil {

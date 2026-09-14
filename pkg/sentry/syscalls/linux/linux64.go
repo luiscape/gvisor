@@ -349,7 +349,7 @@ var AMD64 = &kernel.SyscallTable{
 		314: syscalls.PartiallySupported("sched_setattr", SchedSetattr, "Stub implementation.", nil),
 		315: syscalls.PartiallySupported("sched_getattr", SchedGetattr, "Stub implementation.", nil),
 		316: syscalls.Supported("renameat2", Renameat2),
-		317: syscalls.Supported("seccomp", Seccomp),
+		317: syscalls.PartiallySupported("seccomp", Seccomp, "Only SECCOMP_SET_MODE_FILTER is supported, with flags set to 0 or SECCOMP_FILTER_FLAG_TSYNC.", nil),
 		318: syscalls.Supported("getrandom", GetRandom),
 		319: syscalls.Supported("memfd_create", MemfdCreate),
 		320: syscalls.CapError("kexec_file_load", linux.CAP_SYS_BOOT, "", nil),
@@ -361,7 +361,7 @@ var AMD64 = &kernel.SyscallTable{
 
 		// Syscalls implemented after 325 are "backports" from versions
 		// of Linux after 4.4.
-		326: syscalls.ErrorWithEvent("copy_file_range", linuxerr.ENOSYS, "", nil),
+		326: syscalls.Supported("copy_file_range", CopyFileRange),
 		327: syscalls.PartiallySupportedPoint("preadv2", Preadv2, PointPreadv2, "RWF flags are not supported.", []string{"gvisor.dev/issue/2601"}),
 		328: syscalls.PartiallySupportedPoint("pwritev2", Pwritev2, PointPwritev2, "RWF flags are not supported.", []string{"gvisor.dev/issue/2601"}),
 		329: syscalls.ErrorWithEvent("pkey_mprotect", linuxerr.ENOSYS, "", nil),
@@ -385,6 +385,7 @@ var AMD64 = &kernel.SyscallTable{
 		434: syscalls.Supported("pidfd_open", PIDFDOpen),
 		435: syscalls.PartiallySupported("clone3", Clone3, "Options CLONE_NEWTIME, CLONE_SYSVSEM and SetTid are not supported.", nil),
 		436: syscalls.Supported("close_range", CloseRange),
+		437: syscalls.Supported("openat2", Openat2),
 		438: syscalls.Supported("pidfd_getfd", PIDFDGetFD),
 		439: syscalls.Supported("faccessat2", Faccessat2),
 		441: syscalls.Supported("epoll_pwait2", EpollPwait2),
@@ -668,7 +669,7 @@ var ARM64 = &kernel.SyscallTable{
 		274: syscalls.PartiallySupported("sched_setattr", SchedSetattr, "Stub implementation.", nil),
 		275: syscalls.PartiallySupported("sched_getattr", SchedGetattr, "Stub implementation.", nil),
 		276: syscalls.Supported("renameat2", Renameat2),
-		277: syscalls.Supported("seccomp", Seccomp),
+		277: syscalls.PartiallySupported("seccomp", Seccomp, "Only SECCOMP_SET_MODE_FILTER is supported, with flags set to 0 or SECCOMP_FILTER_FLAG_TSYNC.", nil),
 		278: syscalls.Supported("getrandom", GetRandom),
 		279: syscalls.Supported("memfd_create", MemfdCreate),
 		280: syscalls.PartiallySupported("bpf", Bpf, "Only loading, querying, and attaching of CGROUP_DEVICE programs are supported. Loaded programs have no effect.", nil),
@@ -678,7 +679,7 @@ var ARM64 = &kernel.SyscallTable{
 		284: syscalls.PartiallySupported("mlock2", Mlock2, "Stub implementation. The sandbox lacks appropriate permissions.", nil),
 
 		// Syscalls after 284 are "backports" from versions of Linux after 4.4.
-		285: syscalls.ErrorWithEvent("copy_file_range", linuxerr.ENOSYS, "", nil),
+		285: syscalls.Supported("copy_file_range", CopyFileRange),
 		286: syscalls.PartiallySupportedPoint("preadv2", Preadv2, PointPreadv2, "RWF flags are not supported.", []string{"gvisor.dev/issue/2601"}),
 		287: syscalls.PartiallySupportedPoint("pwritev2", Pwritev2, PointPwritev2, "RWF flags are not supported.", []string{"gvisor.dev/issue/2601"}),
 		288: syscalls.ErrorWithEvent("pkey_mprotect", linuxerr.ENOSYS, "", nil),
@@ -702,6 +703,7 @@ var ARM64 = &kernel.SyscallTable{
 		434: syscalls.Supported("pidfd_open", PIDFDOpen),
 		435: syscalls.PartiallySupported("clone3", Clone3, "Options CLONE_NEWTIME, CLONE_SYSVSEM and clone_args.set_tid are not supported.", nil),
 		436: syscalls.Supported("close_range", CloseRange),
+		437: syscalls.Supported("openat2", Openat2),
 		438: syscalls.Supported("pidfd_getfd", PIDFDGetFD),
 		439: syscalls.Supported("faccessat2", Faccessat2),
 		441: syscalls.Supported("epoll_pwait2", EpollPwait2),

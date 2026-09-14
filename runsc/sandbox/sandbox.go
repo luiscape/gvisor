@@ -45,6 +45,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostos"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/pinring"
 	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
@@ -321,10 +322,6 @@ type Args struct {
 	// open filesystem checkpoint files using O_DIRECT.
 	FSRestoreImagePath string
 	FSRestoreDirect    bool
-
-	// PinRingFile, if non-nil, is the pin ring to donate to the boot
-	// process (see `//pkg/pinring`).
-	PinRingFile *os.File
 }
 
 // New creates the sandbox process. The caller must call Destroy() on the
@@ -596,7 +593,12 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 
 	// Restore the container and start the root container.
 	if err := conn.Call(boot.ContMgrRestore, &opt, nil); err != nil {
-		return fmt.Errorf("restoring container %q: %v", cid, err)
+		if opt.UseCheckpointGofer {
+			if target := getGCSURIFromImagePath(imagePath); target != "" {
+				return fmt.Errorf("restoring container %q from %s: %w", cid, target, err)
+			}
+		}
+		return fmt.Errorf("restoring container %q: %w", cid, err)
 	}
 	s.Restored = true
 	return nil
@@ -987,7 +989,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		log.Infof("Sidecar %q found: prepending Sentry boot command with %s", gvisorbinaries.GvisorSentryPrewarmer.Name, p)
 		cmd.Args = append([]string{p, cmd.Path}, cmd.Args[0:]...)
 		cmd.Path = p
-	} else if conf.SidecarUsagePolicy.AllowEmbeddedFallback() {
+	} else if conf.SidecarUsagePolicy != config.SidecarUsageStrict {
 		gvisorbinaries.GvisorSentryPrewarmer.WarnUnavailable(fmt.Sprintf("Sidecar %q not found or usable (%v). This slows down gVisor startup significantly", gvisorbinaries.GvisorSentryPrewarmer.Name, err))
 	} else {
 		return fmt.Errorf("sidecar %q not usable (%v) and --sidecar-usage-policy is set to STRICT", gvisorbinaries.GvisorSentryPrewarmer.Name, err)
@@ -1025,7 +1027,16 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	donations.DonateAndClose("gofer-filestore-fds", args.GoferFilestoreFiles...)
 	donations.DonateAndClose("mounts-fd", args.MountsFile)
 	donations.Donate("start-sync-fd", startSyncFile)
-	donations.DonateAndClose("pin-ring-fd", args.PinRingFile)
+	var pinRing *os.File
+	if _, err := gvisorbinaries.FDParking.Path(); err != nil {
+		log.Warningf("Sidecar %q not found or usable (%v). This slows down gVisor sandbox teardown.", gvisorbinaries.FDParking.Name, err)
+	} else if ring, err := pinring.NewDisabledIOURing(); err != nil {
+		log.Warningf("Cannot create disabled io_uring ring: %v. This slows down gVisor sandbox teardown.", err)
+	} else {
+		pinRing = ring
+		defer pinRing.Close()
+		donations.Donate("pin-ring-fd", pinRing)
+	}
 	if err := donations.DonateLogFile("user-log-fd", args.UserLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, lfOpts); err != nil {
 		return err
 	}
@@ -1435,6 +1446,48 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	s.Pid.Store(cmd.Process.Pid)
 	log.Infof("Sandbox started, PID: %d", cmd.Process.Pid)
 
+	if pinRing != nil {
+		if err := spawnFDParking(pinRing, cmd.Process.Pid); err != nil {
+			log.Warningf("Cannot spawn sidecar %q: %v. This slows down gVisor sandbox teardown.", gvisorbinaries.FDParking.Name, err)
+		}
+	}
+	return nil
+}
+
+// spawnFDParking starts the runsc-fd-parking sidecar, which holds
+// `ring` until the sandbox process `pid` has exited and thus keeps the
+// sandbox from being the last ref holder of the FDs pinned into the ring.
+// See `//pkg/pinring` and `//runsc/fdparking`.
+func spawnFDParking(ring *os.File, pid int) error {
+	pidfd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		return fmt.Errorf("pidfd_open(%d): %w", pid, err)
+	}
+	defer unix.Close(pidfd)
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		return fmt.Errorf("cannot open %s: %w", os.DevNull, err)
+	}
+	defer devNull.Close()
+	parkingPid, err := gvisorbinaries.FDParking.ForkExec(gvisorbinaries.Options{
+		// FDs 3 (sandbox pidfd) and 4 (pin ring) are what the
+		// `//runsc/fdparking` binary expects.
+		Files: []uintptr{devNull.Fd(), devNull.Fd(), devNull.Fd(), uintptr(pidfd), ring.Fd()},
+		// The sidecar must outlive this process and not die with its session.
+		SysProcAttr: &unix.SysProcAttr{Setsid: true},
+	})
+	if err != nil {
+		return fmt.Errorf("cannot fork/exec: %w", err)
+	}
+	log.Infof("FD parking sidecar started, PID: %d", parkingPid)
+	go func() {
+		// Reap in case it does for some reason.
+		for {
+			if _, err := unix.Wait4(parkingPid, nil, 0, nil); err != unix.EINTR {
+				return
+			}
+		}
+	}()
 	return nil
 }
 
@@ -1696,6 +1749,11 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 	}
 
 	if err := s.call(boot.ContMgrCheckpoint, &opt, nil); err != nil {
+		if opt.UseCheckpointGofer {
+			if target := getGCSURIFromImagePath(imagePath); target != "" {
+				return fmt.Errorf("checkpointing container %q to %s: %w", cid, target, err)
+			}
+		}
 		return fmt.Errorf("checkpointing container %q: %w", cid, err)
 	}
 	s.Checkpointed = true
@@ -1817,6 +1875,11 @@ func (s *Sandbox) FSSave(conf *config.Config, cid string, imagePath string, opts
 	}
 
 	if err := s.call(boot.ContMgrFSSave, &args, nil); err != nil {
+		if args.UseCheckpointGofer {
+			if target := getGCSURIFromImagePath(imagePath); target != "" {
+				return fmt.Errorf("checkpointing filesystem for container %q to %s: %w", cid, target, err)
+			}
+		}
 		return fmt.Errorf("checkpointing filesystem for container %q: %w", cid, err)
 	}
 	return nil
@@ -1911,6 +1974,27 @@ func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([
 
 	closeCleanup.Release()
 	return files[:], nil
+}
+
+// getGCSURIFromImagePath returns the GCS URI (e.g. "gs://bucket" or "gs://bucket/prefix")
+// specified in gcs_opts.json under imagePath, or empty string if not applicable.
+func getGCSURIFromImagePath(imagePath string) string {
+	gcsOptsPath := path.Join(imagePath, checkpointGCSOptsFileName)
+	data, err := os.ReadFile(gcsOptsPath)
+	if err != nil {
+		return ""
+	}
+	var opts struct {
+		Bucket       string `json:"bucket"`
+		ObjectPrefix string `json:"object_prefix"`
+	}
+	if err := json.Unmarshal(data, &opts); err != nil || opts.Bucket == "" {
+		return ""
+	}
+	if opts.ObjectPrefix != "" {
+		return fmt.Sprintf("gs://%s/%s", opts.Bucket, strings.TrimPrefix(opts.ObjectPrefix, "/"))
+	}
+	return fmt.Sprintf("gs://%s", opts.Bucket)
 }
 
 // maybeStartCheckpointGoferAndGetSocket checks if use of a checkpoint gofer is
@@ -2179,6 +2263,15 @@ func (s *Sandbox) HeapProfile(f *os.File, delay time.Duration) error {
 		Delay:       delay,
 	}
 	return s.call(boot.ProfileHeap, &opts, nil)
+}
+
+// GoroutineProfile writes a goroutine stack dump to the given file.
+func (s *Sandbox) GoroutineProfile(f *os.File) error {
+	log.Debugf("Goroutine profile %q", s.ID)
+	opts := control.GoroutineProfileOpts{
+		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
+	}
+	return s.call(boot.ProfileGoroutine, &opts, nil)
 }
 
 // CPUProfile collects a CPU profile.

@@ -176,6 +176,11 @@ syscall_test(
 )
 
 syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:copy_file_range_test",
+)
+
+syscall_test(
     add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:creat_test",
@@ -512,6 +517,11 @@ syscall_test(
     add_overlay = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:open_test",
+)
+
+syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:openat2_test",
 )
 
 syscall_test(

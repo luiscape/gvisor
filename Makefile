@@ -77,6 +77,10 @@ query: ## Runs a bazel query. E.g. make query TARGETS=//test/...
 	@$(call query,$(OPTIONS) $(TARGETS))
 .PHONY: query
 
+mod: ## Runs a bazel mod command. E.g. make mod TARGETS="deps --output json"
+	@$(call mod,$(OPTIONS) $(TARGETS))
+.PHONY: mod
+
 sudo: ## Runs the given $(TARGETS) as per run, but using "sudo -E". E.g. make sudo TARGETS=test/root:root_test ARGS=-test.v
 	@$(call sudo,$(TARGETS),$(ARGS))
 .PHONY: sudo
@@ -135,16 +139,13 @@ endif
 $(RUNTIME_BIN): # See below.
 	@mkdir -p "$(RUNTIME_DIR)"
 ifeq (,$(STAGED_BINARIES))
-	@$(call copy,$(RUNSC_TARGET),$(RUNTIME_BIN))
-	@# Install sidecar binaries next to `RUNTIME_BIN`:
-	@$(call copy,//debian:gvisor-bin-tar,$(RUNTIME_DIR))
-	@tar -C "$(RUNTIME_DIR)" -xf "$(RUNTIME_DIR)/gvisor-bin-tar.tar"
-	@rm -f "$(RUNTIME_DIR)/gvisor-bin-tar.tar"
+	@$(call copy,//:release,$(RUNTIME_DIR))
+	@$(if $(filter-out //runsc,$(RUNSC_TARGET)),$(call copy,$(RUNSC_TARGET),$(RUNTIME_BIN)))
 	@$(if $(EXTRA_SIDECAR_TARGETS),$(call copy,$(EXTRA_SIDECAR_TARGETS),$(RUNTIME_DIR)/gvisor-bin))
 else
 	@gcloud storage cat "${STAGED_BINARIES}" | \
-	  tar -C "$(RUNTIME_DIR)" -zxvf - ./runsc ./gvisor-bin && \
-	  chmod -R a+rx "$(RUNTIME_BIN)" "$(RUNTIME_DIR)/gvisor-bin"
+	  tar -C "$(RUNTIME_DIR)" -zxvf - && \
+	  chmod -R a+rx "$(RUNTIME_DIR)"
 endif
 .PHONY: $(RUNTIME_BIN) # Real file, but force rebuild.
 
@@ -200,15 +201,18 @@ dev: $(RUNTIME_BIN) ## Installs a set of local runtimes. Requires sudo.
 .PHONY: dev
 
 governance-regen: ## Regenerates the files derived from governance/maintainers.yaml and governance/areas.yaml.
-	@$(call run,//governance/tools/maintainers:maintainers_gen,-input governance/maintainers.yaml -areas governance/areas.yaml -format reviewer.json -output .github/reviewer.json)
 	@$(call run,//governance/tools/maintainers:maintainers_gen,-input governance/maintainers.yaml -areas governance/areas.yaml -format MAINTAINERS.md -output MAINTAINERS.md)
 	@$(call run,//governance/tools/maintainers:maintainers_gen,-input governance/maintainers.yaml -areas governance/areas.yaml -format CODEOWNERS -output CODEOWNERS)
 .PHONY: governance-regen
 
 governance-check: governance-regen ## Checks that the files derived from governance/*.yaml are in sync. Can't be a bazel test because it requires visibility across the whole codebase to check for subdirectories' existence.
-	@git diff --exit-code -- CODEOWNERS MAINTAINERS.md .github/reviewer.json || \
+	@git diff --exit-code -- CODEOWNERS MAINTAINERS.md || \
 		(echo "Generated governance files are out of sync. Please run \`make governance-regen\`." >&2; exit 1)
 .PHONY: governance-check
+
+license-check: ## Checks that tools/licensecheck/dependencies.yaml has an entry for every dependency.
+	@$(call run,//tools/licensecheck/main:licensecheck,--mode=verify)
+.PHONY: license-check
 
 ##
 ## Canonical build and test targets.
@@ -242,12 +246,13 @@ debian: ## Builds the debian packages.
 	@$(call build,-c opt //debian:debian)
 .PHONY: debian
 
-smoke-tests: ## Runs a simple smoke test after building runsc.
-	@$(call run,//runsc,--alsologtostderr --network none --debug --TESTONLY-unsafe-nonroot=true --rootless do true)
+smoke-tests: $(RUNTIME_BIN) ## Runs a simple smoke test after building runsc.
+	@$(RUNTIME_BIN) --alsologtostderr --network none --debug --TESTONLY-unsafe-nonroot=true --rootless do true
 .PHONY: smoke-tests
 
-smoke-race-tests: ## Runs a smoke test after build building runsc in race configuration.
-	@$(call run,$(RACE_FLAGS) //runsc:runsc-race,--alsologtostderr --network none --debug --TESTONLY-unsafe-nonroot=true --rootless do true)
+smoke-race-tests: RUNSC_TARGET = $(RACE_FLAGS) //runsc:runsc-race
+smoke-race-tests: $(RUNTIME_BIN) ## Runs a smoke test after build building runsc in race configuration.
+	@$(RUNTIME_BIN) --alsologtostderr --network none --debug --TESTONLY-unsafe-nonroot=true --rootless do true
 .PHONY: smoke-race-tests
 
 nogo-tests:
@@ -517,7 +522,7 @@ nftables-syscall-runc-tests: load-nftables
 	@sudo modprobe nfnetlink
 	@sudo modprobe nf_tables
 	@# Overrides the default `--user` flag of DOCKER_RUN_OPTIONS to run as root.
-	@$(call build_paths,//test/syscalls/linux:socket_netlink_netfilter_test,docker run $(DOCKER_RUN_OPTIONS) --user 0:0 --runtime runc --rm gvisor.dev/images/nftables {})
+	@$(call build_paths,//test/syscalls/linux:socket_netlink_netfilter_test,docker run $(DOCKER_RUN_OPTIONS) --user 0:0 --runtime runc --rm gvisor.dev/images/nftables "$$0")
 .PHONY: nftables-syscall-runc-tests
 
 bwrap-tests: $(RUNTIME_BIN)
@@ -549,13 +554,10 @@ containerd-test-%: load-basic_alpine load-basic_python load-basic_busybox load-b
 	@$(call install_runtime,$(RUNTIME),) # Clear flags.
 	@$(call install_containerd,$*)
 ifeq (,$(STAGED_BINARIES))
-	@(export T=$$(mktemp -d --tmpdir containerd.XXXXXX); \
-	$(call copy,//shim:containerd-shim-runsc-v1,$$T) && \
-	sudo mv $$T/containerd-shim-runsc-v1 "$$(dirname $$(which containerd))"; \
-	rm -rf $$T)
+	@sudo cp -fa "$(RUNTIME_DIR)"/* "$$(dirname $$(which containerd))/"
 else
-	gcloud storage cat "$(STAGED_BINARIES)" | \
-		sudo tar -C "$$(dirname $$(which containerd))" -zxvf - containerd-shim-runsc-v1
+	@gcloud storage cat "$(STAGED_BINARIES)" | \
+		sudo tar -C "$$(dirname $$(which containerd))" -zxvf -
 endif
 	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME) -test.v)
 containerd-tests-min: containerd-test-1.7.31
@@ -875,11 +877,14 @@ $(RELEASE_KEY):
 
 $(RELEASE_ARTIFACTS)/%:
 	@mkdir -p $@
-	@$(call copy,//runsc:runsc,$@)
-	@$(call copy,//runsc/cmd/metricserver:runsc-metric-server,$@)
-	@$(call copy,//shim:containerd-shim-runsc-v1,$@)
 	@$(call copy,//debian:debian,$@)
-	@$(call copy,//debian:gvisor-release-tar,$@)
+	@$(call copy,//debian:gvisor-release-tar-bz2,$@)
+	@$(call copy,//debian:gvisor-release-tar-zstd,$@)
+
+artifacts-python: ensure-bazel-server ## Builds Python SandboxExec wheels into $(RELEASE_ARTIFACTS)/python.
+	@mkdir -p $(RELEASE_ARTIFACTS)/python
+	@$(call wrapper,tools/make_python_release.sh build $(RELEASE_ARTIFACTS)/python "$(RELEASE_NAME)")
+.PHONY: artifacts-python
 
 release: $(RELEASE_KEY) $(RELEASE_ARTIFACTS)/$(ARCH)
 	@mkdir -p $(RELEASE_ROOT)
@@ -887,32 +892,43 @@ release: $(RELEASE_KEY) $(RELEASE_ARTIFACTS)/$(ARCH)
 .PHONY: release
 
 release-tarball: DESTINATION ?= .
-release-tarball: ## Builds an optimized release tarball (gvisor.tar.bz2) and copies it to $(DESTINATION). E.g. make release-tarball DESTINATION=bin/
+release-tarball: ## Builds optimized release tarballs (gvisor.tar.bz2, gvisor.tar.zstd) and copies them to $(DESTINATION). E.g. make release-tarball DESTINATION=bin/
 	@mkdir -p "$(DESTINATION)"
-	@$(call copy,-c opt //debian:gvisor-release-tar,$(DESTINATION))
+	@$(call copy,-c opt //debian:gvisor-release-tar-bz2,$(DESTINATION))
+	@$(call copy,-c opt //debian:gvisor-release-tar-zstd,$(DESTINATION))
 .PHONY: release-tarball
 
-staged-binaries-check: ## Verifies STAGED_BINARIES contains all files from the //debian:gvisor-release-tar fileset.
+staged-binaries-check: ## Verifies STAGED_BINARIES contains all files from the //debian:gvisor-release-tar-bz2 fileset.
 ifeq (,$(STAGED_BINARIES))
 	@echo "STAGED_BINARIES not set; nothing to check."
 else
 	@# T is exported so the nested `cp` inside the copy macro (a child process)
 	@# sees it; the rest of the recipe runs in this shell directly.
 	@export T=$$(mktemp -d --tmpdir staged-check.XXXXXX); \
-	$(call copy,//debian:gvisor-release-tar,$$T) && \
+	$(call copy,//debian:gvisor-release-tar-bz2,$$T) && \
 	tar -tjf "$$T/gvisor.tar.bz2" | sed 's#^\./##' | grep -v '/$$' | sort >"$$T/release.txt" && \
 	gcloud storage cat "$(STAGED_BINARIES)" | tar -tzf - | sed 's#^\./##' | grep -v '/$$' | sort >"$$T/staged.txt" && \
 	comm -23 "$$T/release.txt" "$$T/staged.txt" >"$$T/missing.txt" && \
 	test ! -s "$$T/missing.txt" \
-	  || { echo "ERROR: STAGED_BINARIES missing members from //debian:gvisor-release-tar:" >&2; cat "$$T/missing.txt" >&2; rm -rf "$$T"; exit 1; }; \
+	  || { echo "ERROR: STAGED_BINARIES missing members from //debian:gvisor-release-tar-bz2:" >&2; cat "$$T/missing.txt" >&2; rm -rf "$$T"; exit 1; }; \
 	rm -rf "$$T"
 endif
 .PHONY: staged-binaries-check
 
-tag: ## Creates and pushes a release tag.
+tag: ## Stages a release tag; the release pipeline publishes it once the artifacts are uploaded.
 	@tools/tag_release.sh "$(RELEASE_COMMIT)" "$(RELEASE_NAME)" "$(RELEASE_NOTES)"
 .PHONY: tag
 
-codespell:
-	codespell
-.PHONY: codespell
+##
+## Lint targets.
+##
+##   These run the source-level linters that live outside the Bazel build.
+##   Deep Go analysis is owned by gVisor nogo.
+##
+lint: ## Runs the source linters.
+	@tools/lint.sh
+.PHONY: lint
+
+lint-fix: ## Reformats sources in place.
+	@tools/lint.sh --fix
+.PHONY: lint-fix

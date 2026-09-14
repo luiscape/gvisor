@@ -101,7 +101,7 @@ to get started:
 After setting up dependencies, using Bazel is similar to the Makefile:
 
 ```sh
-bazel build -c opt //debian:gvisor-release-tar
+bazel build -c opt //debian:gvisor-release-tar-bz2
 ```
 
 ### Testing
@@ -158,6 +158,9 @@ the `master` branch, which is then reflected into the `go` branch.
 ## Community & Governance
 
 See [GOVERNANCE.md](GOVERNANCE.md) for project governance information.
+
+See [ADOPTERS.md](ADOPTERS.md) for a list of known production users and
+adopters.
 
 The [gvisor-users mailing list][gvisor-users-list] and
 [gvisor-dev mailing list][gvisor-dev-list] are good starting points for
