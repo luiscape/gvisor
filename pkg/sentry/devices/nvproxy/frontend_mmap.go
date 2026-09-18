@@ -36,6 +36,26 @@ func (fd *frontendFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) 
 	return vfs.GenericProxyDeviceConfigureMMap(&fd.vfsfd, fd, opts)
 }
 
+// AddMapping implements memmap.Mappable.AddMapping.
+func (fd *frontendFD) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
+	fd.mapsMu.Lock()
+	fd.mappings.AddMapping(ms, ar, offset, writable)
+	fd.mapsMu.Unlock()
+	return nil
+}
+
+// RemoveMapping implements memmap.Mappable.RemoveMapping.
+func (fd *frontendFD) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
+	fd.mapsMu.Lock()
+	fd.mappings.RemoveMapping(ms, ar, offset, writable)
+	fd.mapsMu.Unlock()
+}
+
+// CopyMapping implements memmap.Mappable.CopyMapping.
+func (fd *frontendFD) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
+	return fd.AddMapping(ctx, ms, dstAR, offset, writable)
+}
+
 // Translate implements memmap.Mappable.Translate.
 func (fd *frontendFD) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
 	return []memmap.Translation{
@@ -46,6 +66,18 @@ func (fd *frontendFD) Translate(ctx context.Context, required, optional memmap.M
 			Perms:  hostarch.AnyAccess,
 		},
 	}, nil
+}
+
+// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
+//
+// frontendFDMemmapFile is not a savable memmap.File, so every cached
+// translation over it must be dropped before a save; the application's
+// surviving vmas re-fault through Translate against the restored host FD.
+func (fd *frontendFD) InvalidateUnsavable(ctx context.Context) error {
+	fd.mapsMu.Lock()
+	defer fd.mapsMu.Unlock()
+	fd.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
+	return nil
 }
 
 // frontendFDMemmapFile is the subset of frontendFD that is used as a

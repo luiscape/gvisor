@@ -953,6 +953,13 @@ type HasFrontendFD interface {
 	SetFrontendFD(int32)
 }
 
+// HasDeviceInstance is implemented by parameter structs that report the device
+// instance number an object lives on.
+type HasDeviceInstance interface {
+	GetDeviceInstance() uint32
+	SetDeviceInstance(uint32)
+}
+
 // Frontend ioctl parameter struct sizes.
 var (
 	SizeofIoctlRegisterFD             = uint32((*IoctlRegisterFD)(nil).SizeBytes())

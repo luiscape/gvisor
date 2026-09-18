@@ -34,6 +34,7 @@ go_library(
         "proc.go",
         "state.go",
         "state_cuda.go",
+        "state_cuda_shim.go",
         "tpu_control.go",
         "usage.go",
     ],

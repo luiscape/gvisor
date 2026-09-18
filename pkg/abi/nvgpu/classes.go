@@ -642,9 +642,9 @@ type NV00DE_ALLOC_PARAMETERS_V545 struct {
 // +marshal
 type nv00f8Map struct {
 	_       structs.HostLayout
-	offset  uint64
-	hVidMem Handle
-	flags   uint32
+	Offset  uint64
+	HVidMem Handle
+	Flags   uint32
 }
 
 // From src/common/sdk/nvidia/inc/class/cl00e0.h:
@@ -767,6 +767,13 @@ func (p *NV00FD_ALLOCATION_PARAMETERS) SetPOsEvent(posEvent P64) {
 	p.POsEvent = posEvent
 }
 
+// GetNumGPUs returns the number of GPUs that will participate in the
+// multicast object. (NV00FD_ALLOCATION_PARAMETERS_V545 embeds
+// NV00FD_ALLOCATION_PARAMETERS and inherits this method.)
+func (p *NV00FD_ALLOCATION_PARAMETERS) GetNumGPUs() uint32 {
+	return p.NumGPUs
+}
+
 // NV00FD_ALLOCATION_PARAMETERS_V545 is the updated version of
 // NV00FD_ALLOCATION_PARAMETERS since 545.23.06.
 //
@@ -800,6 +807,12 @@ type NV00FD_ALLOCATION_PARAMETERS_V590 struct {
 // GetPOsEvent implements HasPOsEvent.GetPOsEvent.
 func (p *NV00FD_ALLOCATION_PARAMETERS_V590) GetPOsEvent() P64 {
 	return p.POsEvent
+}
+
+// GetNumGPUs returns the number of GPUs that will participate in the
+// multicast object.
+func (p *NV00FD_ALLOCATION_PARAMETERS_V590) GetNumGPUs() uint32 {
+	return p.NumGPUs
 }
 
 // SetPOsEvent implements HasPOsEvent.SetPOsEvent.

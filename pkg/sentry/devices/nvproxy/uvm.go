@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -74,7 +75,6 @@ type uvmFD struct {
 	vfs.FileDescriptionDefaultImpl
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.NoLockFD
-	memmap.MappableNoTrackMappings
 
 	dev           *uvmDevice
 	containerName string
@@ -82,6 +82,13 @@ type uvmFD struct {
 	memmapFile    uvmFDMemmapFile
 
 	queue waiter.Queue
+
+	// Mappings must be tracked so InvalidateUnsavable can drop every
+	// translation over the unsavable uvmFDMemmapFile before a save; see the
+	// equivalent comment on frontendFD.
+	mapsMu sync.Mutex `state:"nosave"`
+	// +checklocks:mapsMu
+	mappings memmap.MappingSet
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.

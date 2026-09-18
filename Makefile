@@ -238,6 +238,11 @@ runsc-plugin-stack:
 	@$(call build,-c opt $(PLUGIN_STACK_FLAGS) //runsc:runsc-plugin-stack)
 .PHONY: runsc-plugin-stack
 
+mcshim: ## Builds the standalone CUDA multicast interposer (tools/mcshim/mcshim.so + mcshim-helper). Only needed for images that carry their own copy: 'make runsc' embeds these into runsc (--cuda-multicast-shim-source=EMBEDDED). Requires Docker, or gcc with MCSHIM_HOST_BUILD=1.
+	@$(call header,MCSHIM)
+	@tools/mcshim/build.sh
+.PHONY: mcshim
+
 debian: ## Builds the debian packages.
 	@$(call build,-c opt //debian:debian)
 .PHONY: debian
