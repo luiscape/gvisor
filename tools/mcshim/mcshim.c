@@ -285,6 +285,8 @@ static CUresult (*r_cuMemGetAddressRange)(CUdeviceptr *, size_t *, CUdeviceptr);
 static CUresult (*r_cuMemcpyDtoH)(void *, CUdeviceptr, size_t);
 static CUresult (*r_cuMemcpyHtoD)(CUdeviceptr, const void *, size_t);
 static CUresult (*r_cuDeviceGetAttribute)(int *, int, CUdevice);
+static CUresult (*r_cuMemAllocReal)(CUdeviceptr *, size_t);
+static CUresult (*r_cuMemFreeReal)(CUdeviceptr);
 
 #define CU_MEM_HANDLE_TYPE_POSIX_FD 0x1
 #define CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED 128
@@ -310,6 +312,8 @@ static void resolve_reals(void) {
 	REAL(r_cuCtxSynchronize, "cuCtxSynchronize");
 	REAL(r_cuDeviceGetAttribute, "cuDeviceGetAttribute");
 	REAL(r_cuIpcGetMemHandle, "cuIpcGetMemHandle");
+	REAL(r_cuMemAllocReal, "cuMemAlloc_v2");
+	REAL(r_cuMemFreeReal, "cuMemFree_v2");
 	/* cuda.h #defines cuIpcOpenMemHandle to the _v2 ABI; resolve that
 	 * first and fall back for drivers that only export the old name. */
 	REAL(r_cuIpcOpenMemHandle, "cuIpcOpenMemHandle_v2");
@@ -374,9 +378,11 @@ static CUdeviceptr ipc_replay_floor(void) {
 
 
 
-/* MCSHIM_FREE_UC_EXPORTS=1: free multicast-participating UC exporter
- * allocations across the checkpoint (contents preserved through process
- * memory) instead of leaving them resident for cuda-checkpoint.
+/* Free multicast-participating UC exporter allocations across the checkpoint
+ * (contents preserved through process memory) instead of leaving them
+ * resident for cuda-checkpoint. On by default; MCSHIM_KEEP_UC_EXPORTS=1 opts
+ * out (MCSHIM_FREE_UC_EXPORTS=1, the former opt-in, is accepted and
+ * redundant).
  *
  * Why: on fabric-attached systems libcuda keeps an internal fabric
  * registration (NV_MEMORY_FABRIC, 0x00f8) over a peer-shared allocation and
@@ -386,15 +392,41 @@ static CUdeviceptr ipc_replay_floor(void) {
  * presents the dead pair [hVidMem, hFabricReg] to the driver and fails with
  * OBJECT_NOT_FOUND instead of re-registering (measured; torch
  * _symmetric_memory multimem is the known caller that keeps such an
- * allocation both fabric-registered and resident at checkpoint time).
- * Freeing the allocation through libcuda tears that bookkeeping down
- * consistently, and the recreate on resume re-registers lazily and freshly.
- * Off by default: it costs a device->host->device copy of every affected
- * allocation and grows the checkpoint by the same amount. */
+ * allocation both fabric-registered and resident at checkpoint time, but
+ * every path that re-exports after restore has the same exposure). Freeing
+ * the allocation through libcuda tears that bookkeeping down consistently,
+ * and the recreate on resume re-registers lazily and freshly.
+ *
+ * Cost: a device->host->device copy of every affected allocation (tens of MB
+ * per rank in the validated engine configs) and a checkpoint larger by the
+ * same amount. */
 static int free_uc_exports_enabled(void) {
 	static int v = -1;
 	if (v < 0)
-		v = getenv("MCSHIM_FREE_UC_EXPORTS") != NULL;
+		v = getenv("MCSHIM_KEEP_UC_EXPORTS") == NULL;
+	return v;
+}
+
+/* Legacy-IPC promotion (default on; MCSHIM_IPC_PROMOTE=0 disables).
+ *
+ * cuIpcOpenMemHandle takes no address hint, so a legacy import closed for
+ * the checkpoint can only be put back at its VA heuristically, and packed
+ * imports (32 MiB at a 32 MiB stride) never come back (measured: the driver
+ * refuses an exact-fit hole). VMM imports have no such problem: the shim
+ * unmaps them, keeps the VA reservation, and re-maps at resume. So at
+ * cuIpcGetMemHandle time the exporter replaces the cuMemAlloc'd buffer with
+ * a cuMemCreate'd one at the SAME VA (contents preserved), exports it as a
+ * POSIX fd, serves the fd on the rendezvous socket, and hands the caller a
+ * blob that names the fd instead of a driver handle. The importer's
+ * cuIpcOpenMemHandle recognises the blob, fetches the fd, imports and maps
+ * it. Everything downstream is the VMM path this shim already checkpoints
+ * exactly. */
+static int ipc_promote_enabled(void) {
+	static int v = -1;
+	if (v < 0) {
+		const char *e = getenv("MCSHIM_IPC_PROMOTE");
+		v = !(e && strcmp(e, "0") == 0);
+	}
 	return v;
 }
 
@@ -418,7 +450,7 @@ static int free_uc_exports_enabled(void) {
  * entry the four tables cost ~3 MB per process, which is noise next to a
  * CUDA context. */
 #define MAXN 4096
-#define MAX_AKA 8
+#define MAX_AKA 16
 #define MAX_DEV 16
 
 /* KIND_IMP: handle came from cuMemImportFromShareableHandle but has not been
@@ -449,6 +481,8 @@ typedef struct {
 	 * importers over a unix socket until the next suspend. */
 	int serve_fd;
 	int serve_sock;
+	int serve_wake; /* write end of the serve thread's stop pipe */
+	pthread_t serve_thread;
 	char serve_path[104]; /* must fit sockaddr_un.sun_path (108) */
 	int serving;
 	/* KIND_UC exporters freed across the checkpoint (see
@@ -464,6 +498,13 @@ typedef struct {
 	 * retried after a FAILED resume tears rebuilt objects back down
 	 * instead of skipping them. */
 	int torn_down;
+	/* Legacy-IPC promotion (see ipc_promote_export): a cuMemAlloc'd buffer
+	 * the application exported with cuIpcGetMemHandle that the shim
+	 * replaced, in place, by a VMM allocation at the same VA. promoted_base
+	 * is that VA (0 if not promoted); promoted_import marks an import made
+	 * on behalf of cuIpcOpenMemHandle of such a buffer. */
+	CUdeviceptr promoted_base;
+	int promoted_import;
 } Alloc;
 
 typedef struct {
@@ -472,8 +513,11 @@ typedef struct {
 	size_t size;
 	size_t offset;
 	int allocIdx; /* index into g_alloc of the mapped handle */
-	CUmemAccessDesc access;
-	int has_access;
+	/* The access set last applied over this mapping (cuMemSetAccess may
+	 * name several devices in one call; all are replayed at resume). */
+#define MAX_ACCESS 16
+	CUmemAccessDesc access[MAX_ACCESS];
+	int naccess;
 	CUcontext ctx;
 	/* Set by unmap_alloc as each unmap succeeds, so a suspend retried
 	 * after a partial failure skips work already done, and a resume after
@@ -548,16 +592,23 @@ static int g_suspended;
  * Set on ANY tracking-table overflow (allocs, mappings, binds, legacy IPC);
  * once set, do_suspend refuses (fail loudly at checkpoint, not after). */
 static int g_track_overflow;
+static const char *g_track_overflow_what; /* which table, for the refusal */
+
+static void track_overflow(const char *what) {
+	if (!g_track_overflow) {
+		g_track_overflow = 1;
+		g_track_overflow_what = what;
+	}
+}
 
 static int alloc_new(void) {
 	for (int i = 0; i < MAXN; i++)
 		if (g_alloc[i].kind == KIND_FREE)
 			return i;
-	if (!g_track_overflow) {
-		g_track_overflow = 1;
+	if (!g_track_overflow)
 		mclog("FATAL: alloc table full (MAXN=%d); object untracked -- "
 		      "suspend is disabled for this process", MAXN);
-	}
+	track_overflow("alloc");
 	return -1;
 }
 
@@ -616,13 +667,31 @@ static void aka_purge(CUmemGenericAllocationHandle h) {
 /* Record h as a's current handle, remembering the previous values so that a
  * later call still referring to one of them can be rewritten (see xlate_mc).
  * Must hold g_lock. Purges h from every alias list first (see aka_purge). */
+static int g_alias_overflow; /* sticky, see alloc_push_aka */
+
 static void alloc_push_aka(Alloc *a, CUmemGenericAllocationHandle h) {
 	aka_purge(h);
 	a->handle = h;
-	if (a->naka < MAX_AKA)
+	if (a->naka < MAX_AKA) {
 		a->aka[a->naka++] = h;
-	else
-		a->aka[MAX_AKA - 1] = h;
+		return;
+	}
+	/* Every rebuild rotates the handle once, so this takes MAX_AKA-1
+	 * restores of one lineage. Evict the OLDEST rotated value but keep
+	 * aka[0]: the original handle is what the application and NCCL hold in
+	 * their structs, and losing it would misroute their next cuMemUnmap /
+	 * cuMemRelease to the wrong object long after the fact. Record the
+	 * eviction; do_suspend refuses on it (a further checkpoint of this
+	 * lineage could not be replayed faithfully), and the log names it. */
+	if (!g_alias_overflow)
+		mclog("WARNING: alias list full (MAX_AKA=%d) for handle 0x%llx; "
+		      "evicting oldest rotated alias -- suspend is disabled for "
+		      "this process",
+		      MAX_AKA, (unsigned long long)h);
+	g_alias_overflow = 1;
+	for (int j = 1; j + 1 < MAX_AKA; j++)
+		a->aka[j] = a->aka[j + 1];
+	a->aka[MAX_AKA - 1] = h;
 }
 
 /* Must hold g_lock. Reset slot i and record the current context + handle. */
@@ -630,7 +699,7 @@ static Alloc *alloc_init(int i, int kind, CUmemGenericAllocationHandle h) {
 	Alloc *a = &g_alloc[i];
 	memset(a, 0, sizeof(*a));
 	a->kind = kind;
-	a->serve_fd = a->serve_sock = -1;
+	a->serve_fd = a->serve_sock = a->serve_wake = -1;
 	r_cuCtxGetCurrent(&a->ctx);
 	alloc_push_aka(a, h);
 	return a;
@@ -1056,7 +1125,7 @@ static unsigned long blob_key(const CUipcMemHandle *b) {
 	return h;
 }
 
-CUresult cuIpcGetMemHandle(CUipcMemHandle *handle, CUdeviceptr dptr) {
+static CUresult legacy_ipc_get(CUipcMemHandle *handle, CUdeviceptr dptr) {
 	resolve_reals();
 	gate_wait();
 	CUresult rc = r_cuIpcGetMemHandle(handle, dptr);
@@ -1080,7 +1149,7 @@ CUresult cuIpcGetMemHandle(CUipcMemHandle *handle, CUdeviceptr dptr) {
 			mclog("track IPC-EXPORT idx=%d ptr=0x%llx key=%016lx", i,
 			      (unsigned long long)dptr, blob_key(handle));
 		} else {
-			g_track_overflow = 1;
+			track_overflow("ipc-export");
 			mclog("IPC-EXPORT table full; ptr=0x%llx UNTRACKED -- "
 			      "suspend is disabled for this process",
 			      (unsigned long long)dptr);
@@ -1090,8 +1159,8 @@ CUresult cuIpcGetMemHandle(CUipcMemHandle *handle, CUdeviceptr dptr) {
 	return rc;
 }
 
-CUresult cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle,
-                            unsigned int flags) {
+static CUresult legacy_ipc_open(CUdeviceptr *pdptr, CUipcMemHandle handle,
+                                unsigned int flags) {
 	resolve_reals();
 	gate_wait();
 	CUresult rc = r_cuIpcOpenMemHandle(pdptr, handle, flags);
@@ -1137,13 +1206,370 @@ CUresult cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle,
 	} else {
 		/* An untracked import is not merely unsupported, it is a
 		 * silent restore failure later, so say so loudly now. */
-		g_track_overflow = 1;
+		track_overflow("ipc-import");
 		mclog("IPC-IMPORT table full; va=0x%llx UNTRACKED -- restore "
 		      "WILL fail",
 		      (unsigned long long)*pdptr);
 	}
 	pthread_mutex_unlock(&g_lock);
 	return rc;
+}
+
+static CUresult legacy_ipc_close(CUdeviceptr dptr) {
+	resolve_reals();
+	gate_wait();
+	CUresult rc = r_cuIpcCloseMemHandle(dptr);
+	if (rc == CUDA_SUCCESS) {
+		pthread_mutex_lock(&g_lock);
+		int i = ipc_find_import(dptr);
+		if (i >= 0) {
+			g_ipc[i].used = 0;
+			mcvlog("untrack IPC-IMPORT idx=%d va=0x%llx", i,
+			       (unsigned long long)dptr);
+			}
+		pthread_mutex_unlock(&g_lock);
+	}
+	return rc;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Legacy-IPC promotion (see ipc_promote_enabled).                    */
+/* ------------------------------------------------------------------ */
+
+#define PROMO_MAGIC "MCSHIMP1"
+
+typedef struct {
+	char magic[8];
+	unsigned long key_dev;
+	unsigned long key_ino;
+	int key_ord;
+	int exporter_pid;
+	unsigned long long size;
+	unsigned long long base;
+	unsigned char pad[64 - 8 - 8 - 8 - 4 - 4 - 8 - 8];
+} PromoBlob;
+
+static int promo_blob_is(const CUipcMemHandle *h) {
+	return memcmp(h->reserved, PROMO_MAGIC, 8) == 0;
+}
+
+/* Forward declarations of the interposed entry points used as building
+ * blocks (calling the wrappers, not the reals, is what makes the promoted
+ * objects tracked like any other VMM object). */
+CUresult cuMemCreate(CUmemGenericAllocationHandle *, size_t,
+                     const CUmemAllocationProp *, unsigned long long);
+CUresult cuMemMap(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle,
+                  unsigned long long);
+CUresult cuMemUnmap(CUdeviceptr, size_t);
+CUresult cuMemSetAccess(CUdeviceptr, size_t, const CUmemAccessDesc *, size_t);
+CUresult cuMemRelease(CUmemGenericAllocationHandle);
+CUresult cuMemExportToShareableHandle(void *, CUmemGenericAllocationHandle, int,
+                                      unsigned long long);
+CUresult cuMemImportFromShareableHandle(CUmemGenericAllocationHandle *, void *,
+                                        int);
+static int start_serving(Alloc *a, int fd);
+static void stop_serving(Alloc *a);
+static int fetch_group_fd_raw(const Alloc *a, int timeout_ms);
+static int alloc_find(CUmemGenericAllocationHandle h);
+static long mono_ms(void);
+
+/* Must hold g_lock. */
+static int promo_find_export(CUdeviceptr base) {
+	for (int i = 0; i < MAXN; i++)
+		if (g_alloc[i].kind == KIND_UC && g_alloc[i].promoted_base == base)
+			return i;
+	return -1;
+}
+
+static void promo_fill_blob(CUipcMemHandle *out, const Alloc *a,
+                            CUdeviceptr base) {
+	PromoBlob b;
+	memset(&b, 0, sizeof(b));
+	memcpy(b.magic, PROMO_MAGIC, 8);
+	b.key_dev = a->key_dev;
+	b.key_ino = a->key_ino;
+	b.key_ord = a->key_ord;
+	b.exporter_pid = (int)getpid();
+	b.size = a->size;
+	b.base = base;
+	memcpy(out->reserved, &b, sizeof(b));
+}
+
+/* Replace the cuMemAlloc'd allocation containing dptr by a VMM allocation at
+ * the same VA and export it. Returns 0 with *handle filled (promoted), 1 to
+ * fall back to the legacy path (allocation untouched), -1 on an
+ * unrecoverable failure (the allocation is gone). Must NOT hold g_lock. */
+static int ipc_promote_export(CUipcMemHandle *handle, CUdeviceptr dptr) {
+	const size_t gran = 2u << 20;
+	CUdeviceptr base = 0;
+	size_t size = 0;
+	if (r_cuMemGetAddressRange(&base, &size, dptr) != CUDA_SUCCESS || !size)
+		return 1;
+	pthread_mutex_lock(&g_lock);
+	int gi = promo_find_export(base);
+	if (gi >= 0) {
+		promo_fill_blob(handle, &g_alloc[gi], base);
+		pthread_mutex_unlock(&g_lock);
+		return 0;
+	}
+	/* A VMM mapping the application exported through the legacy API
+	 * (unsupported by the driver anyway): leave it to the legacy path. */
+	for (int m = 0; m < MAXN; m++)
+		if (g_map[m].used && g_map[m].va <= base &&
+		    base < g_map[m].va + g_map[m].size) {
+			pthread_mutex_unlock(&g_lock);
+			return 1;
+		}
+	pthread_mutex_unlock(&g_lock);
+	/* VMM works in 2 MiB granules; a smaller cudaMalloc'd buffer (vLLM's
+	 * custom all-reduce metadata is 0x41300 bytes) gets a granule-rounded
+	 * VMM allocation. Only the original bytes are copied in and out; the
+	 * tail is never referenced by the application (its offsets are within
+	 * the original size) and is simply extra mapped memory on both sides.
+	 * The reservation must still be exact at base for the whole rounded
+	 * size, which the legacy allocator's own 2 MiB slotting guarantees. */
+	size_t asize = (size + gran - 1) & ~(gran - 1);
+	CUdevice dev = -1;
+	if (r_cuCtxGetDevice(&dev) != CUDA_SUCCESS)
+		return 1;
+	/* The buffer may be in use by in-flight work (it was just allocated
+	 * and possibly initialised); drain before copying it out. Note that
+	 * base/size describe the whole cudaMalloc'd SEGMENT containing dptr
+	 * (a torch caching-allocator segment holds many tensors), all of which
+	 * migrate together -- correct by construction (same VAs, contents
+	 * preserved) but the D2H+H2D cost scales with the segment. */
+	long t0 = mono_ms();
+	r_cuCtxSynchronize();
+	void *host = malloc(size);
+	if (!host)
+		return 1;
+	if (r_cuMemcpyDtoH(host, base, size) != CUDA_SUCCESS) {
+		free(host);
+		return 1;
+	}
+	if (r_cuMemFreeReal(base) != CUDA_SUCCESS) {
+		free(host);
+		return 1;
+	}
+	/* Between this free and the reservation below, another thread of the
+	 * application could allocate into [base, base+asize). Nothing prevents
+	 * that (a reservation cannot overlap a live mapping, so it cannot be
+	 * taken first); the outcome is detected -- the reserve lands elsewhere
+	 * -- and handled by putting the legacy allocation back, or failing the
+	 * export loudly if even that lands elsewhere. In practice exports happen
+	 * during single-threaded communicator setup and the window is a few
+	 * microseconds. */
+	CUdeviceptr va = 0;
+	CUresult rc = r_cuMemAddressReserve(&va, asize, 0, base, 0);
+	if (rc != CUDA_SUCCESS || va != base) {
+		if (rc == CUDA_SUCCESS)
+			r_cuMemAddressFree(va, asize);
+		/* Try to get the legacy allocation back where it was. */
+		CUdeviceptr again = 0;
+		if (r_cuMemAllocReal(&again, size) == CUDA_SUCCESS && again == base &&
+		    r_cuMemcpyHtoD(base, host, size) == CUDA_SUCCESS) {
+			free(host);
+			mclog("PROMOTE: could not reserve 0x%llx+0x%zx (rc=%d got "
+			      "0x%llx); restored legacy allocation, legacy path",
+			      (unsigned long long)base, size, rc,
+			      (unsigned long long)va);
+			return 1;
+		}
+		free(host);
+		mclog("PROMOTE: FATAL: lost allocation 0x%llx+0x%zx (reserve rc=%d "
+		      "got 0x%llx, re-alloc got 0x%llx)",
+		      (unsigned long long)base, size, rc, (unsigned long long)va,
+		      (unsigned long long)again);
+		return -1;
+	}
+	CUmemAllocationProp prop;
+	memset(&prop, 0, sizeof(prop));
+	prop.type = 1; /* CU_MEM_ALLOCATION_TYPE_PINNED */
+	prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FD;
+	prop.location.type = 1; /* CU_MEM_LOCATION_TYPE_DEVICE */
+	prop.location.id = dev;
+	CUmemGenericAllocationHandle h = 0;
+	CUmemAccessDesc acc;
+	memset(&acc, 0, sizeof(acc));
+	acc.location.type = 1;
+	acc.location.id = dev;
+	acc.flags = 3; /* RW */
+	int fd = -1;
+	if ((rc = cuMemCreate(&h, asize, &prop, 0)) != CUDA_SUCCESS ||
+	    (rc = cuMemMap(base, asize, 0, h, 0)) != CUDA_SUCCESS ||
+	    (rc = cuMemSetAccess(base, asize, &acc, 1)) != CUDA_SUCCESS ||
+	    (rc = r_cuMemcpyHtoD(base, host, size)) != CUDA_SUCCESS ||
+	    (rc = cuMemExportToShareableHandle(&fd, h, CU_MEM_HANDLE_TYPE_POSIX_FD,
+	                                       0)) != CUDA_SUCCESS) {
+		free(host);
+		mclog("PROMOTE: FATAL: rebuilding 0x%llx+0x%zx as VMM failed rc=%d",
+		      (unsigned long long)base, size, rc);
+		return -1;
+	}
+	free(host);
+	pthread_mutex_lock(&g_lock);
+	gi = alloc_find(h);
+	if (gi < 0) {
+		pthread_mutex_unlock(&g_lock);
+		close(fd);
+		mclog("PROMOTE: FATAL: promoted allocation untracked (table full)");
+		return -1;
+	}
+	g_alloc[gi].promoted_base = base;
+	if (start_serving(&g_alloc[gi], fd) != 0) {
+		pthread_mutex_unlock(&g_lock);
+		close(fd);
+		mclog("PROMOTE: FATAL: cannot serve fd for 0x%llx",
+		      (unsigned long long)base);
+		return -1;
+	}
+	promo_fill_blob(handle, &g_alloc[gi], base);
+	mclog("PROMOTE: legacy export 0x%llx+0x%zx (mapped 0x%zx) -> VMM idx=%d "
+	      "key=%lx:%lx ord=%d in %ld ms (served on %s)",
+	      (unsigned long long)base, size, asize, gi, g_alloc[gi].key_dev,
+	      g_alloc[gi].key_ino, g_alloc[gi].key_ord, mono_ms() - t0,
+	      g_alloc[gi].serve_path);
+	pthread_mutex_unlock(&g_lock);
+	return 0;
+}
+
+/* Importer side of a promoted export. Must NOT hold g_lock. */
+static CUresult ipc_promote_open(CUdeviceptr *pdptr, const CUipcMemHandle *blob) {
+	PromoBlob b;
+	memcpy(&b, blob->reserved, sizeof(b));
+	Alloc key;
+	memset(&key, 0, sizeof(key));
+	key.key_dev = b.key_dev;
+	key.key_ino = b.key_ino;
+	key.key_ord = b.key_ord;
+	int fd = fetch_group_fd_raw(&key, 60 * 1000);
+	if (fd < 0) {
+		mclog("PROMOTE: import: no fd for key %lx:%lx ord=%d (exporter pid "
+		      "%d, base 0x%llx)",
+		      b.key_dev, b.key_ino, b.key_ord, b.exporter_pid, b.base);
+		return 1; /* CUDA_ERROR_INVALID_VALUE */
+	}
+	CUmemGenericAllocationHandle h = 0;
+	CUresult rc = cuMemImportFromShareableHandle(&h, (void *)(intptr_t)fd,
+	                                             CU_MEM_HANDLE_TYPE_POSIX_FD);
+	close(fd);
+	if (rc != CUDA_SUCCESS)
+		return rc;
+	CUdevice dev = -1;
+	r_cuCtxGetDevice(&dev);
+	CUdeviceptr va = 0;
+	size_t size = (size_t)b.size;
+	if ((rc = r_cuMemAddressReserve(&va, size, 0, 0, 0)) != CUDA_SUCCESS) {
+		cuMemRelease(h);
+		return rc;
+	}
+	CUmemAccessDesc acc;
+	memset(&acc, 0, sizeof(acc));
+	acc.location.type = 1;
+	acc.location.id = dev;
+	acc.flags = 3;
+	if ((rc = cuMemMap(va, size, 0, h, 0)) != CUDA_SUCCESS ||
+	    (rc = cuMemSetAccess(va, size, &acc, 1)) != CUDA_SUCCESS) {
+		cuMemUnmap(va, size);
+		r_cuMemAddressFree(va, size);
+		cuMemRelease(h);
+		return rc;
+	}
+	pthread_mutex_lock(&g_lock);
+	int gi = alloc_find(h);
+	if (gi >= 0)
+		g_alloc[gi].promoted_import = 1;
+	mclog("PROMOTE: legacy import of %lx:%lx ord=%d (exporter pid %d) -> VMM "
+	      "idx=%d at 0x%llx+0x%zx",
+	      b.key_dev, b.key_ino, b.key_ord, b.exporter_pid, gi,
+	      (unsigned long long)va, size);
+	pthread_mutex_unlock(&g_lock);
+	*pdptr = va;
+	return CUDA_SUCCESS;
+}
+
+/* Closing a promoted import (by the VA cuIpcOpenMemHandle returned) or
+ * freeing a promoted export (by its base). Returns 1 if dptr was neither. */
+static int ipc_promote_release(CUdeviceptr dptr, int is_export) {
+	pthread_mutex_lock(&g_lock);
+	int gi = -1;
+	size_t size = 0;
+	if (is_export) {
+		gi = promo_find_export(dptr);
+	} else {
+		for (int m = 0; m < MAXN; m++)
+			if (g_map[m].used && g_map[m].va == dptr &&
+			    g_alloc[g_map[m].allocIdx].promoted_import) {
+				gi = g_map[m].allocIdx;
+				break;
+			}
+	}
+	if (gi < 0) {
+		pthread_mutex_unlock(&g_lock);
+		return 1;
+	}
+	size = g_alloc[gi].size;
+	CUmemGenericAllocationHandle h = g_alloc[gi].handle;
+	if (is_export)
+		stop_serving(&g_alloc[gi]);
+	pthread_mutex_unlock(&g_lock);
+	cuMemUnmap(dptr, size);
+	cuMemRelease(h);
+	r_cuMemAddressFree(dptr, size);
+	mclog("PROMOTE: released promoted %s idx=%d at 0x%llx",
+	      is_export ? "export" : "import", gi, (unsigned long long)dptr);
+	return 0;
+}
+
+/* A promoted export must remain indistinguishable from cudaMalloc'd memory
+ * to the application: SGLang's custom all-reduce probes
+ * cuMemRetainAllocationHandle to decide between its legacy-IPC and its VMM
+ * registration paths per buffer set, and a mixed answer (one promoted block,
+ * others not) sends every block down the VMM path, where the legacy ones
+ * fail. Report promoted ranges as non-VMM. */
+static CUresult (*r_cuMemRetainAllocationHandle)(CUmemGenericAllocationHandle *,
+                                                 void *);
+CUresult cuMemRetainAllocationHandle(CUmemGenericAllocationHandle *h, void *addr);
+CUresult cuMemRetainAllocationHandle(CUmemGenericAllocationHandle *h, void *addr) {
+	REAL(r_cuMemRetainAllocationHandle, "cuMemRetainAllocationHandle");
+	if (!r_cuMemRetainAllocationHandle)
+		return 1;
+	gate_wait();
+	CUdeviceptr p = (CUdeviceptr)(uintptr_t)addr;
+	pthread_mutex_lock(&g_lock);
+	int promoted = 0;
+	for (int i = 0; i < MAXN && !promoted; i++)
+		if (g_alloc[i].kind == KIND_UC && g_alloc[i].promoted_base &&
+		    p >= g_alloc[i].promoted_base &&
+		    p < g_alloc[i].promoted_base + g_alloc[i].size)
+			promoted = 1;
+	pthread_mutex_unlock(&g_lock);
+	if (promoted)
+		return 1; /* CUDA_ERROR_INVALID_VALUE, as for cudaMalloc memory */
+	return r_cuMemRetainAllocationHandle(h, addr);
+}
+
+CUresult cuIpcGetMemHandle(CUipcMemHandle *handle, CUdeviceptr dptr) {
+	resolve_reals();
+	gate_wait();
+	if (handle && ipc_promote_enabled()) {
+		int r = ipc_promote_export(handle, dptr);
+		if (r == 0)
+			return CUDA_SUCCESS;
+		if (r < 0)
+			return 999; /* CUDA_ERROR_UNKNOWN */
+	}
+	return legacy_ipc_get(handle, dptr);
+}
+
+CUresult cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle,
+                            unsigned int flags) {
+	resolve_reals();
+	gate_wait();
+	if (pdptr && promo_blob_is(&handle))
+		return ipc_promote_open(pdptr, &handle);
+	return legacy_ipc_open(pdptr, handle, flags);
 }
 
 /* cuda.h maps cuIpcOpenMemHandle to the _v2 ABI; both names must resolve to
@@ -1156,18 +1582,9 @@ CUresult cuIpcOpenMemHandle_v2(CUdeviceptr *pdptr, CUipcMemHandle handle,
 CUresult cuIpcCloseMemHandle(CUdeviceptr dptr) {
 	resolve_reals();
 	gate_wait();
-	CUresult rc = r_cuIpcCloseMemHandle(dptr);
-	if (rc == CUDA_SUCCESS) {
-		pthread_mutex_lock(&g_lock);
-		int i = ipc_find_import(dptr);
-		if (i >= 0) {
-			g_ipc[i].used = 0;
-			mcvlog("untrack IPC-IMPORT idx=%d va=0x%llx", i,
-			       (unsigned long long)dptr);
-		}
-		pthread_mutex_unlock(&g_lock);
-	}
-	return rc;
+	if (ipc_promote_release(dptr, 0 /* import */) == 0)
+		return CUDA_SUCCESS;
+	return legacy_ipc_close(dptr);
 }
 
 CUresult cuMulticastAddDevice(CUmemGenericAllocationHandle h, CUdevice dev) {
@@ -1235,7 +1652,7 @@ static void bind_record(int gi, int by_addr, CUmemGenericAllocationHandle mem,
 		      size);
 		return;
 	}
-	g_track_overflow = 1;
+	track_overflow("bind");
 	mclog("FATAL: bind table full (MAXN=%d); bind not tracked -- suspend "
 	      "is disabled for this process", MAXN);
 }
@@ -1331,14 +1748,14 @@ CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
 				g_map[m].size = size;
 				g_map[m].offset = offset;
 				g_map[m].allocIdx = ai;
-				g_map[m].has_access = 0;
+				g_map[m].naccess = 0;
 				g_map[m].suspended = 0;
 				r_cuCtxGetCurrent(&g_map[m].ctx);
 				placed = 1;
 				break;
 			}
 			if (!placed) {
-				g_track_overflow = 1;
+				track_overflow("mapping");
 				mclog("FATAL: mapping table full (MAXN=%d); "
 				      "mapping va=0x%llx untracked -- suspend "
 				      "is disabled for this process",
@@ -1371,16 +1788,29 @@ CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size,
 	gate_wait();
 	CUresult rc = r_cuMemSetAccess(ptr, size, desc, count);
 	if (rc == CUDA_SUCCESS && desc && count >= 1) {
-		if (count > 1)
-			mclog("NOTE: cuMemSetAccess va=0x%llx count=%zu "
-			      "(only desc[0] recorded!)",
-			      (unsigned long long)ptr, count);
+		size_t n = count;
+		if (n > MAX_ACCESS) {
+			/* Recording a prefix would silently narrow the access set
+			 * at resume; say so, and let remap_alloc's owner-RW
+			 * fallback apply instead. */
+			mclog("NOTE: cuMemSetAccess va=0x%llx count=%zu exceeds "
+			      "MAX_ACCESS=%d; access set NOT recorded (resume "
+			      "grants owner RW only)",
+			      (unsigned long long)ptr, count, MAX_ACCESS);
+			n = 0;
+		}
+		/* Record on every tracked mapping the call covers, not only one
+		 * starting exactly at ptr: NCCL sets access once over a whole
+		 * reservation range that holds several sub-maps. */
 		pthread_mutex_lock(&g_lock);
-		for (int m = 0; m < MAXN; m++)
-			if (g_map[m].used && g_map[m].va == ptr) {
-				g_map[m].access = desc[0];
-				g_map[m].has_access = 1;
-			}
+		for (int m = 0; m < MAXN; m++) {
+			if (!g_map[m].used || g_map[m].va < ptr ||
+			    g_map[m].va + g_map[m].size > ptr + size)
+				continue;
+			g_map[m].naccess = (int)n;
+			if (n)
+				memcpy(g_map[m].access, desc, n * sizeof(*desc));
+		}
 		pthread_mutex_unlock(&g_lock);
 	}
 	return rc;
@@ -1502,6 +1932,7 @@ static int recv_fd(int sock) {
 typedef struct {
 	int sock;
 	int fd;
+	int wake; /* read end of the stop pipe (see stop_serving) */
 	char path[104];
 } ServeArgs;
 
@@ -1509,14 +1940,26 @@ static void *serve_thread(void *arg) {
 	ServeArgs *sa = arg;
 	mclog("serving group fd on %s", sa->path);
 	for (;;) {
-		int c = accept4(sa->sock, NULL, NULL, SOCK_CLOEXEC);
-		if (c < 0) {
-			/* A stray signal (SIGCHLD is routine under Python
-			 * multiprocessing) must not kill the exporter while
-			 * peers are still fetching. */
+		/* poll() on the listening socket plus a stop pipe, rather than
+		 * blocking in accept(): shutdown() of a listening AF_UNIX socket
+		 * does not wake accept() under every kernel the shim runs on
+		 * (measured: not under gVisor), and a serve thread that never
+		 * exits keeps its dup of the export fd open -- a checkpoint
+		 * blocker the sentry then waits on forever. */
+		struct pollfd pfd[2] = {{sa->sock, POLLIN, 0}, {sa->wake, POLLIN, 0}};
+		int pr = poll(pfd, 2, -1);
+		if (pr < 0) {
 			if (errno == EINTR)
 				continue;
-			break; /* stop_serving's shutdown(), or a real error */
+			break;
+		}
+		if (pfd[1].revents)
+			break; /* stop_serving */
+		int c = accept4(sa->sock, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+		if (c < 0) {
+			if (errno == EINTR || errno == EAGAIN)
+				continue;
+			break;
 		}
 		if (send_fd(c, sa->fd) != 0)
 			mclog("serve: send_fd failed: %s", strerror(errno));
@@ -1525,6 +1968,7 @@ static void *serve_thread(void *arg) {
 	mclog("serve thread for %s exiting", sa->path);
 	close(sa->sock); /* thread-owned (see stop_serving) */
 	close(sa->fd); /* the thread's own dup (see start_serving) */
+	close(sa->wake);
 	free(sa);
 	return NULL;
 }
@@ -1556,24 +2000,29 @@ static int start_serving(Alloc *a, int fd) {
 	/* The thread serves its own dup, decoupled from a->serve_fd (see
 	 * serve_thread). F_DUPFD_CLOEXEC: a plain dup would drop CLOEXEC. */
 	int tfd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
-	if (tfd < 0) {
+	int wake[2];
+	if (tfd < 0 || pipe2(wake, O_CLOEXEC) != 0) {
 		close(s);
+		if (tfd >= 0)
+			close(tfd);
 		free(args);
 		return -1;
 	}
 	args->sock = s;
 	args->fd = tfd;
+	args->wake = wake[0];
 	strcpy(args->path, a->serve_path);
-	pthread_t t;
-	if (pthread_create(&t, NULL, serve_thread, args) != 0) {
+	if (pthread_create(&a->serve_thread, NULL, serve_thread, args) != 0) {
 		close(s);
 		close(tfd);
+		close(wake[0]);
+		close(wake[1]);
 		free(args);
 		return -1;
 	}
-	pthread_detach(t);
 	a->serve_fd = fd;
 	a->serve_sock = s;
+	a->serve_wake = wake[1];
 	a->serving = 1;
 	return 0;
 }
@@ -1581,16 +2030,21 @@ static int start_serving(Alloc *a, int fd) {
 static void stop_serving(Alloc *a) {
 	if (!a->serving)
 		return;
-	if (a->serve_sock >= 0) {
-		/* close() alone does not reliably wake a thread blocked in
-		 * accept(); shutdown() does (AF_UNIX), making the thread exit
-		 * deterministic. The LISTENING fd is closed by the serve
-		 * thread itself, never here: closing a possibly-still-
-		 * accepting fd would let the number be reused and a late
-		 * accept steal an unrelated socket. */
-		shutdown(a->serve_sock, SHUT_RDWR);
-		a->serve_sock = -1;
+	/* Wake the serve thread through its stop pipe and JOIN it: the
+	 * thread owns a dup of the export fd, and an exported fd still open
+	 * anywhere in the process is a checkpoint blocker, so this must not
+	 * return until that dup is closed. The listening fd is closed by the
+	 * thread itself, never here (closing a possibly-still-accepting fd
+	 * would let the number be reused and a late accept steal an
+	 * unrelated socket). */
+	if (a->serve_wake >= 0) {
+		ssize_t n = write(a->serve_wake, "x", 1);
+		(void)n;
+		close(a->serve_wake);
+		a->serve_wake = -1;
 	}
+	pthread_join(a->serve_thread, NULL);
+	a->serve_sock = -1;
 	if (a->serve_path[0])
 		unlink(a->serve_path);
 	if (a->serve_fd >= 0) {
@@ -1770,18 +2224,13 @@ static int ipc_fetch_blob(const IpcEnt *e, CUipcMemHandle *out, int timeout_ms) 
 
 /* Importer-side: connect (with retry; the creator may not be serving yet)
  * and receive the new group fd. */
-static int fetch_group_fd(const Alloc *a, int timeout_ms) {
+/* Connect to the exporter's socket for a (with retry; the exporter may not
+ * be serving yet) and receive the fd. No resume-deadline coupling: also used
+ * at runtime by the legacy-IPC promotion import path. */
+static int fetch_group_fd_raw(const Alloc *a, int timeout_ms) {
 	char path[104];
 	if (group_sock_path(a, path, sizeof(path)) != 0)
 		return -1;
-	long budget = resume_budget_ms();
-	if (budget <= 0) {
-		mclog("RESUME: resume deadline (%lds) exceeded before fetching "
-		      "group fd", RESUME_DEADLINE_MS / 1000);
-		return -1;
-	}
-	if ((long)timeout_ms > budget)
-		timeout_ms = (int)budget;
 	struct sockaddr_un sa;
 	memset(&sa, 0, sizeof(sa));
 	sa.sun_family = AF_UNIX;
@@ -1801,8 +2250,21 @@ static int fetch_group_fd(const Alloc *a, int timeout_ms) {
 		struct timespec ts = {0, 100 * 1000 * 1000};
 		nanosleep(&ts, NULL);
 	}
-	mclog("RESUME: timed out fetching group fd from %s", path);
+	mclog("timed out fetching group fd from %s", path);
 	return -1;
+}
+
+/* Resume-side fetch: bounded by the resume deadline. */
+static int fetch_group_fd(const Alloc *a, int timeout_ms) {
+	long budget = resume_budget_ms();
+	if (budget <= 0) {
+		mclog("RESUME: resume deadline (%lds) exceeded before fetching "
+		      "group fd", RESUME_DEADLINE_MS / 1000);
+		return -1;
+	}
+	if ((long)timeout_ms > budget)
+		timeout_ms = (int)budget;
+	return fetch_group_fd_raw(a, timeout_ms);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1873,25 +2335,26 @@ static int remap_alloc(int gi, CUmemGenericAllocationHandle h,
 			}
 			path = "re-reserved-fixed";
 		}
-		/* Grant access. NCCL frequently sets access once over a whole
-		 * reservation range rather than per sub-map, so a per-map
-		 * capture (has_access) misses it and the re-mapped view ends up
-		 * inaccessible -> the collective kernel faults (719) on the rank
-		 * whose import lost access. Always (re)grant RW for the mapping's
-		 * owning device, which is what NCCL's P2P imports and NVLS VAs
-		 * need; fall back to any captured descriptor. */
-		CUmemAccessDesc acc;
-		if (g_map[m].has_access) {
-			acc = g_map[m].access;
-		} else {
+		/* Grant access: replay the recorded access set (all devices it
+		 * named). A mapping with none recorded -- access set before the
+		 * interposer saw the map, or over a range it could not match --
+		 * gets RW for its owning device, which is what NCCL's P2P imports
+		 * and NVLS VAs need; an inaccessible re-mapped view faults the
+		 * collective kernel (719) on the rank whose import lost access. */
+		CUmemAccessDesc fallback;
+		const CUmemAccessDesc *acc = g_map[m].access;
+		size_t nacc = (size_t)g_map[m].naccess;
+		if (nacc == 0) {
 			CUdevice d = -1;
 			r_cuCtxGetDevice(&d);
-			memset(&acc, 0, sizeof(acc));
-			acc.location.type = 1 /* CU_MEM_LOCATION_TYPE_DEVICE */;
-			acc.location.id = d;
-			acc.flags = 3 /* CU_MEM_ACCESS_FLAGS_PROT_READWRITE */;
+			memset(&fallback, 0, sizeof(fallback));
+			fallback.location.type = 1 /* CU_MEM_LOCATION_TYPE_DEVICE */;
+			fallback.location.id = d;
+			fallback.flags = 3 /* CU_MEM_ACCESS_FLAGS_PROT_READWRITE */;
+			acc = &fallback;
+			nacc = 1;
 		}
-		CUresult ac = r_cuMemSetAccess(g_map[m].va, g_map[m].size, &acc, 1);
+		CUresult ac = r_cuMemSetAccess(g_map[m].va, g_map[m].size, acc, nacc);
 		if (ac != CUDA_SUCCESS) {
 			mclog("RESUME: %s cuMemSetAccess(0x%llx) rc=%d", what,
 			      (unsigned long long)g_map[m].va, ac);
@@ -2073,8 +2536,16 @@ static int do_suspend(void) {
 	r_cuCtxGetCurrent(&saved);
 
 	if (g_track_overflow) {
-		mclog("SUSPEND: refusing: tracking table overflowed earlier, "
-		      "so some object is untracked and cannot be torn down");
+		mclog("SUSPEND: refusing: the %s tracking table (MAXN=%d) "
+		      "overflowed earlier, so some object is untracked and "
+		      "cannot be torn down",
+		      g_track_overflow_what ? g_track_overflow_what : "?", MAXN);
+		return -1;
+	}
+	if (g_alias_overflow) {
+		mclog("SUSPEND: refusing: a handle alias list overflowed earlier "
+		      "(MAX_AKA=%d), so a stale handle the application holds "
+		      "may no longer translate", MAX_AKA);
 		return -1;
 	}
 
@@ -2366,6 +2837,9 @@ static int do_suspend(void) {
 			g_ipc[i].resv = r;
 			g_ipc[i].resv_size = sz;
 			ipc_held++;
+			mcvlog("SUSPEND: held seq=%d 0x%llx+0x%zx (range 0x%zx)",
+			       g_ipc[i].seq, (unsigned long long)base, sz,
+			       g_ipc[i].range_size);
 			continue;
 		}
 		/* The hold attempt is the CLASSIFIER. If the hint was honored,
@@ -2981,12 +3455,49 @@ static struct {
 	size_t size;
 } g_plugs[IPC_MAX_PLUGS];
 
+/* Temporary exact holds over every import target that has not been placed
+ * yet (seq > cur), so a plug reservation whose hint is not honoured cannot
+ * land on one. Released by ipc_release_target_holds right after the plug is
+ * placed, before the reopen, so the reopen sees the wide hole. Imports that
+ * still carry their suspend-time hold are already covered. Must hold g_lock.
+ * Returns the number held, or -1. */
+static struct { CUdeviceptr base; size_t size; } g_tholds[MAXN];
+static int g_ntholds;
+
+static int ipc_hold_unplaced_targets(int cur) {
+	const size_t gran = 2u << 20;
+	g_ntholds = 0;
+	for (int j = 0; j < MAXN; j++) {
+		if (!g_ipc[j].used || !g_ipc[j].is_import || !g_ipc[j].closed ||
+		    g_ipc[j].seq <= cur || g_ipc[j].resv || !g_ipc[j].range_size)
+			continue;
+		size_t sz = (g_ipc[j].range_size + gran - 1) & ~(gran - 1);
+		CUdeviceptr r = 0;
+		if (r_cuMemAddressReserve(&r, sz, 0, g_ipc[j].range_base, 0) !=
+		    CUDA_SUCCESS)
+			continue; /* driver-owned range: cannot be squatted by us either */
+		if (r != g_ipc[j].range_base) {
+			r_cuMemAddressFree(r, sz);
+			continue; /* already occupied; that import is lost anyway */
+		}
+		g_tholds[g_ntholds].base = r;
+		g_tholds[g_ntholds].size = sz;
+		g_ntholds++;
+	}
+	return g_ntholds;
+}
+
+static void ipc_release_target_holds(void) {
+	for (int k = 0; k < g_ntholds; k++)
+		r_cuMemAddressFree(g_tholds[k].base, g_tholds[k].size);
+	g_ntholds = 0;
+}
+
 static int resume_reopen_ipc(int p1_ipc) {
 	int ipc_reopened = 0, ipc_moved = 0, ipc_replaced = 0;
 	int nplugs = 0;
 	if (!ipc_suspend_enabled())
 		return 0; /* nothing was torn down, so nothing to rebuild */
-
 
 	for (int pass_seq = 0; pass_seq < g_ipc_seq; pass_seq++) {
 		for (int i = 0; i < MAXN; i++) {
@@ -3042,13 +3553,18 @@ static int resume_reopen_ipc(int p1_ipc) {
 			 * until every import is placed (they are what stops import
 			 * N+1 falling into the same holes), then all are freed. */
 			int hops = 0;
+			/* Only a LOW landing is walkable: a landing ABOVE the target
+			 * means the driver refused the exact hole (its allocator is
+			 * top-down first-fit and rejects exact fits -- measured), and
+			 * no plugging can change that. Such imports are why legacy
+			 * IPC is promoted to VMM IPC at export time by default. */
 			while (np < g_ipc[i].ptr) {
 				if (nplugs >= IPC_MAX_PLUGS) {
-					mclog("RESUME: seq=%d still 0x%llx short "
-					      "of target after %d hole plugs; "
-					      "giving up",
+					mclog("RESUME: seq=%d still %+lld MiB off "
+					      "target after %d hole plugs; giving up",
 					      g_ipc[i].seq,
-					      (unsigned long long)(g_ipc[i].ptr - np),
+					      ((long long)np - (long long)g_ipc[i].ptr) /
+					          (1024 * 1024),
 					      nplugs);
 					break;
 				}
@@ -3057,35 +3573,55 @@ static int resume_reopen_ipc(int p1_ipc) {
 					      "(seq=%d) failed", g_ipc[i].seq);
 					goto fail;
 				}
-				/* Plug the hole it fell into. Sized like the
-				 * mapping (that is how much of the hole the open
-				 * proved free), capped so it cannot spill past the
-				 * target range. */
+				/* Plug the hole it fell into, with every UNPLACED
+				 * target held meanwhile. cuMemAddressReserve's address
+				 * is a hint: when the hole at np is smaller than the
+				 * plug, the reservation lands somewhere else that fits
+				 * -- and a free target (this import's, or a later
+				 * import's whose hold was not honoured) is exactly
+				 * such a place.
+				 * A plug on a target is unrecoverable, so hold them all
+				 * first, shrink the plug until the hint is honoured,
+				 * and never keep a plug that did not land at np. */
 				const size_t gran = 2u << 20;
-				size_t psz = (g_ipc[i].range_size + gran - 1) &
-				             ~(gran - 1);
+				int nheld = ipc_hold_unplaced_targets(pass_seq);
+				if (nheld < 0)
+					goto fail;
+				size_t psz = (g_ipc[i].range_size + gran - 1) & ~(gran - 1);
+				/* Never spill past the target. */
 				if (psz > (size_t)(g_ipc[i].ptr - np))
 					psz = (size_t)(g_ipc[i].ptr - np);
 				if (psz < gran)
 					psz = gran;
 				CUdeviceptr plug = 0;
-				CUresult prc = r_cuMemAddressReserve(&plug, psz, 0,
-				                                     np, 0);
-				if (prc != CUDA_SUCCESS) {
-					mclog("RESUME: plugging hole at 0x%llx+0x%zx "
-					      "failed rc=%d (seq=%d)",
-					      (unsigned long long)np, psz, prc,
-					      g_ipc[i].seq);
-					goto fail;
+				CUresult prc;
+				for (;;) {
+					plug = 0;
+					prc = r_cuMemAddressReserve(&plug, psz, 0, np, 0);
+					if (prc != CUDA_SUCCESS || plug == np)
+						break;
+					/* Hint not honoured: the hole is smaller. */
+					r_cuMemAddressFree(plug, psz);
+					if (psz <= gran) {
+						prc = 999;
+						break;
+					}
+					psz = ((psz / 2) + gran - 1) & ~(gran - 1);
 				}
-				if (plug != np) {
-					/* Hint not honored: the hole is smaller than
-					 * psz. Take what we got anyway (it plugs SOME
-					 * hole) and keep walking. */
-					mcvlog("RESUME: plug mislanded 0x%llx -> "
-					       "0x%llx (hole smaller than 0x%zx)",
-					       (unsigned long long)np,
-					       (unsigned long long)plug, psz);
+				ipc_release_target_holds();
+				if (prc != CUDA_SUCCESS) {
+					/* Nothing can be reserved at np, not even a
+					 * granule: np is inside a range the driver owns
+					 * (or a target hold). Fail loudly rather than plug
+					 * elsewhere. */
+					mclog("RESUME: cannot plug hole at 0x%llx for "
+					      "seq=%d (rc=%d)",
+					      (unsigned long long)np, g_ipc[i].seq, prc);
+					np = 0;
+					if (r_cuIpcOpenMemHandle(&np, nb, g_ipc[i].flags) !=
+					    CUDA_SUCCESS)
+						goto fail;
+					break; /* accounted as MOVED below */
 				}
 				g_plugs[nplugs].base = plug;
 				g_plugs[nplugs].size = psz;
@@ -3338,7 +3874,18 @@ GATED(cuStreamSynchronize, (CUstream_t st), (st))
  * requires that NOTHING allocates device VA while it runs, or the walked
  * imports land one slot off their original addresses. */
 GATED(cuMemAlloc_v2, (CUdeviceptr *dptr, size_t n), (dptr, n))
-GATED(cuMemFree_v2, (CUdeviceptr dptr), (dptr))
+static CUresult (*r_cuMemFree_v2)(CUdeviceptr);
+CUresult cuMemFree_v2(CUdeviceptr dptr);
+CUresult cuMemFree_v2(CUdeviceptr dptr) {
+	REAL(r_cuMemFree_v2, "cuMemFree_v2");
+	if (!r_cuMemFree_v2)
+		return 1;
+	gate_wait();
+	/* A promoted export is VMM-backed now; free it as such. */
+	if (dptr && ipc_promote_release(dptr, 1 /* export */) == 0)
+		return CUDA_SUCCESS;
+	return r_cuMemFree_v2(dptr);
+}
 GATED(cuMemAllocAsync, (CUdeviceptr *dptr, size_t n, CUstream_t st),
       (dptr, n, st))
 GATED(cuMemFreeAsync, (CUdeviceptr dptr, CUstream_t st), (dptr, st))
@@ -3391,6 +3938,7 @@ static const WrapEntry *wrap_table(void) {
 	    {"cuDeviceGetAttribute", (void *)cuDeviceGetAttribute, 0},
 
 	    {"cuIpcGetMemHandle", (void *)cuIpcGetMemHandle, 0},
+	    {"cuMemRetainAllocationHandle", (void *)cuMemRetainAllocationHandle, 0},
 	    {"cuIpcOpenMemHandle", (void *)cuIpcOpenMemHandle_v2, 0},
 	    {"cuIpcOpenMemHandle_v2", (void *)cuIpcOpenMemHandle_v2, 0},
 	    {"cuIpcCloseMemHandle", (void *)cuIpcCloseMemHandle, 0},
@@ -3908,6 +4456,8 @@ static void mcshim_atfork_child(void) {
 				close(g_alloc[i].serve_sock);
 			if (g_alloc[i].serve_fd >= 0)
 				close(g_alloc[i].serve_fd);
+			if (g_alloc[i].serve_wake >= 0)
+				close(g_alloc[i].serve_wake);
 		}
 		free(g_alloc[i].uc_content);
 		if (g_ipc[i].used && g_ipc[i].serve_sock >= 0)
@@ -3919,6 +4469,8 @@ static void mcshim_atfork_child(void) {
 	memset(g_ipc, 0, sizeof(g_ipc));
 	g_ipc_seq = 0;
 	g_track_overflow = 0;
+	g_track_overflow_what = NULL;
+	g_alias_overflow = 0;
 	__atomic_store_n(&g_suspended, 0, __ATOMIC_SEQ_CST);
 	g_control_started = 0;
 }

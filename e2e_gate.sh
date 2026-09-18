@@ -72,12 +72,16 @@ run_trial() {
         # Retry only the known pre-existing pma save flake. The bench log
         # tail sometimes shows only the stack trace, so also check the run
         # dir's checkpoint log for the signature.
+        # Both are self-healing on retry: the pma flake (historical) and the
+        # straggler guard (a CUDA process initialized late and was not in the
+        # checkpointed set; it is by the next attempt).
         flake=0
-        grep -q "non-MemoryFile of type" "$OUT/$name.attempt$attempt.log" && flake=1
+        transient='non-MemoryFile of type|RM objects survived the cuda-checkpoint action'
+        grep -Eq "$transient" "$OUT/$name.attempt$attempt.log" && flake=1
         rd="$(newest_rundir "$engine")"
-        [ -n "$rd" ] && sudo grep -q "non-MemoryFile of type" "$rd/logs/runsc-checkpoint.log" 2>/dev/null && flake=1
+        [ -n "$rd" ] && sudo grep -Eq "$transient" "$rd/logs/runsc-checkpoint.log" 2>/dev/null && flake=1
         if [ "$flake" = 0 ]; then break; fi
-        note "TRIAL $name hit the known pma save flake; retrying once"
+        note "TRIAL $name hit a known transient checkpoint failure; retrying once"
     done
     echo "$name $verdict" >>"$OUT/verdicts.txt"
 
@@ -106,9 +110,16 @@ run_trial vllm_tp2_xgpu vllm -- --gpus 0,1 --tp 2 --restore-gpus 4,5
 # 3. SGLang TP=4 forced NVLS (fabric objects transient, shim-released).
 run_trial sglang_tp4_nvls sglang SGLANG_EXTRA_ARGS=--enable-nccl-nvls -- --gpus 0,1,2,3 --tp 4
 
-# 4. SGLang TP=4 FlashInfer fusion ENGAGED (persistent FLA/rank ->
-#    exercises nvproxy FLA suspend + post-restore lazy re-register).
-run_trial sglang_tp4_fusion sglang SGLANG_EXTRA_ARGS=--flashinfer-allreduce-fusion-backend\ trtllm -- --gpus 0,1,2,3 --tp 4 --no-torch-compile
+# 4. SGLang TP=4 stock (custom AR on; its legacy IPC is promoted to VMM IPC;
+#    torch.compile off keeps the boot short).
+run_trial sglang_tp4_stock sglang -- --gpus 0,1,2,3 --tp 4 --no-torch-compile
+
+# 4b. SGLang TP=4 FlashInfer fusion ENGAGED (packed 32 MiB legacy imports:
+#     only checkpointable through promotion), restored onto GPUs 4-7.
+run_trial sglang_tp4_fusion_xgpu sglang SGLANG_EXTRA_ARGS=--flashinfer-allreduce-fusion-backend\ trtllm -- --gpus 0,1,2,3 --tp 4 --no-torch-compile --restore-gpus 4,5,6,7
+
+# 5. vLLM TP=2 with a deterministic late-CUDA-init process (admission gate).
+run_trial vllm_tp2_straggler vllm CB_STRAGGLER=1 -- --gpus 0,1 --tp 2
 
 note "==== GATE VERDICTS ===="
 cat "$OUT/verdicts.txt" | tee -a "$SUMMARY"

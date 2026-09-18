@@ -19,7 +19,7 @@
 //
 // The sources live in tools/mcshim; see its README.md for the protocol.
 // runsc/boot materializes these bytes into a container's filesystem when
-// --cuda-multicast-shim-embedded is set, and pkg/sentry/control/state_cuda*
+// --cuda-multicast-shim-source=EMBEDDED is set, and pkg/sentry/control/state_cuda*
 // drives the interposer during checkpoint/restore.
 package mcshimbin
 

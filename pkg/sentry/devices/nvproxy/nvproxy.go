@@ -267,6 +267,10 @@ type nvproxy struct {
 
 	clientsMu sync.RWMutex `state:"nosave"`
 	clients   map[nvgpu.Handle]*rootClient
+
+	// admission gates first-time GPU state acquisition during a CUDA
+	// checkpoint sequence; see cuda_admission.go.
+	admission cudaAdmission `state:"nosave"`
 }
 
 func nvproxyFromVFS(vfsObj *vfs.VirtualFilesystem) *nvproxy {
@@ -315,7 +319,22 @@ type hasExportObjectInfoPtr[T any] interface {
 // application knew before a restore that remapped devices, reporting whether a
 // translation applies. Values the application already agrees with, and
 // sandboxes that were never remapped, return ok == false.
+//
+// Whether libcuda WANTS the translation depends on the driver. Through R580,
+// libcuda resolves the device instance that
+// NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO reports against its own
+// device table -- populated before the restore, so it names the OLD devices
+// -- and a restored process importing a peer's memory needs the old instance
+// back or the import fails with CUDA_ERROR_INVALID_DEVICE. From R610 libcuda
+// resolves it against current device state, and handing it the old instance
+// produces exactly that failure instead. Both directions measured (vLLM TP=2
+// restored onto other GPUs: 580 PASS/FAIL, 610 FAIL/PASS with translation
+// on/off). The boundary between 580.173 and 610.57 is not pinned down; R590
+// and R595 are untested.
 func (nvp *nvproxy) appDeviceInstance(hostDevInst uint32) (uint32, bool) {
+	if nvp.version.Major() >= 610 {
+		return 0, false
+	}
 	nvp.devTransMu.Lock()
 	defer nvp.devTransMu.Unlock()
 	appDevInst, ok := nvp.appDevInstByHostDevInst[hostDevInst]

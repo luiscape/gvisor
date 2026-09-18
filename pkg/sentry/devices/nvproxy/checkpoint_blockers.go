@@ -134,7 +134,7 @@ func (nvp *nvproxy) checkpointBlockers() []CheckpointBlocker {
 	// The blocker disappears when the FD is closed (removed from frontendFDs).
 	nvp.fdsMu.Lock()
 	for fd := range nvp.frontendFDs {
-		if eo := fd.exportedObj; eo != nil {
+		for _, eo := range fd.exportedObjs {
 			out = append(out, CheckpointBlocker{
 				ClientHandle: eo.client,
 				ObjectHandle: eo.object,
@@ -203,6 +203,22 @@ type exportedObjInfo struct {
 	taskID int32
 }
 
+// exportedObjInfoLocked returns the exported object in the lowest slot of fd,
+// which is the fd's identity for the fdinfo oracle (libcuda exports one
+// object per fd, in slot 0).
+//
+// Preconditions: nvp.fdsMu must be locked.
+func (fd *frontendFD) exportedObjInfoLocked() (exportedObjInfo, bool) {
+	var best exportedObjInfo
+	bestSlot, found := uint16(0), false
+	for slot, eo := range fd.exportedObjs {
+		if !found || slot < bestSlot {
+			best, bestSlot, found = eo, slot, true
+		}
+	}
+	return best, found
+}
+
 // ProcFDInfoExtra implements proc's procFDInfoExtra (duck-typed): expose the
 // exported RM object's identity in /proc/[pid]/fdinfo/[fd], analogous to
 // Linux's dmabuf show_fdinfo.
@@ -220,11 +236,17 @@ type exportedObjInfo struct {
 func (fd *frontendFD) ProcFDInfoExtra(ctx context.Context) string {
 	nvp := fd.dev.nvp
 	nvp.fdsMu.Lock()
-	exp := fd.exportedObj
+	exp, ok := fd.exportedObjInfoLocked()
 	nvp.fdsMu.Unlock()
-	if exp == nil {
+	if !ok {
 		return ""
 	}
+	return procFDInfoExportedObjectLine(exp)
+}
+
+// procFDInfoExportedObjectLine formats the fdinfo oracle line; see
+// ProcFDInfoExtra.
+func procFDInfoExportedObjectLine(exp exportedObjInfo) string {
 	return fmt.Sprintf("nvproxy_exported_object:\tclient=%#x object=%#x class=%#x\n",
 		exp.client.Val, exp.object.Val, uint32(exp.class))
 }
@@ -288,43 +310,30 @@ func ctrlClientExportObjectsToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS
 			fi.ctx.Debugf("nvproxy: EXPORT_OBJECTS_TO_FD failed: client %v objects %v index %d status %#x", ioctlParams.HClient, ctrlParams.Objects[:n], ctrlParams.Index, ioctlParams.Status)
 			return
 		}
-		if ctrlParams.NumObjects == 0 {
-			return
-		}
 		// Batch semantics (see ctrl0000unix.h): each call (re)writes NumObjects
-		// slots starting at Index, and a zero handle unexports its slot. The
-		// accounting here is deliberately simpler — the fd is attributed to
-		// Objects[0] of the most recent non-empty batch, and cleared only when
-		// an all-zero batch covers slot 0 (a partial-slot unexport must not
-		// clear the mark: under-reporting a live export is the dangerous
-		// direction for the blocker gate) — because libcuda exports a single
-		// object per fd. Log when that assumption is visibly exceeded.
-		if ctrlParams.NumObjects > 1 || ctrlParams.Index != 0 {
-			fi.ctx.Infof("nvproxy: EXPORT_OBJECTS_TO_FD with NumObjects=%d Index=%d; blocker accounting attributes the fd to the first object only", ctrlParams.NumObjects, ctrlParams.Index)
+		// slots starting at Index, and a zero handle unexports its slot.
+		// Mirror that exactly, so the blocker inventory reports every live
+		// export (libcuda exports one object per fd, in slot 0, but nothing
+		// prevents another client from filling several slots).
+		n := int(ctrlParams.NumObjects)
+		if n > len(ctrlParams.Objects) {
+			n = len(ctrlParams.Objects)
 		}
-		allZero := true
-		for i := uint16(0); i < ctrlParams.NumObjects && int(i) < len(ctrlParams.Objects); i++ {
-			if ctrlParams.Objects[i].Val != 0 {
-				allZero = false
-				break
+		for i := 0; i < n; i++ {
+			slot := ctrlParams.Index + uint16(i)
+			if h := ctrlParams.Objects[i]; h.Val != 0 {
+				markExportedObjFD(fi, ctlFile, slot, ioctlParams.HClient, h)
+			} else {
+				unmarkExportedObjFD(fi, ctlFile, slot)
 			}
 		}
-		if allZero {
-			if ctrlParams.Index == 0 {
-				nvp := fi.fd.dev.nvp
-				nvp.fdsMu.Lock()
-				ctlFile.exportedObj = nil
-				nvp.fdsMu.Unlock()
-			}
-			return
-		}
-		markExportedObjFD(fi, ctlFile, ioctlParams.HClient, ctrlParams.Objects[0])
 	})
 }
 
-// markExportedObjFD marks fd as holding an RM object exported from the given
-// client (attributed to objectH, which may be a zero handle if unknown).
-func markExportedObjFD(fi *frontendIoctlState, fd *frontendFD, clientH, objectH nvgpu.Handle) {
+// markExportedObjFD records that slot of fd holds an RM object exported from
+// the given client (attributed to objectH, which may be a zero handle if
+// unknown).
+func markExportedObjFD(fi *frontendIoctlState, fd *frontendFD, slot uint16, clientH, objectH nvgpu.Handle) {
 	var taskID int32
 	if t := kernel.TaskFromContext(fi.ctx); t != nil {
 		taskID = int32(t.ThreadGroup().ID())
@@ -340,11 +349,26 @@ func markExportedObjFD(fi *frontendIoctlState, fd *frontendFD, clientH, objectH 
 		}
 	}
 	nvp.fdsMu.Lock()
-	fd.exportedObj = &exportedObjInfo{
+	if fd.exportedObjs == nil {
+		fd.exportedObjs = make(map[uint16]exportedObjInfo, 1)
+	}
+	fd.exportedObjs[slot] = exportedObjInfo{
 		client: clientH,
 		object: objectH,
 		class:  class,
 		taskID: taskID,
+	}
+	nvp.fdsMu.Unlock()
+}
+
+// unmarkExportedObjFD records that slot of fd no longer holds an exported
+// object.
+func unmarkExportedObjFD(fi *frontendIoctlState, fd *frontendFD, slot uint16) {
+	nvp := fi.fd.dev.nvp
+	nvp.fdsMu.Lock()
+	delete(fd.exportedObjs, slot)
+	if len(fd.exportedObjs) == 0 {
+		fd.exportedObjs = nil
 	}
 	nvp.fdsMu.Unlock()
 }
@@ -378,6 +402,6 @@ func ctrlClientExportObjectToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS5
 		if ctrlParams.Object.Type == nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM {
 			objectH.Val = binary.LittleEndian.Uint32(ctrlParams.Object.Data[8:12])
 		}
-		markExportedObjFD(fi, ctlFile, ioctlParams.HClient, objectH)
+		markExportedObjFD(fi, ctlFile, 0 /* slot */, ioctlParams.HClient, objectH)
 	})
 }

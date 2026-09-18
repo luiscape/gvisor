@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -112,7 +113,30 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	}
 	sctx := k.SupervisorContext()
 
+	// Close the CUDA admission gate BEFORE collecting the process set, so no
+	// process can acquire its first GPU state between the collection and the
+	// end of the save (nvproxy/cuda_admission.go). Sentry-exec'd processes
+	// (the cuda-checkpoint invocations) are exempt; once collected, so are the
+	// checkpointed processes (a failure-path `--action restore` recreates
+	// their RM clients). The gate stays closed through the save and is opened
+	// by postResumeCuda; fail() opens it on the paths that return the
+	// application to running without going through postResumeCuda.
+	isExec := func(tg *kernel.ThreadGroup) bool {
+		leader := tg.Leader()
+		return leader != nil && leader.Origin == kernel.OriginExec
+	}
+	nvproxy.CloseCudaAdmission(k.VFS(), isExec)
 	cudaProcs := cudaProcs(sctx, k, o.CudaCheckpointPath, k.NvidiaDriverVersion.Major())
+	nvproxy.CloseCudaAdmission(k.VFS(), func(tg *kernel.ThreadGroup) bool {
+		return isExec(tg) || slices.Contains(cudaProcs, tg)
+	})
+	fail := func(err error) error {
+		nvproxy.OpenCudaAdmission(k.VFS())
+		if wasPaused {
+			k.Pause()
+		}
+		return err
+	}
 
 	// Gate: cuda-checkpoint cannot serialize multicast/fabric memory or live
 	// CUDA IPC exports; attempting to checkpoint with such resources live
@@ -125,10 +149,7 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	// All other blockers (e.g. exported fds) always gate.
 	shimDir := cudaShimDir(k, cudaProcs)
 	if err := waitForCudaCheckpointBlockers(k, o.CudaBlockerTimeout, shimDir != "" /* shimWillRelease */); err != nil {
-		if wasPaused {
-			k.Pause()
-		}
-		return err
+		return fail(err)
 	}
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {
@@ -150,10 +171,7 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		if shimDir != "" {
 			unwindCudaMulticastShim(sctx, k, cudaProcs, shimDir)
 		}
-		if wasPaused {
-			k.Pause()
-		}
-		return err
+		return fail(err)
 	}
 	if wasPaused {
 		k.Pause()
@@ -176,8 +194,9 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 // exports/imports (the driver allocates an NV_MEMORY_FABRIC object for a
 // POSIX-FD cuMemExportToShareableHandle on fabric-attached GPUs; it is
 // released along with the export/import state the interposer tears down).
-// The application need not release these itself. A second, strict gate runs
-// after the interposer's suspend and before cuda-checkpoint, so an object
+// The application need not release these itself. Likewise the export fds the
+// interposer serves to importers (see gatedBlockers). A second, strict gate
+// runs after the interposer's suspend and before cuda-checkpoint, so an object
 // this exemption mispredicts still fails the checkpoint loudly rather than
 // hanging cuda-checkpoint.
 func waitForCudaCheckpointBlockers(k *kernel.Kernel, timeout time.Duration, shimWillRelease bool) error {
@@ -206,9 +225,9 @@ func waitForCudaCheckpointBlockers(k *kernel.Kernel, timeout time.Duration, shim
 
 // gatedBlockers returns the blockers that must gate the checkpoint. When
 // shimWillRelease is true, the kinds the interposer's suspend releases later
-// in the checkpoint sequence (multicast objects and fabric / fabric-import
-// companions of VMM exports and imports) are not gated; all other blockers
-// always gate.
+// in the checkpoint sequence (multicast objects, fabric / fabric-import
+// companions of VMM exports and imports, and the export fds it serves) are
+// not gated; all other blockers always gate.
 func gatedBlockers(blockers []nvproxy.CheckpointBlocker, shimWillRelease bool) []nvproxy.CheckpointBlocker {
 	if !shimWillRelease {
 		return blockers
@@ -218,6 +237,13 @@ func gatedBlockers(blockers []nvproxy.CheckpointBlocker, shimWillRelease bool) [
 		switch b.Kind {
 		case nvproxy.BlockerKindMulticast, nvproxy.BlockerKindFabric, nvproxy.BlockerKindFabricImport:
 			// Released by the interposer's suspend.
+		case nvproxy.BlockerKindExportedFD:
+			// The interposer itself holds exported fds between checkpoints:
+			// it serves each promoted legacy-IPC export (and, after a
+			// restore, each re-export) to importers over a socket, and
+			// closes them all at suspend. An fd the APPLICATION holds is
+			// not released by that -- the strict post-suspend gate catches
+			// it.
 		default:
 			out = append(out, b)
 		}
@@ -232,19 +258,34 @@ func cudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string
 	var procs []*kernel.ThreadGroup
 	k.TaskSet().ForEachThreadGroup(func(tg *kernel.ThreadGroup, tgLeader *kernel.Task) {
 		found := false
-		// Note that it is possible for tasks in a thread group to have various FD
-		// tables (via clone(2) with CLONE_THREAD set and CLONE_FILES *not* set).
-		// However, we don't expect this to happen in practice for CUDA processes.
-		// So for efficiency, we just check the tgLeader's FD table, instead of
-		// iterating over all tasks' FD tables in all thread groups.
-		tgLeader.WithMuLocked(func(t *kernel.Task) {
-			t.FDTable().ForEach(sctx, func(_ int32, file *vfs.FileDescription, _ kernel.FDFlags) bool {
-				if _, ok := file.Impl().(nvproxy.NvidiaDeviceFD); ok {
-					found = true
-					return false
+		// Tasks in a thread group can have distinct FD tables (clone(2) with
+		// CLONE_THREAD but not CLONE_FILES), so a CUDA-using thread's device
+		// FDs may be invisible from the leader's table. Rare, but missing a
+		// process here is silent: its GPU state is left out of the snapshot
+		// (the straggler guard in checkpointCudaProcs catches it late, at the
+		// cost of a failed checkpoint). Tables are shared in the common case,
+		// so skip ones already inspected.
+		seen := make(map[*kernel.FDTable]struct{}, 1)
+		// ForEachThreadGroup holds the TaskSet lock, hence the Locked variant.
+		tg.ForEachTaskLocked(func(t *kernel.Task) bool {
+			t.WithMuLocked(func(t *kernel.Task) {
+				fdt := t.FDTable()
+				if fdt == nil {
+					return
 				}
-				return true
+				if _, dup := seen[fdt]; dup {
+					return
+				}
+				seen[fdt] = struct{}{}
+				fdt.ForEach(sctx, func(_ int32, file *vfs.FileDescription, _ kernel.FDFlags) bool {
+					if _, ok := file.Impl().(nvproxy.NvidiaDeviceFD); ok {
+						found = true
+						return false
+					}
+					return true
+				})
 			})
+			return !found
 		})
 		if found {
 			procs = append(procs, tg)
@@ -296,8 +337,20 @@ func postResumeCuda(k *kernel.Kernel, timeline *timing.Timeline) error {
 	cudaCheckpointPath := cudaCheckpointPathVal.(string)
 	cudaCheckpointSequential := k.PopCheckpointState(cudaCheckpointSequentialKey).(bool)
 	cudaProcs := k.PopCheckpointState(cudaProcsKey).([]*kernel.ThreadGroup)
+	// Admit processes that began initializing CUDA during the sequence, FIRST.
+	// The snapshot is final by now (saved, or failed to save), so new GPU
+	// state can no longer be left out of it -- and the interposer's rebuild
+	// below execs a fresh helper process (mcshim-helper) that initializes
+	// CUDA: opening the gate any later deadlocks the resume against it
+	// (measured on the failed-save path; after a true restore the gate is
+	// already open, since it is not saved).
+	nvproxy.OpenCudaAdmission(k.VFS())
 	timeline.Reached("starting cuda-ckpt")
-	// FIXME: b/460451448 - pass --device-map to cuda-checkpoint if accepted
+	// No --device-map is passed to cuda-checkpoint: restoring onto a different
+	// GPU set is handled by nvproxy's device remapping (runsc/boot/nvproxy.go,
+	// nvproxy.DeviceRemapping), which keeps the sandbox-visible device minors
+	// stable and translates them at the RM boundary, so cuda-checkpoint sees
+	// the same devices it checkpointed. (b/460451448)
 	err := restoreCudaProcs(k.SupervisorContext(), k, cudaCheckpointPath, cudaProcs, timeline, cudaCheckpointSequential)
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {

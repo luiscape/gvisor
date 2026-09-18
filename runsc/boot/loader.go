@@ -1507,9 +1507,9 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 
 // setupCudaMulticastShim LD_PRELOADs the multicast suspend/resume interposer
 // into a GPU container (when --cuda-multicast-shim-path and/or
-// --cuda-multicast-shim-embedded is set, nvproxy is enabled, and the driver
+// --cuda-multicast-shim-source=EMBEDDED is set, nvproxy is enabled, and the driver
 // is R550+, cuda-checkpoint's minimum). With
-// --cuda-multicast-shim-embedded, the interposer bundled inside the runsc
+// --cuda-multicast-shim-source=EMBEDDED, the interposer bundled inside the runsc
 // binary is first written into the container's filesystem; otherwise the
 // container image must carry it at --cuda-multicast-shim-path.
 //
@@ -1535,7 +1535,7 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	// Materialize the embedded interposer before anything references its
 	// path: if this fails, the container boots without any preload rather
 	// than with a dangling one.
-	if info.conf.CUDAMulticastShimEmbedded {
+	if info.conf.CUDAMulticastShimSource == config.CUDAMulticastShimSourceEmbedded {
 		if err := l.materializeCudaMulticastShim(info, shimPath); err != nil {
 			return err
 		}
@@ -1585,6 +1585,12 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	env = appendEnvIfAbsent(env, "MCSHIM_IPC_REPLAY_FLOOR", "0")
 	env = appendEnvIfAbsent(env, "MCSHIM_HELPER",
 		path.Join(path.Dir(shimPath), mcshimbin.HelperName))
+	// NCCL shares P2P buffers either through the VMM API (cuMemCreate +
+	// cuMemExportToShareableHandle; NCCL_CUMEM_ENABLE=1) or through legacy
+	// CUDA IPC (cuIpcOpenMemHandle). The interposer restores the former
+	// exactly; the latter only through its legacy-IPC promotion. Pin NCCL to
+	// the VMM path unless the user chose otherwise.
+	env = appendEnvIfAbsent(env, "NCCL_CUMEM_ENABLE", "1")
 	info.procArgs.Envv = env
 
 	// The env append above only covers processes that inherit the initial

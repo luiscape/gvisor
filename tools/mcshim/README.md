@@ -13,25 +13,29 @@ can checkpoint and restore workloads it otherwise refuses:
 *   **VMM imports.** Live `cuMemImportFromShareableHandle` imports (NCCL P2P
     buffers) cannot be restored either; the shim releases and re-imports them
     the same way, re-fetching the re-exported fd from the exporting rank.
-*   **Legacy CUDA IPC imports** (`cuIpcOpenMemHandle`) cannot cross the
-    per-process restore toggle live on these drivers; the shim closes them
-    before the checkpoint and replays them after it. The teardown is gated by
-    `MCSHIM_IPC_SUSPEND` (which the gVisor loader sets) because on driver
-    modes where `cuda-checkpoint` carries IPC itself, touching the imports
-    would be harmful -- a closed import cannot be re-placed at its old VA
-    without the walk described below.
+*   **Legacy CUDA IPC** (`cuIpcGetMemHandle` / `cuIpcOpenMemHandle`, used
+    by the engines' custom all-reduce for `cudaMalloc`'d buffers) is
+    **promoted to VMM IPC** at export time: the exporter's allocation is
+    replaced in place by a `cuMemCreate`'d one at the same VA (contents
+    preserved) and exported as a POSIX fd; the blob handed to the
+    application names that fd, and the importer's `cuIpcOpenMemHandle`
+    imports and maps it. From then on it is the VMM path above, which the
+    shim checkpoints exactly. `MCSHIM_IPC_PROMOTE=0` disables promotion, in
+    which case imports are closed before the checkpoint and *replayed*
+    heuristically after it (see below) -- which cannot bring packed imports
+    back.
 
 Build with `./build.sh` (toolkit-free; runs in a pinned ubuntu:22.04 container
 by default so the result loads under older glibc). The Bazel targets
 `//tools/mcshim:mcshim` and `//tools/mcshim:mcshim_helper` build the same
 artifacts, and `//runsc` embeds them (through `//runsc/mcshimbin`) so that a
 stock runsc binary can inject the interposer into containers whose images do
-not carry it (`--cuda-multicast-shim-embedded`).
+not carry it (`--cuda-multicast-shim-source=EMBEDDED`).
 
 ## How it gets into a container
 
 With `runsc --cuda-multicast-shim-path=/path/to/mcshim.so` (plus nvproxy and
-a R550+ driver) -- or with `--cuda-multicast-shim-embedded`, in which case
+a R550+ driver) -- or with `--cuda-multicast-shim-source=EMBEDDED`, in which case
 runsc first writes its embedded copies of `mcshim.so` and `mcshim-helper`
 into the container filesystem at that path (default
 `/usr/local/lib/mcshim.so`) -- `Loader.setupCudaMulticastShim`
@@ -107,10 +111,11 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 | `MCSHIM_VERBOSE`         | unset           | per-entry suspend/resume diagnostics (chatty across ranks)        |
 | `MCSHIM_DISABLE`         | unset           | silent: no control thread, acks, or gate (interposition/tracking stay active) |
 | `MCSHIM_IPC_SUSPEND`     | unset           | legacy-IPC close+replay across the checkpoint (the loader sets it) |
+| `MCSHIM_IPC_PROMOTE`     | `1`             | promote legacy IPC exports to VMM IPC at export time (0 = legacy close+replay only) |
 | `MCSHIM_IPC_REPLAY_FLOOR`| `0x40000000000` | hex VA; imports whose range base is below it are left live (the loader sets 0) |
 | `MCSHIM_MC_PROXY`        | unset           | rebuild multicast via the mcshim-helper process (the loader sets it) |
 | `MCSHIM_HELPER`          | next to the .so | path to mcshim-helper (the loader sets it)                        |
-| `MCSHIM_FREE_UC_EXPORTS` | unset           | free multicast-bound UC exporter allocations across the checkpoint, contents preserved (needed by torch symm-mem *multimem*) |
+| `MCSHIM_KEEP_UC_EXPORTS` | unset           | opt OUT of freeing multicast-bound UC exporter allocations across the checkpoint (default: freed, contents preserved; see below) |
 | `MCSHIM_HOST_BUILD`      | unset           | build.sh: build with the host toolchain instead of docker         |
 | `MCSHIM_BUILD_IMAGE`     | pinned 22.04    | build.sh: alternative base image                                  |
 
@@ -174,13 +179,14 @@ was long misread as a pre-R610 driver limitation):
     `cuMemAddressFree`, so the VA reservations survive the checkpoint; resume
     maps back into them (re-reserving at the fixed address if a reservation
     did not survive).
-*   **Freed UC exporters** (`MCSHIM_FREE_UC_EXPORTS=1`). On fabric-attached
+*   **Freed UC exporters** (default; `MCSHIM_KEEP_UC_EXPORTS=1` opts out). On fabric-attached
     systems libcuda keeps an internal fabric registration (0x00f8) over a
     peer-shared allocation and caches its handle; the registration cannot be
     checkpointed, and a RESIDENT allocation restored with the stale cache
     fails its next export with OBJECT_NOT_FOUND instead of re-registering
     (measured; torch `_symmetric_memory` multimem keeps exactly such an
-    allocation). With the flag, suspend saves the allocation's contents into
+    allocation, and any path that re-exports after restore has the same
+    exposure). Suspend saves the allocation's contents into
     process memory (carried by the checkpoint), releases it through libcuda
     (tearing the bookkeeping down consistently), and resume recreates it
     fresh, re-maps at the identical VAs, restores contents, and re-exports --
@@ -193,7 +199,17 @@ was long misread as a pre-R610 driver limitation):
     and mappings are rebuilt. `cuMulticastBindMem` blocks until every device
     has joined the group, so the binds are the cross-rank barrier. Serving
     strictly before fetching prevents rank-pair deadlock.
-*   **Legacy IPC replay.** The rendezvous key is the *original* blob (a
+*   **Legacy IPC promotion.** Why not replay: `cuIpcOpenMemHandle` takes no
+    address hint and the driver's legacy VA allocator is top-down first-fit
+    and refuses an exact-fit hole (measured, `gpu_mem_snapshots/probes/
+    ipc_reopen_probe.py`), so an import whose neighbours abut it never
+    reopens at its VA. Promotion sidesteps the allocator entirely. The
+    promoted range must stay indistinguishable from `cudaMalloc` memory to
+    the application: `cuMemRetainAllocationHandle` reports it as non-VMM
+    (SGLang's custom all-reduce probes that to pick its registration path)
+    and `cuMemFree` of the base releases the VMM object. Buffers whose size
+    is not a 2 MiB multiple (none observed) fall back to the legacy path.
+*   **Legacy IPC replay** (`MCSHIM_IPC_PROMOTE=0`). The rendezvous key is the *original* blob (a
     re-export produces different bytes, but both sides know the original).
     Exporters serve the new blob under the old key; importers reopen in
     ascending original-open order, and since `cuIpcOpenMemHandle` takes no
@@ -216,7 +232,10 @@ was long misread as a pre-R610 driver limitation):
     object ever had is kept in an alias list and stale references are
     translated (`xlate`). Because the driver reuses handle values, a newly
     issued value is first purged from every alias list (`aka_purge`) so it
-    can never be misrouted to a dead object.
+    can never be misrouted to a dead object. The list holds 16 values
+    (`MAX_AKA`; one rotation per rebuild); on overflow the oldest rotated
+    value is evicted, the original handle is always kept, and the process
+    logs the eviction and refuses further suspends.
 
 ## Threat model
 

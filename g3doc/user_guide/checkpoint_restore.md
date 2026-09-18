@@ -225,7 +225,7 @@ graphs remain valid.
 
 To enable it, either:
 
-*   set the runtime `--cuda-multicast-shim-embedded` flag: `runsc` carries
+*   set the runtime `--cuda-multicast-shim-source=EMBEDDED` flag: `runsc` carries
     `mcshim.so` and its companion `mcshim-helper` inside its own binary and
     writes them into the container's filesystem at container creation (at
     `--cuda-multicast-shim-path` if set, `/usr/local/lib/mcshim.so` by
@@ -263,7 +263,7 @@ must survive the restore.
 
 Restoring such a snapshot needs no extra flags. However, to take a *further*
 checkpoint of a restored container, the restoring runtime must also be
-configured with `--cuda-multicast-shim-embedded` (or
+configured with `--cuda-multicast-shim-source=EMBEDDED` (or
 `--cuda-multicast-shim-path`): that is how gVisor re-discovers that the
 container carries the interposer.
 

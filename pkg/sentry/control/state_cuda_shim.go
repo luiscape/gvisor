@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -442,6 +443,10 @@ func cudaShimManagedProcs(sctx context.Context, k *kernel.Kernel, cudaProcs []*k
 // acknowledge a rebuild; waiting on the others would stall until the ack
 // timeout.
 func unwindCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, dir string) {
+	// A rebuild execs a fresh mcshim-helper that initializes CUDA; it must not
+	// be held by the admission gate while this waits for its ack. (Idempotent;
+	// callers on the application-keeps-running paths open it too.)
+	nvproxy.OpenCudaAdmission(k.VFS())
 	// Drop any recorded rebuild state: this instance is handling it.
 	k.PopCheckpointState(cudaShimDirKey)
 	tornDown := cudaShimProcsWith(sctx, k, cudaProcs, dir, "suspended")

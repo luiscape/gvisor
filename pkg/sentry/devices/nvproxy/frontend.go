@@ -153,13 +153,13 @@ type frontendFD struct {
 	// protected by dev.nvp.clientsMu.
 	clients map[*rootClient]struct{}
 
-	// exportedObj, if non-nil, records that an RM object was exported into
-	// this FD via NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD or
-	// NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECTS_TO_FD. Such an FD represents
-	// live CUDA IPC and blocks cuda-checkpoint; it is reported by
-	// nvproxy.checkpointBlockers() until this FD is closed. exportedObj is
-	// protected by dev.nvp.fdsMu.
-	exportedObj *exportedObjInfo
+	// exportedObjs, if non-empty, records the RM objects exported into this
+	// FD via NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD (slot 0) or
+	// NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECTS_TO_FD (one entry per exported
+	// slot). Such an FD represents live CUDA IPC and blocks cuda-checkpoint;
+	// every entry is reported by nvproxy.checkpointBlockers() until this FD
+	// is closed. exportedObjs is protected by dev.nvp.fdsMu.
+	exportedObjs map[uint16]exportedObjInfo
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
@@ -1440,6 +1440,11 @@ func rmAllocEventBuffer(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAME
 func rmAllocRootClient(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
 	if !ioctlParams.HClass.IsRootClient() {
 		panic(fmt.Sprintf("rmAllocRootClient() was invoked with HClass whose IsRootClient()==false: %#x", ioctlParams.HClass))
+	}
+	// A root client is the first GPU state a process acquires; during a CUDA
+	// checkpoint sequence, hold newcomers here (see cuda_admission.go).
+	if err := fi.fd.dev.nvp.awaitCudaAdmission(fi.t); err != nil {
+		return 0, err
 	}
 	return rmAllocSimpleParams(fi, ioctlParams, isNVOS64, func(fi *frontendIoctlState, _ *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.Handle) {
 		client := newRootClient(fi.fd, ioctlParams, rightsRequested, allocParams)
