@@ -385,6 +385,38 @@ type Config struct {
 	// unsupported driver version.
 	NVProxyAllowUnsupportedDriver bool `flag:"nvproxy-allow-unsupported-driver"`
 
+	// CUDAMulticastShimPath is the path, inside the container filesystem, to
+	// the multicast suspend/resume interposer (mcshim.so). When it is set for
+	// a GPU container (nvproxy enabled) on driver R550+, the container's
+	// command is run with the interposer LD_PRELOADed.
+	//
+	// cuda-checkpoint cannot checkpoint a process holding live multicast
+	// (NV_MEMORY_MULTICAST_FABRIC, 0x00fd) objects, which NCCL NVLS and
+	// torch _symmetric_memory both create. The interposer tracks every
+	// multicast group and CUDA IPC import at the libcuda layer and, when
+	// gVisor tells it to, releases them before the checkpoint and rebuilds
+	// them at byte-identical virtual addresses afterwards -- so application
+	// pointers and captured CUDA graphs stay valid. gVisor drives those two
+	// transitions around the cuda-checkpoint phases; see
+	// pkg/sentry/control/state_cuda.go.
+	CUDAMulticastShimPath string `flag:"cuda-multicast-shim-path"`
+
+	// CUDAMulticastShimSource selects where the multicast interposer comes
+	// from. CUDAMulticastShimSourceImage (the default) expects the container
+	// image to carry it at CUDAMulticastShimPath. CUDAMulticastShimSourceEmbedded
+	// materializes the interposer bundled inside the runsc binary (mcshim.so
+	// and mcshim-helper, built from tools/mcshim) into each GPU container's
+	// filesystem at container creation, at CUDAMulticastShimPath (or
+	// DefaultCUDAMulticastShimPath when no path is given), so the container
+	// image does not need to carry the interposer itself.
+	//
+	// The write goes through the container's VFS: with a rootfs overlay (the
+	// default --overlay2 configuration) the files land in the overlay, never
+	// in the user's rootfs on the host. They are therefore part of checkpoint
+	// images, so a restored process re-maps exactly the interposer bytes it
+	// had mapped at checkpoint time, even across runsc upgrades.
+	CUDAMulticastShimSource CUDAMulticastShimSource `flag:"cuda-multicast-shim-source"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 
@@ -623,6 +655,64 @@ func (c *Config) GetOverlay2() Overlay2 {
 		return Overlay2{rootMount: true, subMounts: true, medium: "memory"}
 	}
 	return c.Overlay2
+}
+
+// DefaultCUDAMulticastShimPath is the in-container path at which
+// CUDAMulticastShimSourceEmbedded materializes the multicast interposer when
+// CUDAMulticastShimPath does not name a path itself. mcshim-helper is
+// written next to it.
+const DefaultCUDAMulticastShimPath = "/usr/local/lib/mcshim.so"
+
+// CUDAMulticastShimSource selects where the multicast interposer comes from.
+type CUDAMulticastShimSource string
+
+// CUDAMulticastShimSource values.
+const (
+	// CUDAMulticastShimSourceImage: the container image carries the
+	// interposer at --cuda-multicast-shim-path (which enables it).
+	CUDAMulticastShimSourceImage CUDAMulticastShimSource = "IMAGE"
+	// CUDAMulticastShimSourceEmbedded: runsc writes its bundled interposer
+	// into the container at creation.
+	CUDAMulticastShimSourceEmbedded CUDAMulticastShimSource = "EMBEDDED"
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (s *CUDAMulticastShimSource) Set(v string) error {
+	src := CUDAMulticastShimSource(strings.ToUpper(v))
+	switch src {
+	case CUDAMulticastShimSourceImage, CUDAMulticastShimSourceEmbedded:
+		*s = src
+		return nil
+	}
+	return fmt.Errorf("invalid value %q; must be %s or %s", v, CUDAMulticastShimSourceImage, CUDAMulticastShimSourceEmbedded)
+}
+
+// Ptr returns a pointer to `s`. Useful in flag declaration line.
+func (s CUDAMulticastShimSource) Ptr() *CUDAMulticastShimSource {
+	return &s
+}
+
+// Get implements flag.Get.
+func (s *CUDAMulticastShimSource) Get() any {
+	return *s
+}
+
+// String implements flag.String.
+func (s CUDAMulticastShimSource) String() string {
+	return string(s)
+}
+
+// CUDAMulticastShimContainerPath returns the in-container path of the
+// multicast suspend/resume interposer, or "" if the interposer is not
+// enabled.
+func (c *Config) CUDAMulticastShimContainerPath() string {
+	if c.CUDAMulticastShimPath != "" {
+		return c.CUDAMulticastShimPath
+	}
+	if c.CUDAMulticastShimSource == CUDAMulticastShimSourceEmbedded {
+		return DefaultCUDAMulticastShimPath
+	}
+	return ""
 }
 
 // Bundle is a set of flag name-value pairs.

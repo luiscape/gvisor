@@ -84,6 +84,10 @@ type SaveOpts struct {
 	// FSSaveOpts contains options for filesystem checkpoint. If non-nil, we
 	// should split filesystem to separate pages from the full checkpoint.
 	FSSaveOpts *kernel.FSSaveOpts
+	// CudaBlockerTimeout is how long to wait for CUDA checkpoint blockers
+	// (multicast/fabric objects, exported-object FDs) to be released before
+	// failing the checkpoint. Zero means a default timeout.
+	CudaBlockerTimeout time.Duration
 }
 
 // Close releases resources owned by opts.

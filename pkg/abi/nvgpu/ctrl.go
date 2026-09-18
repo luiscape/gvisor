@@ -205,6 +205,16 @@ func (p *NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS) GetFrontendFD() int3
 	return p.FD
 }
 
+// GetDeviceInstance implements HasDeviceInstance.GetDeviceInstance.
+func (p *NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS) GetDeviceInstance() uint32 {
+	return p.DeviceInstance
+}
+
+// SetDeviceInstance implements HasDeviceInstance.SetDeviceInstance.
+func (p *NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS) SetDeviceInstance(devInst uint32) {
+	p.DeviceInstance = devInst
+}
+
 // SetFrontendFD implements HasFrontendFD.SetFrontendFD.
 func (p *NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS) SetFrontendFD(fd int32) {
 	p.FD = fd
@@ -226,6 +236,16 @@ func (p *NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS_V545) GetFrontendFD()
 	return p.FD
 }
 
+// GetDeviceInstance implements HasDeviceInstance.GetDeviceInstance.
+func (p *NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS_V545) GetDeviceInstance() uint32 {
+	return p.DeviceInstance
+}
+
+// SetDeviceInstance implements HasDeviceInstance.SetDeviceInstance.
+func (p *NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS_V545) SetDeviceInstance(devInst uint32) {
+	p.DeviceInstance = devInst
+}
+
 // SetFrontendFD implements HasFrontendFD.SetFrontendFD.
 func (p *NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS_V545) SetFrontendFD(fd int32) {
 	p.FD = fd
@@ -237,6 +257,20 @@ type NV0000_CTRL_OS_UNIX_EXPORT_OBJECT struct {
 	Type uint32   // enum NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE
 	Data [12]byte // union
 }
+
+// From src/common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000unix.h:
+const (
+	// NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM is the
+	// NV0000_CTRL_OS_UNIX_EXPORT_OBJECT.Type value for which Data is
+	// struct {hDevice, hParent, hObject Handle}.
+	NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM = 0
+
+	// NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_FLAGS_EMPTY_FD is the
+	// EMPTY_FD flag bit in NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS.Flags:
+	// the fd is created without an associated object (objects are attached
+	// later, e.g. by NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECTS_TO_FD).
+	NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_FLAGS_EMPTY_FD = 0x1
+)
 
 // +marshal
 type NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS struct {
@@ -629,6 +663,11 @@ const (
 	NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS = 0x2080110b
 
 	NV2080_CTRL_FIFO_DISABLE_CHANNELS_MAX_ENTRIES = 64
+)
+
+// From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fla.h:
+const (
+	NV2080_CTRL_CMD_FLA_GET_FABRIC_MEM_STATS = 0x20803504
 )
 
 // From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080flcn.h:

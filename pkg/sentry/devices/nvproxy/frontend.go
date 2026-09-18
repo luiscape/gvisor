@@ -34,6 +34,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -54,7 +55,18 @@ func (dev *frontendDevice) basename() string {
 	if dev.isCtlDevice() {
 		return "nvidiactl"
 	}
-	return fmt.Sprintf("nvidia%d", dev.minor)
+	return fmt.Sprintf("nvidia%d", dev.hostMinor())
+}
+
+// hostMinor returns the host device minor number backing dev, which differs
+// from dev.minor only after a restore that remapped this device to another GPU.
+func (dev *frontendDevice) hostMinor() uint32 {
+	dev.nvp.devTransMu.Lock()
+	defer dev.nvp.devTransMu.Unlock()
+	if hostMinor, ok := dev.nvp.hostMinorByMinor[dev.minor]; ok {
+		return hostMinor
+	}
+	return dev.minor
 }
 
 // Open implements vfs.Device.Open.
@@ -96,12 +108,22 @@ type frontendFD struct {
 	vfs.FileDescriptionDefaultImpl
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.NoLockFD
-	memmap.MappableNoTrackMappings
 
 	dev           *frontendDevice
 	containerName string
 	hostFD        int32
 	memmapFile    frontendFDMemmapFile
+
+	// Mappings must be tracked, unlike most device FDs
+	// (memmap.MappableNoTrackMappings): frontendFDMemmapFile is not a
+	// savable memmap.File, so every translation over it must be dropped by
+	// InvalidateUnsavable before a save, or encoding panics ("Can't save
+	// pma with non-MemoryFile"). cuda-checkpoint's checkpoint action makes
+	// the application unmap most device mappings before the save, which is
+	// why the panic was only ever seen for the mappings that survive it.
+	mapsMu sync.Mutex `state:"nosave"`
+	// +checklocks:mapsMu
+	mappings memmap.MappingSet
 
 	// The driver's implementation of poll() for these files,
 	// kernel-open/nvidia/nv.c:nvidia_poll(), unsets
@@ -130,6 +152,14 @@ type frontendFD struct {
 	// clients are handles of clients owned by this frontendFD. clients is
 	// protected by dev.nvp.clientsMu.
 	clients map[*rootClient]struct{}
+
+	// exportedObjs, if non-empty, records the RM objects exported into this
+	// FD via NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD (slot 0) or
+	// NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECTS_TO_FD (one entry per exported
+	// slot). Such an FD represents live CUDA IPC and blocks cuda-checkpoint;
+	// every entry is reported by nvproxy.checkpointBlockers() until this FD
+	// is closed. exportedObjs is protected by dev.nvp.fdsMu.
+	exportedObjs map[uint16]exportedObjInfo
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
@@ -1030,6 +1060,51 @@ func ctrlOsUnixMemacctGetLimits(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS5
 	return n, nil
 }
 
+// ctrlOSUnixGetExportObjectInfo handles
+// NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO, whose DeviceInstance output
+// tells the caller which device an exported object lives on. libcuda looks that
+// value up in its own device table, so after a restore onto different GPUs it
+// must be reported as the device instance the application knew before the
+// checkpoint, not the one now backing it.
+func ctrlOSUnixGetExportObjectInfo[Params any, PtrParams hasExportObjectInfoPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
+	var ctrlParamsValue Params
+	ctrlParams := PtrParams(&ctrlParamsValue)
+	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
+		return 0, linuxerr.EINVAL
+	}
+	if _, err := ctrlParams.CopyIn(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return 0, err
+	}
+
+	origFD := ctrlParams.GetFrontendFD()
+	ctlFileGeneric, _ := fi.t.FDTable().Get(origFD)
+	if ctlFileGeneric == nil {
+		return 0, linuxerr.EINVAL
+	}
+	defer ctlFileGeneric.DecRef(fi.ctx)
+	ctlFile, ok := ctlFileGeneric.Impl().(*frontendFD)
+	if !ok {
+		return 0, linuxerr.EINVAL
+	}
+
+	ctrlParams.SetFrontendFD(ctlFile.hostFD)
+	n, err := rmControlInvoke(fi, ioctlParams, ctrlParams)
+	ctrlParams.SetFrontendFD(origFD)
+	if err != nil {
+		return n, err
+	}
+	if appDevInst, ok := fi.fd.dev.nvp.appDeviceInstance(ctrlParams.GetDeviceInstance()); ok {
+		if log.IsLogging(log.Debug) {
+			fi.ctx.Debugf("nvproxy: GET_EXPORT_OBJECT_INFO: reporting device instance %d as %d", ctrlParams.GetDeviceInstance(), appDevInst)
+		}
+		ctrlParams.SetDeviceInstance(appDevInst)
+	}
+	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
 func ctrlMemoryMulticastFabricAttachGPU(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
 	var ctrlParams nvgpu.NV00FD_CTRL_ATTACH_GPU_PARAMS
 	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
@@ -1399,6 +1474,11 @@ func rmAllocEventBuffer(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAME
 func rmAllocRootClient(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
 	if !ioctlParams.HClass.IsRootClient() {
 		panic(fmt.Sprintf("rmAllocRootClient() was invoked with HClass whose IsRootClient()==false: %#x", ioctlParams.HClass))
+	}
+	// A root client is the first GPU state a process acquires; during a CUDA
+	// checkpoint sequence, hold newcomers here (see cuda_admission.go).
+	if err := fi.fd.dev.nvp.awaitCudaAdmission(fi.t); err != nil {
+		return 0, err
 	}
 	return rmAllocSimpleParams(fi, ioctlParams, isNVOS64, func(fi *frontendIoctlState, _ *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.Handle) {
 		client := newRootClient(fi.fd, ioctlParams, rightsRequested, allocParams)
