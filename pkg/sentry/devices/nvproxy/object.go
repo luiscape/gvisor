@@ -20,6 +20,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 )
 
@@ -380,12 +381,16 @@ type rootClient struct {
 	released     bool
 
 	params capturedRmAllocParams
+
+	// tgid is the thread group that allocated the client, for diagnostics.
+	tgid kernel.ThreadID
 }
 
-func newRootClient[Params any](fd *frontendFD, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *Params) *rootClient {
+func newRootClient[Params any](fd *frontendFD, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *Params, tgid kernel.ThreadID) *rootClient {
 	return &rootClient{
 		resources: make(map[nvgpu.Handle]*object),
 		params:    captureRmAllocParams(fd, ioctlParams, rightsRequested, allocParams),
+		tgid:      tgid,
 	}
 }
 

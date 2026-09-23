@@ -68,6 +68,14 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	}
 	sctx := k.SupervisorContext()
 	cudaProcs := cudaProcs(sctx, k, o.CudaCheckpointPath, k.NvidiaDriverVersion.Major())
+	// cuda-checkpoint hangs indefinitely on processes holding NVLink
+	// multicast memory (e.g. NCCL with NVLS), so refuse up front.
+	if blockers := nvproxy.CheckpointBlockers(k.VFS()); blockers != "" {
+		if wasPaused {
+			k.Pause()
+		}
+		return fmt.Errorf("cannot checkpoint CUDA processes holding multicast memory (e.g. NCCL_NVLS_ENABLE=0 to disable NVLS): %s", blockers)
+	}
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {
 		tg.SigsegvLock()
