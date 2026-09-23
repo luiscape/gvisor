@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -67,7 +68,20 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		}
 	}
 	sctx := k.SupervisorContext()
+	// Hold CUDA initialization in processes not in the set collected below
+	// until the save completes (postSaveCuda); such processes would otherwise
+	// hold GPU state that cuda-checkpoint never saved. Exempt the exec'd
+	// cuda-checkpoint invocations (and with them any other exec session, which
+	// is not restorable regardless) and, once collected, the processes being
+	// checkpointed, in which cuda-checkpoint allocates RM clients.
+	isExec := func(tg *kernel.ThreadGroup) bool {
+		return tg.Leader().Origin == kernel.OriginExec
+	}
+	nvproxy.CloseCudaAdmission(k.VFS(), isExec)
 	cudaProcs := cudaProcs(sctx, k, o.CudaCheckpointPath, k.NvidiaDriverVersion.Major())
+	nvproxy.CloseCudaAdmission(k.VFS(), func(tg *kernel.ThreadGroup) bool {
+		return isExec(tg) || slices.Contains(cudaProcs, tg)
+	})
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {
 		tg.SigsegvLock()
@@ -77,6 +91,7 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		k.Pause()
 	}
 	if err != nil {
+		nvproxy.OpenCudaAdmission(k.VFS())
 		// FIXME: b/456299722
 		for _, tg := range cudaProcs {
 			tg.SigsegvUnlock()
@@ -87,6 +102,12 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	k.AddStateToCheckpoint(cudaCheckpointSequentialKey, o.CudaCheckpointSequential)
 	k.AddStateToCheckpoint(cudaProcsKey, cudaProcs)
 	return nil
+}
+
+// postSaveCuda releases processes held by preSaveCuda. It is called after the
+// save regardless of its outcome; a restored kernel has no held processes.
+func postSaveCuda(k *kernel.Kernel) {
+	nvproxy.OpenCudaAdmission(k.VFS())
 }
 
 // cudaProcs returns a list of all CUDA processes in the sandbox. It selects

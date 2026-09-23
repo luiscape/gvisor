@@ -300,7 +300,9 @@ func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *SaveRestoreExec
 	if err := preSave(s.Kernel, saveOpts, execOpts); err != nil {
 		return err
 	}
-	if err := saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog); err != nil {
+	err := saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog)
+	postSaveCuda(s.Kernel)
+	if err != nil {
 		return err
 	}
 	if saveOpts.Resume {

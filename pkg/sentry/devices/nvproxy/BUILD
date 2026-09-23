@@ -42,6 +42,7 @@ go_template_instance(
 go_library(
     name = "nvproxy",
     srcs = [
+        "cuda_admission.go",
         "fds_mutex.go",
         "frontend.go",
         "frontend_mmap.go",
@@ -102,12 +103,16 @@ go_library(
 
 go_test(
     name = "nvproxy_test",
-    srcs = ["nvproxy_test.go"],
+    srcs = [
+        "cuda_admission_test.go",
+        "nvproxy_test.go",
+    ],
     library = ":nvproxy",
     deps = [
         "//pkg/abi/nvgpu",
         "//pkg/seccomp",
         "//pkg/sentry/devices/nvproxy/nvconf",
+        "//pkg/sentry/kernel",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
