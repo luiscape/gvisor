@@ -443,9 +443,8 @@ func cudaShimManagedProcs(sctx context.Context, k *kernel.Kernel, cudaProcs []*k
 // acknowledge a rebuild; waiting on the others would stall until the ack
 // timeout.
 func unwindCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, dir string) {
-	// A rebuild execs a fresh mcshim-helper that initializes CUDA; it must not
-	// be held by the admission gate while this waits for its ack. (Idempotent;
-	// callers on the application-keeps-running paths open it too.)
+	// The application keeps running on this path, so stop holding late CUDA
+	// initializers. (Idempotent; callers open it too.)
 	nvproxy.OpenCudaAdmission(k.VFS())
 	// Drop any recorded rebuild state: this instance is handling it.
 	k.PopCheckpointState(cudaShimDirKey)

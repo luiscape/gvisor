@@ -28,13 +28,3 @@ cc_binary(
     linkshared = True,
     visibility = ["//runsc/mcshimbin:__pkg__"],
 )
-
-# The create/attach proxy the interposer forks to rebuild multicast groups
-# on resume. It must live next to the interposer in the container (the
-# MCSHIM_HELPER environment variable's default).
-cc_binary(
-    name = "mcshim_helper",
-    srcs = ["mcshim_helper.c"],
-    linkopts = ["-ldl"],
-    visibility = ["//runsc/mcshimbin:__pkg__"],
-)

@@ -1,7 +1,7 @@
 # mcshim: CUDA multicast suspend/resume interposer
 
 `mcshim.so` is an `LD_PRELOAD` interposer that gVisor injects into CUDA
-processes so that `cuda-checkpoint` (NVIDIA driver R550+, validated on R580)
+processes so that `cuda-checkpoint` (NVIDIA driver R610+)
 can checkpoint and restore workloads it otherwise refuses:
 
 *   **Multicast (NVLS).** Processes holding live `NV_MEMORY_MULTICAST_FABRIC`
@@ -27,17 +27,16 @@ can checkpoint and restore workloads it otherwise refuses:
 
 Build with `./build.sh` (toolkit-free; runs in a pinned ubuntu:22.04 container
 by default so the result loads under older glibc). The Bazel targets
-`//tools/mcshim:mcshim` and `//tools/mcshim:mcshim_helper` build the same
-artifacts, and `//runsc` embeds them (through `//runsc/mcshimbin`) so that a
+`//tools/mcshim:mcshim` builds the same artifact, and `//runsc` embeds it (through `//runsc/mcshimbin`) so that a
 stock runsc binary can inject the interposer into containers whose images do
 not carry it (`--cuda-multicast-shim-source=EMBEDDED`).
 
 ## How it gets into a container
 
 With `runsc --cuda-multicast-shim-path=/path/to/mcshim.so` (plus nvproxy and
-a R550+ driver) -- or with `--cuda-multicast-shim-source=EMBEDDED`, in which case
-runsc first writes its embedded copies of `mcshim.so` and `mcshim-helper`
-into the container filesystem at that path (default
+an R610+ driver) -- or with `--cuda-multicast-shim-source=EMBEDDED`, in which case
+runsc first writes its embedded copy of `mcshim.so` into the container
+filesystem at that path (default
 `/usr/local/lib/mcshim.so`) -- `Loader.setupCudaMulticastShim`
 (`runsc/boot/loader.go`):
 
@@ -46,8 +45,7 @@ into the container filesystem at that path (default
     `torch_memory_saver` rewrite `LD_PRELOAD` for exactly the worker processes
     that matter; `ld.so.preload` is immune),
 *   sets `MCSHIM_DIR` in the container environment (default `/tmp/mcshim`)
-    unless the container chose its own, plus `MCSHIM_MC_PROXY`,
-    `MCSHIM_IPC_SUSPEND` and `MCSHIM_IPC_REPLAY_FLOOR=0` (see below),
+    unless the container chose its own,
 *   records `GVISOR_CUDA_MULTICAST_SHIM_DIR` in the container *spec*, which is
     how the sentry (`pkg/sentry/control/state_cuda_shim.go`) later discovers
     that it owns an interposer in this container.
@@ -110,59 +108,16 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 | `MCSHIM_LOG`             | stderr          | append log to this path instead of stderr                         |
 | `MCSHIM_VERBOSE`         | unset           | per-entry suspend/resume diagnostics (chatty across ranks)        |
 | `MCSHIM_DISABLE`         | unset           | silent: no control thread, acks, or gate (interposition/tracking stay active) |
-| `MCSHIM_IPC_SUSPEND`     | unset           | legacy-IPC close+replay across the checkpoint (the loader sets it) |
 | `MCSHIM_IPC_PROMOTE`     | `1`             | promote legacy IPC exports to VMM IPC at export time (0 = legacy close+replay only) |
-| `MCSHIM_IPC_REPLAY_FLOOR`| `0x40000000000` | hex VA; imports whose range base is below it are left live (the loader sets 0) |
-| `MCSHIM_MC_PROXY`        | unset           | rebuild multicast via the mcshim-helper process (the loader sets it) |
-| `MCSHIM_HELPER`          | next to the .so | path to mcshim-helper (the loader sets it)                        |
-| `MCSHIM_KEEP_UC_EXPORTS` | unset           | opt OUT of freeing multicast-bound UC exporter allocations across the checkpoint (default: freed, contents preserved; see below) |
 | `MCSHIM_HOST_BUILD`      | unset           | build.sh: build with the host toolchain instead of docker         |
 | `MCSHIM_BUILD_IMAGE`     | pinned 22.04    | build.sh: alternative base image                                  |
 
-`MCSHIM_IPC_REPLAY_FLOOR` is a classifier, not a tuning knob: unreplayable
-legacy imports sit in low driver-owned regions the driver places once per
-process and never repeats; replayable ones sit in the high per-mapping area.
-A live import fails the per-process restore toggle on these drivers, so the
-gVisor loader sets the floor to 0 (close and replay everything); the nonzero
-default only applies to standalone use on driver modes whose job support can
-carry live imports.
+## Restoring onto different GPUs
 
-## The multicast proxy (mcshim-helper)
-
-On these drivers (measured on 580.126.20), a cuda-checkpoint-restored
-process can import a multicast group fd, bind its memory into the group, and
-map the multicast VA -- but `cuMulticastCreate` and `cuMulticastAddDevice`
-fail with `CUDA_ERROR_INVALID_DEVICE` (and `cuCtxCreate` with OOM): the
-restore blocks fresh device admission at the process level. With
-`MCSHIM_MC_PROXY` set (the gVisor loader sets it), the rebuild routes
-exactly those two calls through `mcshim-helper`, a never-checkpointed
-process exec'd for the duration of the rebuild:
-
-*   Creators send `CREATE` (the recorded group properties) and `ADDDEV` (their
-    recorded ordinals) to the helper, import the group fd it returns, and
-    serve that same fd to peers (re-exporting an imported group handle also
-    fails on R580).
-*   Importers re-import from the creator exactly as before, then fetch a
-    second fd for the helper and send their `ADDDEV`s.
-*   Binds, identical-VA mappings, and teardown are unchanged; the group
-    persists through the ranks' imports, so the helper exits when the
-    rebuild is done (and on EOF, so it can never be leaked).
-
-Restoring onto DIFFERENT GPUs works, but only because the sentry keeps the
-move invisible; the interposer itself needs nothing special. Two sentry
-behaviors are load-bearing (both were once broken, and the failure mode was
-the rebuild's first re-import returning `CUDA_ERROR_INVALID_DEVICE`, which
-was long misread as a pre-R610 driver limitation):
-
-*   The sandbox's device namespace must not change: sandbox-visible minors
-    stay what they were before the checkpoint, and the sentry translates
-    them to the new host minors at open time. Anything less breaks freshly
-    exec'd processes -- including `mcshim-helper` -- which open devices by
-    name.
-*   Device identity reported by RM must match what the application's
-    restored libcuda remembers: in particular the `DeviceInstance` output of
-    `NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO`, which libcuda resolves
-    against the device table it built before the checkpoint.
+The interposer needs nothing special: the sentry keeps sandbox-visible
+device minors what they were before the checkpoint and translates them to
+the new host minors at open time, so freshly exec'd processes that open
+devices by name reach the GPUs the sandbox now owns.
 
 ## Design summary
 
@@ -179,19 +134,13 @@ was long misread as a pre-R610 driver limitation):
     `cuMemAddressFree`, so the VA reservations survive the checkpoint; resume
     maps back into them (re-reserving at the fixed address if a reservation
     did not survive).
-*   **Freed UC exporters** (default; `MCSHIM_KEEP_UC_EXPORTS=1` opts out). On fabric-attached
-    systems libcuda keeps an internal fabric registration (0x00f8) over a
-    peer-shared allocation and caches its handle; the registration cannot be
-    checkpointed, and a RESIDENT allocation restored with the stale cache
-    fails its next export with OBJECT_NOT_FOUND instead of re-registering
-    (measured; torch `_symmetric_memory` multimem keeps exactly such an
-    allocation, and any path that re-exports after restore has the same
-    exposure). Suspend saves the allocation's contents into
-    process memory (carried by the checkpoint), releases it through libcuda
-    (tearing the bookkeeping down consistently), and resume recreates it
-    fresh, re-maps at the identical VAs, restores contents, and re-exports --
-    which re-registers lazily. Scoped to multicast-bound exporters; costs a
-    device-host-device copy and checkpoint growth of the same size.
+*   **Freed UC exporters.** A multicast-bound exporter allocation left
+    resident across the checkpoint fails its next export after restore with
+    OBJECT_NOT_FOUND (measured on R610: vLLM TP=4, torch `_symmetric_memory`).
+    Suspend saves its contents into process memory (carried by the
+    checkpoint) and releases it; resume recreates it, re-maps at the identical
+    VAs, restores contents, and re-exports. Costs a device-host-device copy
+    and checkpoint growth of the same size.
 *   **Three-phase cross-rank resume.** (1) every exporter re-creates its
     object, re-exports it and serves the fd on a unix socket keyed by the
     original export identity (nvproxy's fdinfo oracle, else `st_dev:st_ino`

@@ -387,7 +387,7 @@ type Config struct {
 
 	// CUDAMulticastShimPath is the path, inside the container filesystem, to
 	// the multicast suspend/resume interposer (mcshim.so). When it is set for
-	// a GPU container (nvproxy enabled) on driver R550+, the container's
+	// a GPU container (nvproxy enabled) on driver R610+, the container's
 	// command is run with the interposer LD_PRELOADed.
 	//
 	// cuda-checkpoint cannot checkpoint a process holding live multicast
@@ -404,8 +404,8 @@ type Config struct {
 	// CUDAMulticastShimSource selects where the multicast interposer comes
 	// from. CUDAMulticastShimSourceImage (the default) expects the container
 	// image to carry it at CUDAMulticastShimPath. CUDAMulticastShimSourceEmbedded
-	// materializes the interposer bundled inside the runsc binary (mcshim.so
-	// and mcshim-helper, built from tools/mcshim) into each GPU container's
+	// materializes the interposer bundled inside the runsc binary (mcshim.so,
+	// built from tools/mcshim) into each GPU container's
 	// filesystem at container creation, at CUDAMulticastShimPath (or
 	// DefaultCUDAMulticastShimPath when no path is given), so the container
 	// image does not need to carry the interposer itself.
@@ -659,8 +659,7 @@ func (c *Config) GetOverlay2() Overlay2 {
 
 // DefaultCUDAMulticastShimPath is the in-container path at which
 // CUDAMulticastShimSourceEmbedded materializes the multicast interposer when
-// CUDAMulticastShimPath does not name a path itself. mcshim-helper is
-// written next to it.
+// CUDAMulticastShimPath does not name a path itself.
 const DefaultCUDAMulticastShimPath = "/usr/local/lib/mcshim.so"
 
 // CUDAMulticastShimSource selects where the multicast interposer comes from.

@@ -210,25 +210,20 @@ func (nvp *nvproxy) recordDeviceTranslations(dr *DeviceRemapping) {
 	}
 	nvp.devTransRecorded = true
 	hostMinors := make(map[uint32]uint32)
-	appDevInsts := make(map[uint32]uint32)
 	for oldID, newID := range dr.NewDeviceByOld {
 		if oldID.Minor != newID.Minor {
 			hostMinors[oldID.Minor] = newID.Minor
 		}
-		if oldID.DeviceInstance != newID.DeviceInstance {
-			appDevInsts[newID.DeviceInstance] = oldID.DeviceInstance
-		}
 	}
-	if len(hostMinors) == 0 && len(appDevInsts) == 0 {
+	if len(hostMinors) == 0 {
 		// This restore does not move devices; any translations recorded by an
 		// earlier restore remain exactly as correct as they were.
 		return
 	}
-	if len(nvp.hostMinorByMinor) != 0 || len(nvp.appDevInstByHostDevInst) != 0 {
+	if len(nvp.hostMinorByMinor) != 0 {
 		panic(fmt.Sprintf("nvproxy: this sandbox was already restored onto different GPUs once; restoring it onto yet another set is not supported (existing minor translation %v, new remapping %v)", nvp.hostMinorByMinor, dr))
 	}
 	nvp.hostMinorByMinor = hostMinors
-	nvp.appDevInstByHostDevInst = appDevInsts
 }
 
 // afterLoad is invoked by stateify.
@@ -239,19 +234,6 @@ func (nvp *nvproxy) afterLoad(ctx goContext.Context) {
 		panic(fmt.Sprintf("driver version %q not found in abis map", nvp.version))
 	}
 	nvp.abi = abiEntry.cons()
-	// Drop FLA registrations suspended for the checkpoint: after a true
-	// restore they are not replayable and not replayed. Measured, in order
-	// of theory death: the cuda-checkpoint restore toggle rebuilds the
-	// application's client through privileged debugger paths nvproxy never
-	// sees (the post-toggle object graph contains only cuda-checkpoint's
-	// utility clients), no live fd is RM-associated with the restored
-	// client from the sentry side, and sentry-driven RM_ALLOC into it is
-	// refused with NV_ERR_INSUFFICIENT_PERMISSIONS regardless of carrier
-	// fd. libcuda re-registers lazily on the next export instead, which is
-	// sufficient for workloads that do not cache registration state
-	// (FlashInfer fusion passes e2e); see ReplayFLARegistrations for the
-	// flows where true replay does apply.
-	nvp.suspendedFLARegs = nil
 	if dr := DeviceRemappingFromContext(ctx); dr != nil {
 		// Also done by frontendFD.load(), since stateify does not order it
 		// against this hook; this call covers a sandbox with no frontend FDs.

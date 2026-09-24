@@ -223,15 +223,6 @@ type nvproxy struct {
 	devInfo                DeviceInfo
 	regularDevs            [nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1]*frontendDevice
 
-	// suspendedFLARegs records FLA registrations host-freed for an
-	// in-progress checkpoint, for replay after the cuda-checkpoint restore
-	// toggle. It lives here rather than in the object graph because
-	// cuda-checkpoint's checkpoint phase frees the process's RM objects
-	// through nvproxy, cascading graph entries away before the sandbox state
-	// is saved. Accessed only from checkpoint/restore control paths, which
-	// are serialized; no lock needed.
-	suspendedFLARegs []suspendedFLARegistration
-
 	// devTransMu guards the device translation state below. It is
 	// deliberately not fdsMu: afterLoad() calls frontendFD.load() while
 	// holding fdsMu, and load() records the translations, so reusing fdsMu
@@ -253,14 +244,6 @@ type nvproxy struct {
 	// GPU this sandbox is now entitled to, not the one the checkpoint was
 	// taken from. Read by frontendDevice.basename().
 	hostMinorByMinor map[uint32]uint32
-
-	// appDevInstByHostDevInst translates a host device instance number to the
-	// one the application saw before a restore remapped devices. RM reports
-	// device instances to userspace (e.g. in
-	// NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO), and libcuda resolves
-	// them against its own device table, which a restored process populated
-	// before the move.
-	appDevInstByHostDevInst map[uint32]uint32
 
 	fdsMu       fdsMutex `state:"nosave"`
 	frontendFDs map[*frontendFD]struct{}
@@ -305,40 +288,6 @@ type hasFrontendFDPtr[T any] interface {
 type hasStatusPtr[T any] interface {
 	marshalPtr[T]
 	nvgpu.HasStatus
-}
-
-// hasExportObjectInfoPtr is implemented by the versioned parameter structs of
-// NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO.
-type hasExportObjectInfoPtr[T any] interface {
-	marshalPtr[T]
-	nvgpu.HasFrontendFD
-	nvgpu.HasDeviceInstance
-}
-
-// appDeviceInstance translates a host device instance number to the one the
-// application knew before a restore that remapped devices, reporting whether a
-// translation applies. Values the application already agrees with, and
-// sandboxes that were never remapped, return ok == false.
-//
-// Whether libcuda WANTS the translation depends on the driver. Through R580,
-// libcuda resolves the device instance that
-// NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO reports against its own
-// device table -- populated before the restore, so it names the OLD devices
-// -- and a restored process importing a peer's memory needs the old instance
-// back or the import fails with CUDA_ERROR_INVALID_DEVICE. From R610 libcuda
-// resolves it against current device state, and handing it the old instance
-// produces exactly that failure instead. Both directions measured (vLLM TP=2
-// restored onto other GPUs: 580 PASS/FAIL, 610 FAIL/PASS with translation
-// on/off). The boundary between 580.173 and 610.57 is not pinned down; R590
-// and R595 are untested.
-func (nvp *nvproxy) appDeviceInstance(hostDevInst uint32) (uint32, bool) {
-	if nvp.version.Major() >= 610 {
-		return 0, false
-	}
-	nvp.devTransMu.Lock()
-	defer nvp.devTransMu.Unlock()
-	appDevInst, ok := nvp.appDevInstByHostDevInst[hostDevInst]
-	return appDevInst, ok
 }
 
 type hasFrontendFDAndStatusPtr[T any] interface {

@@ -6,8 +6,8 @@ package(
 )
 
 # go:embed cannot reference files outside this package, and the cc_binary
-# outputs carry build-system names (libmcshim.so, mcshim_helper); copy them
-# here under the names the loader materializes them as.
+# output carries a build-system name (libmcshim.so); copy it here under the
+# name the loader materializes it as.
 genrule(
     name = "mcshim_so",
     srcs = ["//tools/mcshim"],
@@ -15,19 +15,9 @@ genrule(
     cmd = "cat < $(SRCS) > $(OUTS)",
 )
 
-genrule(
-    name = "mcshim_helper_bin",
-    srcs = ["//tools/mcshim:mcshim_helper"],
-    outs = ["mcshim-helper.bin"],
-    cmd = "cat < $(SRCS) > $(OUTS)",
-)
-
 go_library(
     name = "mcshimbin",
     srcs = ["mcshimbin.go"],
-    embedsrcs = [
-        "mcshim.so",
-        "mcshim-helper.bin",
-    ],
+    embedsrcs = ["mcshim.so"],
     visibility = ["//runsc:__subpackages__"],
 )

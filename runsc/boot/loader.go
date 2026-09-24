@@ -1561,7 +1561,7 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 // setupCudaMulticastShim LD_PRELOADs the multicast suspend/resume interposer
 // into a GPU container (when --cuda-multicast-shim-path and/or
 // --cuda-multicast-shim-source=EMBEDDED is set, nvproxy is enabled, and the driver
-// is R550+, cuda-checkpoint's minimum). With
+// is R610+). With
 // --cuda-multicast-shim-source=EMBEDDED, the interposer bundled inside the runsc
 // binary is first written into the container's filesystem; otherwise the
 // container image must carry it at --cuda-multicast-shim-path.
@@ -1571,18 +1571,13 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 // interposer releases them before the checkpoint and rebuilds them at
 // byte-identical VAs afterwards; control/state_cuda.go drives both transitions
 // around the cuda-checkpoint phases via the marker directory exported here.
-//
-// The interposer is what makes cross-process CUDA state survive at all on
-// these drivers: without job support (an R610+ feature, unsupported here),
-// cuda-checkpoint checkpoints processes individually, and the interposer's
-// teardown is precisely what empties the cross-process state beforehand.
 func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	shimPath := info.conf.CUDAMulticastShimContainerPath()
 	if shimPath == "" || !specutils.NVProxyEnabled(info.spec, info.conf) {
 		return nil
 	}
-	if major := l.k.NvidiaDriverVersion.Major(); major < 550 {
-		log.Warningf("the multicast interposer is enabled but driver R%d is older than R550 (cuda-checkpoint's minimum); not preloading it into container %q", major, info.containerName)
+	if major := l.k.NvidiaDriverVersion.Major(); major < 610 {
+		log.Warningf("the multicast interposer is enabled but driver R%d is older than R610; not preloading it into container %q", major, info.containerName)
 		return nil
 	}
 	// Materialize the embedded interposer before anything references its
@@ -1625,19 +1620,6 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 		shimDir = control.DefaultCudaMulticastShimDir
 		env = append(env, control.CudaMulticastShimDirEnv+"="+shimDir)
 	}
-	// These drivers block a cuda-checkpoint-restored process from
-	// cuMulticastCreate/cuMulticastAddDevice (CUDA_ERROR_INVALID_DEVICE) and
-	// cannot carry live CUDA IPC imports across a checkpoint. Configure the
-	// interposer accordingly, unless the user already chose: MCSHIM_MC_PROXY
-	// has it rebuild multicast through a fresh helper process (mcshim-helper,
-	// expected next to the interposer library), and MCSHIM_IPC_REPLAY_FLOOR=0
-	// has it close and replay EVERY legacy IPC import (a live one fails the
-	// per-process restore toggle with "invalid argument").
-	env = appendEnvIfAbsent(env, "MCSHIM_MC_PROXY", "1")
-	env = appendEnvIfAbsent(env, "MCSHIM_IPC_SUSPEND", "1")
-	env = appendEnvIfAbsent(env, "MCSHIM_IPC_REPLAY_FLOOR", "0")
-	env = appendEnvIfAbsent(env, "MCSHIM_HELPER",
-		path.Join(path.Dir(shimPath), mcshimbin.HelperName))
 	// NCCL shares P2P buffers either through the VMM API (cuMemCreate +
 	// cuMemExportToShareableHandle; NCCL_CUMEM_ENABLE=1) or through legacy
 	// CUDA IPC (cuIpcOpenMemHandle). The interposer restores the former
@@ -1679,11 +1661,10 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 }
 
 // materializeCudaMulticastShim writes the multicast interposer bundled
-// inside the runsc binary (mcshim.so) and its helper (mcshim-helper) into
-// the container's filesystem, at shimPath and next to it respectively, both
-// mode 0755.
+// inside the runsc binary (mcshim.so) into the container's filesystem at
+// shimPath, mode 0755.
 //
-// Because the write goes through the container's VFS, the two files are part
+// Because the write goes through the container's VFS, the file is part
 // of the container's checkpointable filesystem state (with the default
 // --overlay2 configuration, the rootfs overlay). A checkpoint therefore
 // carries the exact interposer bytes the application has mapped, and the
@@ -1693,11 +1674,7 @@ func (l *Loader) materializeCudaMulticastShim(info *containerInfo, shimPath stri
 	if err := l.writeContainerFile(info, shimPath, mcshimbin.Interposer(), 0755); err != nil {
 		return fmt.Errorf("materializing embedded multicast interposer: %w", err)
 	}
-	helperPath := path.Join(path.Dir(shimPath), mcshimbin.HelperName)
-	if err := l.writeContainerFile(info, helperPath, mcshimbin.Helper(), 0755); err != nil {
-		return fmt.Errorf("materializing embedded multicast interposer helper: %w", err)
-	}
-	log.Infof("Materialized embedded multicast interposer at %q (helper at %q) in container %q", shimPath, helperPath, info.containerName)
+	log.Infof("Materialized embedded multicast interposer at %q in container %q", shimPath, info.containerName)
 	return nil
 }
 

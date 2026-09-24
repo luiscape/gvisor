@@ -41,7 +41,7 @@ func testGraph(t *testing.T, clientH nvgpu.Handle, objs map[uint32]nvgpu.ClassID
 	return nvp
 }
 
-func TestCheckpointBlockersReportsOnlyFabricClasses(t *testing.T) {
+func TestCheckpointBlockersReportsOnlyBlockerClasses(t *testing.T) {
 	clientH := nvgpu.Handle{Val: 0xc1d00001}
 	nvp := testGraph(t, clientH, map[uint32]nvgpu.ClassID{
 		0x10: nvgpu.NV01_DEVICE_0,
@@ -57,7 +57,6 @@ func TestCheckpointBlockersReportsOnlyFabricClasses(t *testing.T) {
 		kind BlockerKind
 	}{
 		{0x20, BlockerKindMulticast},
-		{0x21, BlockerKindFabric},
 		{0x22, BlockerKindFabricImport},
 	}
 	if len(got) != len(want) {
@@ -112,11 +111,10 @@ func TestFormatBlockersByClient(t *testing.T) {
 	blockers := []CheckpointBlocker{
 		{ClientHandle: c1, ObjectHandle: nvgpu.Handle{Val: 1}, Kind: BlockerKindMulticast, TaskID: 7},
 		{ClientHandle: c1, ObjectHandle: nvgpu.Handle{Val: 2}, Kind: BlockerKindMulticast, TaskID: 7},
-		{ClientHandle: c1, ObjectHandle: nvgpu.Handle{Val: 3}, Kind: BlockerKindExportedFD, TaskID: 7},
-		{ClientHandle: c2, ObjectHandle: nvgpu.Handle{Val: 4}, Kind: BlockerKindFabric, TaskID: 9},
+		{ClientHandle: c2, ObjectHandle: nvgpu.Handle{Val: 4}, Kind: BlockerKindFabricImport, TaskID: 9},
 	}
 	got := FormatBlockersByClient(blockers)
-	want := "task 7 (client 0xc1d00001): 1 exported-fd, 2 multicast; task 9 (client 0xc1d00002): 1 fabric"
+	want := "task 7 (client 0xc1d00001): 2 multicast; task 9 (client 0xc1d00002): 1 fabric-import"
 	if got != want {
 		t.Errorf("FormatBlockersByClient() =\n  %s\nwant\n  %s", got, want)
 	}

@@ -97,7 +97,6 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -329,73 +328,6 @@ static int mcverbose(void) {
   return v;
 }
 
-/* Whether to tear legacy CUDA IPC imports down across the checkpoint.
- *
- * On the supported drivers cuda-checkpoint checkpoints processes
- * individually and cannot carry a live legacy IPC import across the
- * per-process restore toggle, so the teardown is required; gVisor sets
- * MCSHIM_IPC_SUSPEND=1 when it preloads the interposer. It stays an env
- * gate (rather than unconditional) because on driver modes where IPC IS
- * covered by cuda-checkpoint itself, touching the imports would be harmful
- * -- cuIpcOpenMemHandle has no address hint, so anything the interposer
- * closes it cannot put back at the same VA (measured: 0 of 58 returned)
- * -- and because the gate is the only way to A/B the question. */
-static int ipc_suspend_enabled(void) {
-  static int v = -1;
-  if (v < 0) v = getenv("MCSHIM_IPC_SUSPEND") != NULL;
-  return v;
-}
-
-/* MCSHIM_IPC_REPLAY_FLOOR=<hex VA> (default 0x40000000000): imports whose
- * range sits BELOW this address are left live across the checkpoint instead
- * of closed and replayed.
- *
- * The populations separate by ADDRESS REGION, not size (a size threshold was
- * tried and misclassified TP=4, whose small imports live high and replay
- * fine). Every unreplayable import observed sits in a low driver region
- * (0x31..-0x3a.., placements the driver makes once in a young process and
- * never repeats -- even a same-blob reopen in the same live process moves);
- * every replayable one sits in the high per-mapping area (~0x7e..). 4 TB
- * splits them with orders of magnitude to spare on both sides. */
-static CUdeviceptr ipc_replay_floor(void) {
-  static unsigned long long v;
-  static int init;
-  if (!init) {
-    const char* e = getenv("MCSHIM_IPC_REPLAY_FLOOR");
-    v = e ? strtoull(e, NULL, 16) : 0x40000000000ULL;
-    init = 1;
-  }
-  return (CUdeviceptr)v;
-}
-
-/* Free multicast-participating UC exporter allocations across the checkpoint
- * (contents preserved through process memory) instead of leaving them
- * resident for cuda-checkpoint. On by default; MCSHIM_KEEP_UC_EXPORTS=1 opts
- * out (MCSHIM_FREE_UC_EXPORTS=1, the former opt-in, is accepted and
- * redundant).
- *
- * Why: on fabric-attached systems libcuda keeps an internal fabric
- * registration (NV_MEMORY_FABRIC, 0x00f8) over a peer-shared allocation and
- * caches its handle in the allocation's bookkeeping. The registration cannot
- * be checkpointed; it is freed before the save. A RESIDENT allocation then
- * comes back with the stale cached handle, and libcuda's next export of it
- * presents the dead pair [hVidMem, hFabricReg] to the driver and fails with
- * OBJECT_NOT_FOUND instead of re-registering (measured; torch
- * _symmetric_memory multimem is the known caller that keeps such an
- * allocation both fabric-registered and resident at checkpoint time, but
- * every path that re-exports after restore has the same exposure). Freeing
- * the allocation through libcuda tears that bookkeeping down consistently,
- * and the recreate on resume re-registers lazily and freshly.
- *
- * Cost: a device->host->device copy of every affected allocation (tens of MB
- * per rank in the validated engine configs) and a checkpoint larger by the
- * same amount. */
-static int free_uc_exports_enabled(void) {
-  static int v = -1;
-  if (v < 0) v = getenv("MCSHIM_KEEP_UC_EXPORTS") == NULL;
-  return v;
-}
-
 /* Legacy-IPC promotion (default on; MCSHIM_IPC_PROMOTE=0 disables).
  *
  * cuIpcOpenMemHandle takes no address hint, so a legacy import closed for
@@ -473,8 +405,8 @@ typedef struct {
   pthread_t serve_thread;
   char serve_path[104]; /* must fit sockaddr_un.sun_path (108) */
   int serving;
-  /* KIND_UC exporters freed across the checkpoint (see
-   * MCSHIM_FREE_UC_EXPORTS): device contents saved into process memory
+  /* Multicast-bound KIND_UC exporters freed across the checkpoint (see
+   * do_suspend): device contents saved into process memory
    * (which the checkpoint carries) for restoration after the recreate.
    * NULL when no backup is held. */
   void* uc_content;
@@ -888,11 +820,7 @@ CUresult cuMemExportToShareableHandle(void* shHandle,
    * one un-serializable NV_MEMORY_FABRIC (00f8) object per pool chunk.
    * Failing the export makes the probe conclude fabric is unavailable
    * and fall back to POSIX fds, which the shim fully supports; on a
-   * single node that costs nothing. (Not sufficient by itself: on
-   * fabric-attached systems libcuda also creates driver-internal 00f8
-   * FLA registrations over FD-shared memory once the RM fabric probe
-   * has succeeded -- suppressing those is nvproxy's job, by gating
-   * NV2080_CTRL_CMD_GET_GPU_FABRIC_PROBE_INFO on fabric-imex-mgmt.) */
+   * single node that costs nothing. */
   if (type == CU_MEM_HANDLE_TYPE_FABRIC && !getenv("MCSHIM_ALLOW_FABRIC")) {
     static int logged;
     if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
@@ -1021,8 +949,6 @@ int nvmlDeviceGetGpuFabricInfoV(void* device, void* gpuFabricInfo) {
  * identical. Masking the capability steers allocators to fds, which the shim
  * fully supports. MCSHIM_ALLOW_FABRIC=1 restores truthful reporting (e.g.
  * for multi-node, where checkpointing is out of scope anyway). */
-#define CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED 132
-
 CUresult cuDeviceGetAttribute(int* pi, int attrib, CUdevice dev) {
   resolve_reals();
   CUresult rc = r_cuDeviceGetAttribute(pi, attrib, dev);
@@ -1038,36 +964,14 @@ CUresult cuDeviceGetAttribute(int* pi, int attrib, CUdevice dev) {
           dev);
     *pi = 0;
   }
-  /* Opt-in multicast hiding (MCSHIM_HIDE_MULTICAST=1) for workloads whose
-   * multicast path cannot survive restore. Today that is exactly torch
-   * symm-mem multimem: its userspace caches the FLA registration handle
-   * of the covered workspace across exports, the registration cannot be
-   * checkpointed or recreated (NVIDIA-side gap; see nvproxy
-   * fla_registration.go), so its post-restore re-export fails. Masking
-   * this attribute makes torch select its two-shot symm-mem kernel,
-   * which round-trips checkpoints. Do NOT set this for NCCL-NVLS or
-   * FlashInfer-fusion workloads: their multicast state is fully
-   * suspend/resumable and the mask would only cost performance. */
-  if (rc == CUDA_SUCCESS && pi &&
-      attrib == CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED && *pi != 0 &&
-      getenv("MCSHIM_HIDE_MULTICAST")) {
-    static int logged;
-    if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
-      mclog(
-          "masking MULTICAST_SUPPORTED=0 (dev %d) per "
-          "MCSHIM_HIDE_MULTICAST=1",
-          dev);
-    *pi = 0;
-  }
   return rc;
 }
 
 /* ------------------------------------------------------------------ */
 /* Legacy CUDA IPC interposition                                      */
 /*                                                                    */
-/* In job mode -- the only mode where legacy IPC is checkpointable at  */
-/* all -- a live import is the sole thing blocking restore. Exporting  */
-/* is fine and needs no teardown; the importer must close, and reopen  */
+/* A live import fails the per-process restore toggle. Exporting is   */
+/* fine and needs no teardown; the importer must close, and reopen     */
 /* afterwards. (Measured.)                                             */
 /* ------------------------------------------------------------------ */
 
@@ -2526,15 +2430,17 @@ static int do_suspend(void) {
           (unsigned long long)g_alloc[gi].handle);
   }
 
-  /* Multicast-participating UC exporter allocations (opt-in, see
-   * free_uc_exports_enabled): save contents into process memory, unmap
-   * (reservations retained), and RELEASE the allocation, so libcuda
-   * tears down its fabric-registration bookkeeping consistently instead
-   * of carrying a soon-stale cached handle through the checkpoint. Runs
-   * after the group teardown above so every bind referencing the memory
-   * is already unbound. */
+  /* Multicast-bound UC exporter allocations: save contents into process
+   * memory, unmap (reservations retained), and RELEASE the allocation.
+   * An allocation left resident comes back from cuda-checkpoint with
+   * libcuda bookkeeping the driver no longer recognizes, and its next
+   * export fails (OBJECT_NOT_FOUND; measured on R610 with vLLM TP=4 and
+   * torch symmetric memory). Recreating it on resume avoids that, at the
+   * cost of a device->host->device copy (tens of MB per rank). Runs after
+   * the group teardown above so every bind referencing the memory is
+   * already unbound. */
   int uc_freed = 0;
-  for (int gi = 0; free_uc_exports_enabled() && gi < MAXN; gi++) {
+  for (int gi = 0; gi < MAXN; gi++) {
     if (g_alloc[gi].kind != KIND_UC || !g_alloc[gi].has_key) continue;
     if (g_alloc[gi].torn_down) continue; /* fully done by an earlier attempt */
     if (!uc_is_mc_bound(gi)) continue;
@@ -2636,17 +2542,10 @@ static int do_suspend(void) {
    *
    * Closing order does not matter; REOPEN order does, and is replayed
    * from each entry's seq on resume. */
-  int ipc_closed = 0, ipc_live = 0;
+  int ipc_closed = 0;
   for (int i = 0; i < MAXN; i++) {
     if (g_ipc[i].serving) ipc_stop_serving(&g_ipc[i]);
     if (!g_ipc[i].used || !g_ipc[i].is_import) continue;
-    if (!ipc_suspend_enabled()) {
-      /* Left for the driver's job-mode IPC support to carry
-       * across the checkpoint. Counted so the log still says
-       * how much legacy IPC is in play. */
-      ipc_live++;
-      continue;
-    }
     if (g_ipc[i].closed) {
       /* Closed by an earlier attempt (a partial suspend, or a
        * failed resume that never reopened it). Its range and
@@ -2690,15 +2589,6 @@ static int do_suspend(void) {
      * probing classifier was tried and misfires in the high arena;
      * a wrong guess here is loud, not corrupting (live imports can
      * fail the toggle; replayed ones verify their address). */
-    if (g_ipc[i].range_base < ipc_replay_floor()) {
-      ipc_live++;
-      mclog(
-          "SUSPEND: leaving IPC import seq=%d va=0x%llx "
-          "(low-region placement -> unreplayable) live "
-          "for the driver to carry",
-          g_ipc[i].seq, (unsigned long long)g_ipc[i].ptr);
-      continue;
-    }
     CUresult rc = r_cuIpcCloseMemHandle(g_ipc[i].ptr);
     if (rc != CUDA_SUCCESS) {
       mclog("SUSPEND: cuIpcCloseMemHandle(0x%llx) rc=%d",
@@ -2726,7 +2616,6 @@ static int do_suspend(void) {
    * conflating them cost a day of theorizing already. */
   int ipc_held = 0;
   for (int i = 0; i < MAXN; i++) {
-    if (!ipc_suspend_enabled()) break;
     if (!g_ipc[i].used || !g_ipc[i].is_import || !g_ipc[i].closed ||
         !g_ipc[i].range_size)
       continue;
@@ -2771,11 +2660,8 @@ static int do_suspend(void) {
     }
   }
 
-  if (ipc_closed || ipc_live)
-    mclog(
-        "SUSPEND: legacy IPC: %d closed (%d held; replayable), "
-        "%d left live (driver-owned or suspend disabled)",
-        ipc_closed, ipc_held, ipc_live);
+  if (ipc_closed)
+    mclog("SUSPEND: legacy IPC: %d closed (%d held)", ipc_closed, ipc_held);
 
   ctx_probe("suspend-exit");
 
@@ -2783,9 +2669,8 @@ static int do_suspend(void) {
   if (r_cuCtxSynchronize) r_cuCtxSynchronize();
   mclog(
       "SUSPEND done: groups=%d imports=%d uc_freed=%d unmapped=%d "
-      "unbound=%d released=%d ipc_closed=%d ipc_left_live=%d",
-      groups, imports, uc_freed, unmapped, unbound, released, ipc_closed,
-      ipc_live);
+      "unbound=%d released=%d ipc_closed=%d",
+      groups, imports, uc_freed, unmapped, unbound, released, ipc_closed);
   return 0;
 }
 
@@ -2798,173 +2683,6 @@ static int do_suspend(void) {
 /* exporter starts serving (phase 1) before anyone fetches (phase 2), and   */
 /* bindings/mappings that need all handles resolved come last (phase 3).    */
 /* ------------------------------------------------------------------ */
-
-/* ------------------------------------------------------------------ */
-/* Multicast proxy.                                                   */
-/*                                                                    */
-/* On R580, a cuda-checkpoint-restored process can IMPORT a multicast */
-/* group fd, BIND its memory to it, and MAP the multicast VA -- but   */
-/* cuMulticastCreate and cuMulticastAddDevice fail with               */
-/* CUDA_ERROR_INVALID_DEVICE, and cuCtxCreate fails with OOM: the     */
-/* restore blocks fresh device admission at the PROCESS level         */
-/* (measured: gpu_mem_snapshots/phase0/native_mc_after_restore.py).   */
-/* A never-checkpointed helper (mcshim-helper, exec'd here) performs  */
-/* exactly create+attach on the rank's behalf; the group persists     */
-/* once the rank holds its own import (measured:                      */
-/* native_mc_proxy_restore.py), so the helper exits right after the   */
-/* rebuild. Enabled by MCSHIM_MC_PROXY (the gVisor loader sets it).   */
-/* ------------------------------------------------------------------ */
-
-static int g_helper_sock = -1;
-static pid_t g_helper_pid;
-
-static int mc_proxy_enabled(void) {
-  static int v = -1;
-  if (v < 0) v = getenv("MCSHIM_MC_PROXY") != NULL;
-  return v;
-}
-
-/* Resolve the helper binary: $MCSHIM_HELPER, else "mcshim-helper" next to
- * this library. */
-static int helper_path(char* buf, size_t n) {
-  const char* env = getenv("MCSHIM_HELPER");
-  if (env && *env) {
-    snprintf(buf, n, "%s", env);
-    return 0;
-  }
-  Dl_info info;
-  if (!dladdr((void*)&helper_path, &info) || !info.dli_fname) return -1;
-  snprintf(buf, n, "%s", info.dli_fname);
-  char* slash = strrchr(buf, '/');
-  if (!slash) return -1;
-  snprintf(slash + 1, n - (slash + 1 - buf), "mcshim-helper");
-  return 0;
-}
-
-static int helper_start(void) {
-  if (g_helper_sock >= 0) return 0;
-  char path[512];
-  if (helper_path(path, sizeof(path)) != 0) {
-    mclog("RESUME: cannot locate mcshim-helper");
-    return -1;
-  }
-  int sp[2];
-  /* The child's end crosses exec, so no SOCK_CLOEXEC on creation; the
-   * parent's end gets FD_CLOEXEC below. */
-  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) {
-    mclog("RESUME: helper socketpair: %s", strerror(errno));
-    return -1;
-  }
-  pid_t pid = fork();
-  if (pid < 0) {
-    mclog("RESUME: helper fork: %s", strerror(errno));
-    close(sp[0]);
-    close(sp[1]);
-    return -1;
-  }
-  if (pid == 0) {
-    /* Child: exec the helper with only its socket end. The shim in
-     * the child (ld.so.preload) is silenced; the helper resolves
-     * the driver itself. */
-    close(sp[0]);
-    char fdstr[16];
-    snprintf(fdstr, sizeof(fdstr), "%d", sp[1]);
-    setenv("MCSHIM_DISABLE", "1", 1);
-    execl(path, path, fdstr, (char*)NULL);
-    _exit(127);
-  }
-  close(sp[1]);
-  fcntl(sp[0], F_SETFD, FD_CLOEXEC);
-  g_helper_sock = sp[0];
-  g_helper_pid = pid;
-  mclog("RESUME: multicast proxy helper started (pid=%d, %s)", (int)pid, path);
-  return 0;
-}
-
-/* One command round-trip: send line (+ optional fd), await "OK"/"ERR" (+
- * optional fd). Bounded by the resume budget. */
-static int helper_txn(const char* cmd, int fd_send, int* fd_recv) {
-  if (helper_start() != 0) return -1;
-  struct iovec iov = {(void*)cmd, strlen(cmd)};
-  char cbuf[CMSG_SPACE(sizeof(int))];
-  struct msghdr mh;
-  memset(&mh, 0, sizeof(mh));
-  mh.msg_iov = &iov;
-  mh.msg_iovlen = 1;
-  if (fd_send >= 0) {
-    mh.msg_control = cbuf;
-    mh.msg_controllen = sizeof(cbuf);
-    struct cmsghdr* c = CMSG_FIRSTHDR(&mh);
-    c->cmsg_level = SOL_SOCKET;
-    c->cmsg_type = SCM_RIGHTS;
-    c->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(c), &fd_send, sizeof(int));
-  }
-  if (sendmsg(g_helper_sock, &mh, 0) < 0) {
-    mclog("RESUME: helper send (%s): %s", cmd, strerror(errno));
-    return -1;
-  }
-  long budget = resume_budget_ms();
-  if (budget <= 0 || budget > 60000) budget = 60000;
-  struct pollfd pfd = {g_helper_sock, POLLIN, 0};
-  int pr = poll(&pfd, 1, (int)budget);
-  if (pr <= 0) {
-    mclog("RESUME: helper reply timeout (%s)", cmd);
-    return -1;
-  }
-  char rbuf[128];
-  struct iovec riov = {rbuf, sizeof(rbuf) - 1};
-  char rcbuf[CMSG_SPACE(sizeof(int))];
-  memset(&mh, 0, sizeof(mh));
-  mh.msg_iov = &riov;
-  mh.msg_iovlen = 1;
-  mh.msg_control = rcbuf;
-  mh.msg_controllen = sizeof(rcbuf);
-  ssize_t r = recvmsg(g_helper_sock, &mh, MSG_CMSG_CLOEXEC);
-  if (r <= 0) {
-    mclog("RESUME: helper died (%s)", cmd);
-    return -1;
-  }
-  rbuf[r] = 0;
-  if (fd_recv) {
-    *fd_recv = -1;
-    for (struct cmsghdr* c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c))
-      if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS)
-        memcpy(fd_recv, CMSG_DATA(c), sizeof(int));
-  }
-  if (strncmp(rbuf, "OK", 2) != 0) {
-    mclog("RESUME: helper %s -> %s", cmd, rbuf);
-    return -1;
-  }
-  return 0;
-}
-
-static void helper_stop(void) {
-  if (g_helper_sock < 0) return;
-  /* Best-effort EXIT; EOF on our end makes the helper exit anyway. */
-  ssize_t n = write(g_helper_sock, "EXIT\n", 5);
-  (void)n;
-  close(g_helper_sock);
-  g_helper_sock = -1;
-  if (g_helper_pid > 0) {
-    for (int i = 0; i < 50; i++) {
-      if (waitpid(g_helper_pid, NULL, WNOHANG) != 0) break;
-      struct timespec ts = {0, 100 * 1000 * 1000};
-      nanosleep(&ts, NULL);
-    }
-    g_helper_pid = 0;
-  }
-}
-
-/* Proxy a group's AddDevice list through the helper. */
-static int helper_add_devices(int gi) {
-  for (int d = 0; d < g_alloc[gi].ndev; d++) {
-    char cmd[64];
-    snprintf(cmd, sizeof(cmd), "ADDDEV %d\n", g_alloc[gi].devs[d]);
-    if (helper_txn(cmd, -1, NULL) != 0) return -1;
-  }
-  return 0;
-}
 
 static int resume_reopen_ipc(int p1_ipc);
 
@@ -3016,54 +2734,7 @@ static int do_resume(void) {
        * without recreating, so peers that DID tear down can
        * still refetch during the unwind. */
       CUmemGenericAllocationHandle newmc = g_alloc[gi].handle;
-      int need_serve = 1;
-      if (full[gi] && mc_proxy_enabled()) {
-        /* Pre-R610: create+attach in the helper, then hold
-         * the group via our own import (binds and maps are
-         * measured to work in the restored process). The
-         * HELPER's export fd is also what gets served to
-         * peers: re-exporting an imported group handle from
-         * a restored process fails on R580. */
-        char cmd[160];
-        snprintf(cmd, sizeof(cmd), "CREATE %u %zu %llu %llu\n",
-                 g_alloc[gi].mprop.numDevices, (size_t)g_alloc[gi].mprop.size,
-                 (unsigned long long)g_alloc[gi].mprop.handleTypes,
-                 (unsigned long long)g_alloc[gi].mprop.flags);
-        int mcfd = -1;
-        if (helper_txn(cmd, -1, &mcfd) != 0 || mcfd < 0) {
-          mclog(
-              "RESUME: proxied cuMulticastCreate "
-              "idx=%d failed",
-              gi);
-          return -1;
-        }
-        if (helper_add_devices(gi) != 0) {
-          close(mcfd);
-          return -1;
-        }
-        CUresult rc = r_cuMemImportFromShareableHandle(
-            &newmc, (void*)(intptr_t)mcfd, CU_MEM_HANDLE_TYPE_POSIX_FD);
-        if (rc != CUDA_SUCCESS) {
-          close(mcfd);
-          mclog(
-              "RESUME: import of proxied group "
-              "idx=%d rc=%d",
-              gi, rc);
-          return -1;
-        }
-        alloc_push_aka(&g_alloc[gi], newmc);
-        g_alloc[gi].torn_down = 0;
-        if (g_alloc[gi].has_key) {
-          fcntl(mcfd, F_SETFD, FD_CLOEXEC);
-          if (start_serving(&g_alloc[gi], mcfd) != 0) {
-            close(mcfd);
-            return -1;
-          }
-        } else {
-          close(mcfd);
-        }
-        need_serve = 0;
-      } else if (full[gi]) {
+      if (full[gi]) {
         if (r_cuMulticastCreate(&newmc, &g_alloc[gi].mprop) != CUDA_SUCCESS) {
           mclog(
               "RESUME: cuMulticastCreate idx=%d "
@@ -3076,19 +2747,15 @@ static int do_resume(void) {
          * down, not skip it. */
         g_alloc[gi].torn_down = 0;
       }
-      if (need_serve && g_alloc[gi].has_key && reexport_serve(gi, newmc) != 0)
-        return -1;
+      if (g_alloc[gi].has_key && reexport_serve(gi, newmc) != 0) return -1;
       groups++;
       p1_mc++;
     } else if (g_alloc[gi].kind == KIND_UC) {
       CUmemGenericAllocationHandle h = g_alloc[gi].handle;
       if (g_alloc[gi].uc_content && full[gi]) {
-        /* Freed across the checkpoint (see
-         * free_uc_exports_enabled): recreate with the
-         * original properties -- a FRESH allocation, so
-         * libcuda re-registers it lazily instead of
-         * presenting its stale cached fabric
-         * registration -- re-map at the identical VAs,
+        /* Freed across the checkpoint (see do_suspend):
+         * recreate with the original properties, re-map
+         * at the identical VAs,
          * and restore the saved contents. Must precede
          * the re-export below and this rank's binds in
          * phase 3. */
@@ -3151,8 +2818,6 @@ static int do_resume(void) {
    * starts fetching. */
   int p1_ipc = 0;
   for (int i = 0; i < MAXN; i++) {
-    if (!ipc_suspend_enabled())
-      break; /* no importer will fetch; do not re-export */
     if (!g_ipc[i].used || g_ipc[i].is_import) continue;
     if (g_ipc[i].ctx) r_cuCtxSetCurrent(g_ipc[i].ctx);
     /* The blob a re-export produces differs from the original, so
@@ -3184,24 +2849,6 @@ static int do_resume(void) {
       if (reimport(gi, &newmc) != 0) return -1;
       alloc_push_aka(&g_alloc[gi], newmc);
       g_alloc[gi].torn_down = 0; /* live again */
-      /* Pre-R610: this rank's AddDevice calls must also run in
-       * the helper. Re-exporting our import fails on R580, so
-       * fetch a SECOND fd from the creator (still serving) and
-       * hand that to the helper. */
-      if (mc_proxy_enabled() && g_alloc[gi].ndev > 0) {
-        int fd = fetch_group_fd(&g_alloc[gi], 60 * 1000);
-        if (fd < 0) {
-          mclog(
-              "RESUME: refetch for proxied "
-              "AddDevice idx=%d failed",
-              gi);
-          return -1;
-        }
-        int ok = helper_txn("IMPORT\n", fd, NULL) == 0 &&
-                 helper_add_devices(gi) == 0;
-        close(fd);
-        if (!ok) return -1;
-      }
       groups++;
     } else if (g_alloc[gi].kind == KIND_IMP) {
       if (g_alloc[gi].ctx) r_cuCtxSetCurrent(g_alloc[gi].ctx);
@@ -3229,9 +2876,7 @@ static int do_resume(void) {
     if (g_alloc[gi].ctx) r_cuCtxSetCurrent(g_alloc[gi].ctx);
     if (g_alloc[gi].kind == KIND_MC) {
       CUmemGenericAllocationHandle mc = g_alloc[gi].handle;
-      /* In proxy mode every AddDevice already ran in the helper
-       * (phase 1 for creators, phase 2 for importers). */
-      if (!partial && !mc_proxy_enabled())
+      if (!partial)
         for (int d = 0; d < g_alloc[gi].ndev; d++)
           if (r_cuMulticastAddDevice(mc, g_alloc[gi].devs[d]) != CUDA_SUCCESS) {
             mclog(
@@ -3361,9 +3006,6 @@ static void ipc_release_target_holds(void) {
 static int resume_reopen_ipc(int p1_ipc) {
   int ipc_reopened = 0, ipc_moved = 0, ipc_replaced = 0;
   int nplugs = 0;
-  if (!ipc_suspend_enabled())
-    return 0; /* nothing was torn down, so nothing to rebuild */
-
   for (int pass_seq = 0; pass_seq < g_ipc_seq; pass_seq++) {
     for (int i = 0; i < MAXN; i++) {
       if (!g_ipc[i].used || !g_ipc[i].is_import || !g_ipc[i].closed ||
@@ -4194,10 +3836,6 @@ static void* control_thread(void* arg) {
          * edge converges once the underlying cause
          * clears. */
         rc = do_resume();
-        /* The multicast-proxy helper (if any) is only
-         * needed while the rebuild runs; the groups
-         * persist through this process's imports. */
-        helper_stop();
         if (rc == 0) gate_disarm();
       }
       pthread_mutex_unlock(&g_lock);
