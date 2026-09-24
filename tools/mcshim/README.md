@@ -114,10 +114,10 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 
 ## Restoring onto different GPUs
 
-The interposer needs nothing special: the sentry keeps sandbox-visible
-device minors what they were before the checkpoint and translates them to
-the new host minors at open time, so freshly exec'd processes that open
-devices by name reach the GPUs the sandbox now owns.
+The interposer needs nothing special. runsc creates `/dev/nvidia#` files for
+the GPUs the restored container is given, rebinds open device FDs to them,
+and passes `cuda-checkpoint --device-map` so CUDA state is restored onto the
+new devices; the interposer's rebuild then runs against them.
 
 ## Design summary
 

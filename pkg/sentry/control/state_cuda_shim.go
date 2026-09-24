@@ -117,7 +117,7 @@ const (
 
 	// cudaShimDirKey records, in the checkpoint, the rendezvous directory of
 	// an interposer that was suspended. Its presence is what tells
-	// postResumeCuda that a rebuild is owed, and carrying the directory
+	// postRestoreCuda that a rebuild is owed, and carrying the directory
 	// itself keeps the rebuild independent of how the container's
 	// environment is reconstructed.
 	cudaShimDirKey = "cuda-multicast-shim-dir"

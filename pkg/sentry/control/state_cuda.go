@@ -17,6 +17,7 @@ package control
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"slices"
 	"sort"
@@ -104,8 +105,8 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	// (the cuda-checkpoint invocations) are exempt; once collected, so are the
 	// checkpointed processes (a failure-path `--action restore` recreates
 	// their RM clients). The gate stays closed through the save and is opened
-	// by postResumeCuda; fail() opens it on the paths that return the
-	// application to running without going through postResumeCuda.
+	// by postRestoreCuda; fail() opens it on the paths that return the
+	// application to running without going through postRestoreCuda.
 	isExec := func(tg *kernel.ThreadGroup) bool {
 		leader := tg.Leader()
 		return leader != nil && leader.Origin == kernel.OriginExec
@@ -283,11 +284,10 @@ func cudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string
 	return procs
 }
 
-func postRestoreCuda(k *kernel.Kernel, timeline *timing.Timeline) error {
-	return postResumeCuda(k, timeline)
-}
-
-func postResumeCuda(k *kernel.Kernel, timeline *timing.Timeline) error {
+// postRestoreCuda restores CUDA processes that were checkpointed by
+// preSaveCuda. nvproxyRemapping is non-nil only when called after a restore
+// that remapped GPUs.
+func postRestoreCuda(k *kernel.Kernel, timeline *timing.Timeline, nvproxyRemapping *nvproxy.DeviceRemapping) error {
 	cudaCheckpointPathVal := k.PopCheckpointState(cudaCheckpointPathKey)
 	if cudaCheckpointPathVal == nil {
 		return nil
@@ -301,12 +301,7 @@ func postResumeCuda(k *kernel.Kernel, timeline *timing.Timeline) error {
 	// already open, since it is not saved.)
 	nvproxy.OpenCudaAdmission(k.VFS())
 	timeline.Reached("starting cuda-ckpt")
-	// No --device-map is passed to cuda-checkpoint: restoring onto a different
-	// GPU set is handled by nvproxy's device remapping (runsc/boot/nvproxy.go,
-	// nvproxy.DeviceRemapping), which keeps the sandbox-visible device minors
-	// stable and translates them at the RM boundary, so cuda-checkpoint sees
-	// the same devices it checkpointed. (b/460451448)
-	err := restoreCudaProcs(k.SupervisorContext(), k, cudaCheckpointPath, cudaProcs, timeline, cudaCheckpointSequential)
+	err := restoreCudaProcs(k.SupervisorContext(), k, cudaCheckpointPath, cudaProcs, timeline, cudaCheckpointSequential, nvproxyRemapping)
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {
 		tg.SigsegvUnlock()
@@ -715,30 +710,74 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 	return nil
 }
 
-// restoreCudaProcs resumes all CUDA processes in cudaProcs, the inverse of
-// checkpointCudaProcs.
+// cudaCheckpointDeviceMap returns the value to pass to cuda-checkpoint's
+// --device-map flag to restore CUDA state checkpointed on dr's old devices
+// onto its new devices, in the format "oldUuid1=newUuid1,oldUuid2=newUuid2".
+// cuda-checkpoint requires the map to list all checkpointed devices, so all
+// saved devices are included even if only some are remapped. It returns ""
+// if dr is nil or an identity, in which case no device map is needed.
+func cudaCheckpointDeviceMap(dr *nvproxy.DeviceRemapping) (string, error) {
+	if dr == nil {
+		return "", nil
+	}
+	identity := true
+	pairs := make([]string, 0, len(dr.OldDeviceByMinor))
+	for _, oldMinor := range slices.Sorted(maps.Keys(dr.OldDeviceByMinor)) {
+		oldID := dr.OldDeviceByMinor[oldMinor]
+		newID := dr.NewDeviceByOld[oldID]
+		if oldID.UUID == "" || newID.UUID == "" {
+			return "", fmt.Errorf("nvproxy device has no UUID: %v => %v", oldID, newID)
+		}
+		if oldID.UUID != newID.UUID {
+			identity = false
+		}
+		pairs = append(pairs, oldID.UUID+"="+newID.UUID)
+	}
+	if identity {
+		return "", nil
+	}
+	return strings.Join(pairs, ","), nil
+}
+
+// restoreCudaProcs restores CUDA state in all of the given (currently
+// checkpointed) CUDA processes, the inverse of checkpointCudaProcs. If
+// nvproxyRemapping maps any device to a different one, CUDA state is restored
+// onto the new devices via cuda-checkpoint's --device-map flag.
 //
-// Unlike the save side (which must lock all coupled processes in parallel
-// before checkpointing any), the restore side uses a full per-process --toggle
-// (restore + unlock in one atomic step), sequentially by default.
-//
-// What is measured: splitting restore and unlock into separate all-process
-// phases fails (importer restore hits "unknown error", or resumed ranks hit
-// "unspecified launch failure" on their first kernel launch), and a parallel
-// toggle is no better than a sequential one. What is NOT established is any
-// ordering rule among the members: captured failures fit no exporter-first or
-// position-based pattern, so the sequencing here should be read as "one
-// atomic toggle per process, one at a time", not as a dependency order.
-func restoreCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, timeline *timing.Timeline, sequential bool) error {
+// Failures are not undone: if CUDA can't be restored, the sandbox can't make
+// progress regardless, so the error is simply returned to the caller.
+func restoreCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, timeline *timing.Timeline, sequential bool, nvproxyRemapping *nvproxy.DeviceRemapping) error {
+	deviceMap, err := cudaCheckpointDeviceMap(nvproxyRemapping)
+	if err != nil {
+		return err
+	}
 	start := time.Now()
 	nullFD, cleanup := openCudaCheckpointNullFD(sctx, k)
 	defer cleanup()
-
-	restored, err := runCudaAction(sctx, k, cudaCheckpointPath, cudaProcs, []string{"--toggle"}, !sequential, nullFD)
-	timeline.Reached("cuda toggled to running")
-	if err != nil {
-		return fmt.Errorf("cuda-checkpoint restore toggle failed: %w", err)
+	if deviceMap == "" {
+		// --toggle transitions checkpointed => running in a single invocation.
+		restored, err := runCudaAction(sctx, k, cudaCheckpointPath, cudaProcs, []string{"--toggle"}, !sequential, nullFD)
+		timeline.Reached("cuda toggled to running")
+		if err != nil {
+			return fmt.Errorf("cuda-checkpoint restore toggle failed: %w", err)
+		}
+		log.Infof("cuda-checkpoint restore toggle on %d processes took [%s]", len(restored), time.Since(start))
+		return nil
 	}
-	log.Infof("cuda-checkpoint restore toggle on %d processes took [%s]", len(restored), time.Since(start))
+	// GPU migration via --device-map requires driver >= R580.
+	if major := k.NvidiaDriverVersion.Major(); major < 580 {
+		return fmt.Errorf("GPUs changed across restore, but cuda-checkpoint --device-map requires driver >= R580 (have R%d)", major)
+	}
+	log.Infof("cuda-checkpoint device map: %s", deviceMap)
+	restored, err := runCudaAction(sctx, k, cudaCheckpointPath, cudaProcs, []string{"--action", "restore", "--device-map", deviceMap}, !sequential, nullFD)
+	timeline.Reached("cuda restored")
+	if err != nil {
+		return fmt.Errorf("cuda-checkpoint restore failed: %w", err)
+	}
+	if _, err := runCudaAction(sctx, k, cudaCheckpointPath, restored, []string{"--action", "unlock"}, !sequential, nullFD); err != nil {
+		return fmt.Errorf("cuda-checkpoint unlock failed: %w", err)
+	}
+	timeline.Reached("cuda unlocked")
+	log.Infof("cuda-checkpoint restore+unlock on %d processes took [%s]", len(restored), time.Since(start))
 	return nil
 }

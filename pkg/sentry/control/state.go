@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/fdcollector"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -308,14 +309,14 @@ func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *SaveRestoreExec
 	if err := saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog); err != nil {
 		// preSaveCuda has already released the GPU state, gated the
 		// application, and stashed the checkpoint keys; if the kernel will
-		// resume running, undo all of that -- postResumeCuda is exactly that
+		// resume running, undo all of that -- postRestoreCuda is exactly that
 		// inverse and is a no-op if preSaveCuda did not run. Skip it while the
 		// kernel is paused (the docker flow, where preSaveCuda re-took
 		// docker's pause): exec'd cuda-checkpoint processes would be born
 		// frozen and hang this RPC. The keys survive, and docker's eventual
 		// unpause runs the same inverse via Resume -> PostResume.
 		if saveOpts.Resume && !s.Kernel.IsPaused() {
-			if rerr := postResumeCuda(s.Kernel, nil); rerr != nil {
+			if rerr := postRestoreCuda(s.Kernel, nil, nil); rerr != nil {
 				log.Warningf("Failed to resume CUDA processes after failed save: %v", rerr)
 			}
 		}
@@ -370,13 +371,14 @@ func PostResume(k *kernel.Kernel, timeline *timing.Timeline) error {
 		return err
 	}
 
-	return postResumeCuda(k, timeline)
+	return postRestoreCuda(k, timeline, nil)
 }
 
-// PostRestore is called after restoring the kernel.
+// PostRestore is called after restoring the kernel. nvproxyRemapping, if
+// non-nil, describes how GPUs were remapped by this restore.
 //
 // Precondition: The kernel should be running.
-func PostRestore(k *kernel.Kernel, timeline *timing.Timeline) error {
+func PostRestore(k *kernel.Kernel, timeline *timing.Timeline, nvproxyRemapping *nvproxy.DeviceRemapping) error {
 	if k.IsPaused() {
 		// The kernel is still paused (double-pause can happen with Docker which
 		// calls pause first and then checkpoint command). The final resume command
@@ -396,7 +398,7 @@ func PostRestore(k *kernel.Kernel, timeline *timing.Timeline) error {
 		return err
 	}
 
-	return postRestoreCuda(k, timeline)
+	return postRestoreCuda(k, timeline, nvproxyRemapping)
 }
 
 // SaveRestoreExec creates a new process that executes the save/restore

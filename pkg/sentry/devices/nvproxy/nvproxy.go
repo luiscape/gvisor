@@ -223,28 +223,6 @@ type nvproxy struct {
 	devInfo                DeviceInfo
 	regularDevs            [nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1]*frontendDevice
 
-	// devTransMu guards the device translation state below. It is
-	// deliberately not fdsMu: afterLoad() calls frontendFD.load() while
-	// holding fdsMu, and load() records the translations, so reusing fdsMu
-	// would self-deadlock.
-	devTransMu sync.Mutex `state:"nosave"`
-
-	// devTransRecorded is whether recordDeviceTranslations ran during the
-	// current restore. It distinguishes "another restore hook already recorded
-	// this restore's remapping" from "the translations were loaded from the
-	// statefile", which non-nil maps alone cannot.
-	devTransRecorded bool `state:"nosave"`
-
-	// hostMinorByMinor translates a sandbox-visible regular device minor
-	// number to the host minor number backing it. It is empty until a restore
-	// remaps devices, and only contains entries for minors that moved; absent
-	// entries are identity. It exists because the application's device
-	// namespace must not change across restore: a process that opens
-	// /dev/nvidia0 after being restored onto a different GPU has to reach the
-	// GPU this sandbox is now entitled to, not the one the checkpoint was
-	// taken from. Read by frontendDevice.basename().
-	hostMinorByMinor map[uint32]uint32
-
 	fdsMu       fdsMutex `state:"nosave"`
 	frontendFDs map[*frontendFD]struct{}
 
