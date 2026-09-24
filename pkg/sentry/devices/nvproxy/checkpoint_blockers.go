@@ -23,7 +23,6 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
@@ -35,12 +34,14 @@ import (
 // and NVLS multicast (e.g. NCCL NVLS and PyTorch symmetric memory), and FDs
 // holding exported RM objects (live CUDA IPC).
 
-// blockerClasses are the RM object classes reported as checkpoint blockers.
+// blockerClasses are the RM object classes reported as checkpoint blockers:
+// cuda-checkpoint hangs on NVLink multicast groups (NCCL NVLS, PyTorch
+// symmetric memory) and on imports of another process's fabric memory.
+// NV_MEMORY_FABRIC and NV_MEMORY_EXPORT are not blockers: libcuda allocates
+// them per context and per export, and both checkpoint and restore fine.
 var blockerClasses = map[nvgpu.ClassID]struct{}{
-	nvgpu.NV_MEMORY_FABRIC:              {},
 	nvgpu.NV_MEMORY_MULTICAST_FABRIC:    {},
 	nvgpu.NV_MEMORY_FABRIC_IMPORTED_REF: {},
-	nvgpu.NV_MEMORY_EXPORT:              {},
 }
 
 // BlockerKind labels the kind of resource blocking a CUDA checkpoint.
@@ -50,21 +51,12 @@ type BlockerKind string
 const (
 	// BlockerKindMulticast is a live NV_MEMORY_MULTICAST_FABRIC object.
 	BlockerKindMulticast BlockerKind = "multicast"
-	// BlockerKindFabric is a live NV_MEMORY_FABRIC object.
-	BlockerKindFabric BlockerKind = "fabric"
 	// BlockerKindFabricImport is a live NV_MEMORY_FABRIC_IMPORTED_REF object.
 	BlockerKindFabricImport BlockerKind = "fabric-import"
-	// BlockerKindExport is a live NV_MEMORY_EXPORT object.
-	BlockerKindExport BlockerKind = "export"
-	// BlockerKindExportedFD is an open FD holding an exported RM object
-	// (NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT(S)_TO_FD).
-	BlockerKindExportedFD BlockerKind = "exported-fd"
 )
 
-// CheckpointBlocker describes a live driver resource that blocks
-// cuda-checkpoint from checkpointing the sandbox: multicast/fabric RM objects
-// (which cuda-checkpoint cannot serialize) and FDs holding exported RM
-// objects (live CUDA IPC).
+// CheckpointBlocker describes a live RM object that blocks cuda-checkpoint
+// from checkpointing the sandbox.
 type CheckpointBlocker struct {
 	ClientHandle nvgpu.Handle
 	ObjectHandle nvgpu.Handle
@@ -82,12 +74,8 @@ func blockerKind(class nvgpu.ClassID) BlockerKind {
 	switch class {
 	case nvgpu.NV_MEMORY_MULTICAST_FABRIC:
 		return BlockerKindMulticast
-	case nvgpu.NV_MEMORY_FABRIC_IMPORTED_REF:
-		return BlockerKindFabricImport
-	case nvgpu.NV_MEMORY_EXPORT:
-		return BlockerKindExport
 	default:
-		return BlockerKindFabric
+		return BlockerKindFabricImport
 	}
 }
 
@@ -105,7 +93,6 @@ func CheckpointBlockers(vfsObj *vfs.VirtualFilesystem) []CheckpointBlocker {
 func (nvp *nvproxy) checkpointBlockers() []CheckpointBlocker {
 	var out []CheckpointBlocker
 
-	// Fabric/multicast RM objects.
 	nvp.clientsMu.RLock()
 	clients := make([]*rootClient, 0, len(nvp.clients))
 	for _, c := range nvp.clients {
@@ -129,22 +116,6 @@ func (nvp *nvproxy) checkpointBlockers() []CheckpointBlocker {
 		}
 		client.objsMu.Unlock()
 	}
-
-	// FDs holding exported RM objects (NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD).
-	// The blocker disappears when the FD is closed (removed from frontendFDs).
-	nvp.fdsMu.Lock()
-	for fd := range nvp.frontendFDs {
-		for _, eo := range fd.exportedObjs {
-			out = append(out, CheckpointBlocker{
-				ClientHandle: eo.client,
-				ObjectHandle: eo.object,
-				Class:        eo.class,
-				TaskID:       eo.taskID,
-				Kind:         BlockerKindExportedFD,
-			})
-		}
-	}
-	nvp.fdsMu.Unlock()
 
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].ClientHandle.Val != out[j].ClientHandle.Val {
@@ -200,7 +171,6 @@ type exportedObjInfo struct {
 	client nvgpu.Handle
 	object nvgpu.Handle
 	class  nvgpu.ClassID
-	taskID int32
 }
 
 // exportedObjInfoLocked returns the exported object in the lowest slot of fd,
@@ -334,10 +304,6 @@ func ctrlClientExportObjectsToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS
 // the given client (attributed to objectH, which may be a zero handle if
 // unknown).
 func markExportedObjFD(fi *frontendIoctlState, fd *frontendFD, slot uint16, clientH, objectH nvgpu.Handle) {
-	var taskID int32
-	if t := kernel.TaskFromContext(fi.ctx); t != nil {
-		taskID = int32(t.ThreadGroup().ID())
-	}
 	var class nvgpu.ClassID
 	nvp := fi.fd.dev.nvp
 	if objectH.Val != 0 {
@@ -356,7 +322,6 @@ func markExportedObjFD(fi *frontendIoctlState, fd *frontendFD, slot uint16, clie
 		client: clientH,
 		object: objectH,
 		class:  class,
-		taskID: taskID,
 	}
 	nvp.fdsMu.Unlock()
 }

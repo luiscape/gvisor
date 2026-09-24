@@ -309,20 +309,11 @@ func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *SaveRestoreExec
 		// preSaveCuda has already released the GPU state, gated the
 		// application, and stashed the checkpoint keys; if the kernel will
 		// resume running, undo all of that -- postResumeCuda is exactly that
-		// inverse and is a no-op if preSaveCuda did not run. Mark the save as
-		// failed first so postResumeCuda treats this as failure recovery
-		// (replay host-freed FLA registrations) rather than out-of-scope
-		// resume-after-save. Skip the inverse itself while the kernel is
-		// paused (the docker flow, where preSaveCuda re-took docker's pause):
-		// exec'd cuda-checkpoint processes would be born frozen and hang this
-		// RPC. The keys -- including the failure marker -- survive, and
-		// docker's eventual unpause runs the same inverse via Resume ->
-		// PostResume. (preSaveCuda clears a stale marker at the start of the
-		// next attempt, so a failure here cannot leak into a later successful
-		// image and misroute its restore into the recovery branch.)
-		if saveOpts.CudaCheckpointPath != "" {
-			s.Kernel.AddStateToCheckpoint(cudaSaveFailedKey, true)
-		}
+		// inverse and is a no-op if preSaveCuda did not run. Skip it while the
+		// kernel is paused (the docker flow, where preSaveCuda re-took
+		// docker's pause): exec'd cuda-checkpoint processes would be born
+		// frozen and hang this RPC. The keys survive, and docker's eventual
+		// unpause runs the same inverse via Resume -> PostResume.
 		if saveOpts.Resume && !s.Kernel.IsPaused() {
 			if rerr := postResumeCuda(s.Kernel, nil); rerr != nil {
 				log.Warningf("Failed to resume CUDA processes after failed save: %v", rerr)
