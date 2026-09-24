@@ -56,10 +56,6 @@ const (
 	// cannot be quiesced until its peers are too), so this must be generous.
 	cudaLockTimeoutMS = 30000
 
-	// cudaBlockerPollInterval is how often the checkpoint-blocker gate
-	// re-polls nvproxy for live blockers before giving up.
-	cudaBlockerPollInterval = 500 * time.Millisecond
-
 	// cudaLockGateAttempts bounds how many times the (gate, lock) pair is
 	// retried when the lock cannot quiesce every rank. Only meaningful with
 	// the multicast interposer, whose gate is what gets released between
@@ -70,14 +66,6 @@ const (
 	// attempts, giving in-flight collectives time to complete.
 	cudaLockGateRetryDelay = 500 * time.Millisecond
 )
-
-// DefaultCudaBlockerTimeout is the default for SaveOpts.CudaBlockerTimeout:
-// how long preSaveCuda waits for checkpoint blockers (multicast/fabric
-// objects, exported-object FDs) to disappear before failing the checkpoint.
-// Blockers only disappear if the application tears the resources down itself,
-// so a short default just bounds the wait; nvproxy-driven multicast suspend
-// (which removes the blockers) is a separate, later step.
-const DefaultCudaBlockerTimeout = 10 * time.Second
 
 func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	if o.CudaCheckpointPath == "" {
@@ -99,17 +87,14 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	}
 	sctx := k.SupervisorContext()
 
-	// Close the CUDA admission gate BEFORE collecting the process set, so no
-	// process can acquire its first GPU state between the collection and the
-	// end of the save (nvproxy/cuda_admission.go). Sentry-exec'd processes
-	// (the cuda-checkpoint invocations) are exempt; once collected, so are the
-	// checkpointed processes (a failure-path `--action restore` recreates
-	// their RM clients). The gate stays closed through the save and is opened
-	// by postRestoreCuda; fail() opens it on the paths that return the
-	// application to running without going through postRestoreCuda.
+	// Hold CUDA initialization in processes not in the set collected below
+	// until the save completes (postSaveCuda); such processes would otherwise
+	// hold GPU state that cuda-checkpoint never saved. Exempt the exec'd
+	// cuda-checkpoint invocations (and with them any other exec session, which
+	// is not restorable regardless) and, once collected, the processes being
+	// checkpointed, in which cuda-checkpoint allocates RM clients.
 	isExec := func(tg *kernel.ThreadGroup) bool {
-		leader := tg.Leader()
-		return leader != nil && leader.Origin == kernel.OriginExec
+		return tg.Leader().Origin == kernel.OriginExec
 	}
 	nvproxy.CloseCudaAdmission(k.VFS(), isExec)
 	cudaProcs := cudaProcs(sctx, k, o.CudaCheckpointPath, k.NvidiaDriverVersion.Major())
@@ -124,24 +109,21 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		return err
 	}
 
-	// Gate: cuda-checkpoint cannot serialize multicast/fabric memory or live
-	// CUDA IPC exports; attempting to checkpoint with such resources live
-	// hangs or corrupts the snapshot. Poll (the app may be tearing them down)
-	// and fail loudly with a per-client attribution if they persist.
-	//
-	// Multicast/fabric objects are exempt when the LD_PRELOADed interposer is
-	// present: checkpointCudaProcs drives it to release them between the
-	// cuda-checkpoint lock and checkpoint phases (see state_cuda_shim.go).
-	// All other blockers (e.g. exported fds) always gate.
+	// cuda-checkpoint hangs indefinitely on processes holding NVLink
+	// multicast memory (e.g. NCCL with NVLS), so refuse up front -- unless the
+	// multicast interposer is present, which releases it before
+	// cuda-checkpoint runs (checkpointCudaProcs re-checks afterwards).
 	shimDir := cudaShimDir(k, cudaProcs)
-	if err := waitForCudaCheckpointBlockers(k, o.CudaBlockerTimeout, shimDir != "" /* shimWillRelease */); err != nil {
-		return fail(err)
+	if shimDir == "" {
+		if blockers := nvproxy.CheckpointBlockers(k.VFS()); blockers != "" {
+			return fail(fmt.Errorf("cannot checkpoint CUDA processes holding multicast memory (e.g. NCCL_NVLS_ENABLE=0 to disable NVLS): %s", blockers))
+		}
 	}
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {
 		tg.SigsegvLock()
 	}
-	err := checkpointCudaProcs(sctx, k, o.CudaCheckpointPath, cudaProcs, o.CudaCheckpointSequential, o.CudaBlockerTimeout, shimDir)
+	err := checkpointCudaProcs(sctx, k, o.CudaCheckpointPath, cudaProcs, o.CudaCheckpointSequential, shimDir)
 	if err != nil {
 		// Unwind BEFORE re-pausing (the docker flow): the interposer rebuild
 		// needs the application's shim control threads to run and
@@ -168,43 +150,10 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	return nil
 }
 
-// waitForCudaCheckpointBlockers polls nvproxy for checkpoint blockers until
-// they disappear or timeout elapses, in which case it returns an error
-// attributing the blockers to their owning clients/tasks. When
-// shimWillRelease is true it returns immediately; see gatedBlockers.
-func waitForCudaCheckpointBlockers(k *kernel.Kernel, timeout time.Duration, shimWillRelease bool) error {
-	if timeout <= 0 {
-		timeout = DefaultCudaBlockerTimeout
-	}
-	deadline := time.Now().Add(timeout)
-	var lastLog time.Time
-	blockers := gatedBlockers(nvproxy.CheckpointBlockers(k.VFS()), shimWillRelease)
-	for len(blockers) != 0 {
-		if time.Now().After(deadline) {
-			return fmt.Errorf("cuda-checkpoint cannot proceed: %d resource(s) it cannot serialize are still live after %s: %s",
-				len(blockers), timeout, nvproxy.FormatBlockersByClient(blockers))
-		}
-		// Rate-limit: with a long user-set timeout, logging the full blocker
-		// list every poll would flood the log.
-		if time.Since(lastLog) >= 5*time.Second {
-			lastLog = time.Now()
-			log.Infof("Waiting for CUDA checkpoint blockers to be released: %s", nvproxy.FormatBlockersByClient(blockers))
-		}
-		time.Sleep(cudaBlockerPollInterval)
-		blockers = gatedBlockers(nvproxy.CheckpointBlockers(k.VFS()), shimWillRelease)
-	}
-	return nil
-}
-
-// gatedBlockers returns the blockers that must gate the checkpoint. When
-// shimWillRelease is true, none do: the interposer's suspend releases every
-// blocker kind later in the checkpoint sequence, and a strict re-check after
-// it catches anything left.
-func gatedBlockers(blockers []nvproxy.CheckpointBlocker, shimWillRelease bool) []nvproxy.CheckpointBlocker {
-	if shimWillRelease {
-		return nil
-	}
-	return blockers
+// postSaveCuda releases processes held by preSaveCuda. It is called after the
+// save regardless of its outcome; a restored kernel has no held processes.
+func postSaveCuda(k *kernel.Kernel) {
+	nvproxy.OpenCudaAdmission(k.VFS())
 }
 
 // cudaProcs returns a list of all CUDA processes in the sandbox. It selects
@@ -295,11 +244,6 @@ func postRestoreCuda(k *kernel.Kernel, timeline *timing.Timeline, nvproxyRemappi
 	cudaCheckpointPath := cudaCheckpointPathVal.(string)
 	cudaCheckpointSequential := k.PopCheckpointState(cudaCheckpointSequentialKey).(bool)
 	cudaProcs := k.PopCheckpointState(cudaProcsKey).([]*kernel.ThreadGroup)
-	// Admit processes that began initializing CUDA during the sequence. The
-	// snapshot is final by now (saved, or failed to save), so new GPU state
-	// can no longer be left out of it. (After a true restore the gate is
-	// already open, since it is not saved.)
-	nvproxy.OpenCudaAdmission(k.VFS())
 	timeline.Reached("starting cuda-ckpt")
 	err := restoreCudaProcs(k.SupervisorContext(), k, cudaCheckpointPath, cudaProcs, timeline, cudaCheckpointSequential, nvproxyRemapping)
 	// FIXME: b/456299722
@@ -576,7 +520,7 @@ func runCudaAction(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath st
 //     checkpointing while its peer keeps spinning waiting for it, deadlocking
 //     the snapshot.
 //  2. Checkpoint all locked processes, releasing their GPU state.
-func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, sequential bool, blockerTimeout time.Duration, shimDir string) error {
+func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, sequential bool, shimDir string) error {
 	start := time.Now()
 	nullFD, cleanup := openCudaCheckpointNullFD(sctx, k)
 	defer cleanup()
@@ -679,12 +623,11 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 			return err
 		}
 		// Verify rather than trust: the interposer acknowledging its suspend
-		// does not by itself prove the process is serializable. Re-run the
-		// gate with nothing exempt, so anything left unreleased fails here
-		// instead of becoming a snapshot that only misbehaves after restore.
-		if err := waitForCudaCheckpointBlockers(k, blockerTimeout, false /* shimWillRelease */); err != nil {
+		// does not by itself prove the process is serializable, and
+		// cuda-checkpoint would hang on anything left unreleased.
+		if blockers := nvproxy.CheckpointBlockers(k.VFS()); blockers != "" {
 			undo(nil)
-			return fmt.Errorf("multicast interposer suspended but resources remain: %w", err)
+			return fmt.Errorf("multicast interposer suspended but resources remain: %s", blockers)
 		}
 		var err error
 		if locked, err = runCudaAction(sctx, k, cudaCheckpointPath, cudaProcs, lockArgs, true /* parallel */, nullFD); err != nil {

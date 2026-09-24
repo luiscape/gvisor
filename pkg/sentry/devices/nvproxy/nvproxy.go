@@ -229,8 +229,6 @@ type nvproxy struct {
 	clientsMu sync.RWMutex `state:"nosave"`
 	clients   map[nvgpu.Handle]*rootClient
 
-	// admission gates first-time GPU state acquisition during a CUDA
-	// checkpoint sequence; see cuda_admission.go.
 	admission cudaAdmission `state:"nosave"`
 }
 

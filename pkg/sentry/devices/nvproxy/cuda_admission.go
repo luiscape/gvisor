@@ -22,42 +22,23 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
-// CUDA admission gate.
+// cudaAdmission gates a process's first RM root client allocation, i.e. CUDA
+// initialization, while a CUDA checkpoint is in progress. A process that
+// initializes CUDA after the checkpoint collected its set of CUDA processes
+// would hold GPU state that cuda-checkpoint never saved; holding it here
+// instead makes it initialize after the save, or after the restore.
 //
-// A CUDA checkpoint sequence (pkg/sentry/control/state_cuda.go) collects the
-// set of CUDA processes, then locks, tears down, and checkpoints them, then
-// saves the sandbox. A process that initializes CUDA AFTER the set was
-// collected -- engines spawn helpers that take seconds to reach cuInit; the
-// window is tens of seconds -- ends up with GPU state that cuda-checkpoint
-// never serialized but that nvproxy's object graph would replay blind on
-// restore, where it fails (a CUDA context cannot be recreated by replaying
-// its RM allocations). This gate removes the race.
-//
-// While the gate is closed, a process's FIRST acquisition of GPU state -- the
-// allocation of an RM root client, which every other RM object descends from
-// -- blocks until the gate opens. A blocked process has no GPU state, so it
-// is saved as an ordinary process sleeping in a syscall; after a restore it
-// retries the allocation against the restored devices and initializes CUDA
-// normally, as if it had started a moment later. Processes the sequence must
-// let through (the cuda-checkpoint invocations themselves, and the processes
-// being checkpointed, which re-allocate their clients on a failure-path
-// restore) are exempted by the caller's predicate.
-//
-// The gate must be open before any interposer rebuild (the rebuild execs a
-// fresh helper process that initializes CUDA), and is deliberately not saved:
-// a checkpointed image is restored into a kernel where no sequence is in
-// progress.
+// Not saved: a restored kernel has no checkpoint in progress.
 type cudaAdmission struct {
 	mu sync.Mutex `state:"nosave"`
-	// closed is non-nil while the gate is closed; it is closed (the channel)
-	// to release every waiter when the gate opens.
-	closed chan struct{}                  `state:"nosave"`
+	// closed is non-nil while the gate is closed, and is closed to release
+	// all waiters when the gate opens.
+	// +checklocks:mu
+	closed chan struct{} `state:"nosave"`
+	// +checklocks:mu
 	exempt func(*kernel.ThreadGroup) bool `state:"nosave"`
 }
 
-// close closes the gate. exempt names the thread groups allowed through; nil
-// exempts none. Closing an already-closed gate replaces the predicate and
-// keeps existing waiters waiting.
 func (a *cudaAdmission) close(exempt func(*kernel.ThreadGroup) bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -67,7 +48,6 @@ func (a *cudaAdmission) close(exempt func(*kernel.ThreadGroup) bool) {
 	a.exempt = exempt
 }
 
-// open opens the gate, releasing every waiter. No-op if already open.
 func (a *cudaAdmission) open() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -78,50 +58,48 @@ func (a *cudaAdmission) open() {
 	}
 }
 
-// wait returns (nil, true) if tg may proceed now, or (ch, false) with the
-// channel that is closed when the gate next opens.
-func (a *cudaAdmission) wait(tg *kernel.ThreadGroup) (<-chan struct{}, bool) {
+// wait returns nil if tg may proceed, or the channel closed when the gate
+// next opens.
+func (a *cudaAdmission) wait(tg *kernel.ThreadGroup) <-chan struct{} {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.closed == nil || (a.exempt != nil && a.exempt(tg)) {
-		return nil, true
+		return nil
 	}
-	return a.closed, false
+	return a.closed
 }
 
-// CloseCudaAdmission closes the admission gate of the nvproxy registered in
-// vfsObj (no-op if nvproxy is not registered). See cudaAdmission.close.
+// CloseCudaAdmission holds CUDA initialization in all processes except those
+// for which exempt returns true, until OpenCudaAdmission is called. It is a
+// no-op if nvproxy is not registered.
 func CloseCudaAdmission(vfsObj *vfs.VirtualFilesystem, exempt func(*kernel.ThreadGroup) bool) {
 	if nvp := nvproxyFromVFS(vfsObj); nvp != nil {
 		nvp.admission.close(exempt)
 	}
 }
 
-// OpenCudaAdmission opens the admission gate, releasing every process blocked
-// in it. No-op if the gate is open or nvproxy is not registered.
+// OpenCudaAdmission releases processes held by CloseCudaAdmission. It is a
+// no-op if the gate is open or nvproxy is not registered.
 func OpenCudaAdmission(vfsObj *vfs.VirtualFilesystem) {
 	if nvp := nvproxyFromVFS(vfsObj); nvp != nil {
 		nvp.admission.open()
 	}
 }
 
-// awaitCudaAdmission blocks t while the admission gate is closed for its
-// thread group. It returns nil once admitted, or ERESTARTNOINTR if the block
-// was interrupted (by a save, or a signal), so that the ioctl is transparently
-// retried -- after the restore, against the restored devices.
+// awaitCudaAdmission blocks t while the gate is closed for its thread group.
+// If the block is interrupted, the ioctl is restarted so that it retries
+// after the save or restore completes.
 func (nvp *nvproxy) awaitCudaAdmission(t *kernel.Task) error {
-	logged := false
-	for {
-		ch, admitted := nvp.admission.wait(t.ThreadGroup())
-		if admitted {
-			return nil
-		}
-		if !logged {
-			logged = true
-			log.Infof("nvproxy: task %d is initializing CUDA during a checkpoint sequence; holding its RM root client allocation until the sequence ends", t.ThreadGroup().ID())
-		}
+	ch := nvp.admission.wait(t.ThreadGroup())
+	if ch == nil {
+		return nil
+	}
+	log.Infof("nvproxy: holding CUDA initialization in PID %d until the in-progress checkpoint completes", t.ThreadGroup().ID())
+	for ch != nil {
 		if err := t.Block(ch); err != nil {
 			return linuxerr.ERESTARTNOINTR
 		}
+		ch = nvp.admission.wait(t.ThreadGroup())
 	}
+	return nil
 }

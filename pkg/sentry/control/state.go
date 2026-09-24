@@ -117,10 +117,6 @@ type SaveOpts struct {
 
 	// RunscVersion is the runsc binary version.
 	RunscVersion string `json:"runsc_version"`
-	// CudaBlockerTimeout is how long to wait for CUDA checkpoint blockers
-	// (multicast/fabric objects, exported-object FDs) to be released before
-	// failing the checkpoint. Zero means a default timeout.
-	CudaBlockerTimeout time.Duration `json:"cuda_blocker_timeout"`
 }
 
 // SaveRestoreExecOpts contains options for executing a binary
@@ -148,7 +144,6 @@ func ConvertToStateSaveOpts(o *SaveOpts) (*state.SaveOpts, error) {
 		Resume:                         o.Resume,
 		CudaCheckpointPath:             o.CudaCheckpointPath,
 		CudaCheckpointSequential:       o.CudaCheckpointSequential,
-		CudaBlockerTimeout:             o.CudaBlockerTimeout,
 	}
 	if err := setSaveOpts(o, saveOpts); err != nil {
 		saveOpts.Close()
@@ -306,7 +301,9 @@ func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *SaveRestoreExec
 	if err := preSave(s.Kernel, saveOpts, execOpts); err != nil {
 		return err
 	}
-	if err := saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog); err != nil {
+	err := saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog)
+	postSaveCuda(s.Kernel)
+	if err != nil {
 		// preSaveCuda has already released the GPU state, gated the
 		// application, and stashed the checkpoint keys; if the kernel will
 		// resume running, undo all of that -- postRestoreCuda is exactly that

@@ -36,12 +36,6 @@ type object struct {
 	parent nvgpu.Handle
 	impl   objectImpl
 
-	// taskID is the thread group ID (in the thread group's own PID namespace,
-	// i.e. container-relative) of the task that allocated this object, or 0 if
-	// unknown. It attributes checkpoint blockers to an application process
-	// (e.g. a tensor-parallel rank) for logging; see CheckpointBlockers().
-	taskID int32
-
 	// The driver tracks parent/child relationships and "arbitrary dependency"
 	// relationships between objects separately; we treat parent/child
 	// relationships as equivalent to other dependencies. These fields are
@@ -87,9 +81,6 @@ func (nvp *nvproxy) objAdd(ctx context.Context, client *rootClient, h nvgpu.Hand
 	o.handle = h
 	o.parent = parentH
 	o.impl = oi
-	if t := kernel.TaskFromContext(ctx); t != nil {
-		o.taskID = int32(t.ThreadGroup().ID())
-	}
 	if _, ok := client.resources[h]; ok {
 		ctx.Warningf("nvproxy: handle %v:%v already in use", client.handle, h)
 	}
@@ -390,12 +381,16 @@ type rootClient struct {
 	released     bool
 
 	params capturedRmAllocParams
+
+	// tgid is the thread group that allocated the client, for diagnostics.
+	tgid kernel.ThreadID
 }
 
-func newRootClient[Params any](fd *frontendFD, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *Params) *rootClient {
+func newRootClient[Params any](fd *frontendFD, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *Params, tgid kernel.ThreadID) *rootClient {
 	return &rootClient{
 		resources: make(map[nvgpu.Handle]*object),
 		params:    captureRmAllocParams(fd, ioctlParams, rightsRequested, allocParams),
+		tgid:      tgid,
 	}
 }
 

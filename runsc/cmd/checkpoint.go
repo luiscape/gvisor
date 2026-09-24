@@ -42,7 +42,6 @@ type Checkpoint struct {
 	excludeCommittedZeroPages bool
 	cudaCheckpointPath        string
 	cudaCheckpointSequential  bool
-	cudaBlockerTimeout        time.Duration
 	saveRestoreExecArgv       string
 	saveRestoreExecTimeout    time.Duration
 	splitFSCheckpointPaths    string
@@ -77,9 +76,8 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.Var(newCheckpointCompressionValue(statefile.CompressionLevelDefault, &c.compression), "compression", "compress checkpoint image on disk. Values: none|flate-best-speed.")
 	f.BoolVar(&c.excludeCommittedZeroPages, "exclude-committed-zero-pages", false, "exclude committed zero-filled pages from checkpoint")
 	f.BoolVar(&c.direct, "direct", false, "use O_DIRECT for writing checkpoint pages file")
-	f.StringVar(&c.cudaCheckpointPath, "cuda-checkpoint-path", "", "path to the cuda-checkpoint binary in the container.")
+	f.StringVar(&c.cudaCheckpointPath, "cuda-checkpoint-path", "", "path to the cuda-checkpoint binary in the container")
 	f.BoolVar(&c.cudaCheckpointSequential, "cuda-checkpoint-sequential", false, "run cuda-checkpoint sequentially in the container")
-	f.DurationVar(&c.cudaBlockerTimeout, "cuda-checkpoint-blocker-timeout", control.DefaultCudaBlockerTimeout, "how long to wait for CUDA checkpoint blockers (multicast/fabric objects, exported-object FDs) to be released before failing the checkpoint")
 	f.StringVar(&c.saveRestoreExecArgv, "save-restore-exec-argv", "", "argv (split by spaces) for a save/restore binary that's automatically executed in the sandbox before saving and after restoring. If the execution fails, the save/restore process will fail.")
 	f.DurationVar(&c.saveRestoreExecTimeout, "save-restore-exec-timeout", control.DefaultSaveRestoreExecTimeout, "timeout for the binary pointed to by save-restore-exec-argv.")
 	f.StringVar(&c.splitFSCheckpointPaths, "fs-checkpoint-paths", "", "comma-separated list of container:path targets to include in the filesystem checkpoint. For capturing all of tmpfs, the value should be \"all-tmpfs\".")
@@ -139,7 +137,6 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		ExcludeCommittedZeroPages:  c.excludeCommittedZeroPages,
 		CudaCheckpointPath:         c.cudaCheckpointPath,
 		CudaCheckpointSequential:   c.cudaCheckpointSequential,
-		CudaBlockerTimeout:         c.cudaBlockerTimeout,
 		SaveRestoreExecArgv:        c.saveRestoreExecArgv,
 		SaveRestoreExecTimeout:     c.saveRestoreExecTimeout,
 		SaveRestoreExecContainerID: cont.ID,

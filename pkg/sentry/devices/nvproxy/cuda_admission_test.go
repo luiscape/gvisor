@@ -20,25 +20,23 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 )
 
-func TestCudaAdmissionGate(t *testing.T) {
+func TestCudaAdmission(t *testing.T) {
 	var a cudaAdmission
-	tg := &kernel.ThreadGroup{}
-	exemptTG := &kernel.ThreadGroup{}
-	isExempt := func(x *kernel.ThreadGroup) bool { return x == exemptTG }
+	exempted := &kernel.ThreadGroup{}
+	held := &kernel.ThreadGroup{}
+	isExempted := func(tg *kernel.ThreadGroup) bool { return tg == exempted }
 
-	// Open by default.
-	if _, ok := a.wait(tg); !ok {
-		t.Fatal("fresh gate should admit")
+	if a.wait(held) != nil {
+		t.Fatal("open gate held a thread group")
 	}
 
-	// Closed: non-exempt waits, exempt passes.
-	a.close(isExempt)
-	ch, ok := a.wait(tg)
-	if ok || ch == nil {
-		t.Fatal("closed gate should hand out a wait channel")
+	a.close(isExempted)
+	ch := a.wait(held)
+	if ch == nil {
+		t.Fatal("closed gate admitted a non-exempt thread group")
 	}
-	if _, ok := a.wait(exemptTG); !ok {
-		t.Fatal("exempt thread group should pass a closed gate")
+	if a.wait(exempted) != nil {
+		t.Fatal("closed gate held an exempt thread group")
 	}
 	select {
 	case <-ch:
@@ -46,25 +44,25 @@ func TestCudaAdmissionGate(t *testing.T) {
 	default:
 	}
 
-	// Re-closing replaces the predicate but keeps the same waiters waiting.
+	// Closing again keeps waiters waiting but may replace the predicate.
 	a.close(nil)
-	if _, ok := a.wait(exemptTG); ok {
-		t.Fatal("replaced predicate should no longer exempt")
+	if a.wait(exempted) == nil {
+		t.Fatal("re-closed gate with no exemptions admitted a thread group")
 	}
-	ch2, _ := a.wait(tg)
-	if ch2 != ch {
-		t.Fatal("re-close must not drop existing waiters (channel changed)")
+	select {
+	case <-ch:
+		t.Fatal("wait channel closed by a second close")
+	default:
 	}
 
-	// Open releases everyone and admits newcomers; a second open is a no-op.
 	a.open()
 	select {
 	case <-ch:
 	default:
 		t.Fatal("open did not release waiters")
 	}
-	if _, ok := a.wait(tg); !ok {
-		t.Fatal("open gate should admit")
+	if a.wait(held) != nil {
+		t.Fatal("reopened gate held a thread group")
 	}
-	a.open()
+	a.open() // no-op
 }

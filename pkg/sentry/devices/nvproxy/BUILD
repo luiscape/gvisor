@@ -44,6 +44,7 @@ go_library(
     srcs = [
         "checkpoint_blockers.go",
         "cuda_admission.go",
+        "exported_objects.go",
         "fds_mutex.go",
         "frontend.go",
         "frontend_mmap.go",
@@ -107,6 +108,7 @@ go_test(
     srcs = [
         "checkpoint_blockers_test.go",
         "cuda_admission_test.go",
+        "exported_objects_test.go",
         "nvproxy_test.go",
     ],
     library = ":nvproxy",
