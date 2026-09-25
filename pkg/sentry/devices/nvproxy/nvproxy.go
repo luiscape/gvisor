@@ -148,16 +148,7 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		nvp.devInfo.FabricIMEXManagementDevMinor = opts.HostSettings.FabricIMEXManagementDevMinor
 	}
 
-	// IMEX channel devices are exposed only together with the
-	// fabric-imex-mgmt capability: IMEX is multi-node (MNNVL) memory-sharing
-	// functionality, the capability that grants its management interface is
-	// deliberately privileged, and native container runtimes only expose
-	// these nodes when IMEX is explicitly requested. (Note that hiding them
-	// does NOT hide the fabric domain from libcuda -- that is signaled by
-	// the RM fabric probe, which stays available to default sandboxes so
-	// single-node NVLS multicast keeps working; see version.go.)
-	if imexChannelCount := opts.HostSettings.IMEXChannelCount(); imexChannelCount != 0 &&
-		opts.DriverCaps&nvconf.CapFabricIMEXManagement != 0 {
+	if imexChannelCount := opts.HostSettings.IMEXChannelCount(); imexChannelCount != 0 {
 		capsIMEXChannelsDevMajor, err := vfsObj.GetDynamicCharDevMajor()
 		if err != nil {
 			return nil, fmt.Errorf("allocating device major number for nvidia-caps-imex-channels: %w", err)
