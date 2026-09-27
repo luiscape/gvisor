@@ -61,14 +61,13 @@ processes sharing one directory.
 | `gate`                | sentry     | created: block GPU submission; removed: unblock (refused while teardown state is outstanding) |
 | `suspend`             | sentry     | created: tear down tracked state; removed: rebuild it          |
 | `present.<pid>`       | shim       | this pid runs a control thread and will ack transitions        |
-| `gated.<pid>` / `ungated.<pid>`     | shim | gate armed / released                            |
+| `gated.<pid>`         | shim       | gate armed                                                     |
 | `suspended.<pid>` / `resumed.<pid>` | shim | teardown / rebuild finished                      |
 | `error.<pid>`         | shim       | the transition in flight failed (sentry fails fast on this)    |
 
-The sentry waits up to 5 minutes for acks; the shim caps its own resume at
-240s (`RESUME_DEADLINE_MS`) so the two sides cannot time out disagreeing. On
-startup the control thread removes any stale acks a dead predecessor with the
-same (reused) pid left behind, then writes `present.<pid>`.
+The sentry waits up to 5 minutes for acks. On startup the control thread
+removes any stale acks a dead predecessor with the same (reused) pid left
+behind, then writes `present.<pid>`.
 
 The `suspend` marker lives in the container filesystem, so it is **part of the
 checkpoint image**: after a restore it still exists, the shim stays suspended
@@ -102,9 +101,7 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 | :----------------------- | :-------------- | :---------------------------------------------------------------- |
 | `MCSHIM_DIR`             | `/tmp/mcshim`   | control/rendezvous directory (the sentry normally sets it)        |
 | `MCSHIM_LOG`             | stderr          | append log to this path instead of stderr                         |
-| `MCSHIM_VERBOSE`         | unset           | per-entry suspend/resume diagnostics (chatty across ranks)        |
 | `MCSHIM_DISABLE`         | unset           | silent: no control thread, acks, or gate (interposition/tracking stay active) |
-
 | `MCSHIM_HOST_BUILD`      | unset           | build.sh: build with the host toolchain instead of docker         |
 | `MCSHIM_BUILD_IMAGE`     | pinned 22.04    | build.sh: alternative base image                                  |
 
@@ -128,8 +125,7 @@ new devices; the interposer's rebuild then runs against them.
     exactly the remaining work.
 *   **Identical-VA guarantee.** Suspend unmaps with `cuMemUnmap` only, never
     `cuMemAddressFree`, so the VA reservations survive the checkpoint; resume
-    maps back into them (re-reserving at the fixed address if a reservation
-    did not survive).
+    maps back into them.
 *   **Freed UC exporters.** A multicast-bound exporter allocation left
     resident across the checkpoint fails its next export after restore with
     OBJECT_NOT_FOUND (measured on R610: vLLM TP=4, torch `_symmetric_memory`).
@@ -138,13 +134,15 @@ new devices; the interposer's rebuild then runs against them.
     VAs, restores contents, and re-exports. Costs a device-host-device copy
     and checkpoint growth of the same size.
 *   **Three-phase cross-rank resume.** (1) every exporter re-creates its
-    object, re-exports it and serves the fd on a unix socket keyed by the
-    original export identity (nvproxy's fdinfo oracle, else `st_dev:st_ino`
-    plus a creation ordinal); (2) importers connect and re-import; (3) binds
-    and mappings are rebuilt. `cuMulticastBindMem` blocks until every device
-    has joined the group, so the binds are the cross-rank barrier. Serving
-    strictly before fetching prevents rank-pair deadlock.
-
+    object, re-exports it and publishes `<pid> <fd>` in `$MCSHIM_DIR` under
+    the original export's identity (nvproxy's fdinfo line); (2) importers
+    copy the fd with `pidfd_getfd(2)` and re-import; (3) binds and mappings
+    are rebuilt. `cuMulticastBindMem` blocks until every device has joined
+    the group, so the binds are the cross-rank barrier. Publishing strictly
+    before fetching prevents rank-pair deadlock. `pidfd_getfd` needs ptrace
+    access, which YAMA denies between sibling processes, so an exporter sets
+    `PR_SET_PTRACER_ANY` while it has fds published: until the sentry removes
+    the `gate` marker after every process has resumed.
 *   **The gate.** While suspended, interposed submission entry points
     (launch/memcpy/memset/stream) block on a condvar instead of touching
     unmapped VAs and faulting the context. All tracked mutators
@@ -155,14 +153,11 @@ new devices; the interposer's rebuild then runs against them.
     entry points and is never gated. While teardown state is outstanding (a
     resume failed partway), the shim refuses to release the gate even if
     the `gate` marker is removed.
-*   **Handle aliasing.** Rebuilds rotate opaque handles; every handle an
-    object ever had is kept in an alias list and stale references are
-    translated (`xlate`). Because the driver reuses handle values, a newly
-    issued value is first purged from every alias list (`aka_purge`) so it
-    can never be misrouted to a dead object. The list holds 16 values
-    (`MAX_AKA`; one rotation per rebuild); on overflow the oldest rotated
-    value is evicted, the original handle is always kept, and the process
-    logs the eviction and refuses further suspends.
+*   **Handle translation.** Rebuilds rotate opaque handles; each object keeps
+    the original handle the application holds, and calls using it are
+    translated (`xlate_mc`). Because the driver reuses handle values, an
+    object whose original handle is issued anew stops translating it, so the
+    value can never be misrouted to a dead object.
 
 ## Threat model
 
@@ -176,9 +171,9 @@ inside the container's trust domain, not gVisor's:
     it could not already do to the app directly, being the same trust domain.
 *   The shim never trusts marker *content*, only existence, so nothing parses
     attacker-controlled bytes out of the control directory.
-*   The rendezvous sockets carry fds/blobs between ranks of one job. Do
-    **not** share one `MCSHIM_DIR` volume across jobs: rendezvous keys could
-    collide and cross-connect unrelated processes.
+*   While fds are published after a restore, any process in the container
+    may ptrace the exporters (`PR_SET_PTRACER_ANY`). Do **not** share one
+    `MCSHIM_DIR` volume across jobs: rendezvous keys could collide.
 *   The sentry side (`state_cuda_shim.go`) treats acks as liveness signals
     with timeouts, never as data.
 
@@ -188,11 +183,8 @@ inside the container's trust domain, not gVisor's:
     stream flag, the shim declines to redirect stream-semantics-sensitive
     entries (its wrappers forward to the legacy-stream reals). Such apps are
     not gated on those entries.
-*   **Fork.** A child forked after `cuInit` starts with fresh, empty tracking
-    (correct: CUDA contexts are unusable across fork) and its own gate/locks;
-    inherited rendezvous fds are closed in the child (a serve thread's own
-    dup is unreachable and may linger until exec); it participates in the
-    protocol only if it initializes CUDA itself.
+*   **Fork.** A child forked after `cuInit` cannot use CUDA, so the shim
+    stays inactive in it; inherited published fds are closed.
 *   **A failed resume leaves the application gated.** Deliberately: better
     blocked than corrupt. The shim refuses to release the gate while
     teardown state is outstanding -- the sentry's unwind removing the `gate`

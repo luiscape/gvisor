@@ -93,7 +93,7 @@ flowchart TD
     end
     L --> M
     S <-->|"marker files in MCSHIM_DIR"| M
-    M <-->|"unix sockets: re-exported fds"| P["peer ranks' mcshim"]
+    M <-->|"pidfd_getfd: re-exported fds"| P["peer ranks' mcshim"]
     LC -->|ioctls| N
     CC -->|ioctls| N
     N --> H[host NVIDIA driver]
@@ -101,7 +101,7 @@ flowchart TD
 
 ### The interposer (`tools/mcshim`)
 
-A single C file (~2,400 lines, no CUDA toolkit dependency) that interposes 39
+A single C file (~1,950 lines, no CUDA toolkit dependency) that interposes 39
 CUDA driver entry points, directly and through `cuGetProcAddress`: 23
 submission entry points (launches, copies, memsets) that the gate can block,
 and 16 that track state, initialize, or resolve entry points. It is inert
@@ -120,11 +120,14 @@ until a process calls `cuInit`.
     checkpoint carries) and released, because a resident one fails its next
     export after restore.
 -   **Resume**, in three phases across ranks: every exporter recreates its
-    object, re-exports it, and serves the new fd on a unix socket keyed by the
-    original export's identity; importers connect and re-import; binds and
-    mappings are rebuilt at the original VAs. `cuMulticastBindMem` blocks
-    until every device has joined, so the binds are the cross-rank barrier.
-    Serving strictly before fetching avoids rank-pair deadlock.
+    object, re-exports it, and publishes the new fd number under the original
+    export's identity; importers copy the fd with `pidfd_getfd` and re-import;
+    binds and mappings are rebuilt at the original VAs. `cuMulticastBindMem`
+    blocks until every device has joined, so the binds are the cross-rank
+    barrier. Publishing strictly before fetching avoids rank-pair deadlock.
+    `pidfd_getfd` needs ptrace access, which YAMA denies between sibling
+    processes, so exporters set `PR_SET_PTRACER_ANY` until the sentry removes
+    the gate after every process has resumed.
 -   **Handle aliasing.** Rebuilt objects get new opaque handles; the
     interposer translates the stale handles NCCL and PyTorch keep in their own
     structs.
@@ -134,9 +137,9 @@ until a process calls `cuInit`.
     state after the sentry verified there is none. A failed resume leaves the
     application gated rather than running on inconsistent state.
 
-Settings: `MCSHIM_DIR`, `MCSHIM_LOG`, `MCSHIM_VERBOSE`, `MCSHIM_DISABLE`,
-`MCSHIM_ALLOW_FABRIC` (fabric-handle support is reported as absent by
-default, so frameworks choose POSIX fds).
+Settings: `MCSHIM_DIR`, `MCSHIM_LOG`, `MCSHIM_DISABLE`, `MCSHIM_ALLOW_FABRIC`
+(fabric-handle support is reported as absent by default, so frameworks choose
+POSIX fds).
 
 ### Delivery and injection (runsc)
 
@@ -174,7 +177,7 @@ File                                | Writer      | Meaning
 `gate`                              | sentry      | created: block GPU submission; removed: unblock
 `suspend`                           | sentry      | created: tear down; removed: rebuild
 `present.<pid>`                     | interposer  | this process participates
-`gated.<pid>`, `ungated.<pid>`      | interposer  | gate armed / released
+`gated.<pid>`                       | interposer  | gate armed
 `suspended.<pid>`, `resumed.<pid>`  | interposer  | teardown / rebuild finished
 `error.<pid>`                       | interposer  | the transition failed; the sentry fails fast
 
@@ -203,7 +206,7 @@ sequenceDiagram
     Note over S: restore
     S->>C: one process at a time: toggle, or restore with --device-map, then unlock
     S->>M: remove suspend
-    M->>M: serve, re-import, re-bind, re-map at original VAs
+    M->>M: publish, re-import, re-bind, re-map at original VAs
     M-->>S: resumed.pid
     S->>M: remove gate
 ```
@@ -238,8 +241,8 @@ blocker inventory refuses a checkpoint `cuda-checkpoint` would hang on.
     ```
 
     This is the rendezvous key exporters and importers agree on after
-    restore. Linux precedent: dmabuf and DRM `show_fdinfo`. The interposer
-    falls back to `st_dev:st_ino` plus a creation ordinal without it.
+    restore. Linux precedent: dmabuf and DRM `show_fdinfo`. Without it the
+    interposer refuses the checkpoint.
 
 -   **Device-mapping tracking** on `frontendFD` / `uvmFD` so
     `InvalidateUnsavable` drops device pmas before save (previously #14863,
@@ -265,26 +268,29 @@ attention heads do not split 8 ways.
 
 Workload                                  | GPUs       | Checkpoint (image) | Restore | First inference after restore | vs. cold boot
 ----------------------------------------- | ---------- | ------------------ | ------- | ----------------------------- | -------------
-vLLM TP=2                                 | 0,1        | 9.5 s (12G)        | 1.9 s   | 10.3 s                        | 22x
-vLLM TP=4                                 | 0-3        | 19.6 s (18G)       | 3.5 s   | 16.4 s                        | 14x
-vLLM TP=8                                 | 0-7        | 48.2 s (35G)       | 6.9 s   | 38.1 s                        | 8x
+vLLM TP=2                                 | 0,1        | 8.4 s (12G)        | 1.9 s   | 6.1 s                         | 35x
+vLLM TP=4                                 | 0-3        | 14.4 s (18G)       | 2.8 s   | 11.1 s                        | 22x
+vLLM TP=8                                 | 0-7        | 38.7 s (35G)       | 5.4 s   | 27.1 s                        | 11x
 vLLM TP=2                                 | 0,1 -> 4,5 | 8.5 s (12G)        | 2.0 s   | 6.4 s                         | 34x
-vLLM TP=4                                 | 0-3 -> 4-7 | 14.6 s (18G)       | 2.8 s   | 12.0 s                        | 20x
-vLLM TP=2                                 | 0,1 -> 1,2 | 8.7 s (12G)        | 1.9 s   | 6.3 s                         | 35x
-SGLang TP=4                               | 0-3        | 14.7 s (17G)       | 2.9 s   | 11.2 s                        | 15x
+vLLM TP=4                                 | 0-3 -> 4-7 | 14.4 s (18G)       | 2.9 s   | 12.1 s                        | 20x
+vLLM TP=2                                 | 0,1 -> 1,2 | 8.5 s (12G)        | 1.9 s   | 6.3 s                         | 34x
+SGLang TP=4                               | 0-3        | 14.5 s (17G)       | 2.7 s   | 10.9 s                        | 15x
 SGLang TP=4                               | 0-3 -> 4-7 | 14.6 s (17G)       | 2.7 s   | 11.8 s                        | 14x
-SGLang TP=4 `--enable-nccl-nvls`          | 0-3        | 14.8 s (17G)       | 2.7 s   | 10.9 s                        | 15x
+SGLang TP=4 `--enable-nccl-nvls`          | 0-3        | 14.7 s (17G)       | 2.7 s   | 11.1 s                        | 15x
 SGLang TP=4 `--enable-torch-symm-mem`     | 0-3        | 14.8 s (17G)       | 2.7 s   | 11.1 s                        | 15x
-SGLang TP=4 FlashInfer all-reduce fusion  | 0-3        | 16.2 s (18G)       | 2.8 s   | 11.9 s                        | 14x
-SGLang TP=4 FlashInfer all-reduce fusion  | 0-3 -> 4-7 | 16.3 s (18G)       | 2.8 s   | 12.9 s                        | 13x
-SGLang TP=4 `--enable-nccl-nvls`          | 0-3 -> 4-7 | 14.7 s (17G)       | 2.7 s   | 12.0 s                        | 14x
-SGLang TP=4 `--enable-torch-symm-mem`     | 0-3 -> 4-7 | 14.8 s (17G)       | 2.7 s   | 12.1 s                        | 14x
-SGLang TP=8                               | 0-7        | 42.2 s (33G)       | 5.2 s   | 26.9 s                        | 7x
+SGLang TP=4 FlashInfer all-reduce fusion  | 0-3        | 16.1 s (18G)       | 2.8 s   | 12.0 s                        | 14x
+SGLang TP=4 FlashInfer all-reduce fusion  | 0-3 -> 4-7 | 16.2 s (18G)       | 2.8 s   | 13.0 s                        | 13x
+SGLang TP=4 `--enable-nccl-nvls`          | 0-3 -> 4-7 | 14.6 s (17G)       | 2.7 s   | 12.1 s                        | 14x
+SGLang TP=4 `--enable-torch-symm-mem`     | 0-3 -> 4-7 | 14.8 s (17G)       | 2.7 s   | 11.9 s                        | 14x
+SGLang TP=8                               | 0-7        | 41.3 s (33G)       | 5.2 s   | 26.7 s                        | 7x
 
 Timings are from a single run; repeat runs on this host varied by up to about
-30%, and the first runs of a batch were the slowest. The interposer's share is
-small: arming the gate takes about 0.1 s, teardown 0.2 to 1.2 s, and the
-rebuild 0.9 to 1.6 s at TP=2 and TP=4 and about 4 s at TP=8.
+30%. The interposer's share is small: arming the gate takes about 0.1 s,
+teardown 0.1 to 0.7 s, and the rebuild 0.9 to 1.6 s at TP=2 and TP=4 and
+about 4 s at TP=8. vLLM TP=4, SGLang TP=4 with symmetric memory, and the
+vLLM TP=2 cross-GPU restore also pass in containers without
+`CAP_SYS_PTRACE`, where `pidfd_getfd` relies on the exporters'
+`PR_SET_PTRACER_ANY`.
 
 Job mode requires running `cuda-checkpoint` one process at a time. Against
 running it in parallel (which an earlier version allowed; see
@@ -309,7 +315,8 @@ tests, including one that pins the fdinfo line format.
     FlashInfer. Each would need its own patch, maintained against upstream.
 -   **`cuda-checkpoint` job mode alone** (`--launch-job`, R610). It carries
     legacy IPC, but still hangs on multicast and fails to restore VMM
-    imports.
+    imports: with the interposer handling only multicast, vLLM TP=4's restore
+    fails with `invalid argument` on every rank holding VMM imports.
 -   **Legacy IPC in the interposer.** An earlier version replaced each
     `cudaMalloc`'d range the application exported, at its original address,
     by an exported VMM allocation, making legacy IPC ordinary VMM IPC. It
