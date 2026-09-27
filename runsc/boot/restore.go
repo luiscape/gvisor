@@ -738,6 +738,15 @@ func (r *restorer) calculateWallTimeSavings(s *Savings) error {
 }
 
 func (l *Loader) save(o *control.SaveOpts) error {
+	// Containers run in a cuda-checkpoint job (see setupCudaCheckpointJob) are
+	// checkpointed with the same binary, and jobs must be checkpointed and
+	// restored sequentially.
+	if p := l.root.conf.CUDACheckpointPath; p != "" {
+		if o.CudaCheckpointPath == "" {
+			o.CudaCheckpointPath = p
+		}
+		o.CudaCheckpointSequential = true
+	}
 	saveOpts, err := control.ConvertToStateSaveOpts(o)
 	if err != nil {
 		l.k.OnCheckpointAttempt(err)

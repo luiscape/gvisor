@@ -13,17 +13,11 @@ can checkpoint and restore workloads it otherwise refuses:
 *   **VMM imports.** Live `cuMemImportFromShareableHandle` imports (NCCL P2P
     buffers) cannot be restored either; the shim releases and re-imports them
     the same way, re-fetching the re-exported fd from the exporting rank.
-*   **Legacy CUDA IPC** (`cuIpcGetMemHandle` / `cuIpcOpenMemHandle`, used
-    by the engines' custom all-reduce for `cudaMalloc`'d buffers) is
-    **promoted to VMM IPC** at export time: the exporter's allocation is
-    replaced in place by a `cuMemCreate`'d one at the same VA (contents
-    preserved) and exported as a POSIX fd; the blob handed to the
-    application names that fd, and the importer's `cuIpcOpenMemHandle`
-    imports and maps it. From then on it is the VMM path above, which the
-    shim checkpoints exactly. `MCSHIM_IPC_PROMOTE=0` disables promotion, in
-    which case imports are closed before the checkpoint and *replayed*
-    heuristically after it (see below) -- which cannot bring packed imports
-    back.
+
+Legacy CUDA IPC (`cuIpcGetMemHandle` / `cuIpcOpenMemHandle`, used by the
+engines' custom all-reduce) is not the shim's concern: `cuda-checkpoint`
+carries it when the processes share a job, which runsc arranges with
+`--cuda-checkpoint-path`.
 
 Build with `./build.sh` (toolkit-free; runs in a pinned ubuntu:22.04 container
 by default so the result loads under older glibc). The Bazel targets
@@ -94,8 +88,10 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
     process cannot),
 4.  create `suspend`, wait for `suspended.<pid>`,
 5.  verify the checkpoint-blocker set is empty (trust but verify),
-6.  re-lock, `--action checkpoint`, save the sandbox;
-7.  on restore: `--toggle` each process, wait until all report "running",
+6.  re-lock, `--action checkpoint` (one process at a time in job mode), save
+    the sandbox;
+7.  on restore: `--toggle` each process (`--action restore --device-map`
+    then `--action unlock` when the GPUs changed),
 8.  remove `suspend`, wait for `resumed.<pid>`,
 9.  remove `gate` (the shim also releases the gate itself on a successful
     resume).
@@ -108,7 +104,7 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 | `MCSHIM_LOG`             | stderr          | append log to this path instead of stderr                         |
 | `MCSHIM_VERBOSE`         | unset           | per-entry suspend/resume diagnostics (chatty across ranks)        |
 | `MCSHIM_DISABLE`         | unset           | silent: no control thread, acks, or gate (interposition/tracking stay active) |
-| `MCSHIM_IPC_PROMOTE`     | `1`             | promote legacy IPC exports to VMM IPC at export time (0 = legacy close+replay only) |
+
 | `MCSHIM_HOST_BUILD`      | unset           | build.sh: build with the host toolchain instead of docker         |
 | `MCSHIM_BUILD_IMAGE`     | pinned 22.04    | build.sh: alternative base image                                  |
 
@@ -123,13 +119,13 @@ new devices; the interposer's rebuild then runs against them.
 
 *   **Tracking tables.** Fixed-size (`MAXN` = 4096 each): allocations/groups
     (`g_alloc`, with per-object `torn_down`), mappings (`g_map`, per-mapping
-    `suspended`), multicast binds (`g_bind`, per-bind `unbound`), legacy IPC
-    participation (`g_ipc`). This is live state: app-initiated frees drop
-    entries out of the replay set. Any overflow is loud and sticky
-    (`g_track_overflow`): suspend refuses thereafter, failing the checkpoint
-    up front instead of corrupting the restore. The per-entry flags clear as
-    each entry is torn down or rebuilt, making both directions re-enterable
-    after partial failures: a retried edge does exactly the remaining work.
+    `suspended`), multicast binds (`g_bind`, per-bind `unbound`). This is
+    live state: app-initiated frees drop entries out of the replay set. Any
+    overflow is loud and sticky (`g_untracked`): suspend refuses thereafter,
+    failing the checkpoint up front instead of corrupting the restore. The
+    per-entry flags clear as each entry is torn down or rebuilt, making both
+    directions re-enterable after partial failures: a retried edge does
+    exactly the remaining work.
 *   **Identical-VA guarantee.** Suspend unmaps with `cuMemUnmap` only, never
     `cuMemAddressFree`, so the VA reservations survive the checkpoint; resume
     maps back into them (re-reserving at the fixed address if a reservation
@@ -148,30 +144,12 @@ new devices; the interposer's rebuild then runs against them.
     and mappings are rebuilt. `cuMulticastBindMem` blocks until every device
     has joined the group, so the binds are the cross-rank barrier. Serving
     strictly before fetching prevents rank-pair deadlock.
-*   **Legacy IPC promotion.** Why not replay: `cuIpcOpenMemHandle` takes no
-    address hint and the driver's legacy VA allocator is top-down first-fit
-    and refuses an exact-fit hole (measured, `gpu_mem_snapshots/probes/
-    ipc_reopen_probe.py`), so an import whose neighbours abut it never
-    reopens at its VA. Promotion sidesteps the allocator entirely. The
-    promoted range must stay indistinguishable from `cudaMalloc` memory to
-    the application: `cuMemRetainAllocationHandle` reports it as non-VMM
-    (SGLang's custom all-reduce probes that to pick its registration path)
-    and `cuMemFree` of the base releases the VMM object. Buffers whose size
-    is not a 2 MiB multiple (none observed) fall back to the legacy path.
-*   **Legacy IPC replay** (`MCSHIM_IPC_PROMOTE=0`). The rendezvous key is the *original* blob (a
-    re-export produces different bytes, but both sides know the original).
-    Exporters serve the new blob under the old key; importers reopen in
-    ascending original-open order, and since `cuIpcOpenMemHandle` takes no
-    address hint, the shim holds reservations over the closed ranges across
-    the checkpoint and walks stray placements back by plugging lower arena
-    holes one reservation at a time. A reopen that still lands elsewhere
-    fails the resume loudly -- a moved import is silent corruption.
+
 *   **The gate.** While suspended, interposed submission entry points
-    (launch/memcpy/memset/stream, plus the `cuMemAlloc*` family, whose
-    allocations would shift the IPC reopen walk) block on a condvar instead
-    of touching unmapped VAs and faulting the context. All tracked mutators
-    (`cuMemCreate`, `cuMulticast*`, export/import, `cuIpc*`, map/unmap,
-    release) are gated too: a thread reaching one in the unlocked teardown
+    (launch/memcpy/memset/stream) block on a condvar instead of touching
+    unmapped VAs and faulting the context. All tracked mutators
+    (`cuMemCreate`, `cuMulticast*`, export/import, map/unmap, release) are
+    gated too: a thread reaching one in the unlocked teardown
     window would create or free shared state after the strict blocker gate
     verified there was none. The shim's own teardown/rebuild calls the real
     entry points and is never gated. While teardown state is outstanding (a
@@ -224,10 +202,10 @@ inside the container's trust domain, not gVisor's:
     unhealthy.
 *   **Fixed table sizes.** `MAXN` = 4096 entries per table, with loud +
     sticky refusal on overflow rather than silent partial tracking.
-*   **Low-arena legacy imports** (e.g. custom all-reduce signal pads at
-    TP=8) sit in driver-owned regions where no replay can place them, so
-    they cannot cross a checkpoint on these drivers at all; run such
-    workloads with the engine's custom all-reduce disabled.
+*   **Legacy CUDA IPC needs job mode.** Without `--cuda-checkpoint-path`,
+    `cuda-checkpoint --action checkpoint` hangs on processes holding legacy
+    IPC imports (measured: vLLM TP=4 with custom all-reduce). runsc logs a
+    warning at container creation when the interposer is enabled without it.
 *   **Multicast slot contention on restore** manifests as a re-bind timeout
     (binds are the cross-rank barrier, so one rank failing to join blocks
     the rest until the deadline).

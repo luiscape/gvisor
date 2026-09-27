@@ -577,21 +577,10 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 		return fmt.Errorf("cuda-checkpoint lock phase failed: %w", err)
 	}
 
-	// Interposer teardown, sandwiched inside the lock.
-	//
-	// Two constraints collide. The interposer must issue libcuda calls
-	// (cuMemUnmap / cuMulticastUnbind / cuMemRelease), which a locked process
-	// cannot do. But it must not tear multicast down while the application is
-	// still using it, and the application cannot simply be gated first: a rank
-	// gated before submitting its next collective starves peers already
-	// spinning in that collective, so the gate alone deadlocks the drain
-	// (observed with NVLS disabled and a workload with no idle gap).
-	//
-	// cuda-checkpoint's parallel lock is precisely the thing that can quiesce
-	// coupled ranks. So: arm the gate while still locked -- the interposer only
-	// flips a flag and issues no CUDA calls, so this is safe -- then unlock, so
-	// the teardown runs against an already-drained GPU that the application is
-	// barred from touching. Then re-lock for the checkpoint.
+	// Interposer teardown, between two locks. The teardown issues libcuda calls,
+	// which a locked process cannot make, so unlock: the lock has drained the
+	// GPU, and the gate armed in phase 1 keeps the application off it. Then
+	// re-lock for the checkpoint.
 	if shimDir != "" {
 		// undo returns the application to running after a failure in this
 		// window. Unlock FIRST: the unwind's rebuild issues libcuda calls

@@ -385,6 +385,15 @@ type Config struct {
 	// unsupported driver version.
 	NVProxyAllowUnsupportedDriver bool `flag:"nvproxy-allow-unsupported-driver"`
 
+	// CUDACheckpointPath is the path to the cuda-checkpoint binary inside the
+	// container filesystem. On driver R610+, a GPU container's command is
+	// wrapped in `cuda-checkpoint --launch-job` so that its CUDA processes share
+	// a job, which lets cuda-checkpoint carry their CUDA IPC
+	// (cuIpcGetMemHandle) state. Checkpoints then default to this binary and run
+	// it sequentially, as jobs require. See
+	// https://github.com/NVIDIA/cuda-checkpoint#610-features.
+	CUDACheckpointPath string `flag:"cuda-checkpoint-path"`
+
 	// CUDAMulticastShimPath is the path, inside the container filesystem, to
 	// the multicast suspend/resume interposer (mcshim.so). When it is set for
 	// a GPU container (nvproxy enabled) on driver R610+, the container's
@@ -393,7 +402,7 @@ type Config struct {
 	// cuda-checkpoint cannot checkpoint a process holding live multicast
 	// (NV_MEMORY_MULTICAST_FABRIC, 0x00fd) objects, which NCCL NVLS and
 	// torch _symmetric_memory both create. The interposer tracks every
-	// multicast group and CUDA IPC import at the libcuda layer and, when
+	// multicast group and VMM IPC import at the libcuda layer and, when
 	// gVisor tells it to, releases them before the checkpoint and rebuilds
 	// them at byte-identical virtual addresses afterwards -- so application
 	// pointers and captured CUDA graphs stay valid. gVisor drives those two

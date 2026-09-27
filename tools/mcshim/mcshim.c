@@ -14,74 +14,26 @@
  * limitations under the License.
  */
 
-/*
- * mcshim.c -- generic libcuda-level multicast suspend/resume interposer.
+/* mcshim: libcuda-level multicast suspend/resume interposer (see README.md).
  *
- * An LD_PRELOAD shim that interposes the CUDA driver's multicast +
- * virtual-memory-management (VMM) entry points, tracks every multicast group
- * (its handle, participating devices, backing unicast allocations, VA
- * reservations, bindings, and mappings), and on request tears that state
- * down and later rebuilds it -- transparently, for ANY multicast owner (NCCL
- * NVLS, torch _symmetric_memory, raw cuMulticast).
+ * An LD_PRELOAD shim that tracks multicast groups, VMM allocations, exports,
+ * imports, binds and mappings, and on request tears them down and rebuilds them
+ * at identical virtual addresses, for any owner (NCCL NVLS, torch
+ * _symmetric_memory, raw cuMulticast). It works in-process because libcuda
+ * keeps its own bookkeeping: freeing the RM objects from nvproxy leaves libcuda
+ * inconsistent, and the restore fails.
  *
- * Why in-process: freeing the 0x00fd (NV_MEMORY_MULTICAST_FABRIC) objects from
- * nvproxy makes cuda-checkpoint's SAVE succeed but its RESTORE toggle refuse,
- * because libcuda's userspace bookkeeping still lists the multicast allocation.
- * Running the teardown through libcuda (as this shim does) keeps application
- * structs, libcuda tables, and kernel RM state consistent.
+ * The sentry drives it through marker files in $MCSHIM_DIR (see
+ * pkg/sentry/control/state_cuda_shim.go). After a rebuild, exporters serve the
+ * re-exported fd on a unix socket keyed by the original export's identity, and
+ * importers fetch and re-import it. Unicast device memory stays
+ * cuda-checkpoint's responsibility, and so does legacy CUDA IPC (cuIpc*),
+ * which cuda-checkpoint carries when the processes share a job (runsc
+ * --cuda-checkpoint-path).
  *
- * Orchestration (driven by the gVisor sentry; see
- * pkg/sentry/control/state_cuda_shim.go):
- *   (a) the app is quiesced (the gate marker plus cuda-checkpoint's lock),
- *   (b) SUSPEND: unmap MC VAs keeping the reservations -> unbind -> release the
- *       0x00fd handles.  The multicast blocker set is now empty.
- *   (c) cuda-checkpoint checkpoint/restore.
- *   (d) RESUME: recreate the group (new handle) -> re-addDevice -> re-bind the
- *       same (cuda-checkpoint-restored) unicast handles -> re-map at the
- *       IDENTICAL VAs.  Captured CUDA graphs and app pointers stay valid
- * because every VA is byte-identical; only the opaque MC handle changes, which
- *       only teardown paths observe (and the shim translates stale handles).
- *
- * Trigger: a background control thread polls $MCSHIM_DIR for an
- * existence-based marker, which makes the protocol race-free for any number
- * of rank processes sharing the control dir:
- *   "suspend" appears    -> perform (b), ack "suspended.<pid>"
- *   "suspend" disappears -> perform (d), ack "resumed.<pid>"
- * The marker lives in the container's filesystem, so it is part of the
- * checkpoint image: after a restore it still exists and the shim stays
- * suspended until the orchestrator (the sentry) removes it.
- *
- * Multi-process ranks (one process per GPU, the vLLM/SGLang TP topology):
- * rank 0 creates the group and exports it (cuMemExportToShareableHandle);
- * peers import it (cuMemImportFromShareableHandle). The shim records the
- * export/import relationship using the exported object's identity as the
- * rendezvous key (see record_key) -- SCM_RIGHTS passes the same open file
- * description, so exporter and importers observe the same identity. On
- * resume the creator re-exports the recreated group and serves the new fd on
- * a unix socket ($MCSHIM_DIR/mcgrp-<key>.sock); importers reconnect,
- * re-import, and every rank re-adds its device and re-binds.
- * cuMulticastBindMem blocks until all devices have joined, so the binds
- * themselves are the cross-rank barrier. Unicast device memory stays
- * cuda-checkpoint's responsibility; the shim only manages the multicast
- * layer, VMM/legacy-IPC imports, and the VA mappings that reference the
- * released handles.
- *
- * Interposition mechanism: plain LD_PRELOAD symbol interposition only catches
- * calls resolved through the global scope (build-time linking). Real CUDA
- * consumers -- torch, NCCL, ctypes -- dlopen libcuda.so.1 and dlsym the
- * entry points (or use cuGetProcAddress), which bypasses symbol
- * interposition. So the shim ALSO interposes dlsym itself (resolving the
- * real dlsym via dlvsym, which we do not wrap) and cuGetProcAddress/_v2,
- * redirecting lookups of the tracked entry points to the shim's wrappers.
- * A third resolution path exists: the CUDA *runtime*'s public
- * cudaGetDriverEntryPoint[ByVersion] exports (torch >= 2.11 resolves its
- * entire c10 DriverAPI table this way), which reach libcuda through
- * libcudart's internal dlvsym/export-table bootstrap that neither hook
- * sees. The torch->libcudart hop is a normal cross-DSO call, though, so
- * the shim interposes those four cudart exports as well.
- *
- * Build:  ./build.sh   (toolkit-free: CUDA types are declared locally)
- */
+ * Besides symbol interposition, the shim interposes dlsym, cuGetProcAddress and
+ * cudart's cudaGetDriverEntryPoint* resolvers, through which torch, NCCL and
+ * ctypes resolve driver entry points. */
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -100,9 +52,7 @@
 #include <time.h>
 #include <unistd.h>
 
-/* ------------------------------------------------------------------ */
-/* Minimal CUDA driver ABI (x86_64), mirrored from cuda.h.            */
-/* ------------------------------------------------------------------ */
+/* Minimal CUDA driver ABI (x86_64), mirrored from cuda.h. */
 
 typedef int CUresult;
 typedef int CUdevice;
@@ -147,24 +97,12 @@ typedef struct {
   unsigned long long flags;
 } CUmulticastObjectProp;
 
-/* Legacy (pre-VMM) CUDA IPC. A separate API from cuMemExport/Import: it
- * shares cuMemAlloc'd memory through an opaque 64-byte blob rather than an OS
- * handle, and the blob is passed to cuIpcOpenMemHandle BY VALUE. */
-#define CU_IPC_HANDLE_SIZE 64
-
-typedef struct {
-  unsigned char reserved[CU_IPC_HANDLE_SIZE];
-} CUipcMemHandle;
-
-/* ------------------------------------------------------------------ */
-/* Logging                                                            */
-/* ------------------------------------------------------------------ */
+/* Logging. */
 
 static FILE* g_log;
 static pthread_mutex_t g_loglock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Defined with the control thread below; started lazily from cuInit so
- * only real CUDA consumers poll for control markers. */
+/* Started lazily from cuInit, so only CUDA users poll for markers. */
 static void ensure_control_thread(void);
 static void gate_wait(void);
 
@@ -192,34 +130,23 @@ static void mclog(const char* fmt, ...) {
   pthread_mutex_unlock(&g_loglock);
 }
 
-/* ------------------------------------------------------------------ */
-/* Real dlsym: resolved via dlvsym (which we do not interpose), so our
- * own dlsym wrapper below can delegate without recursing.            */
-/* ------------------------------------------------------------------ */
+/* The real dlsym, resolved via dlvsym (not interposed) so that the dlsym
+ * wrapper can delegate without recursing. */
 
 static void* (*real_dlsym)(void*, const char*);
 
 static void init_real_dlsym(void) {
   if (real_dlsym) return;
-  /* glibc >= 2.34 moved dlsym into libc under GLIBC_2.34; older
-   * installs export it as GLIBC_2.2.5 (compat alias also present on
-   * new glibc, but prefer the current version). */
+  /* glibc >= 2.34 exports dlsym as GLIBC_2.34, older glibc as GLIBC_2.2.5. */
   *(void**)(&real_dlsym) = dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
   if (!real_dlsym)
     *(void**)(&real_dlsym) = dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
   if (!real_dlsym) mclog("FATAL: could not resolve real dlsym via dlvsym");
 }
 
-/* ------------------------------------------------------------------ */
-/* Real driver symbol resolution.                                     */
-/*                                                                    */
-/* Resolve against an explicit libcuda.so.1 handle, NOT RTLD_NEXT:    */
-/* consumers commonly dlopen libcuda with RTLD_LOCAL (ctypes, torch), */
-/* which keeps it out of the global scope RTLD_NEXT searches. dlopen  */
-/* of an already-loaded soname just bumps its refcount and returns    */
-/* the same handle. Must use real_dlsym here: the interposed dlsym    */
-/* below would redirect these names back to our own wrappers.         */
-/* ------------------------------------------------------------------ */
+/* Resolve reals against an explicit libcuda.so.1 handle, not RTLD_NEXT:
+ * consumers often dlopen libcuda RTLD_LOCAL. Uses real_dlsym, since the
+ * interposed dlsym would return our own wrappers. */
 
 static void* libcuda_handle(void) {
   static void* h;
@@ -271,16 +198,9 @@ static CUresult (*r_cuMemImportFromShareableHandle)(
 static CUresult (*r_cuCtxGetCurrent)(CUcontext*);
 static CUresult (*r_cuCtxSetCurrent)(CUcontext);
 static CUresult (*r_cuCtxSynchronize)(void);
-static CUresult (*r_cuIpcGetMemHandle)(CUipcMemHandle*, CUdeviceptr);
-static CUresult (*r_cuIpcOpenMemHandle)(CUdeviceptr*, CUipcMemHandle,
-                                        unsigned int);
-static CUresult (*r_cuIpcCloseMemHandle)(CUdeviceptr);
-static CUresult (*r_cuMemGetAddressRange)(CUdeviceptr*, size_t*, CUdeviceptr);
 static CUresult (*r_cuMemcpyDtoH)(void*, CUdeviceptr, size_t);
 static CUresult (*r_cuMemcpyHtoD)(CUdeviceptr, const void*, size_t);
 static CUresult (*r_cuDeviceGetAttribute)(int*, int, CUdevice);
-static CUresult (*r_cuMemAllocReal)(CUdeviceptr*, size_t);
-static CUresult (*r_cuMemFreeReal)(CUdeviceptr);
 
 #define CU_MEM_HANDLE_TYPE_POSIX_FD 0x1
 #define CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED 128
@@ -305,49 +225,14 @@ static void resolve_reals(void) {
   REAL(r_cuCtxSetCurrent, "cuCtxSetCurrent");
   REAL(r_cuCtxSynchronize, "cuCtxSynchronize");
   REAL(r_cuDeviceGetAttribute, "cuDeviceGetAttribute");
-  REAL(r_cuIpcGetMemHandle, "cuIpcGetMemHandle");
-  REAL(r_cuMemAllocReal, "cuMemAlloc_v2");
-  REAL(r_cuMemFreeReal, "cuMemFree_v2");
-  /* cuda.h #defines cuIpcOpenMemHandle to the _v2 ABI; resolve that
-   * first and fall back for drivers that only export the old name. */
-  REAL(r_cuIpcOpenMemHandle, "cuIpcOpenMemHandle_v2");
-  REAL(r_cuIpcOpenMemHandle, "cuIpcOpenMemHandle");
-  REAL(r_cuIpcCloseMemHandle, "cuIpcCloseMemHandle");
-  REAL(r_cuMemGetAddressRange, "cuMemGetAddressRange_v2");
-  REAL(r_cuMemGetAddressRange, "cuMemGetAddressRange");
   REAL(r_cuMemcpyDtoH, "cuMemcpyDtoH_v2");
   REAL(r_cuMemcpyHtoD, "cuMemcpyHtoD_v2");
 }
 
-/* MCSHIM_VERBOSE=1 opts into per-entry suspend/resume diagnostics (which
- * import moved where, reservation outcomes). Off by default: per-entry
- * output across ranks floods the application's stderr. */
+/* MCSHIM_VERBOSE=1 enables per-entry suspend/resume diagnostics. */
 static int mcverbose(void) {
   static int v = -1;
   if (v < 0) v = getenv("MCSHIM_VERBOSE") != NULL;
-  return v;
-}
-
-/* Legacy-IPC promotion (default on; MCSHIM_IPC_PROMOTE=0 disables).
- *
- * cuIpcOpenMemHandle takes no address hint, so a legacy import closed for
- * the checkpoint can only be put back at its VA heuristically, and packed
- * imports (32 MiB at a 32 MiB stride) never come back (measured: the driver
- * refuses an exact-fit hole). VMM imports have no such problem: the shim
- * unmaps them, keeps the VA reservation, and re-maps at resume. So at
- * cuIpcGetMemHandle time the exporter replaces the cuMemAlloc'd buffer with
- * a cuMemCreate'd one at the SAME VA (contents preserved), exports it as a
- * POSIX fd, serves the fd on the rendezvous socket, and hands the caller a
- * blob that names the fd instead of a driver handle. The importer's
- * cuIpcOpenMemHandle recognises the blob, fetches the fd, imports and maps
- * it. Everything downstream is the VMM path this shim already checkpoints
- * exactly. */
-static int ipc_promote_enabled(void) {
-  static int v = -1;
-  if (v < 0) {
-    const char* e = getenv("MCSHIM_IPC_PROMOTE");
-    v = !(e && strcmp(e, "0") == 0);
-  }
   return v;
 }
 
@@ -356,27 +241,17 @@ static int ipc_promote_enabled(void) {
     if (mcverbose()) mclog(__VA_ARGS__); \
   } while (0)
 
-/* ------------------------------------------------------------------ */
-/* Tracked state (the live object graph, at the libcuda layer).       */
-/*                                                                    */
-/* This is live state, not an ioctl log: app-initiated frees/unbinds  */
-/* remove entries, so they drop out of the replay set automatically.  */
-/* ------------------------------------------------------------------ */
+/* Tracked state: the live object graph. Frees remove entries, so freed objects
+ * drop out of the replay set. */
 
-/* Sized for the largest observed footprint with headroom: an SGLang TP=8
- * rank tracks >512 objects (its per-peer buffers scale with world size),
- * which overflowed the previous MAXN of 512 and disabled suspend. Static
- * tables keep the interposer allocation-free on hot paths; at ~200 bytes per
- * entry the four tables cost ~3 MB per process, which is noise next to a
- * CUDA context. */
+/* Static tables (about 3 MB per process) keep hot paths allocation-free. An
+ * SGLang TP=8 rank tracks more than 512 objects. */
 #define MAXN 4096
 #define MAX_AKA 16
 #define MAX_DEV 16
 
-/* KIND_IMP: handle came from cuMemImportFromShareableHandle but has not been
- * classified yet; upgraded to KIND_MC when cuMulticastAddDevice is called on
- * it. (Imports of unicast memory would stay KIND_IMP and are not suspended;
- * cross-rank UC import replay is future work.) */
+/* KIND_IMP is an import; cuMulticastAddDevice on it proves it a multicast group
+ * and makes it KIND_MC. */
 enum { KIND_FREE = 0, KIND_UC = 1, KIND_MC = 2, KIND_IMP = 3 };
 
 typedef struct {
@@ -390,41 +265,26 @@ typedef struct {
   CUmulticastObjectProp mprop; /* KIND_MC */
   int devs[MAX_DEV];           /* KIND_MC: added devices */
   int ndev;
-  /* Cross-process rendezvous identity (KIND_MC/KIND_IMP): the exported
-   * fd's st_dev:st_ino + a per-key ordinal for the (unlikely) case of
-   * key collisions across multiple groups. */
+  /* Rendezvous identity of the export (see record_key). */
   int imported; /* 1 = handle came from an import */
   int has_key;
   unsigned long key_dev, key_ino;
   int key_ord;
-  /* Creator-side, post-resume: the re-exported fd being served to
-   * importers over a unix socket until the next suspend. */
+  /* After a resume: the re-exported fd, served to importers until the next
+   * suspend. */
   int serve_fd;
   int serve_sock;
   int serve_wake; /* write end of the serve thread's stop pipe */
   pthread_t serve_thread;
   char serve_path[104]; /* must fit sockaddr_un.sun_path (108) */
   int serving;
-  /* Multicast-bound KIND_UC exporters freed across the checkpoint (see
-   * do_suspend): device contents saved into process memory
-   * (which the checkpoint carries) for restoration after the recreate.
-   * NULL when no backup is held. */
+  /* Contents of a multicast-bound exporter freed across the checkpoint (see
+   * do_suspend); NULL if none. */
   void* uc_content;
-  /* Set by do_suspend once this object is fully torn down (released on
-   * the device); do_resume rebuilds only objects with this set, so a
-   * resume after a PARTIAL suspend failure unwinds exactly what was torn
-   * down instead of double-creating live objects. Cleared the moment the
-   * object is live again (recreated or re-imported), so a suspend
-   * retried after a FAILED resume tears rebuilt objects back down
-   * instead of skipping them. */
+  /* Set once suspend has released the object; resume rebuilds only these.
+   * Cleared as soon as the object is live again, so retries after a partial
+   * failure redo exactly the remaining work. */
   int torn_down;
-  /* Legacy-IPC promotion (see ipc_promote_export): a cuMemAlloc'd buffer
-   * the application exported with cuIpcGetMemHandle that the shim
-   * replaced, in place, by a VMM allocation at the same VA. promoted_base
-   * is that VA (0 if not promoted); promoted_import marks an import made
-   * on behalf of cuIpcOpenMemHandle of such a buffer. */
-  CUdeviceptr promoted_base;
-  int promoted_import;
 } Alloc;
 
 typedef struct {
@@ -433,16 +293,13 @@ typedef struct {
   size_t size;
   size_t offset;
   int allocIdx; /* index into g_alloc of the mapped handle */
-  /* The access set last applied over this mapping (cuMemSetAccess may
-   * name several devices in one call; all are replayed at resume). */
+  /* Access set last applied to this mapping, replayed at resume. */
 #define MAX_ACCESS 16
   CUmemAccessDesc access[MAX_ACCESS];
   int naccess;
   CUcontext ctx;
-  /* Set by unmap_alloc as each unmap succeeds, so a suspend retried
-   * after a partial failure skips work already done, and a resume after
-   * a partial suspend re-maps exactly what was unmapped. Cleared as
-   * each re-map succeeds and in do_resume's success epilogue. */
+  /* Set as each unmap succeeds, cleared as each re-map succeeds (see
+   * torn_down). */
   int suspended;
 } Mapping;
 
@@ -457,79 +314,38 @@ typedef struct {
   size_t size;
   CUcontext ctx;
   CUdevice dev; /* device hosting the memory (unbind is per-device) */
-  /* Set by do_suspend as each unbind succeeds (see Mapping.suspended
-   * for the rationale); cleared as each re-bind succeeds and in
-   * do_resume's success epilogue. */
+  /* Set as each unbind succeeds, cleared as each re-bind succeeds. */
   int unbound;
 } Bind;
-
-/* Legacy CUDA IPC participation. Kept in its own table rather than folded
- * into Alloc: legacy IPC has no CUmemGenericAllocationHandle to key on (only
- * a device pointer), and none of Alloc's mapping/bind machinery applies.
- *
- * The rendezvous key is the ORIGINAL blob. The blob a re-export produces
- * after a restore is different (measured), so it cannot identify anything
- * across the checkpoint; but both the exporter and its importers saw the
- * same original bytes, which makes those bytes a cross-process name that
- * survives. */
-typedef struct {
-  int used;
-  int is_import;        /* 1 = we opened a peer's handle; 0 = we exported */
-  CUdeviceptr ptr;      /* import: VA from cuIpcOpenMemHandle
-                         * export: the local pointer we exported */
-  CUipcMemHandle blob0; /* the original blob: the rendezvous key */
-  unsigned int flags;   /* import: flags passed to cuIpcOpenMemHandle */
-  CUcontext ctx;
-  int seq; /* open order; imports must be reopened in it */
-  /* Exporter-side serving state (post-resume). */
-  int serving;
-  int serve_sock;
-  char serve_path[104];
-  /* Address reservation held across the checkpoint so the range cannot be
-   * taken while the import is closed (the same trick the VMM path uses --
-   * see remap_alloc's "retained-reservation"). */
-  CUdeviceptr resv;
-  size_t resv_size;
-  /* The mapping's true extent (cuMemGetAddressRange), captured just
-   * before the close; the reopen must land on range_base. */
-  CUdeviceptr range_base;
-  size_t range_size;
-  int closed; /* 1 = closed by suspend, not yet reopened; only these
-               * are reopened, each clearing it as its reopen lands */
-} IpcEnt;
 
 static Alloc g_alloc[MAXN];
 static Mapping g_map[MAXN];
 static Bind g_bind[MAXN];
-static IpcEnt g_ipc[MAXN];
-static int g_ipc_seq;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 /* All accesses are atomic or under g_gate_lock (see the suspend gate). */
 static int g_suspended;
 
-/* Sticky: an object the shim failed to track cannot be torn down at suspend,
- * and an untracked live import turns a restore failure into silent corruption.
- * Set on ANY tracking-table overflow (allocs, mappings, binds, legacy IPC);
- * once set, do_suspend refuses (fail loudly at checkpoint, not after). */
-static int g_track_overflow;
-static const char* g_track_overflow_what; /* which table, for the refusal */
+/* Sticky: some state could not be tracked (a table overflow), so do_suspend
+ * refuses. Must hold g_lock. */
+static int g_untracked;
+static const char* g_untracked_why;
 
-static void track_overflow(const char* what) {
-  if (!g_track_overflow) {
-    g_track_overflow = 1;
-    g_track_overflow_what = what;
+static void mark_untracked(const char* why) {
+  if (!g_untracked) {
+    g_untracked = 1;
+    g_untracked_why = why;
   }
 }
 
 static int alloc_new(void) {
   for (int i = 0; i < MAXN; i++)
     if (g_alloc[i].kind == KIND_FREE) return i;
-  if (!g_track_overflow)
+  if (!g_untracked)
     mclog(
         "FATAL: alloc table full (MAXN=%d); object untracked -- "
         "suspend is disabled for this process",
         MAXN);
-  track_overflow("alloc");
+  mark_untracked("alloc table overflow");
   return -1;
 }
 
@@ -540,12 +356,8 @@ static int alloc_find(CUmemGenericAllocationHandle h) {
   return -1;
 }
 
-/* Translate a possibly-stale handle to its object's current handle. The app
- * (or NCCL) may retain the original handle in its structs; after a resume a
- * multicast group or an imported allocation has a new handle, so rewrite calls
- * that reference an old value. Applied to every kind: it is the identity for
- * objects whose handle did not rotate, and callers cannot always tell which
- * kind a handle belongs to. */
+/* Translate a possibly stale handle to its object's current one: apps and NCCL
+ * keep original handles in their structs, and a rebuild rotates them. */
 static CUmemGenericAllocationHandle xlate_mc(CUmemGenericAllocationHandle h) {
   for (int i = 0; i < MAXN; i++) {
     if (g_alloc[i].kind == KIND_FREE) continue;
@@ -555,17 +367,10 @@ static CUmemGenericAllocationHandle xlate_mc(CUmemGenericAllocationHandle h) {
   return h;
 }
 
-/* Must hold g_lock. Drop handle value h from every object's alias list: the
- * driver reuses handle values, so when a value is issued anew, any alias
- * still carrying it elsewhere is stale. Leaving it would make xlate_mc
- * rewrite a legitimate reference to the new object into a reference to an
- * unrelated one. Application churn makes such collisions routine -- vLLM's
- * sleep/wake releases and re-creates every weight allocation -- and the
- * symptom is some later, unrelated cuMem* call failing ("operation not
- * supported" out of vLLM's own allocator), intermittently and only after a
- * rebuild has created aliases. Called on every newly issued handle, even
- * ones the shim fails to track (table overflow): an untracked handle must
- * not be misrouted through a stale alias either. */
+/* Must hold g_lock. Drop h from every alias list. The driver reuses handle
+ * values, so a stale alias could misroute a call on the new object to an
+ * unrelated one (vLLM's sleep/wake churn makes this routine). Also called for
+ * untracked handles. */
 static void aka_purge(CUmemGenericAllocationHandle h) {
   for (int i = 0; i < MAXN; i++) {
     Alloc* o = &g_alloc[i];
@@ -579,9 +384,8 @@ static void aka_purge(CUmemGenericAllocationHandle h) {
   }
 }
 
-/* Record h as a's current handle, remembering the previous values so that a
- * later call still referring to one of them can be rewritten (see xlate_mc).
- * Must hold g_lock. Purges h from every alias list first (see aka_purge). */
+/* Must hold g_lock. Record h as a's current handle, keeping previous values as
+ * aliases (see xlate_mc) after purging h from every list. */
 static int g_alias_overflow; /* sticky, see alloc_push_aka */
 
 static void alloc_push_aka(Alloc* a, CUmemGenericAllocationHandle h) {
@@ -591,13 +395,8 @@ static void alloc_push_aka(Alloc* a, CUmemGenericAllocationHandle h) {
     a->aka[a->naka++] = h;
     return;
   }
-  /* Every rebuild rotates the handle once, so this takes MAX_AKA-1
-   * restores of one lineage. Evict the OLDEST rotated value but keep
-   * aka[0]: the original handle is what the application and NCCL hold in
-   * their structs, and losing it would misroute their next cuMemUnmap /
-   * cuMemRelease to the wrong object long after the fact. Record the
-   * eviction; do_suspend refuses on it (a further checkpoint of this
-   * lineage could not be replayed faithfully), and the log names it. */
+  /* Each rebuild rotates the handle once. Evict the oldest rotated value but
+   * keep aka[0], the original the app holds; further suspends are refused. */
   if (!g_alias_overflow)
     mclog(
         "WARNING: alias list full (MAX_AKA=%d) for handle 0x%llx; "
@@ -629,9 +428,8 @@ static CUmemGenericAllocationHandle xlate_locked(
   return r;
 }
 
-/* Per-key ordinal: how many other live allocs already carry this key. Lets
- * multiple groups that hash to the same fd identity still rendezvous, as
- * long as ranks create/import them in the same order. */
+/* How many other live allocs carry this key, so that groups with colliding keys
+ * still rendezvous when ranks create them in the same order. */
 static int key_ordinal(unsigned long dev, unsigned long ino, int self) {
   int n = 0;
   for (int i = 0; i < MAXN; i++)
@@ -641,13 +439,12 @@ static int key_ordinal(unsigned long dev, unsigned long ino, int self) {
   return n;
 }
 
-/* Identity oracle: under gVisor, nvproxy exposes the exported RM object's
- * identity in /proc/self/fdinfo/<fd> as
+/* nvproxy reports an exported RM object's identity in /proc/self/fdinfo/<fd>:
+ *
  *   nvproxy_exported_object:\tclient=0x... object=0x... class=0x...
- * The (client, object) pair is globally unique and identical for exporter
- * and every SCM_RIGHTS recipient (same FileDescription), so it scales to
- * arbitrarily many exported objects. Returns 0 and fills client/object on
- * success. */
+ *
+ * The pair is unique, and the same for the exporter and every SCM_RIGHTS
+ * recipient. Returns 0 on success. */
 static int fdinfo_oracle(int fd, unsigned long* client, unsigned long* object) {
   char path[64], line[256];
   snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
@@ -665,12 +462,9 @@ static int fdinfo_oracle(int fd, unsigned long* client, unsigned long* object) {
   return found;
 }
 
-/* Must hold g_lock. Record the rendezvous identity: the nvproxy fdinfo
- * oracle when available (gVisor; scales to any number of objects), else the
- * fd's st_dev:st_ino (native; all NVIDIA export fds are opens of
- * /dev/nvidiactl and share one inode, so only the per-key creation ordinal
- * disambiguates -- fine for few groups only). First key wins: peers
- * rendezvous against the identity of the export they actually received. */
+/* Must hold g_lock. Record the rendezvous identity: nvproxy's fdinfo line if
+ * present, else st_dev:st_ino plus a creation ordinal (all NVIDIA export fds
+ * share one inode, so that only works for a few groups). The first key wins. */
 static void record_key(int i, int fd) {
   unsigned long kd, ki;
   struct stat st;
@@ -692,17 +486,13 @@ static void record_key(int i, int fd) {
   a->key_ord = key_ordinal(kd, ki, i);
 }
 
-/* ------------------------------------------------------------------ */
-/* Interposed entry points                                            */
-/* ------------------------------------------------------------------ */
+/* Interposed entry points. */
 
 CUresult cuInit(unsigned int flags) {
   static CUresult (*real)(unsigned int);
   REAL(real, "cuInit");
   if (!real) return 3; /* CUDA_ERROR_NOT_INITIALIZED */
-  /* Only processes that actually initialize CUDA participate in the
-   * suspend/resume protocol (launchers/helpers that merely load libcuda
-   * must not ack markers). */
+  /* Only processes that initialize CUDA take part in the protocol. */
   ensure_control_thread();
   return real(flags);
 }
@@ -714,16 +504,10 @@ CUresult cuMemCreate(CUmemGenericAllocationHandle* h, size_t size,
                      unsigned long long flags) {
   resolve_reals();
   gate_wait();
-  /* Strip the fabric handle type: it creates an NV_MEMORY_FABRIC (00f8)
-   * object at ALLOCATION time -- before any export -- which
-   * cuda-checkpoint cannot serialize and this shim does not suspend, so
-   * one such allocation blocks every checkpoint. Single-node, fabric
-   * handles buy nothing over POSIX fds (the multicast/NVLS path is
-   * identical), and frameworks request them merely because the device
-   * advertises support (torch >= 2.11 symmetric memory does). Masking
-   * the capability bit in cuDeviceGetAttribute is not sufficient:
-   * statically linked CUDA runtimes reach the driver through paths this
-   * shim cannot interpose, so the request itself must be rewritten. */
+  /* Strip the FABRIC handle type: it creates an NV_MEMORY_FABRIC (00f8) object
+   * at allocation time, which cuda-checkpoint cannot serialize. On a single
+   * node POSIX fds are equivalent. Masking the device attribute is not enough,
+   * since statically linked runtimes bypass it. */
   CUmemAllocationProp fixed;
   if (prop && (prop->requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC) &&
       !getenv("MCSHIM_ALLOW_FABRIC")) {
@@ -750,8 +534,7 @@ CUresult cuMemCreate(CUmemGenericAllocationHandle* h, size_t size,
       a->size = size;
       if (prop) a->uprop = *prop;
     } else {
-      /* Untracked, but its handle value must still not be
-       * misrouted through a stale alias (see aka_purge). */
+      /* Untracked, but still purge stale aliases of its value. */
       aka_purge(*h);
     }
     pthread_mutex_unlock(&g_lock);
@@ -763,12 +546,8 @@ CUresult cuMulticastCreate(CUmemGenericAllocationHandle* h,
                            const CUmulticastObjectProp* prop) {
   resolve_reals();
   gate_wait();
-  /* Same strip as cuMemCreate: a multicast group created with the
-   * FABRIC handle type gets a companion NV_MEMORY_FABRIC (00f8) object
-   * that cuda-checkpoint cannot serialize and that outlives the shim's
-   * multicast teardown (it belongs to the group's fabric export, not to
-   * the binds). torch 2.11 requests FD|FABRIC unconditionally on
-   * fabric-attached systems; single-node, FD-only is equivalent. */
+  /* Same strip as cuMemCreate: a FABRIC-typed group gets an NV_MEMORY_FABRIC
+   * (00f8) companion object that outlives the multicast teardown. */
   CUmulticastObjectProp mfixed;
   if (prop && (prop->handleTypes & CU_MEM_HANDLE_TYPE_FABRIC) &&
       !getenv("MCSHIM_ALLOW_FABRIC")) {
@@ -812,15 +591,10 @@ CUresult cuMemExportToShareableHandle(void* shHandle,
                                       unsigned long long flags) {
   resolve_reals();
   gate_wait();
-  /* Refuse fabric-typed exports. Stripping the handle type at
-   * cuMemCreate is not enough: the driver happily fabric-exports
-   * memory that never requested fabric handles, so torch 2.11's
-   * empirical isFabricSupported probe (create, then export-as-FABRIC)
-   * still succeeds and symm-mem then exchanges CUmemFabricHandles --
-   * one un-serializable NV_MEMORY_FABRIC (00f8) object per pool chunk.
-   * Failing the export makes the probe conclude fabric is unavailable
-   * and fall back to POSIX fds, which the shim fully supports; on a
-   * single node that costs nothing. */
+  /* Refuse fabric exports. The driver fabric-exports memory that never asked
+   * for fabric handles, so torch's export-as-FABRIC probe would succeed and
+   * create one 00f8 object per pool chunk. Failing it makes torch fall back to
+   * POSIX fds. */
   if (type == CU_MEM_HANDLE_TYPE_FABRIC && !getenv("MCSHIM_ALLOW_FABRIC")) {
     static int logged;
     if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
@@ -835,10 +609,8 @@ CUresult cuMemExportToShareableHandle(void* shHandle,
   if (rc == CUDA_SUCCESS && type == CU_MEM_HANDLE_TYPE_POSIX_FD && shHandle) {
     pthread_mutex_lock(&g_lock);
     int i = alloc_find(real_h);
-    /* Record the rendezvous identity for BOTH multicast groups and
-     * unicast allocations: a UC export is a P2P peer buffer whose
-     * importers must re-fetch it after restore, so its exporter
-     * must re-export + serve on resume (has_key drives that). */
+    /* Multicast groups and unicast (P2P) exports alike must be re-exported and
+     * served on resume. */
     if (i >= 0 && (g_alloc[i].kind == KIND_MC || g_alloc[i].kind == KIND_UC)) {
       record_key(i, *(int*)shHandle);
       mclog("track EXPORT idx=%d kind=%d key=%lx:%lx ord=%d", i,
@@ -854,10 +626,7 @@ CUresult cuMemImportFromShareableHandle(CUmemGenericAllocationHandle* h,
                                         void* osHandle, int type) {
   resolve_reals();
   gate_wait();
-  /* Mirror of the export-side refusal: an imported fabric ref is an
-   * NV_MEMORY_FABRIC_IMPORTED_REF (00fb) object, equally
-   * un-serializable. Unreachable when exports are refused too (peers
-   * then never see a fabric handle); kept for defense in depth. */
+  /* Mirror of the export refusal: an imported fabric ref is a 00fb object. */
   if (type == CU_MEM_HANDLE_TYPE_FABRIC && !getenv("MCSHIM_ALLOW_FABRIC")) {
     static int logged;
     if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
@@ -874,8 +643,7 @@ CUresult cuMemImportFromShareableHandle(CUmemGenericAllocationHandle* h,
     if (i >= 0) {
       Alloc* a = alloc_init(i, KIND_IMP, *h);
       a->imported = 1;
-      /* For POSIX-FD imports osHandle is the fd value cast
-       * to void*. */
+      /* For POSIX-FD imports osHandle is the fd. */
       record_key(i, (int)(intptr_t)osHandle);
       mclog(
           "track IMPORT idx=%d handle=0x%llx key=%lx:%lx "
@@ -889,18 +657,10 @@ CUresult cuMemImportFromShareableHandle(CUmemGenericAllocationHandle* h,
   return rc;
 }
 
-/* NVML fabric-info smoothing.
- *
- * torch >= 2.11's isFabricSupported() TORCH_CHECKs that
- * nvmlDeviceGetGpuFabricInfoV returns NVML_SUCCESS and only then inspects
- * fabricInfo.state -- an NVML error is a hard crash, not a fallback. On any
- * stack where the query errors (measured on a sandbox that denied the RM
- * fabric probe; host/driver variance can produce the same), torch dies at
- * symm-mem init. Translate failure into what a fabric-less host reports:
- * NVML_SUCCESS with state=NVML_GPU_FABRIC_STATE_NOT_SUPPORTED (0), which
- * torch handles gracefully. The versioned-struct size travels in the
- * version field's low 24 bits (NVML_STRUCT_VERSION), so the payload can be
- * zeroed exactly. Opt out with MCSHIM_ALLOW_FABRIC=1. */
+/* torch >= 2.11 treats a failing nvmlDeviceGetGpuFabricInfoV as fatal. Report a
+ * failure as NVML_SUCCESS with state NOT_SUPPORTED (0), as a fabric-less host
+ * does. The struct size is in the version's low 24 bits. MCSHIM_ALLOW_FABRIC=1
+ * opts out. */
 static int nvml_fabric_info_smooth(void* info, int rc, const char* via) {
   if (rc == 0 || !info || getenv("MCSHIM_ALLOW_FABRIC")) return rc;
   unsigned int version = *(unsigned int*)info;
@@ -938,17 +698,10 @@ int nvmlDeviceGetGpuFabricInfoV(void* device, void* gpuFabricInfo) {
                                  "nvmlDeviceGetGpuFabricInfoV");
 }
 
-/* Hide fabric-handle support from the application unless explicitly allowed.
- *
- * Memory created with CU_MEM_HANDLE_TYPE_FABRIC becomes an NV_MEMORY_FABRIC
- * (00f8) object that cuda-checkpoint cannot serialize and this shim does not
- * suspend, so it blocks every checkpoint. Frameworks pick the handle type by
- * querying this attribute (torch >= 2.11's symmetric memory prefers fabric
- * handles wherever the device advertises them), and on a single node fabric
- * handles buy nothing over POSIX fds: the multicast/NVLS performance path is
- * identical. Masking the capability steers allocators to fds, which the shim
- * fully supports. MCSHIM_ALLOW_FABRIC=1 restores truthful reporting (e.g.
- * for multi-node, where checkpointing is out of scope anyway). */
+/* Report no fabric-handle support unless MCSHIM_ALLOW_FABRIC=1, so that
+ * frameworks choose POSIX fds. Fabric memory creates 00f8 objects that
+ * cuda-checkpoint cannot serialize, and on a single node fds perform the same.
+ */
 CUresult cuDeviceGetAttribute(int* pi, int attrib, CUdevice dev) {
   resolve_reals();
   CUresult rc = r_cuDeviceGetAttribute(pi, attrib, dev);
@@ -967,499 +720,6 @@ CUresult cuDeviceGetAttribute(int* pi, int attrib, CUdevice dev) {
   return rc;
 }
 
-/* ------------------------------------------------------------------ */
-/* Legacy CUDA IPC interposition                                      */
-/*                                                                    */
-/* A live import fails the per-process restore toggle. Exporting is   */
-/* fine and needs no teardown; the importer must close, and reopen     */
-/* afterwards. (Measured.)                                             */
-/* ------------------------------------------------------------------ */
-
-static int ipc_new(void) {
-  for (int i = 0; i < MAXN; i++)
-    if (!g_ipc[i].used) return i;
-  return -1;
-}
-
-/* Find the live import that owns a device pointer. */
-static int ipc_find_import(CUdeviceptr p) {
-  for (int i = 0; i < MAXN; i++)
-    if (g_ipc[i].used && g_ipc[i].is_import && g_ipc[i].ptr == p) return i;
-  return -1;
-}
-
-static int ipc_find_export(CUdeviceptr p) {
-  for (int i = 0; i < MAXN; i++)
-    if (g_ipc[i].used && !g_ipc[i].is_import && g_ipc[i].ptr == p) return i;
-  return -1;
-}
-
-/* FNV-1a over the original blob: a short, stable, cross-process name for one
- * shared allocation, usable as a socket path. */
-static unsigned long blob_key(const CUipcMemHandle* b) {
-  unsigned long h = 1469598103934665603UL;
-  for (int i = 0; i < CU_IPC_HANDLE_SIZE; i++) {
-    h ^= b->reserved[i];
-    h *= 1099511628211UL;
-  }
-  return h;
-}
-
-static CUresult legacy_ipc_get(CUipcMemHandle* handle, CUdeviceptr dptr) {
-  resolve_reals();
-  gate_wait();
-  CUresult rc = r_cuIpcGetMemHandle(handle, dptr);
-  if (rc != CUDA_SUCCESS || !handle) return rc;
-  pthread_mutex_lock(&g_lock);
-  /* Re-exporting the same pointer is idempotent from our point of view:
-   * keep the FIRST blob, since that is the one peers used as the key. */
-  if (ipc_find_export(dptr) < 0) {
-    int i = ipc_new();
-    if (i >= 0) {
-      IpcEnt* e = &g_ipc[i];
-      memset(e, 0, sizeof(*e));
-      e->used = 1;
-      e->is_import = 0;
-      e->ptr = dptr;
-      e->blob0 = *handle;
-      e->serve_sock = -1;
-      e->seq = g_ipc_seq++;
-      r_cuCtxGetCurrent(&e->ctx);
-      mclog("track IPC-EXPORT idx=%d ptr=0x%llx key=%016lx", i,
-            (unsigned long long)dptr, blob_key(handle));
-    } else {
-      track_overflow("ipc-export");
-      mclog(
-          "IPC-EXPORT table full; ptr=0x%llx UNTRACKED -- "
-          "suspend is disabled for this process",
-          (unsigned long long)dptr);
-    }
-  }
-  pthread_mutex_unlock(&g_lock);
-  return rc;
-}
-
-static CUresult legacy_ipc_open(CUdeviceptr* pdptr, CUipcMemHandle handle,
-                                unsigned int flags) {
-  resolve_reals();
-  gate_wait();
-  CUresult rc = r_cuIpcOpenMemHandle(pdptr, handle, flags);
-  if (rc != CUDA_SUCCESS || !pdptr) return rc;
-  pthread_mutex_lock(&g_lock);
-  int i = ipc_new();
-  if (i >= 0) {
-    IpcEnt* e = &g_ipc[i];
-    memset(e, 0, sizeof(*e));
-    e->used = 1;
-    e->is_import = 1;
-    e->ptr = *pdptr;
-    e->blob0 = handle;
-    e->flags = flags;
-    e->serve_sock = -1;
-    e->seq = g_ipc_seq++;
-    r_cuCtxGetCurrent(&e->ctx);
-    /* Record the placement's CONTEXT, not just the address. The
-     * driver places imports inside internal arenas, and which arena
-     * it picks at first-open decides whether a replay can ever get
-     * the address back (TP=8 places some imports in a low arena that
-     * a fresh open never chooses again). The neighbours say what the
-     * arena was created next to. */
-    CUdeviceptr rb = 0, nb_lo = 0, nb_hi = 0;
-    size_t rs = 0, ns_lo = 0, ns_hi = 0;
-    CUresult lo_rc = 999, hi_rc = 999;
-    if (r_cuMemGetAddressRange &&
-        r_cuMemGetAddressRange(&rb, &rs, *pdptr) == CUDA_SUCCESS) {
-      if (rb >= (2u << 20))
-        lo_rc = r_cuMemGetAddressRange(&nb_lo, &ns_lo, rb - 1);
-      hi_rc = r_cuMemGetAddressRange(&nb_hi, &ns_hi, rb + rs);
-    }
-    mclog(
-        "track IPC-IMPORT idx=%d seq=%d va=0x%llx key=%016lx "
-        "range=0x%llx+0x%zx below=[rc=%d 0x%llx+0x%zx] "
-        "above=[rc=%d 0x%llx+0x%zx]",
-        i, e->seq, (unsigned long long)*pdptr, blob_key(&handle),
-        (unsigned long long)rb, rs, lo_rc, (unsigned long long)nb_lo, ns_lo,
-        hi_rc, (unsigned long long)nb_hi, ns_hi);
-  } else {
-    /* An untracked import is not merely unsupported, it is a
-     * silent restore failure later, so say so loudly now. */
-    track_overflow("ipc-import");
-    mclog(
-        "IPC-IMPORT table full; va=0x%llx UNTRACKED -- restore "
-        "WILL fail",
-        (unsigned long long)*pdptr);
-  }
-  pthread_mutex_unlock(&g_lock);
-  return rc;
-}
-
-static CUresult legacy_ipc_close(CUdeviceptr dptr) {
-  resolve_reals();
-  gate_wait();
-  CUresult rc = r_cuIpcCloseMemHandle(dptr);
-  if (rc == CUDA_SUCCESS) {
-    pthread_mutex_lock(&g_lock);
-    int i = ipc_find_import(dptr);
-    if (i >= 0) {
-      g_ipc[i].used = 0;
-      mcvlog("untrack IPC-IMPORT idx=%d va=0x%llx", i,
-             (unsigned long long)dptr);
-    }
-    pthread_mutex_unlock(&g_lock);
-  }
-  return rc;
-}
-
-/* ------------------------------------------------------------------ */
-/* Legacy-IPC promotion (see ipc_promote_enabled).                    */
-/* ------------------------------------------------------------------ */
-
-#define PROMO_MAGIC "MCSHIMP1"
-
-typedef struct {
-  char magic[8];
-  unsigned long key_dev;
-  unsigned long key_ino;
-  int key_ord;
-  int exporter_pid;
-  unsigned long long size;
-  unsigned long long base;
-  unsigned char pad[64 - 8 - 8 - 8 - 4 - 4 - 8 - 8];
-} PromoBlob;
-
-static int promo_blob_is(const CUipcMemHandle* h) {
-  return memcmp(h->reserved, PROMO_MAGIC, 8) == 0;
-}
-
-/* Forward declarations of the interposed entry points used as building
- * blocks (calling the wrappers, not the reals, is what makes the promoted
- * objects tracked like any other VMM object). */
-CUresult cuMemCreate(CUmemGenericAllocationHandle*, size_t,
-                     const CUmemAllocationProp*, unsigned long long);
-CUresult cuMemMap(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle,
-                  unsigned long long);
-CUresult cuMemUnmap(CUdeviceptr, size_t);
-CUresult cuMemSetAccess(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t);
-CUresult cuMemRelease(CUmemGenericAllocationHandle);
-CUresult cuMemExportToShareableHandle(void*, CUmemGenericAllocationHandle, int,
-                                      unsigned long long);
-CUresult cuMemImportFromShareableHandle(CUmemGenericAllocationHandle*, void*,
-                                        int);
-static int start_serving(Alloc* a, int fd);
-static void stop_serving(Alloc* a);
-static int fetch_group_fd_raw(const Alloc* a, int timeout_ms);
-static int alloc_find(CUmemGenericAllocationHandle h);
-static long mono_ms(void);
-
-/* Must hold g_lock. */
-static int promo_find_export(CUdeviceptr base) {
-  for (int i = 0; i < MAXN; i++)
-    if (g_alloc[i].kind == KIND_UC && g_alloc[i].promoted_base == base)
-      return i;
-  return -1;
-}
-
-static void promo_fill_blob(CUipcMemHandle* out, const Alloc* a,
-                            CUdeviceptr base) {
-  PromoBlob b;
-  memset(&b, 0, sizeof(b));
-  memcpy(b.magic, PROMO_MAGIC, 8);
-  b.key_dev = a->key_dev;
-  b.key_ino = a->key_ino;
-  b.key_ord = a->key_ord;
-  b.exporter_pid = (int)getpid();
-  b.size = a->size;
-  b.base = base;
-  memcpy(out->reserved, &b, sizeof(b));
-}
-
-/* Replace the cuMemAlloc'd allocation containing dptr by a VMM allocation at
- * the same VA and export it. Returns 0 with *handle filled (promoted), 1 to
- * fall back to the legacy path (allocation untouched), -1 on an
- * unrecoverable failure (the allocation is gone). Must NOT hold g_lock. */
-static int ipc_promote_export(CUipcMemHandle* handle, CUdeviceptr dptr) {
-  const size_t gran = 2u << 20;
-  CUdeviceptr base = 0;
-  size_t size = 0;
-  if (r_cuMemGetAddressRange(&base, &size, dptr) != CUDA_SUCCESS || !size)
-    return 1;
-  pthread_mutex_lock(&g_lock);
-  int gi = promo_find_export(base);
-  if (gi >= 0) {
-    promo_fill_blob(handle, &g_alloc[gi], base);
-    pthread_mutex_unlock(&g_lock);
-    return 0;
-  }
-  /* A VMM mapping the application exported through the legacy API
-   * (unsupported by the driver anyway): leave it to the legacy path. */
-  for (int m = 0; m < MAXN; m++)
-    if (g_map[m].used && g_map[m].va <= base &&
-        base < g_map[m].va + g_map[m].size) {
-      pthread_mutex_unlock(&g_lock);
-      return 1;
-    }
-  pthread_mutex_unlock(&g_lock);
-  /* VMM works in 2 MiB granules; a smaller cudaMalloc'd buffer (vLLM's
-   * custom all-reduce metadata is 0x41300 bytes) gets a granule-rounded
-   * VMM allocation. Only the original bytes are copied in and out; the
-   * tail is never referenced by the application (its offsets are within
-   * the original size) and is simply extra mapped memory on both sides.
-   * The reservation must still be exact at base for the whole rounded
-   * size, which the legacy allocator's own 2 MiB slotting guarantees. */
-  size_t asize = (size + gran - 1) & ~(gran - 1);
-  CUdevice dev = -1;
-  if (r_cuCtxGetDevice(&dev) != CUDA_SUCCESS) return 1;
-  /* The buffer may be in use by in-flight work (it was just allocated
-   * and possibly initialised); drain before copying it out. Note that
-   * base/size describe the whole cudaMalloc'd SEGMENT containing dptr
-   * (a torch caching-allocator segment holds many tensors), all of which
-   * migrate together -- correct by construction (same VAs, contents
-   * preserved) but the D2H+H2D cost scales with the segment. */
-  long t0 = mono_ms();
-  r_cuCtxSynchronize();
-  void* host = malloc(size);
-  if (!host) return 1;
-  if (r_cuMemcpyDtoH(host, base, size) != CUDA_SUCCESS) {
-    free(host);
-    return 1;
-  }
-  if (r_cuMemFreeReal(base) != CUDA_SUCCESS) {
-    free(host);
-    return 1;
-  }
-  /* Between this free and the reservation below, another thread of the
-   * application could allocate into [base, base+asize). Nothing prevents
-   * that (a reservation cannot overlap a live mapping, so it cannot be
-   * taken first); the outcome is detected -- the reserve lands elsewhere
-   * -- and handled by putting the legacy allocation back, or failing the
-   * export loudly if even that lands elsewhere. In practice exports happen
-   * during single-threaded communicator setup and the window is a few
-   * microseconds. */
-  CUdeviceptr va = 0;
-  CUresult rc = r_cuMemAddressReserve(&va, asize, 0, base, 0);
-  if (rc != CUDA_SUCCESS || va != base) {
-    if (rc == CUDA_SUCCESS) r_cuMemAddressFree(va, asize);
-    /* Try to get the legacy allocation back where it was. */
-    CUdeviceptr again = 0;
-    if (r_cuMemAllocReal(&again, size) == CUDA_SUCCESS && again == base &&
-        r_cuMemcpyHtoD(base, host, size) == CUDA_SUCCESS) {
-      free(host);
-      mclog(
-          "PROMOTE: could not reserve 0x%llx+0x%zx (rc=%d got "
-          "0x%llx); restored legacy allocation, legacy path",
-          (unsigned long long)base, size, rc, (unsigned long long)va);
-      return 1;
-    }
-    free(host);
-    mclog(
-        "PROMOTE: FATAL: lost allocation 0x%llx+0x%zx (reserve rc=%d "
-        "got 0x%llx, re-alloc got 0x%llx)",
-        (unsigned long long)base, size, rc, (unsigned long long)va,
-        (unsigned long long)again);
-    return -1;
-  }
-  CUmemAllocationProp prop;
-  memset(&prop, 0, sizeof(prop));
-  prop.type = 1; /* CU_MEM_ALLOCATION_TYPE_PINNED */
-  prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FD;
-  prop.location.type = 1; /* CU_MEM_LOCATION_TYPE_DEVICE */
-  prop.location.id = dev;
-  CUmemGenericAllocationHandle h = 0;
-  CUmemAccessDesc acc;
-  memset(&acc, 0, sizeof(acc));
-  acc.location.type = 1;
-  acc.location.id = dev;
-  acc.flags = 3; /* RW */
-  int fd = -1;
-  if ((rc = cuMemCreate(&h, asize, &prop, 0)) != CUDA_SUCCESS ||
-      (rc = cuMemMap(base, asize, 0, h, 0)) != CUDA_SUCCESS ||
-      (rc = cuMemSetAccess(base, asize, &acc, 1)) != CUDA_SUCCESS ||
-      (rc = r_cuMemcpyHtoD(base, host, size)) != CUDA_SUCCESS ||
-      (rc = cuMemExportToShareableHandle(&fd, h, CU_MEM_HANDLE_TYPE_POSIX_FD,
-                                         0)) != CUDA_SUCCESS) {
-    free(host);
-    mclog("PROMOTE: FATAL: rebuilding 0x%llx+0x%zx as VMM failed rc=%d",
-          (unsigned long long)base, size, rc);
-    return -1;
-  }
-  free(host);
-  pthread_mutex_lock(&g_lock);
-  gi = alloc_find(h);
-  if (gi < 0) {
-    pthread_mutex_unlock(&g_lock);
-    close(fd);
-    mclog("PROMOTE: FATAL: promoted allocation untracked (table full)");
-    return -1;
-  }
-  g_alloc[gi].promoted_base = base;
-  if (start_serving(&g_alloc[gi], fd) != 0) {
-    pthread_mutex_unlock(&g_lock);
-    close(fd);
-    mclog("PROMOTE: FATAL: cannot serve fd for 0x%llx",
-          (unsigned long long)base);
-    return -1;
-  }
-  promo_fill_blob(handle, &g_alloc[gi], base);
-  mclog(
-      "PROMOTE: legacy export 0x%llx+0x%zx (mapped 0x%zx) -> VMM idx=%d "
-      "key=%lx:%lx ord=%d in %ld ms (served on %s)",
-      (unsigned long long)base, size, asize, gi, g_alloc[gi].key_dev,
-      g_alloc[gi].key_ino, g_alloc[gi].key_ord, mono_ms() - t0,
-      g_alloc[gi].serve_path);
-  pthread_mutex_unlock(&g_lock);
-  return 0;
-}
-
-/* Importer side of a promoted export. Must NOT hold g_lock. */
-static CUresult ipc_promote_open(CUdeviceptr* pdptr,
-                                 const CUipcMemHandle* blob) {
-  PromoBlob b;
-  memcpy(&b, blob->reserved, sizeof(b));
-  Alloc key;
-  memset(&key, 0, sizeof(key));
-  key.key_dev = b.key_dev;
-  key.key_ino = b.key_ino;
-  key.key_ord = b.key_ord;
-  int fd = fetch_group_fd_raw(&key, 60 * 1000);
-  if (fd < 0) {
-    mclog(
-        "PROMOTE: import: no fd for key %lx:%lx ord=%d (exporter pid "
-        "%d, base 0x%llx)",
-        b.key_dev, b.key_ino, b.key_ord, b.exporter_pid, b.base);
-    return 1; /* CUDA_ERROR_INVALID_VALUE */
-  }
-  CUmemGenericAllocationHandle h = 0;
-  CUresult rc = cuMemImportFromShareableHandle(&h, (void*)(intptr_t)fd,
-                                               CU_MEM_HANDLE_TYPE_POSIX_FD);
-  close(fd);
-  if (rc != CUDA_SUCCESS) return rc;
-  CUdevice dev = -1;
-  r_cuCtxGetDevice(&dev);
-  CUdeviceptr va = 0;
-  size_t size = (size_t)b.size;
-  if ((rc = r_cuMemAddressReserve(&va, size, 0, 0, 0)) != CUDA_SUCCESS) {
-    cuMemRelease(h);
-    return rc;
-  }
-  CUmemAccessDesc acc;
-  memset(&acc, 0, sizeof(acc));
-  acc.location.type = 1;
-  acc.location.id = dev;
-  acc.flags = 3;
-  if ((rc = cuMemMap(va, size, 0, h, 0)) != CUDA_SUCCESS ||
-      (rc = cuMemSetAccess(va, size, &acc, 1)) != CUDA_SUCCESS) {
-    cuMemUnmap(va, size);
-    r_cuMemAddressFree(va, size);
-    cuMemRelease(h);
-    return rc;
-  }
-  pthread_mutex_lock(&g_lock);
-  int gi = alloc_find(h);
-  if (gi >= 0) g_alloc[gi].promoted_import = 1;
-  mclog(
-      "PROMOTE: legacy import of %lx:%lx ord=%d (exporter pid %d) -> VMM "
-      "idx=%d at 0x%llx+0x%zx",
-      b.key_dev, b.key_ino, b.key_ord, b.exporter_pid, gi,
-      (unsigned long long)va, size);
-  pthread_mutex_unlock(&g_lock);
-  *pdptr = va;
-  return CUDA_SUCCESS;
-}
-
-/* Closing a promoted import (by the VA cuIpcOpenMemHandle returned) or
- * freeing a promoted export (by its base). Returns 1 if dptr was neither. */
-static int ipc_promote_release(CUdeviceptr dptr, int is_export) {
-  pthread_mutex_lock(&g_lock);
-  int gi = -1;
-  size_t size = 0;
-  if (is_export) {
-    gi = promo_find_export(dptr);
-  } else {
-    for (int m = 0; m < MAXN; m++)
-      if (g_map[m].used && g_map[m].va == dptr &&
-          g_alloc[g_map[m].allocIdx].promoted_import) {
-        gi = g_map[m].allocIdx;
-        break;
-      }
-  }
-  if (gi < 0) {
-    pthread_mutex_unlock(&g_lock);
-    return 1;
-  }
-  size = g_alloc[gi].size;
-  CUmemGenericAllocationHandle h = g_alloc[gi].handle;
-  if (is_export) stop_serving(&g_alloc[gi]);
-  pthread_mutex_unlock(&g_lock);
-  cuMemUnmap(dptr, size);
-  cuMemRelease(h);
-  r_cuMemAddressFree(dptr, size);
-  mclog("PROMOTE: released promoted %s idx=%d at 0x%llx",
-        is_export ? "export" : "import", gi, (unsigned long long)dptr);
-  return 0;
-}
-
-/* A promoted export must remain indistinguishable from cudaMalloc'd memory
- * to the application: SGLang's custom all-reduce probes
- * cuMemRetainAllocationHandle to decide between its legacy-IPC and its VMM
- * registration paths per buffer set, and a mixed answer (one promoted block,
- * others not) sends every block down the VMM path, where the legacy ones
- * fail. Report promoted ranges as non-VMM. */
-static CUresult (*r_cuMemRetainAllocationHandle)(CUmemGenericAllocationHandle*,
-                                                 void*);
-CUresult cuMemRetainAllocationHandle(CUmemGenericAllocationHandle* h,
-                                     void* addr);
-CUresult cuMemRetainAllocationHandle(CUmemGenericAllocationHandle* h,
-                                     void* addr) {
-  REAL(r_cuMemRetainAllocationHandle, "cuMemRetainAllocationHandle");
-  if (!r_cuMemRetainAllocationHandle) return 1;
-  gate_wait();
-  CUdeviceptr p = (CUdeviceptr)(uintptr_t)addr;
-  pthread_mutex_lock(&g_lock);
-  int promoted = 0;
-  for (int i = 0; i < MAXN && !promoted; i++)
-    if (g_alloc[i].kind == KIND_UC && g_alloc[i].promoted_base &&
-        p >= g_alloc[i].promoted_base &&
-        p < g_alloc[i].promoted_base + g_alloc[i].size)
-      promoted = 1;
-  pthread_mutex_unlock(&g_lock);
-  if (promoted)
-    return 1; /* CUDA_ERROR_INVALID_VALUE, as for cudaMalloc memory */
-  return r_cuMemRetainAllocationHandle(h, addr);
-}
-
-CUresult cuIpcGetMemHandle(CUipcMemHandle* handle, CUdeviceptr dptr) {
-  resolve_reals();
-  gate_wait();
-  if (handle && ipc_promote_enabled()) {
-    int r = ipc_promote_export(handle, dptr);
-    if (r == 0) return CUDA_SUCCESS;
-    if (r < 0) return 999; /* CUDA_ERROR_UNKNOWN */
-  }
-  return legacy_ipc_get(handle, dptr);
-}
-
-CUresult cuIpcOpenMemHandle(CUdeviceptr* pdptr, CUipcMemHandle handle,
-                            unsigned int flags) {
-  resolve_reals();
-  gate_wait();
-  if (pdptr && promo_blob_is(&handle)) return ipc_promote_open(pdptr, &handle);
-  return legacy_ipc_open(pdptr, handle, flags);
-}
-
-/* cuda.h maps cuIpcOpenMemHandle to the _v2 ABI; both names must resolve to
- * the wrapper or an app linking the versioned symbol bypasses the shim. */
-CUresult cuIpcOpenMemHandle_v2(CUdeviceptr* pdptr, CUipcMemHandle handle,
-                               unsigned int flags) {
-  return cuIpcOpenMemHandle(pdptr, handle, flags);
-}
-
-CUresult cuIpcCloseMemHandle(CUdeviceptr dptr) {
-  resolve_reals();
-  gate_wait();
-  if (ipc_promote_release(dptr, 0 /* import */) == 0) return CUDA_SUCCESS;
-  return legacy_ipc_close(dptr);
-}
-
 CUresult cuMulticastAddDevice(CUmemGenericAllocationHandle h, CUdevice dev) {
   resolve_reals();
   gate_wait();
@@ -1469,8 +729,7 @@ CUresult cuMulticastAddDevice(CUmemGenericAllocationHandle h, CUdevice dev) {
   if (rc == CUDA_SUCCESS) {
     pthread_mutex_lock(&g_lock);
     int i = alloc_find(real_h);
-    /* An AddDevice on an imported handle proves it is a multicast
-     * group: classify it so suspend/resume manages it. */
+    /* AddDevice proves that an imported handle is a multicast group. */
     if (i >= 0 && g_alloc[i].kind == KIND_IMP) {
       g_alloc[i].kind = KIND_MC;
       mclog("import idx=%d classified as MC group", i);
@@ -1487,9 +746,7 @@ CUresult cuMulticastAddDevice(CUmemGenericAllocationHandle h, CUdevice dev) {
   return rc;
 }
 
-/* Must hold g_lock. Record a successful bind unless it is already tracked
- * (resume re-binds existing entries through the reals, but a paranoid app
- * re-binding the same range must not duplicate). */
+/* Must hold g_lock. Record a successful bind unless it is already tracked. */
 static void bind_record(int gi, int by_addr, CUmemGenericAllocationHandle mem,
                         CUdeviceptr va, size_t mcOffset, size_t memOffset,
                         size_t size, CUdevice dev) {
@@ -1520,7 +777,7 @@ static void bind_record(int gi, int by_addr, CUmemGenericAllocationHandle mem,
         (unsigned long long)(by_addr ? va : mem), dev, mcOffset, size);
     return;
   }
-  track_overflow("bind");
+  mark_untracked("bind table overflow");
   mclog(
       "FATAL: bind table full (MAXN=%d); bind not tracked -- suspend "
       "is disabled for this process",
@@ -1533,18 +790,14 @@ CUresult cuMulticastBindMem(CUmemGenericAllocationHandle mc, size_t mcOffset,
   resolve_reals();
   gate_wait();
   CUmemGenericAllocationHandle real_mc = xlate_locked(mc);
-  /* The bound memory may itself be referenced by a stale handle (an
-   * import whose handle rotated across a rebuild); translate it too, and
-   * record the translated value so dedupe and later unbind/rebind key on
-   * the current handle. */
+  /* The bound memory may be a rotated import handle; record the current one. */
   CUmemGenericAllocationHandle real_mem = xlate_locked(mem);
 
   CUresult rc =
       r_cuMulticastBindMem(real_mc, mcOffset, real_mem, memOffset, size, flags);
   if (rc == CUDA_SUCCESS) {
     pthread_mutex_lock(&g_lock);
-    /* The unbind is per-device: the device hosting the memory
-     * comes from the UC alloc's prop. */
+    /* Unbind is per device: the one hosting the memory. */
     CUdevice dev = -1;
     int mi = alloc_find(real_mem);
     if (mi >= 0 && g_alloc[mi].kind == KIND_UC)
@@ -1565,8 +818,7 @@ CUresult cuMulticastBindAddr(CUmemGenericAllocationHandle mc, size_t mcOffset,
   CUresult rc = r_cuMulticastBindAddr(real_mc, mcOffset, memptr, size, flags);
   if (rc == CUDA_SUCCESS) {
     pthread_mutex_lock(&g_lock);
-    /* Replay is by VA (stable across restore); the hosting device
-     * is the caller's current device. */
+    /* Replay is by VA; the hosting device is the caller's. */
     CUdevice dev = -1;
     r_cuCtxGetDevice(&dev);
     bind_record(alloc_find(real_mc), 1, 0, memptr, mcOffset, 0, size, dev);
@@ -1581,9 +833,8 @@ CUresult cuMulticastUnbind(CUmemGenericAllocationHandle mc, CUdevice dev,
   gate_wait();
   CUmemGenericAllocationHandle real_mc = xlate_locked(mc);
   CUresult rc = r_cuMulticastUnbind(real_mc, dev, mcOffset, size);
-  /* App-initiated: drop this device's recorded bind so it leaves the
-   * replay set. (While suspended the app is quiesced by protocol; the
-   * shim's own teardown calls the reals directly and never gets here.) */
+  /* App-initiated: drop the recorded bind. The shim's own teardown calls the
+   * reals. */
   if (rc == CUDA_SUCCESS && !__atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST)) {
     pthread_mutex_lock(&g_lock);
     int gi = alloc_find(real_mc);
@@ -1622,7 +873,7 @@ CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
         break;
       }
       if (!placed) {
-        track_overflow("mapping");
+        mark_untracked("mapping table overflow");
         mclog(
             "FATAL: mapping table full (MAXN=%d); "
             "mapping va=0x%llx untracked -- suspend "
@@ -1657,9 +908,8 @@ CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size,
   if (rc == CUDA_SUCCESS && desc && count >= 1) {
     size_t n = count;
     if (n > MAX_ACCESS) {
-      /* Recording a prefix would silently narrow the access set
-       * at resume; say so, and let remap_alloc's owner-RW
-       * fallback apply instead. */
+      /* A prefix would silently narrow the access set at resume; log, and let
+       * remap_alloc's owner-RW fallback apply. */
       mclog(
           "NOTE: cuMemSetAccess va=0x%llx count=%zu exceeds "
           "MAX_ACCESS=%d; access set NOT recorded (resume "
@@ -1667,9 +917,8 @@ CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size,
           (unsigned long long)ptr, count, MAX_ACCESS);
       n = 0;
     }
-    /* Record on every tracked mapping the call covers, not only one
-     * starting exactly at ptr: NCCL sets access once over a whole
-     * reservation range that holds several sub-maps. */
+    /* Record on every tracked mapping in range: NCCL sets access once over a
+     * reservation holding several maps. */
     pthread_mutex_lock(&g_lock);
     for (int m = 0; m < MAXN; m++) {
       if (!g_map[m].used || g_map[m].va < ptr ||
@@ -1685,9 +934,7 @@ CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size,
 
 static void stop_serving(Alloc* a);
 
-/* Must hold g_lock. Forget alloc i and everything that references it, so a
- * reused slot can never inherit stale binds/maps (freed objects must drop
- * out of the replay set, and dependents die with their object). */
+/* Must hold g_lock. Forget alloc i and the binds and maps that reference it. */
 static void alloc_forget(int i) {
   for (int b = 0; b < MAXN; b++)
     if (g_bind[b].used &&
@@ -1716,19 +963,15 @@ CUresult cuMemRelease(CUmemGenericAllocationHandle handle) {
   return rc;
 }
 
-/* ------------------------------------------------------------------ */
-/* Cross-rank fd rendezvous: the creator serves the re-exported fd on */
-/* a unix socket keyed by the original export identity; importers     */
-/* connect and receive it via SCM_RIGHTS.                             */
-/* ------------------------------------------------------------------ */
+/* Cross-rank fd rendezvous: an exporter serves its re-exported fd on a unix
+ * socket keyed by the original export identity, and importers receive it via
+ * SCM_RIGHTS. */
 
-/* Fallback only: the sentry normally sets MCSHIM_DIR explicitly (see
- * DefaultCudaMulticastShimDir in pkg/sentry/control/state_cuda_shim.go,
- * which this default matches). */
+/* Default only; the sentry sets MCSHIM_DIR (see DefaultCudaMulticastShimDir).
+ */
 static char g_dir[512] = "/tmp/mcshim";
 
-/* Returns 0, or -1 if the path would not fit sockaddr_un.sun_path (keep
- * MCSHIM_DIR short, e.g. /tmp/mcshim). */
+/* Returns -1 if the path does not fit sun_path (keep MCSHIM_DIR short). */
 static int group_sock_path(const Alloc* a, char* out, size_t n) {
   int w = snprintf(out, n, "%s/mcgrp-%lx-%lx-%d.sock", g_dir, a->key_dev,
                    a->key_ino, a->key_ord);
@@ -1773,8 +1016,8 @@ static int recv_fd(int sock) {
   msg.msg_iovlen = 1;
   msg.msg_control = u.buf;
   msg.msg_controllen = sizeof(u.buf);
-  /* MSG_CMSG_CLOEXEC: a received export fd leaking into a forked child
-   * keeps the RM object alive there and blocks the NEXT checkpoint. */
+  /* MSG_CMSG_CLOEXEC: an export fd leaked into a child blocks the next
+   * checkpoint. */
   if (recvmsg(sock, &msg, MSG_CMSG_CLOEXEC) <= 0) return -1;
   struct cmsghdr* c = CMSG_FIRSTHDR(&msg);
   if (!c || c->cmsg_type != SCM_RIGHTS) return -1;
@@ -1783,14 +1026,9 @@ static int recv_fd(int sock) {
   return fd;
 }
 
-/* Creator-side accept loop: hand the re-exported fd to each connecting
- * importer. Owns its heap-allocated args (never the Alloc, whose slot may be
- * freed and reused while this thread runs), its OWN dup of the served fd
- * (so stop_serving closing the original can never turn a late-accepted
- * connection into an SCM_RIGHTS send of a closed -- possibly reused -- fd
- * number), and the LISTENING socket (stop_serving only shutdown()s it; if it
- * closed it, the number could be reused and a late accept would steal an
- * unrelated fd). Exits when stop_serving shuts the socket down. */
+/* Exporter accept loop. It owns its args, its own dup of the served fd and the
+ * listening socket, so that stop_serving can never make a late accept send a
+ * closed or reused fd number. Exits when stop_serving wakes it. */
 typedef struct {
   int sock;
   int fd;
@@ -1802,12 +1040,9 @@ static void* serve_thread(void* arg) {
   ServeArgs* sa = arg;
   mclog("serving group fd on %s", sa->path);
   for (;;) {
-    /* poll() on the listening socket plus a stop pipe, rather than
-     * blocking in accept(): shutdown() of a listening AF_UNIX socket
-     * does not wake accept() under every kernel the shim runs on
-     * (measured: not under gVisor), and a serve thread that never
-     * exits keeps its dup of the export fd open -- a checkpoint
-     * blocker the sentry then waits on forever. */
+    /* poll() with a stop pipe: shutdown() does not wake accept() under gVisor,
+     * and a thread that never exits keeps its dup of the export fd open, which
+     * blocks the checkpoint. */
     struct pollfd pfd[2] = {{sa->sock, POLLIN, 0}, {sa->wake, POLLIN, 0}};
     int pr = poll(pfd, 2, -1);
     if (pr < 0) {
@@ -1852,8 +1087,7 @@ static int start_serving(Alloc* a, int fd) {
     close(s);
     return -1;
   }
-  /* The thread serves its own dup, decoupled from a->serve_fd (see
-   * serve_thread). F_DUPFD_CLOEXEC: a plain dup would drop CLOEXEC. */
+  /* The thread serves its own dup (see serve_thread). */
   int tfd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
   int wake[2];
   if (tfd < 0 || pipe2(wake, O_CLOEXEC) != 0) {
@@ -1883,13 +1117,8 @@ static int start_serving(Alloc* a, int fd) {
 
 static void stop_serving(Alloc* a) {
   if (!a->serving) return;
-  /* Wake the serve thread through its stop pipe and JOIN it: the
-   * thread owns a dup of the export fd, and an exported fd still open
-   * anywhere in the process is a checkpoint blocker, so this must not
-   * return until that dup is closed. The listening fd is closed by the
-   * thread itself, never here (closing a possibly-still-accepting fd
-   * would let the number be reused and a late accept steal an
-   * unrelated socket). */
+  /* Wake and join the serve thread: its dup of the export fd blocks the
+   * checkpoint until closed. The thread closes the listening fd itself. */
   if (a->serve_wake >= 0) {
     ssize_t n = write(a->serve_wake, "x", 1);
     (void)n;
@@ -1907,105 +1136,9 @@ static void stop_serving(Alloc* a) {
   mclog("stopped serving group fd");
 }
 
-/* ------------------------------------------------------------------ */
-/* Legacy IPC rendezvous: same shape as the fd rendezvous above, but   */
-/* the payload is 64 opaque bytes, so no SCM_RIGHTS is involved.       */
-/* ------------------------------------------------------------------ */
-
-static int ipc_sock_path(const IpcEnt* e, char* out, size_t n) {
-  int w =
-      snprintf(out, n, "%s/ipcblob-%016lx.sock", g_dir, blob_key(&e->blob0));
-  if (w < 0 || (size_t)w >= n) {
-    mclog("IPC socket path too long (MCSHIM_DIR=%s)", g_dir);
-    return -1;
-  }
-  return 0;
-}
-
-typedef struct {
-  int sock;
-  CUipcMemHandle blob;
-  char path[104];
-} IpcServeArgs;
-
-static void* ipc_serve_thread(void* arg) {
-  IpcServeArgs* sa = arg;
-  mclog("serving IPC blob on %s", sa->path);
-  for (;;) {
-    int c = accept4(sa->sock, NULL, NULL, SOCK_CLOEXEC);
-    if (c < 0) {
-      if (errno == EINTR) continue; /* see serve_thread */
-      break;
-    }
-    ssize_t w = write(c, sa->blob.reserved, CU_IPC_HANDLE_SIZE);
-    if (w != CU_IPC_HANDLE_SIZE)
-      mclog("IPC serve: short write (%zd): %s", w, strerror(errno));
-    close(c);
-  }
-  mclog("IPC serve thread for %s exiting", sa->path);
-  close(sa->sock); /* thread-owned (see ipc_stop_serving) */
-  free(sa);
-  return NULL;
-}
-
-/* Must hold g_lock. */
-static int ipc_start_serving(IpcEnt* e, const CUipcMemHandle* blob) {
-  if (ipc_sock_path(e, e->serve_path, sizeof(e->serve_path)) != 0) return -1;
-  struct sockaddr_un sa;
-  unlink(e->serve_path);
-  int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (s < 0) return -1;
-  memset(&sa, 0, sizeof(sa));
-  sa.sun_family = AF_UNIX;
-  strcpy(sa.sun_path, e->serve_path);
-  if (bind(s, (struct sockaddr*)&sa, sizeof(sa)) != 0 || listen(s, 64) != 0) {
-    mclog("RESUME: IPC bind/listen(%s) failed: %s", e->serve_path,
-          strerror(errno));
-    close(s);
-    return -1;
-  }
-  IpcServeArgs* args = malloc(sizeof(*args));
-  if (!args) {
-    close(s);
-    return -1;
-  }
-  args->sock = s;
-  args->blob = *blob;
-  strcpy(args->path, e->serve_path);
-  pthread_t t;
-  if (pthread_create(&t, NULL, ipc_serve_thread, args) != 0) {
-    close(s);
-    free(args);
-    return -1;
-  }
-  pthread_detach(t);
-  e->serve_sock = s;
-  e->serving = 1;
-  return 0;
-}
-
-static void ipc_stop_serving(IpcEnt* e) {
-  if (!e->serving) return;
-  if (e->serve_sock >= 0) {
-    /* shutdown() reliably wakes the thread out of accept();
-     * close() alone does not, and the listening fd itself is
-     * thread-owned (see stop_serving for why). */
-    shutdown(e->serve_sock, SHUT_RDWR);
-    e->serve_sock = -1;
-  }
-  if (e->serve_path[0]) unlink(e->serve_path);
-  e->serving = 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* Resume deadline.                                                    */
-/*                                                                     */
-/* The sentry gives up waiting for resumed.<pid> after 5 minutes. The  */
-/* shim's per-fetch timeouts and re-import retries could exceed that   */
-/* in aggregate, leaving the two sides disagreeing about the outcome.  */
-/* So every resume gets one total budget, comfortably inside the       */
-/* sentry's, and every rendezvous wait is capped by what remains.      */
-/* ------------------------------------------------------------------ */
+/* The sentry waits 5 minutes for resumed.<pid>. One total resume budget inside
+ * that caps every rendezvous wait, so the two sides cannot disagree about the
+ * outcome. */
 
 #define RESUME_DEADLINE_MS (240 * 1000L)
 
@@ -2021,53 +1154,18 @@ static long g_resume_deadline;
 /* Remaining resume budget in ms; <= 0 once the deadline has passed. */
 static long resume_budget_ms(void) { return g_resume_deadline - mono_ms(); }
 
-/* Importer-side: connect (with retry; the exporter may not be serving yet)
- * and read the re-exported blob. */
-static int ipc_fetch_blob(const IpcEnt* e, CUipcMemHandle* out,
-                          int timeout_ms) {
-  char path[104];
-  if (ipc_sock_path(e, path, sizeof(path)) != 0) return -1;
+/* Connect to the exporter's socket, retrying until it serves or the resume
+ * deadline passes, and receive the fd. */
+static int fetch_group_fd(const Alloc* a, int timeout_ms) {
   long budget = resume_budget_ms();
   if (budget <= 0) {
     mclog(
         "RESUME: resume deadline (%lds) exceeded before fetching "
-        "IPC blob",
+        "group fd",
         RESUME_DEADLINE_MS / 1000);
     return -1;
   }
   if ((long)timeout_ms > budget) timeout_ms = (int)budget;
-  struct sockaddr_un sa;
-  memset(&sa, 0, sizeof(sa));
-  sa.sun_family = AF_UNIX;
-  strcpy(sa.sun_path, path);
-  for (int waited = 0; waited < timeout_ms; waited += 100) {
-    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (s < 0) return -1;
-    if (connect(s, (struct sockaddr*)&sa, sizeof(sa)) == 0) {
-      size_t got = 0;
-      while (got < CU_IPC_HANDLE_SIZE) {
-        ssize_t r = read(s, out->reserved + got, CU_IPC_HANDLE_SIZE - got);
-        if (r <= 0) break;
-        got += (size_t)r;
-      }
-      close(s);
-      if (got == CU_IPC_HANDLE_SIZE) return 0;
-    } else {
-      close(s);
-    }
-    struct timespec ts = {0, 100 * 1000 * 1000};
-    nanosleep(&ts, NULL);
-  }
-  mclog("RESUME: timed out fetching IPC blob from %s", path);
-  return -1;
-}
-
-/* Importer-side: connect (with retry; the creator may not be serving yet)
- * and receive the new group fd. */
-/* Connect to the exporter's socket for a (with retry; the exporter may not
- * be serving yet) and receive the fd. No resume-deadline coupling: also used
- * at runtime by the legacy-IPC promotion import path. */
-static int fetch_group_fd_raw(const Alloc* a, int timeout_ms) {
   char path[104];
   if (group_sock_path(a, path, sizeof(path)) != 0) return -1;
   struct sockaddr_un sa;
@@ -2091,23 +1189,7 @@ static int fetch_group_fd_raw(const Alloc* a, int timeout_ms) {
   return -1;
 }
 
-/* Resume-side fetch: bounded by the resume deadline. */
-static int fetch_group_fd(const Alloc* a, int timeout_ms) {
-  long budget = resume_budget_ms();
-  if (budget <= 0) {
-    mclog(
-        "RESUME: resume deadline (%lds) exceeded before fetching "
-        "group fd",
-        RESUME_DEADLINE_MS / 1000);
-    return -1;
-  }
-  if ((long)timeout_ms > budget) timeout_ms = (int)budget;
-  return fetch_group_fd_raw(a, timeout_ms);
-}
-
-/* ------------------------------------------------------------------ */
-/* Suspend / resume shared helpers                                    */
-/* ------------------------------------------------------------------ */
+/* Suspend/resume helpers. */
 
 /* Must hold g_lock. Unmap every VA that maps alloc gi, KEEPING the VA
  * reservations (cuMemUnmap only -- never cuMemAddressFree). */
@@ -2129,14 +1211,10 @@ static int unmap_alloc(int gi, const char* what, int* unmapped) {
   return 0;
 }
 
-/* Must hold g_lock. Re-map every VA of alloc gi at its IDENTICAL address,
- * backed by handle h. Prefers the retained reservation; re-reserves at the
- * fixed address if it did not survive restore.
- *
- * partial != 0 means alloc gi is still LIVE (a suspend failed before tearing
- * it down): re-map only the mappings that suspend actually unmapped
- * (.suspended), the rest are still mapped. For torn-down objects every
- * recorded mapping is re-mapped, exactly as before partial unwind existed. */
+/* Must hold g_lock. Re-map every VA of alloc gi at the identical address,
+ * backed by h, in the retained reservation (re-reserving at the fixed address
+ * if needed). With partial set, gi is still live after a failed suspend, so
+ * only what was unmapped is re-mapped. */
 static int remap_alloc(int gi, CUmemGenericAllocationHandle h, const char* what,
                        int partial, int* remapped) {
   for (int m = 0; m < MAXN; m++) {
@@ -2168,12 +1246,9 @@ static int remap_alloc(int gi, CUmemGenericAllocationHandle h, const char* what,
       }
       path = "re-reserved-fixed";
     }
-    /* Grant access: replay the recorded access set (all devices it
-     * named). A mapping with none recorded -- access set before the
-     * interposer saw the map, or over a range it could not match --
-     * gets RW for its owning device, which is what NCCL's P2P imports
-     * and NVLS VAs need; an inaccessible re-mapped view faults the
-     * collective kernel (719) on the rank whose import lost access. */
+    /* Replay the recorded access set. With none recorded, grant RW to the
+     * owning device, which NCCL's imports and NVLS VAs need: an inaccessible
+     * view faults the collective (719). */
     CUmemAccessDesc fallback;
     const CUmemAccessDesc* acc = g_map[m].access;
     size_t nacc = (size_t)g_map[m].naccess;
@@ -2201,10 +1276,8 @@ static int remap_alloc(int gi, CUmemGenericAllocationHandle h, const char* what,
   return 0;
 }
 
-/* Must hold g_lock. Synchronize every distinct tracked context and log the
- * result. CUDA latches an unrecoverable fault into the context, so the first
- * probe that reports non-zero brackets exactly when the context died. Purely
- * diagnostic: never fatal, and every context is probed so all ranks report. */
+/* Must hold g_lock. Synchronize every tracked context and log the result, to
+ * bracket when a context faulted. Diagnostic only. */
 static void ctx_probe(const char* tag) {
   CUcontext saved = NULL;
   r_cuCtxGetCurrent(&saved);
@@ -2228,13 +1301,9 @@ static void ctx_probe(const char* tag) {
 /* Must hold g_lock. Re-export alloc gi's handle h and start serving it on the
  * rendezvous socket, so importers can fetch it. */
 static int reexport_serve(int gi, CUmemGenericAllocationHandle h) {
-  /* cuMemExportToShareableHandle can transiently return INVALID_VALUE (1)
-   * on a freshly cuda-checkpoint-restored allocation: the handle is valid
-   * (it survived restore) but the driver's export path is briefly not
-   * ready. Left unretried this aborts the rank's resume, so peers time out
-   * fetching the buffers it should serve -> ~10% one-rank 719. Retry with a
-   * short backoff, bounded so a genuine failure stays loud. Mirrors the
-   * re-import 304 retry. */
+  /* A freshly restored allocation can transiently fail its export with
+   * INVALID_VALUE; retry briefly (unretried, peers time out and fault with
+   * 719). */
   int fd = -1;
   CUresult rc = 0;
   for (int attempt = 0; attempt < 100; attempt++) {
@@ -2256,8 +1325,8 @@ static int reexport_serve(int gi, CUmemGenericAllocationHandle h) {
     mclog("RESUME: re-export idx=%d gave up rc=%d fd=%d", gi, rc, fd);
     return -1;
   }
-  /* The export fd must not leak into forked children, where it keeps
-   * the RM object alive and blocks the NEXT checkpoint. */
+  /* Keep the export fd out of forked children, where it blocks the next
+   * checkpoint. */
   fcntl(fd, F_SETFD, FD_CLOEXEC);
   if (start_serving(&g_alloc[gi], fd) != 0) {
     close(fd);
@@ -2266,10 +1335,8 @@ static int reexport_serve(int gi, CUmemGenericAllocationHandle h) {
   return 0;
 }
 
-/* Must hold g_lock. Fetch alloc gi's re-exported fd from its exporter and
- * re-import it into *out. Concurrent imports of the same object can
- * transiently fail (CUDA_ERROR_OPERATING_SYSTEM=304 when several ranks import
- * within ~1ms), so retry with a fresh fd, bounded so a real failure is loud. */
+/* Must hold g_lock. Fetch gi's re-exported fd and re-import it. Concurrent
+ * imports can transiently fail with 304, so retry, bounded. */
 static int reimport(int gi, CUmemGenericAllocationHandle* out) {
   if (!g_alloc[gi].has_key) {
     mclog("RESUME: imported idx=%d has no rendezvous key", gi);
@@ -2296,10 +1363,8 @@ static int reimport(int gi, CUmemGenericAllocationHandle* out) {
             gi, g_alloc[gi].key_dev, g_alloc[gi].key_ino, attempt);
       return 0;
     }
-    /* Report the FIRST failure as it happens. Retrying silently for
-     * 20s and only then reporting hides both the timing (which is
-     * what correlates this against the sentry's ioctl log) and the
-     * fact that the very first attempt already failed. */
+    /* Report the first failure as it happens, for correlation with the sentry's
+     * logs. */
     if (attempt == 0) {
       CUdevice cur = -1;
       r_cuCtxGetDevice(&cur);
@@ -2308,10 +1373,8 @@ static int reimport(int gi, CUmemGenericAllocationHandle* out) {
           "rc=%d on first attempt",
           gi, g_alloc[gi].key_dev, g_alloc[gi].key_ino, cur, rc);
     }
-    /* CUDA_ERROR_INVALID_DEVICE is never transient: the importing
-     * process cannot address the exporter's device at all, which
-     * retrying cannot change. Fail immediately instead of burning
-     * the resume budget. */
+    /* INVALID_DEVICE is never transient: this process cannot address the
+     * exporter's device. */
     if (rc == CUDA_ERROR_INVALID_DEVICE) {
       mclog(
           "RESUME: re-import idx=%d gave up: INVALID_DEVICE "
@@ -2332,14 +1395,10 @@ static int reimport(int gi, CUmemGenericAllocationHandle* out) {
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* Suspend                                                            */
-/* ------------------------------------------------------------------ */
+/* Suspend. */
 
-/* Must hold g_lock. */
-/* Must hold g_lock. Whether alloc gi's memory is bound into any tracked
- * multicast group (by handle; cuMulticastBindAddr participation is matched
- * by its mapping VA instead, since no handle crosses that call). */
+/* Must hold g_lock. Whether alloc gi's memory is bound into a tracked multicast
+ * group (by handle, or for cuMulticastBindAddr by mapping VA). */
 static int uc_is_mc_bound(int gi) {
   for (int b = 0; b < MAXN; b++) {
     if (!g_bind[b].used) continue;
@@ -2362,12 +1421,9 @@ static int do_suspend(void) {
   CUcontext saved = NULL;
   r_cuCtxGetCurrent(&saved);
 
-  if (g_track_overflow) {
-    mclog(
-        "SUSPEND: refusing: the %s tracking table (MAXN=%d) "
-        "overflowed earlier, so some object is untracked and "
-        "cannot be torn down",
-        g_track_overflow_what ? g_track_overflow_what : "?", MAXN);
+  if (g_untracked) {
+    mclog("SUSPEND: refusing: untracked state (%s) cannot be torn down",
+          g_untracked_why);
     return -1;
   }
   if (g_alias_overflow) {
@@ -2381,16 +1437,13 @@ static int do_suspend(void) {
 
   ctx_probe("suspend-entry");
 
-  /* Stop serving any previous resume's re-exported fds first: a held
-   * export fd is itself a checkpoint blocker. */
+  /* Stop serving the previous resume's fds: a held export fd blocks the
+   * checkpoint. */
   for (int i = 0; i < MAXN; i++)
     if (g_alloc[i].serving) stop_serving(&g_alloc[i]);
 
-  /* Multicast groups: unmap MC VAs, unbind each device, release the
-   * 0x00fd handle. Objects already torn down, binds already unbound and
-   * mappings already unmapped (per-entry flags) are skipped, so a
-   * suspend retried after a partial failure resumes where it left off
-   * instead of re-tearing (and failing on) work already done. */
+  /* Multicast groups: unmap, unbind each device, release. Per-entry flags make
+   * a retried suspend skip finished work. */
   for (int gi = 0; gi < MAXN; gi++) {
     if (g_alloc[gi].kind != KIND_MC) continue;
     if (g_alloc[gi].torn_down) continue; /* fully done by an earlier attempt */
@@ -2430,15 +1483,10 @@ static int do_suspend(void) {
           (unsigned long long)g_alloc[gi].handle);
   }
 
-  /* Multicast-bound UC exporter allocations: save contents into process
-   * memory, unmap (reservations retained), and RELEASE the allocation.
-   * An allocation left resident comes back from cuda-checkpoint with
-   * libcuda bookkeeping the driver no longer recognizes, and its next
-   * export fails (OBJECT_NOT_FOUND; measured on R610 with vLLM TP=4 and
-   * torch symmetric memory). Recreating it on resume avoids that, at the
-   * cost of a device->host->device copy (tens of MB per rank). Runs after
-   * the group teardown above so every bind referencing the memory is
-   * already unbound. */
+  /* Multicast-bound exporters: save contents, unmap (keeping reservations) and
+   * release. Left resident, the next export after restore fails with
+   * OBJECT_NOT_FOUND (R610, vLLM TP=4 and torch symmetric memory). Runs after
+   * the group teardown, so the memory is already unbound. */
   int uc_freed = 0;
   for (int gi = 0; gi < MAXN; gi++) {
     if (g_alloc[gi].kind != KIND_UC || !g_alloc[gi].has_key) continue;
@@ -2471,8 +1519,7 @@ static int do_suspend(void) {
         copied++;
       }
       if (!copied) {
-        /* No live mapping to copy from: leave the
-         * allocation resident rather than lose its
+        /* No live mapping to copy from: leave it resident rather than lose its
          * contents. */
         free(buf);
         mclog(
@@ -2499,20 +1546,15 @@ static int do_suspend(void) {
         gi, (unsigned long long)g_alloc[gi].handle, g_alloc[gi].size);
   }
 
-  /* UC imports (P2P peer buffers): unmap the views and release the
-   * imported handle. The backing physical memory is the EXPORTER's
-   * resident allocation, saved by cuda-checkpoint, so no content backup
-   * is needed here -- only the local import must be released so this
-   * process holds no live VMM import across the checkpoint (which R610
-   * cuda-checkpoint cannot restore). */
+  /* UC imports (P2P peer buffers): unmap and release. The memory is the
+   * exporter's and cuda-checkpoint saves it; only the live import must go,
+   * since cuda-checkpoint cannot restore it. */
   for (int ii = 0; ii < MAXN; ii++) {
     if (g_alloc[ii].kind != KIND_IMP) continue;
     if (g_alloc[ii].torn_down) continue; /* fully done by an earlier attempt */
     imports++;
-    /* Layout diagnostics: how many mappings back this import, and
-     * their (va, size, offset). NCCL mapping imports at nonzero
-     * offsets or an import with != 1 mapping would mean the shim's
-     * replay must reproduce that exactly. */
+    /* Layout diagnostics: a nonzero offset, or more than one mapping per
+     * import, would need exact replay. */
     int nmap = 0;
     for (int m = 0; m < MAXN; m++) {
       if (!g_map[m].used || g_map[m].allocIdx != ii) continue;
@@ -2536,155 +1578,20 @@ static int do_suspend(void) {
     released++;
   }
 
-  /* Legacy CUDA IPC imports. Only the import blocks the restore -- the
-   * exporter keeps its allocation and needs no teardown -- so close
-   * every live one and leave the exports alone.
-   *
-   * Closing order does not matter; REOPEN order does, and is replayed
-   * from each entry's seq on resume. */
-  int ipc_closed = 0;
-  for (int i = 0; i < MAXN; i++) {
-    if (g_ipc[i].serving) ipc_stop_serving(&g_ipc[i]);
-    if (!g_ipc[i].used || !g_ipc[i].is_import) continue;
-    if (g_ipc[i].closed) {
-      /* Closed by an earlier attempt (a partial suspend, or a
-       * failed resume that never reopened it). Its range and
-       * any held reservation are still valid: re-closing would
-       * fail, and resetting resv would leak the hold. */
-      ipc_closed++;
-      continue;
-    }
-    if (g_ipc[i].ctx) r_cuCtxSetCurrent(g_ipc[i].ctx);
-    /* Learn the mapping's extent before closing it (the reopen must
-     * land back on it), then close. The RESERVE happens in a second
-     * pass below, after every import is closed: reserving here, one
-     * import at a time, asks for a granule-rounded range while the
-     * neighbouring imports are still mapped, and any overlap makes
-     * the reservation silently land elsewhere. */
-    g_ipc[i].resv = 0;
-    g_ipc[i].resv_size = 0;
-    g_ipc[i].closed = 0;
-    if (r_cuMemGetAddressRange &&
-        r_cuMemGetAddressRange(&g_ipc[i].range_base, &g_ipc[i].range_size,
-                               g_ipc[i].ptr) != CUDA_SUCCESS) {
-      g_ipc[i].range_base = g_ipc[i].ptr;
-      g_ipc[i].range_size = 0;
-    }
-    /* Classify BEFORE closing, because closing an unreplayable
-     * import is unrecoverable: even an immediate reopen of the same
-     * blob in the same live process lands ~75 TB away (measured --
-     * the placement is a one-time young-process decision the driver
-     * never repeats). Such imports must cross the checkpoint live,
-     * carried by the driver's own (intermittent) job-mode support.
-     *
-     * The classifier is SIZE. Small exporter allocations are
-     * suballocated inside driver-owned regions where user
-     * reservations are not honored (fixed-address reserves of
-     * provably free space get bumped), so no replay can ever place
-     * them; allocations with dedicated mappings live in user space
-     * where close+hold+walk is measured to work. Every observation
-     * so far separates cleanly: 0x41300 and 0x200000 imports are
-     * driver-owned (TP=8's signal pads), 0x801300 and 0x1000000
-     * ones are replayable (TP=2/4/8 data buffers). An adjacency-
-     * probing classifier was tried and misfires in the high arena;
-     * a wrong guess here is loud, not corrupting (live imports can
-     * fail the toggle; replayed ones verify their address). */
-    CUresult rc = r_cuIpcCloseMemHandle(g_ipc[i].ptr);
-    if (rc != CUDA_SUCCESS) {
-      mclog("SUSPEND: cuIpcCloseMemHandle(0x%llx) rc=%d",
-            (unsigned long long)g_ipc[i].ptr, rc);
-      return -1;
-    }
-    g_ipc[i].closed = 1;
-    ipc_closed++;
-    mcvlog(
-        "SUSPEND: closed IPC import idx=%d seq=%d va=0x%llx "
-        "range=0x%llx+0x%zx",
-        i, g_ipc[i].seq, (unsigned long long)g_ipc[i].ptr,
-        (unsigned long long)g_ipc[i].range_base, g_ipc[i].range_size);
-  }
-
-  /* Second pass: hold every closed import's range across the checkpoint,
-   * so the restore cannot put something else there (which is what pushed
-   * reopened imports 21.6 GB away). Now that ALL imports are closed, a
-   * granule-rounded reservation cannot collide with a still-mapped
-   * neighbour.
-   *
-   * cuMemAddressReserve's addr argument is a HINT: on contention it
-   * SUCCEEDS at a different address rather than failing. Both outcomes
-   * are logged distinctly, with what occupies the wanted range, because
-   * conflating them cost a day of theorizing already. */
-  int ipc_held = 0;
-  for (int i = 0; i < MAXN; i++) {
-    if (!g_ipc[i].used || !g_ipc[i].is_import || !g_ipc[i].closed ||
-        !g_ipc[i].range_size)
-      continue;
-    if (g_ipc[i].resv) {
-      ipc_held++; /* still held by an earlier attempt */
-      continue;
-    }
-    if (g_ipc[i].ctx) r_cuCtxSetCurrent(g_ipc[i].ctx);
-    const size_t gran = 2u << 20;
-    CUdeviceptr base = g_ipc[i].range_base;
-    size_t sz = (g_ipc[i].range_size + gran - 1) & ~(gran - 1);
-    CUdeviceptr r = 0;
-    CUresult rc = r_cuMemAddressReserve(&r, sz, 0, base, 0);
-    if (rc == CUDA_SUCCESS && r == base) {
-      g_ipc[i].resv = r;
-      g_ipc[i].resv_size = sz;
-      ipc_held++;
-      mcvlog("SUSPEND: held seq=%d 0x%llx+0x%zx (range 0x%zx)", g_ipc[i].seq,
-             (unsigned long long)base, sz, g_ipc[i].range_size);
-      continue;
-    }
-    /* The hold attempt is the CLASSIFIER. If the hint was honored,
-     * this import lives in reservable address space and the replay
-     * machinery can put it back. If not -- reserve failed, or
-     * succeeded somewhere else while the wanted range sits provably
-     * free -- then the range is inside a driver-owned region
-     * (0x31..-0x3b.. here) where user reservations are not honored,
-     * fences cannot be built, and no replay can work. There is no
-     * revival: the import stays torn down with no held range, and
-     * the resume walk fails loudly if it cannot place it. */
-    if (rc == CUDA_SUCCESS) {
-      mcvlog(
-          "SUSPEND: reserve for seq=%d mislanded: wanted "
-          "0x%llx+0x%zx, got 0x%llx -> driver-owned range",
-          g_ipc[i].seq, (unsigned long long)base, sz, (unsigned long long)r);
-      r_cuMemAddressFree(r, sz);
-    } else {
-      mcvlog(
-          "SUSPEND: reserve for seq=%d failed rc=%d "
-          "(wanted 0x%llx+0x%zx) -> driver-owned range",
-          g_ipc[i].seq, rc, (unsigned long long)base, sz);
-    }
-  }
-
-  if (ipc_closed)
-    mclog("SUSPEND: legacy IPC: %d closed (%d held)", ipc_closed, ipc_held);
-
   ctx_probe("suspend-exit");
 
   if (saved) r_cuCtxSetCurrent(saved);
   if (r_cuCtxSynchronize) r_cuCtxSynchronize();
   mclog(
       "SUSPEND done: groups=%d imports=%d uc_freed=%d unmapped=%d "
-      "unbound=%d released=%d ipc_closed=%d",
-      groups, imports, uc_freed, unmapped, unbound, released, ipc_closed);
+      "unbound=%d released=%d",
+      groups, imports, uc_freed, unmapped, unbound, released);
   return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Resume (three phases)                                              */
-/*                                                                    */
-/* A rank is simultaneously an EXPORTER (of its multicast groups and its    */
-/* P2P peer buffers) and an IMPORTER (of its peers'). If it fetched before  */
-/* it served, two ranks could deadlock waiting on each other. So every      */
-/* exporter starts serving (phase 1) before anyone fetches (phase 2), and   */
-/* bindings/mappings that need all handles resolved come last (phase 3).    */
-/* ------------------------------------------------------------------ */
-
-static int resume_reopen_ipc(int p1_ipc);
+/* Resume. A rank both exports and imports, so every exporter serves (phase 1)
+ * before anyone fetches (phase 2), which avoids deadlock; binds and mappings
+ * follow (phase 3). */
 
 /* Must hold g_lock. */
 static int do_resume(void) {
@@ -2692,47 +1599,31 @@ static int do_resume(void) {
   CUcontext saved = NULL;
   r_cuCtxGetCurrent(&saved);
 
-  /* One total budget for the whole rebuild, comfortably inside the
-   * sentry's 5-minute ack timeout: fail loudly here rather than let the
-   * two sides time out disagreeing about the outcome. */
+  /* One budget for the whole rebuild, inside the sentry's 5-minute ack timeout.
+   */
   g_resume_deadline = mono_ms() + RESUME_DEADLINE_MS;
 
-  /* Snapshot which objects need the FULL rebuild (torn down by suspend).
-   * torn_down itself is cleared below the moment an object is live
-   * again, so a suspend retried after a FAILED resume tears rebuilt
-   * objects back down instead of skipping them, and a retried resume
-   * cannot double-create them. Phases 2 and 3 therefore decide off this
-   * snapshot, never the live flag. */
+  /* Snapshot which objects need a full rebuild. torn_down is cleared as each
+   * object comes back, so phases 2 and 3 use this snapshot. */
   char full[MAXN];
   for (int gi = 0; gi < MAXN; gi++) full[gi] = (char)g_alloc[gi].torn_down;
 
-  /* Phase 0: warm each context. The first VMM/IPC call issued from this
-   * (control) thread on a freshly cuda-checkpoint-restored context can
-   * return CUDA_ERROR_UNKNOWN; a synchronize first clears it. (Rank 0
-   * was masked because its first op is cuMulticastCreate; importer ranks,
-   * whose first op was a re-export, hit the stale-context error.)
-   *
-   * The synchronize result is also the earliest possible health probe:
-   * it runs before the shim has issued any rebuild work, so a sticky
-   * error here means cuda-checkpoint's restore itself left the context
-   * faulted, and no rebuild policy can be responsible. Logged, not
-   * fatal, so every rank reports. */
+  /* Phase 0: the first VMM call on a freshly restored context can fail with
+   * CUDA_ERROR_UNKNOWN, and a synchronize clears it. Its result also shows
+   * whether cuda-checkpoint's restore left the context faulted. */
   ctx_probe("resume-entry");
   ctx_probe("resume-warm");
 
-  /* Phase 1: every exporter re-establishes its object and starts
-   * serving the re-exported fd. */
+  /* Phase 1: every exporter re-creates its object and serves the re-exported
+   * fd. */
   int p1_mc = 0, p1_uc = 0;
   for (int gi = 0; gi < MAXN; gi++) {
-    /* The context switch happens after the kind checks so a
-     * KIND_FREE slot can never install a stale context. */
+    /* Switch context only after the kind checks, so a free slot never installs
+     * a stale one. */
     if (g_alloc[gi].kind == KIND_MC && !g_alloc[gi].imported) {
       if (g_alloc[gi].ctx) r_cuCtxSetCurrent(g_alloc[gi].ctx);
-      /* Multicast creator: new group handle, then serve it.
-       * After a PARTIAL suspend failure a group may still be
-       * live (torn_down unset); serve its existing handle
-       * without recreating, so peers that DID tear down can
-       * still refetch during the unwind. */
+      /* Multicast creator. After a partial suspend the group may still be live;
+       * serve its existing handle so peers that did tear down can refetch. */
       CUmemGenericAllocationHandle newmc = g_alloc[gi].handle;
       if (full[gi]) {
         if (r_cuMulticastCreate(&newmc, &g_alloc[gi].mprop) != CUDA_SUCCESS) {
@@ -2743,8 +1634,7 @@ static int do_resume(void) {
           return -1;
         }
         alloc_push_aka(&g_alloc[gi], newmc);
-        /* Live again: a retried suspend must tear it
-         * down, not skip it. */
+        /* Live again: a retried suspend must tear it down. */
         g_alloc[gi].torn_down = 0;
       }
       if (g_alloc[gi].has_key && reexport_serve(gi, newmc) != 0) return -1;
@@ -2753,12 +1643,9 @@ static int do_resume(void) {
     } else if (g_alloc[gi].kind == KIND_UC) {
       CUmemGenericAllocationHandle h = g_alloc[gi].handle;
       if (g_alloc[gi].uc_content && full[gi]) {
-        /* Freed across the checkpoint (see do_suspend):
-         * recreate with the original properties, re-map
-         * at the identical VAs,
-         * and restore the saved contents. Must precede
-         * the re-export below and this rank's binds in
-         * phase 3. */
+        /* Freed across the checkpoint (see do_suspend): recreate, re-map at the
+         * identical VAs and restore the contents, before the re-export below
+         * and the phase 3 binds. */
         if (g_alloc[gi].ctx) r_cuCtxSetCurrent(g_alloc[gi].ctx);
         CUmemGenericAllocationHandle nh = 0;
         CUresult rc =
@@ -2792,11 +1679,8 @@ static int do_resume(void) {
         free(g_alloc[gi].uc_content);
         g_alloc[gi].uc_content = NULL;
       } else if (g_alloc[gi].uc_content) {
-        /* Partial suspend: the allocation is still live
-         * on the device (release never ran), so the
-         * device contents are authoritative; re-map
-         * whatever the suspend unmapped and drop the
-         * backup. */
+        /* Partial suspend: still live, so the device contents are
+         * authoritative. Re-map what was unmapped and drop the backup. */
         if (remap_alloc(gi, h, "UC-export", 1 /* partial */, &remapped) != 0)
           return -1;
         free(g_alloc[gi].uc_content);
@@ -2804,43 +1688,18 @@ static int do_resume(void) {
       }
       if (g_alloc[gi].has_key) {
         if (g_alloc[gi].ctx) r_cuCtxSetCurrent(g_alloc[gi].ctx);
-        /* Exporter of a P2P peer buffer: serve the handle
-         * importers must fetch. */
+        /* P2P exporter: serve the handle importers fetch. */
         if (reexport_serve(gi, h) != 0) return -1;
         served++;
         p1_uc++;
       }
     }
   }
-  /* Legacy IPC exporters re-export and serve here too, in phase 1, for
-   * the same anti-deadlock reason: a rank that is an exporter to one
-   * peer and an importer from another must be serving before anybody
-   * starts fetching. */
-  int p1_ipc = 0;
-  for (int i = 0; i < MAXN; i++) {
-    if (!g_ipc[i].used || g_ipc[i].is_import) continue;
-    if (g_ipc[i].ctx) r_cuCtxSetCurrent(g_ipc[i].ctx);
-    /* The blob a re-export produces differs from the original, so
-     * importers cannot reuse what they have; serve the new one
-     * under the original blob's key, which both sides still know. */
-    CUipcMemHandle nb;
-    CUresult rc = r_cuIpcGetMemHandle(&nb, g_ipc[i].ptr);
-    if (rc != CUDA_SUCCESS) {
-      mclog("RESUME: cuIpcGetMemHandle(0x%llx) rc=%d",
-            (unsigned long long)g_ipc[i].ptr, rc);
-      return -1;
-    }
-    if (ipc_start_serving(&g_ipc[i], &nb) != 0) return -1;
-    p1_ipc++;
-  }
 
-  mclog(
-      "RESUME: phase1 done (%d MC creators, %d UC exporters served, "
-      "%d IPC exporters served)",
-      p1_mc, p1_uc, p1_ipc);
+  mclog("RESUME: phase1 done (%d MC creators, %d UC exporters served)", p1_mc,
+        p1_uc);
 
-  /* Phase 2: importers fetch the re-exported fd and re-import (new
-   * handle). Serving is already up for every exporter, so no deadlock. */
+  /* Phase 2: importers fetch and re-import (new handles). */
   for (int gi = 0; gi < MAXN; gi++) {
     if (!full[gi]) continue; /* still live (partial suspend); nothing to redo */
     if (g_alloc[gi].kind == KIND_MC && g_alloc[gi].imported) {
@@ -2860,16 +1719,9 @@ static int do_resume(void) {
     }
   }
 
-  /* Phase 3: rebuild bindings and re-map every VA at its IDENTICAL
-   * address, now that all handles (local and imported) are resolved.
-   *
-   * Torn-down objects take the full path: AddDevice replay, every
-   * recorded bind, every recorded mapping (exactly the validated
-   * behavior). Objects a partial suspend left LIVE need only their
-   * per-entry unwind: re-bind the binds it unbound (.unbound) and
-   * re-map the mappings it unmapped (.suspended), against the LIVE
-   * handle -- no AddDevice replay, since no device was ever detached
-   * from a group that was never released. */
+  /* Phase 3: rebuild binds and re-map every VA at its identical address.
+   * Torn-down objects replay AddDevice, binds and mappings; objects a partial
+   * suspend left live only redo what it undid. */
   for (int gi = 0; gi < MAXN; gi++) {
     if (g_alloc[gi].kind != KIND_MC && g_alloc[gi].kind != KIND_IMP) continue;
     int partial = !full[gi];
@@ -2885,8 +1737,8 @@ static int do_resume(void) {
                 g_alloc[gi].devs[d]);
             return -1;
           }
-      /* cuMulticastBindMem blocks until every device has
-       * joined -- the binds are the cross-rank barrier. */
+      /* cuMulticastBindMem blocks until every device joins: the binds are the
+       * cross-rank barrier. */
       for (int b = 0; b < MAXN; b++) {
         if (!g_bind[b].used || g_bind[b].groupIdx != gi) continue;
         if (partial && !g_bind[b].unbound)
@@ -2897,10 +1749,6 @@ static int do_resume(void) {
                 ? r_cuMulticastBindAddr(mc, g_bind[b].mcOffset, g_bind[b].va,
                                         g_bind[b].size, 0)
                 : r_cuMulticastBindMem(mc, g_bind[b].mcOffset,
-                                       /* The bound memory may itself be an
-                                        * imported handle, and those do
-                                        * rotate across a rebuild; identity
-                                        * for anything that did not. */
                                        xlate_mc(g_bind[b].mem),
                                        g_bind[b].memOffset, g_bind[b].size, 0);
         if (rc != CUDA_SUCCESS) {
@@ -2919,25 +1767,7 @@ static int do_resume(void) {
     }
   }
 
-  /* Phase 4: reopen legacy IPC imports.
-   *
-   * Last, and in ascending open order. cuIpcOpenMemHandle takes no
-   * address hint -- unlike cuMemAddressReserve, the driver picks the
-   * address, and it picks the next free slot. So the original VA comes
-   * back only if the allocation state it sees matches what it saw the
-   * first time, which is why this runs after every VMM mapping has been
-   * restored to its identical address, and why nothing may allocate in
-   * between (and why the whole cuMemAlloc* family is gated). Measured:
-   * an interposed allocation moves the import by exactly one slot.
-   *
-   * A moved import is silent corruption: the application still holds the
-   * old pointer and nothing returns an error. So verify, and fail loudly
-   * rather than hand back a working-looking process. */
-  if (resume_reopen_ipc(p1_ipc) != 0) return -1;
-
-  /* Everything is rebuilt; the next suspend starts from a clean slate.
-   * (torn_down was already cleared per-object as each rebuild landed;
-   * the sweeps keep every flag consistent regardless.) */
+  /* Everything is rebuilt; reset every flag for the next suspend. */
   for (int gi = 0; gi < MAXN; gi++) g_alloc[gi].torn_down = 0;
   for (int b = 0; b < MAXN; b++) g_bind[b].unbound = 0;
   for (int m = 0; m < MAXN; m++) g_map[m].suspended = 0;
@@ -2951,261 +1781,7 @@ static int do_resume(void) {
   return 0;
 }
 
-/* Reopen every legacy IPC import, in its original open order, and verify each
- * lands where it was. Must hold g_lock. */
-/* Temporary reservations plugging arena holes during the reopen walk. Freed
- * once every import is placed; until then they are what keeps import N+1 from
- * falling into the holes already probed for import N. */
-#define IPC_MAX_PLUGS 16384
-static struct {
-  CUdeviceptr base;
-  size_t size;
-} g_plugs[IPC_MAX_PLUGS];
-
-/* Temporary exact holds over every import target that has not been placed
- * yet (seq > cur), so a plug reservation whose hint is not honoured cannot
- * land on one. Released by ipc_release_target_holds right after the plug is
- * placed, before the reopen, so the reopen sees the wide hole. Imports that
- * still carry their suspend-time hold are already covered. Must hold g_lock.
- * Returns the number held, or -1. */
-static struct {
-  CUdeviceptr base;
-  size_t size;
-} g_tholds[MAXN];
-static int g_ntholds;
-
-static int ipc_hold_unplaced_targets(int cur) {
-  const size_t gran = 2u << 20;
-  g_ntholds = 0;
-  for (int j = 0; j < MAXN; j++) {
-    if (!g_ipc[j].used || !g_ipc[j].is_import || !g_ipc[j].closed ||
-        g_ipc[j].seq <= cur || g_ipc[j].resv || !g_ipc[j].range_size)
-      continue;
-    size_t sz = (g_ipc[j].range_size + gran - 1) & ~(gran - 1);
-    CUdeviceptr r = 0;
-    if (r_cuMemAddressReserve(&r, sz, 0, g_ipc[j].range_base, 0) !=
-        CUDA_SUCCESS)
-      continue; /* driver-owned range: cannot be squatted by us either */
-    if (r != g_ipc[j].range_base) {
-      r_cuMemAddressFree(r, sz);
-      continue; /* already occupied; that import is lost anyway */
-    }
-    g_tholds[g_ntholds].base = r;
-    g_tholds[g_ntholds].size = sz;
-    g_ntholds++;
-  }
-  return g_ntholds;
-}
-
-static void ipc_release_target_holds(void) {
-  for (int k = 0; k < g_ntholds; k++)
-    r_cuMemAddressFree(g_tholds[k].base, g_tholds[k].size);
-  g_ntholds = 0;
-}
-
-static int resume_reopen_ipc(int p1_ipc) {
-  int ipc_reopened = 0, ipc_moved = 0, ipc_replaced = 0;
-  int nplugs = 0;
-  for (int pass_seq = 0; pass_seq < g_ipc_seq; pass_seq++) {
-    for (int i = 0; i < MAXN; i++) {
-      if (!g_ipc[i].used || !g_ipc[i].is_import || !g_ipc[i].closed ||
-          g_ipc[i].seq != pass_seq)
-        continue;
-      if (g_ipc[i].ctx) r_cuCtxSetCurrent(g_ipc[i].ctx);
-      CUipcMemHandle nb;
-      if (ipc_fetch_blob(&g_ipc[i], &nb, 60000) != 0) goto fail;
-      /* Release the held range immediately before THIS reopen
-       * and no earlier: every other target must stay reserved,
-       * or this import can squat on a later import's address.
-       * (Freeing them all up front was tried while chasing the
-       * TP=8 low-arena problem; it did not help that and broke
-       * the TP=4 walk.) */
-      if (g_ipc[i].resv) {
-        CUresult frc = r_cuMemAddressFree(g_ipc[i].resv, g_ipc[i].resv_size);
-        if (frc != CUDA_SUCCESS)
-          mclog(
-              "RESUME: freeing held range for "
-              "seq=%d rc=%d",
-              g_ipc[i].seq, frc);
-        g_ipc[i].resv = 0;
-      }
-      CUdeviceptr np = 0;
-      CUresult rc = r_cuIpcOpenMemHandle(&np, nb, g_ipc[i].flags);
-      if (rc != CUDA_SUCCESS) {
-        mclog("RESUME: cuIpcOpenMemHandle(seq=%d) rc=%d", g_ipc[i].seq, rc);
-        goto fail;
-      }
-
-      /* Walk it back if it landed low.
-       *
-       * cuIpcOpenMemHandle takes no address hint; it takes the
-       * lowest free hole in its arena. The import's own range is
-       * protected (we held a reservation over it across the
-       * checkpoint), but the arena has OTHER free holes below it
-       * -- between the import clusters, and where /sleep freed
-       * the weights and KV cache -- and the driver prefers those.
-       *
-       * A single fence over [landed, target) cannot work: that
-       * span crosses the other imports' held reservations, and a
-       * reservation cannot overlap an existing one. So plug the
-       * holes one at a time instead. Wherever the open lands IS,
-       * by construction, the lowest free hole: close it, reserve
-       * exactly there, and open again. Each iteration eliminates
-       * one hole, so this terminates, and once nothing below the
-       * target is free the open lands exactly on it. Plugs stay
-       * until every import is placed (they are what stops import
-       * N+1 falling into the same holes), then all are freed. */
-      int hops = 0;
-      /* Only a LOW landing is walkable: a landing ABOVE the target
-       * means the driver refused the exact hole (its allocator is
-       * top-down first-fit and rejects exact fits -- measured), and
-       * no plugging can change that. Such imports are why legacy
-       * IPC is promoted to VMM IPC at export time by default. */
-      while (np < g_ipc[i].ptr) {
-        if (nplugs >= IPC_MAX_PLUGS) {
-          mclog(
-              "RESUME: seq=%d still %+lld MiB off "
-              "target after %d hole plugs; giving up",
-              g_ipc[i].seq,
-              ((long long)np - (long long)g_ipc[i].ptr) / (1024 * 1024),
-              nplugs);
-          break;
-        }
-        if (r_cuIpcCloseMemHandle(np) != CUDA_SUCCESS) {
-          mclog(
-              "RESUME: close during re-place "
-              "(seq=%d) failed",
-              g_ipc[i].seq);
-          goto fail;
-        }
-        /* Plug the hole it fell into, with every UNPLACED
-         * target held meanwhile. cuMemAddressReserve's address
-         * is a hint: when the hole at np is smaller than the
-         * plug, the reservation lands somewhere else that fits
-         * -- and a free target (this import's, or a later
-         * import's whose hold was not honoured) is exactly
-         * such a place.
-         * A plug on a target is unrecoverable, so hold them all
-         * first, shrink the plug until the hint is honoured,
-         * and never keep a plug that did not land at np. */
-        const size_t gran = 2u << 20;
-        int nheld = ipc_hold_unplaced_targets(pass_seq);
-        if (nheld < 0) goto fail;
-        size_t psz = (g_ipc[i].range_size + gran - 1) & ~(gran - 1);
-        /* Never spill past the target. */
-        if (psz > (size_t)(g_ipc[i].ptr - np))
-          psz = (size_t)(g_ipc[i].ptr - np);
-        if (psz < gran) psz = gran;
-        CUdeviceptr plug = 0;
-        CUresult prc;
-        for (;;) {
-          plug = 0;
-          prc = r_cuMemAddressReserve(&plug, psz, 0, np, 0);
-          if (prc != CUDA_SUCCESS || plug == np) break;
-          /* Hint not honoured: the hole is smaller. */
-          r_cuMemAddressFree(plug, psz);
-          if (psz <= gran) {
-            prc = 999;
-            break;
-          }
-          psz = ((psz / 2) + gran - 1) & ~(gran - 1);
-        }
-        ipc_release_target_holds();
-        if (prc != CUDA_SUCCESS) {
-          /* Nothing can be reserved at np, not even a
-           * granule: np is inside a range the driver owns
-           * (or a target hold). Fail loudly rather than plug
-           * elsewhere. */
-          mclog(
-              "RESUME: cannot plug hole at 0x%llx for "
-              "seq=%d (rc=%d)",
-              (unsigned long long)np, g_ipc[i].seq, prc);
-          np = 0;
-          if (r_cuIpcOpenMemHandle(&np, nb, g_ipc[i].flags) != CUDA_SUCCESS)
-            goto fail;
-          break; /* accounted as MOVED below */
-        }
-        g_plugs[nplugs].base = plug;
-        g_plugs[nplugs].size = psz;
-        nplugs++;
-        hops++;
-        np = 0;
-        rc = r_cuIpcOpenMemHandle(&np, nb, g_ipc[i].flags);
-        if (rc != CUDA_SUCCESS) {
-          mclog(
-              "RESUME: re-place open seq=%d rc=%d "
-              "after %d plugs",
-              g_ipc[i].seq, rc, hops);
-          goto fail;
-        }
-      }
-      if (hops && np == g_ipc[i].ptr) {
-        ipc_replaced++;
-        mcvlog(
-            "RESUME: seq=%d walked back to 0x%llx in %d "
-            "hole plugs",
-            g_ipc[i].seq, (unsigned long long)np, hops);
-      }
-
-      if (np != g_ipc[i].ptr) {
-        /* Keep going rather than stopping at the first
-         * mismatch: how MANY move, and by how much, is
-         * what distinguishes a placement-ordering bug
-         * from the approach being unworkable. The resume
-         * still fails below -- the application holds the
-         * old pointers, so a moved import is silent
-         * corruption, not a warning. */
-        ipc_moved++;
-        mclog(
-            "RESUME: IPC import seq=%d MOVED: 0x%llx -> "
-            "0x%llx (delta %+lld MiB)",
-            g_ipc[i].seq, (unsigned long long)g_ipc[i].ptr,
-            (unsigned long long)np,
-            ((long long)np - (long long)g_ipc[i].ptr) / (1024 * 1024));
-        continue;
-      }
-      /* Live again at the right address: a retried
-       * suspend re-closes it, and the gate-release
-       * check no longer counts it as outstanding. */
-      g_ipc[i].closed = 0;
-      ipc_reopened++;
-      mcvlog("RESUME: reopened IPC import seq=%d va=0x%llx", g_ipc[i].seq,
-             (unsigned long long)np);
-    }
-  }
-  /* Every import is placed (or we are about to fail); the hole plugs
-   * have served their purpose. */
-  for (int p = 0; p < nplugs; p++)
-    r_cuMemAddressFree(g_plugs[p].base, g_plugs[p].size);
-
-  if (ipc_reopened || p1_ipc || ipc_moved)
-    mclog(
-        "RESUME: legacy IPC done (%d reopened at identical VAs, "
-        "of which %d walked back via %d hole plugs; %d MOVED, "
-        "%d served)",
-        ipc_reopened, ipc_replaced, nplugs, ipc_moved, p1_ipc);
-  if (ipc_moved) {
-    mclog(
-        "RESUME: FATAL: %d of %d legacy IPC imports did not return "
-        "to their original address. cuIpcOpenMemHandle takes no "
-        "address hint, so placement depends on the allocation "
-        "state at reopen time matching the original.",
-        ipc_moved, ipc_moved + ipc_reopened);
-    return -1;
-  }
-  return 0;
-
-fail:
-  /* The plugs are only ever temporary; a failure return must not leak
-   * them into the (still gated, possibly retried) address space. */
-  for (int p = 0; p < nplugs; p++)
-    r_cuMemAddressFree(g_plugs[p].base, g_plugs[p].size);
-  return -1;
-}
-
-/* ------------------------------------------------------------------ */
-/* Control thread: poll $MCSHIM_DIR for suspend/resume markers.       */
-/* ------------------------------------------------------------------ */
+/* Control thread: polls $MCSHIM_DIR for markers. */
 
 static void marker(const char* name, char* out, size_t n) {
   snprintf(out, n, "%s/%s", g_dir, name);
@@ -3234,44 +1810,23 @@ static void marker_write(const char* name, const char* body) {
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* Lookup interposition: dlsym + cuGetProcAddress.                    */
-/*                                                                    */
-/* torch/NCCL/ctypes resolve driver entry points with                 */
-/* dlsym(dlopen("libcuda.so.1"), name) or cuGetProcAddress, which     */
-/* bypasses classic symbol interposition. Redirect lookups of the     */
-/* tracked entry points to the shim's wrappers.                       */
-/* ------------------------------------------------------------------ */
+/* Lookup interposition: torch, NCCL and ctypes resolve driver entry points with
+ * dlsym or cuGetProcAddress, bypassing symbol interposition, so tracked names
+ * are redirected to the wrappers. */
 
-/* All wrappers above are already defined; only the cuGetProcAddress pair is
- * defined below the table and needs declarations. */
-
-/* ------------------------------------------------------------------ */
-/* Suspend gate.                                                      */
-/*                                                                    */
-/* Between suspend and resume the multicast groups and peer imports    */
-/* are released and their VAs are unmapped. Any application thread     */
-/* that reaches the GPU in that window touches an unmapped VA and      */
-/* faults its context (CUDA_ERROR_ILLEGAL_ADDRESS, 700) -- and because */
-/* the ranks share a multicast group, one rank doing so can fault      */
-/* every rank. The acceptance harness avoids this by pausing the       */
-/* workload, but a real workload (vLLM, SGLang) has no such pause:     */
-/* `cuda-checkpoint --toggle` restores AND unlocks each process, so the */
-/* application becomes runnable while the rebuild is still in flight.  */
-/*                                                                    */
-/* So the shim makes the guarantee itself: while suspended, the        */
-/* interposed entry points through which GPU work is submitted block   */
-/* until the rebuild completes. The application observes a pause, not  */
-/* a fault, and needs no cooperation. The shim's own suspend/resume    */
-/* work calls the real entry points (r_*) directly and is never gated. */
-/* ------------------------------------------------------------------ */
+/* Suspend gate. While suspended, multicast groups and imports are released and
+ * their VAs unmapped: an app thread touching the GPU then faults its context
+ * (700), and through a shared group every rank. cuda-checkpoint --toggle
+ * restores and unlocks the app before the rebuild, so the entry points that
+ * submit GPU work block until it completes. The shim's own work calls the
+ * reals. */
 
 static pthread_mutex_t g_gate_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_gate_cv = PTHREAD_COND_INITIALIZER;
 
-/* Arm before the teardown begins, so no app thread can slip between the
- * decision to suspend and the first unmap. g_suspended is read locklessly on
- * the gate_wait fast path, so all transitions are atomic stores. */
+/* Arm before the teardown, so that no app thread slips in before the first
+ * unmap. gate_wait reads g_suspended locklessly, so transitions are atomic
+ * stores. */
 static void gate_arm(void) {
   pthread_mutex_lock(&g_gate_lock);
   __atomic_store_n(&g_suspended, 1, __ATOMIC_SEQ_CST);
@@ -3298,16 +1853,10 @@ static void gate_wait(void) {
   pthread_mutex_unlock(&g_gate_lock);
 }
 
-/* Entry points through which the application submits GPU work or waits on
- * it. Each one blocks while suspended, then forwards unchanged. The tracked
- * mutators above (cuMemCreate, the cuMulticast and cuIpc families, exports,
- * imports, map/unmap, release) call gate_wait() directly for the same
- * reason plus one more: a thread reaching them in the unlocked teardown
- * window would create or free shared state AFTER the strict blocker gate
- * verified there was none, yielding a snapshot that hangs the checkpoint or
- * only fails at restore. The suspend/resume machinery itself always calls
- * the r_ reals, never these wrappers, so gating them cannot deadlock the
- * transition. */
+/* Entry points that submit GPU work or wait on it: block while suspended, then
+ * forward. Tracked mutators call gate_wait() too, so that nothing creates or
+ * frees shared state after the strict blocker check. Suspend and resume use the
+ * reals, so gating cannot deadlock them. */
 #define GATED(name, proto, args)                            \
   static CUresult(*r_##name) proto;                         \
   CUresult name proto;                                      \
@@ -3370,29 +1919,6 @@ GATED(cuMemsetD16Async,
 GATED(cuLaunchHostFunc, (CUstream_t st, CUhostFn_t fn, void* userData),
       (st, fn, userData))
 GATED(cuStreamSynchronize, (CUstream_t st), (st))
-/* The allocation family is gated for a different reason than the
- * submission entries: the legacy-IPC reopen walk (resume_reopen_ipc)
- * requires that NOTHING allocates device VA while it runs, or the walked
- * imports land one slot off their original addresses. */
-GATED(cuMemAlloc_v2, (CUdeviceptr * dptr, size_t n), (dptr, n))
-static CUresult (*r_cuMemFree_v2)(CUdeviceptr);
-CUresult cuMemFree_v2(CUdeviceptr dptr);
-CUresult cuMemFree_v2(CUdeviceptr dptr) {
-  REAL(r_cuMemFree_v2, "cuMemFree_v2");
-  if (!r_cuMemFree_v2) return 1;
-  gate_wait();
-  /* A promoted export is VMM-backed now; free it as such. */
-  if (dptr && ipc_promote_release(dptr, 1 /* export */) == 0)
-    return CUDA_SUCCESS;
-  return r_cuMemFree_v2(dptr);
-}
-GATED(cuMemAllocAsync, (CUdeviceptr * dptr, size_t n, CUstream_t st),
-      (dptr, n, st))
-GATED(cuMemFreeAsync, (CUdeviceptr dptr, CUstream_t st), (dptr, st))
-GATED(cuMemAllocPitch_v2,
-      (CUdeviceptr * dptr, size_t* pPitch, size_t WidthInBytes, size_t Height,
-       unsigned int ElementSizeBytes),
-      (dptr, pPitch, WidthInBytes, Height, ElementSizeBytes))
 
 CUresult cuGetProcAddress(const char*, void**, int, unsigned long long);
 CUresult cuGetProcAddress_v2(const char*, void**, int, unsigned long long,
@@ -3409,11 +1935,8 @@ int cudaGetDriverEntryPointByVersion_ptsz(const char*, void**, unsigned int,
 typedef struct {
   const char* name;
   void* fn;
-  /* The wrapper forwards to the LEGACY-stream real, so redirecting a
-   * per-thread-default-stream (PTDS) cuGetProcAddress lookup to it
-   * would silently change the app's NULL-stream semantics; such
-   * lookups are declined (see gpa_redirect). State-tracking entries
-   * have no stream semantics and are always redirected. */
+  /* Wrappers forward to the legacy-stream real, so PTDS lookups are not
+   * redirected to them (see gpa_redirect). */
   int stream_sem;
 } WrapEntry;
 
@@ -3435,11 +1958,6 @@ static const WrapEntry* wrap_table(void) {
        0},
       {"cuDeviceGetAttribute", (void*)cuDeviceGetAttribute, 0},
 
-      {"cuIpcGetMemHandle", (void*)cuIpcGetMemHandle, 0},
-      {"cuMemRetainAllocationHandle", (void*)cuMemRetainAllocationHandle, 0},
-      {"cuIpcOpenMemHandle", (void*)cuIpcOpenMemHandle_v2, 0},
-      {"cuIpcOpenMemHandle_v2", (void*)cuIpcOpenMemHandle_v2, 0},
-      {"cuIpcCloseMemHandle", (void*)cuIpcCloseMemHandle, 0},
       {"cuLaunchKernel", (void*)cuLaunchKernel, 1},
       {"cuLaunchKernelEx", (void*)cuLaunchKernelEx, 1},
       {"cuLaunchCooperativeKernel", (void*)cuLaunchCooperativeKernel, 1},
@@ -3476,24 +1994,11 @@ static const WrapEntry* wrap_table(void) {
       {"cuMemcpy3DAsync", (void*)cuMemcpy3DAsync_v2, 1},
       {"cuMemcpy3DAsync_v2", (void*)cuMemcpy3DAsync_v2, 1},
       {"cuStreamSynchronize", (void*)cuStreamSynchronize, 1},
-      /* Gated (the legacy-IPC reopen walk requires that nothing
-       * allocates device VA while it runs) but without PTDS/PTSZ
-       * variants, so always redirected. */
-      {"cuMemAlloc", (void*)cuMemAlloc_v2, 0},
-      {"cuMemAlloc_v2", (void*)cuMemAlloc_v2, 0},
-      {"cuMemFree", (void*)cuMemFree_v2, 0},
-      {"cuMemFree_v2", (void*)cuMemFree_v2, 0},
-      {"cuMemAllocPitch", (void*)cuMemAllocPitch_v2, 0},
-      {"cuMemAllocPitch_v2", (void*)cuMemAllocPitch_v2, 0},
-      /* Stream-ordered allocators DO have _ptsz variants. */
-      {"cuMemAllocAsync", (void*)cuMemAllocAsync, 1},
-      {"cuMemFreeAsync", (void*)cuMemFreeAsync, 1},
       {"cuGetProcAddress", (void*)cuGetProcAddress, 0},
       {"cuGetProcAddress_v2", (void*)cuGetProcAddress_v2, 0},
       /* NVML fabric-info smoothing (see nvml_fabric_info_smooth). */
       {"nvmlDeviceGetGpuFabricInfoV", (void*)nvmlDeviceGetGpuFabricInfoV, 0},
-      /* CUDA runtime resolvers: covers apps that dlsym them from a
-       * dlopen'd libcudart rather than linking it. */
+      /* Covers apps that dlsym these from a dlopen'd libcudart. */
       {"cudaGetDriverEntryPoint", (void*)cudaGetDriverEntryPoint, 0},
       {"cudaGetDriverEntryPoint_ptsz", (void*)cudaGetDriverEntryPoint_ptsz, 0},
       {"cudaGetDriverEntryPointByVersion",
@@ -3517,17 +2022,16 @@ static void* wrapper_for(const char* name) {
   return e ? e->fn : NULL;
 }
 
-/* Interposed dlsym: hand out shim wrappers for tracked driver symbols.
- * Note: delegating through a dlvsym-resolved dlsym re-anchors RTLD_NEXT at
- * mcshim's link map, which can confuse interposers stacked after it
- * (inherent to the technique). */
+/* Interposed dlsym: hand out wrappers for tracked driver symbols. Delegating
+ * through a dlvsym-resolved dlsym re-anchors RTLD_NEXT at mcshim, which can
+ * confuse interposers stacked after it. */
 void* dlsym(void* handle, const char* symbol) {
   init_real_dlsym();
   if (!real_dlsym) return NULL;
   void* w = wrapper_for(symbol);
   if (w) {
-    /* Only redirect if the real library actually has the symbol
-     * (so feature probes against old drivers still behave). */
+    /* Redirect only if the library has the symbol, so feature probes still
+     * work. */
     void* r = real_dlsym(handle, symbol);
     if (r) return w;
     return r;
@@ -3535,13 +2039,10 @@ void* dlsym(void* handle, const char* symbol) {
   return real_dlsym(handle, symbol);
 }
 
-/* Interposed cuGetProcAddress (CUDA 11.3+ runtime/apps resolve driver
- * entry points through this): same redirection -- but the resolver itself
- * needs ABI-aware handling. A query for "cuGetProcAddress" at
- * cudaVersion >= 12000 returns the 5-arg v2 ABI, so it must get our v2
- * wrapper: handing out the 4-arg v1 wrapper leaves the caller's
- * symbolStatus unwritten (uninitialized), which made stock NCCL mark every
- * symbol missing and call NULL pfns. */
+/* Interposed cuGetProcAddress. A lookup of "cuGetProcAddress" at cudaVersion >=
+ * 12000 expects the 5-argument v2 ABI, so it must get the v2 wrapper: the v1
+ * wrapper leaves symbolStatus unwritten, and NCCL then treats every symbol as
+ * missing. */
 
 #define CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM (1ULL << 1)
 
@@ -3552,11 +2053,9 @@ static void* gpa_redirect(const char* symbol, int cudaVersion,
                                 : (void*)cuGetProcAddress;
   const WrapEntry* e = wrap_entry(symbol);
   if (!e) return NULL;
-  /* A PTDS lookup of a stream-semantics-sensitive entry gets the
-   * driver's own _ptds/_ptsz pfn unmodified: our wrapper forwards to
-   * the legacy-stream real and would silently change the app's
-   * NULL-stream semantics. (Such an app is then not gated on these
-   * entries -- a known limitation, logged so it is diagnosable.) */
+  /* A PTDS lookup of a stream-sensitive entry gets the driver's own pfn, since
+   * the wrapper would change NULL-stream semantics. Such apps are not gated on
+   * these entries (logged). */
   if (e->stream_sem &&
       (flags & CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM)) {
     static int logged;
@@ -3600,32 +2099,14 @@ CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion,
   return rc;
 }
 
-/* Interposed CUDA *runtime* driver-entry-point resolvers.
- *
- * torch >= 2.11 resolves its entire c10 DriverAPI table -- cuMemCreate,
- * cuMulticastCreate, cuMemExportToShareableHandle, ... -- through
- * cudaGetDriverEntryPointByVersion (a public libcudart export). libcudart
- * reaches libcuda through an internal dlvsym/cuGetExportTable bootstrap that
- * neither the dlsym hook nor the cuGetProcAddress wrappers ever see, so
- * every symbol resolved this way was invisible to the shim. The
- * torch->libcudart hop itself is an ordinary cross-DSO binding, which
- * LD_PRELOAD wins: interpose the resolver, let the real runtime do the
- * lookup, then post-process the result exactly like cuGetProcAddress.
- *
- * The runtime's cudaEnable{Default,LegacyStream,PerThreadDefaultStream}
- * flag values (0, 1, 2) coincide numerically with the driver's
- * CU_GET_PROC_ADDRESS_* bits, so gpa_redirect's PTDS decline logic applies
- * unchanged -- except in the _ptsz variants, where cudaEnableDefault means
- * PTDS (the caller was compiled with per-thread default streams), so the
- * effective flags for the redirect decision are mapped first.
- *
- * The real functions live in libcudart, not libcuda: resolve via RTLD_NEXT
- * (app linked cudart into the global scope), then by soname against an
- * already-loaded copy (torch dlopens its bundled cudart RTLD_LOCAL). Never
- * force-load: if no cudart is loaded, no one can be calling us. If two
- * different-major cudarts are loaded, the newest wins the forward; their
- * resolvers differ only in the default-version mapping of the unversioned
- * variants, and no supported image ships two. */
+/* Interposed cudart resolvers. torch >= 2.11 resolves its driver API through
+ * cudaGetDriverEntryPointByVersion, and cudart reaches libcuda by a path
+ * neither hook sees, so interpose the resolver, let cudart look the symbol up,
+ * and post-process like cuGetProcAddress. cudart's cudaEnable* values equal the
+ * driver's CU_GET_PROC_ADDRESS_* bits, except that cudaEnableDefault means PTDS
+ * in the _ptsz variants. The reals live in libcudart: resolve via RTLD_NEXT,
+ * then in an already-loaded libcudart (torch dlopens it RTLD_LOCAL). Never
+ * force-load it. */
 
 #define CUDA_ERROR_RT_SYMBOL_NOT_FOUND 500 /* cudaErrorSymbolNotFound */
 
@@ -3656,9 +2137,8 @@ static unsigned long long rt_eff_flags(unsigned long long flags, int ptsz) {
   return flags;
 }
 
-/* The unversioned resolver returns entry points matching the runtime's own
- * ABI generation; every cudart >= 12.0 (the supported floor) maps to the
- * v2-era driver ABI, hence version 12000 for the redirect decision. */
+/* The unversioned resolver follows the runtime's own ABI generation, and cudart
+ * >= 12.0 means the v2-era driver ABI. */
 static void rt_gpa_post(const char* symbol, void** pfn, int cudaVersion,
                         unsigned long long flags) {
   void* w;
@@ -3713,13 +2193,10 @@ int cudaGetDriverEntryPointByVersion_ptsz(const char* symbol, void** pfn,
   return rc;
 }
 
-/* Existence-based, edge-triggered protocol (race-free for N ranks sharing
- * the control dir):
- *   "suspend" appears    -> suspend once, ack "suspended.<pid>"
- *   "suspend" disappears -> resume once,  ack "resumed.<pid>"
- * Failures ack "error.<pid>" and wait for the next edge (no retry storm).
- * The marker file is part of the checkpoint image (container /tmp), so after
- * a restore the shim stays suspended until the orchestrator removes it. */
+/* Edge-triggered on marker existence: "suspend" appearing suspends and acks
+ * suspended.<pid>, disappearing resumes and acks resumed.<pid>, and failures
+ * ack error.<pid>. The marker is in the checkpoint image, so after a restore
+ * the shim stays suspended until the sentry removes it. */
 static void* control_thread(void* arg) {
   (void)arg;
   char ack_s[64], ack_r[64], ack_e[64];
@@ -3729,19 +2206,11 @@ static void* control_thread(void* arg) {
   char ack_g[64], ack_ug[64];
   snprintf(ack_g, sizeof(ack_g), "gated.%d", (int)getpid());
   snprintf(ack_ug, sizeof(ack_ug), "ungated.%d", (int)getpid());
-  /* Announce that this process is interposer-managed. Only processes that
-   * resolved a tracked CUDA entry point get a control thread, so only they
-   * can ever acknowledge a transition. The orchestrator selects CUDA
-   * processes by looking for open NVIDIA device FDs, which is a broader set
-   * (a vLLM API server or engine-core process holds them without ever
-   * touching multicast). Without this file the orchestrator would wait
-   * forever for acknowledgements from processes that have no interposer. */
+  /* present.<pid> tells the sentry that this process will ack. The sentry
+   * selects CUDA processes by their open NVIDIA fds, a broader set. */
   char present[64];
   snprintf(present, sizeof(present), "present.%d", (int)getpid());
-  /* Clear any acks a dead predecessor left behind first: pids are
-   * reused inside a container, so a stale suspended.<pid> (etc.) could
-   * otherwise satisfy the sentry's ack wait with a dead process's
-   * answer. */
+  /* Clear acks left by a dead process with the same pid. */
   marker_rm(ack_s);
   marker_rm(ack_r);
   marker_rm(ack_e);
@@ -3752,11 +2221,8 @@ static void* control_thread(void* arg) {
   int prev = 0;      /* treat startup as not-suspended */
   int prev_gate = 0; /* and not-gated */
   for (;;) {
-    /* "gate" bars the application from the GPU. Handled first and
-     * separately from "suspend" because it issues no CUDA calls, so
-     * the orchestrator can arm it while this process is locked by
-     * cuda-checkpoint -- which is what lets the lock, rather than
-     * the gate, be the thing that quiesces coupled ranks. */
+    /* "gate" issues no CUDA calls, so the sentry can arm it while
+     * cuda-checkpoint holds this process locked. */
     int wgate = marker_exists("gate");
     if (wgate != prev_gate) {
       prev_gate = wgate;
@@ -3765,21 +2231,14 @@ static void* control_thread(void* arg) {
         marker_rm(ack_ug);
         marker_write(ack_g, "ok");
       } else {
-        /* Refuse to release the gate while teardown state
-         * is outstanding (a resume failed partway):
-         * ungated, the app would run over unmapped GPU
-         * state and fault every coupled rank. The sentry's
-         * unwind removing the marker does not override
-         * this; only a successful resume clears the flags.
-         * (prev_gate was updated above, so a re-created
-         * marker still re-arms cleanly.) No ungated ack is
-         * written: the process is still gated. */
+        /* Refuse to ungate while teardown state is outstanding (a failed
+         * resume): the app would fault every coupled rank. Only a successful
+         * resume clears it. */
         int torn = 0;
         pthread_mutex_lock(&g_lock);
         for (int i = 0; i < MAXN; i++) {
           if (g_alloc[i].kind != KIND_FREE && g_alloc[i].torn_down) torn++;
           if (g_map[i].used && g_map[i].suspended) torn++;
-          if (g_ipc[i].used && g_ipc[i].is_import && g_ipc[i].closed) torn++;
         }
         pthread_mutex_unlock(&g_lock);
         if (torn) {
@@ -3800,41 +2259,24 @@ static void* control_thread(void* arg) {
     int want = marker_exists("suspend");
     if (want != prev) {
       prev = want;
-      /* Drop any stale error ack before starting this
-       * transition: the sentry fast-fails on error.<pid>, so
-       * only errors from the transition in flight may be
-       * visible. */
+      /* Drop a stale error ack: the sentry fails fast on error.<pid>. */
       marker_rm(ack_e);
       pthread_mutex_lock(&g_lock);
       resolve_reals();
       int rc;
       if (want) {
-        /* Arm first: an app thread must not reach the
-         * GPU between here and the last unmap. */
+        /* Arm first: no app thread may reach the GPU before the last unmap. */
         gate_arm();
         rc = do_suspend();
         if (rc != 0)
-          /* Deliberate: a failed checkpoint must
-           * leave the application running, not
-           * blocked. Whatever partial teardown
-           * happened is rebuilt when the sentry's
-           * unwind removes the suspend marker (the
-           * resume edge below); the window until
-           * then is the price of not deadlocking
-           * the app if the orchestrator goes away. */
+          /* A failed suspend leaves the app running, not blocked. The sentry's
+           * unwind removes the marker, and the resume edge rebuilds any partial
+           * teardown. */
           gate_disarm();
       } else {
-        /* On a FAILED resume the gate stays armed: the
-         * GPU state is partially rebuilt, and blocking
-         * the app beats letting it compute on it (better
-         * blocked than corrupt). Removing the "gate"
-         * marker does not override this -- the gate edge
-         * above refuses to release while teardown state
-         * is outstanding. Teardown and rebuild are
-         * re-enterable (per-entry flags, cleared as each
-         * entry is rebuilt), so a retried suspend/resume
-         * edge converges once the underlying cause
-         * clears. */
+        /* A failed resume keeps the gate armed: better blocked than corrupt.
+         * Teardown and rebuild are re-enterable, so a retried edge converges.
+         */
         rc = do_resume();
         if (rc == 0) gate_disarm();
       }
@@ -3849,14 +2291,9 @@ static void* control_thread(void* arg) {
         marker_write(ack_r, "ok");
       }
     }
-    /* Poll fast. The orchestrator arms the gate on every rank by
-     * creating one marker, so the spread in when the ranks observe
-     * it bounds how likely a peer is to enter a collective after
-     * another rank has already gated -- a straddled collective that
-     * neither the gate nor the lock can then quiesce. At 100ms the
-     * spread was wide enough that a workload with no idle gap
-     * exhausted the orchestrator's lock retries; a few ms of skew
-     * makes it rare. Two stat()s per interval is negligible. */
+    /* Poll every 5 ms: the spread in when ranks see the gate bounds how often a
+     * collective straddles it. At 100 ms, busy workloads exhausted the sentry's
+     * lock retries. */
     struct timespec ts = {0, 5 * 1000 * 1000}; /* 5ms */
     nanosleep(&ts, NULL);
   }
@@ -3865,12 +2302,9 @@ static void* control_thread(void* arg) {
 
 static int g_disabled;
 
-/* Start the control thread lazily, only in processes that actually resolve
- * a tracked CUDA entry point. Every process spawned in the container (shell
- * helpers, `runsc exec touch`, cuda-checkpoint itself) may inherit
- * LD_PRELOAD and share $MCSHIM_DIR; if they all polled for markers, a
- * short-lived helper could consume (or falsely ack) a suspend/resume meant
- * for the CUDA workload. */
+/* Start the control thread only in processes that resolve a tracked entry
+ * point, so that helpers inheriting LD_PRELOAD (shells, runsc exec,
+ * cuda-checkpoint) never consume or ack markers. */
 static void control_thread_start(void) {
   if (g_disabled) return;
   pthread_t t;
@@ -3878,18 +2312,15 @@ static void control_thread_start(void) {
   if (err == 0)
     pthread_detach(t);
   else
-    /* Left silent this surfaces as an inexplicable sentry ack
-     * timeout: no control thread, no present.<pid>, no acks. */
+    /* Otherwise this surfaces as an unexplained sentry ack timeout. */
     mclog(
         "FATAL: control thread creation failed: %s -- this "
         "process will never acknowledge suspend/resume markers",
         strerror(err));
 }
 
-/* Not pthread_once: the fork child handler must be able to reset this so a
- * forked child that later calls cuInit starts its OWN control thread
- * (pthread_once state cannot be reset portably). Guarded by g_lock, which
- * the child handler re-initializes. */
+/* Not pthread_once, which cannot be reset in a fork child. Guarded by g_lock.
+ */
 static int g_control_started;
 
 static void ensure_control_thread(void) {
@@ -3900,24 +2331,18 @@ static void ensure_control_thread(void) {
   if (need) control_thread_start();
 }
 
-/* Fork safety. A forked child has fresh CUDA state (a CUDA context is not
- * usable across fork), so tracking inherited from the parent would describe
- * objects the child does not hold; and any shim mutex held by another parent
- * thread at fork time would deadlock the child's first tracked call. Re-init
- * every lock, drop all tracking, and let the child start its own control
- * thread if it ever initializes CUDA itself. */
+/* Fork: a child has no usable CUDA state, and a lock held by another parent
+ * thread would deadlock it. Reset locks and tracking; the child starts its own
+ * control thread if it initializes CUDA. */
 static void mcshim_atfork_child(void) {
   g_loglock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
   g_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
   g_gate_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
   g_gate_cv = (pthread_cond_t)PTHREAD_COND_INITIALIZER;
-  /* Close inherited rendezvous fds BEFORE dropping the tables that name
-   * them: a held export fd keeps the RM object alive in this child
-   * (CLOEXEC only helps across exec) and would block the parent's NEXT
-   * checkpoint. Do NOT unlink the socket paths: the parent still serves
-   * them. The serve threads' own fds (ServeArgs) are unreachable by
-   * design -- fork does not replicate the owning threads -- and remain
-   * a known residue in a child that never execs. */
+  /* Close inherited rendezvous fds first: a held export fd keeps the RM object
+   * alive and blocks the parent's next checkpoint. The socket paths stay, since
+   * the parent still serves them. Serve threads' own dups are unreachable and
+   * linger until exec. */
   for (int i = 0; i < MAXN; i++) {
     if (g_alloc[i].kind != KIND_FREE) {
       if (g_alloc[i].serve_sock >= 0) close(g_alloc[i].serve_sock);
@@ -3925,15 +2350,12 @@ static void mcshim_atfork_child(void) {
       if (g_alloc[i].serve_wake >= 0) close(g_alloc[i].serve_wake);
     }
     free(g_alloc[i].uc_content);
-    if (g_ipc[i].used && g_ipc[i].serve_sock >= 0) close(g_ipc[i].serve_sock);
   }
   memset(g_alloc, 0, sizeof(g_alloc));
   memset(g_map, 0, sizeof(g_map));
   memset(g_bind, 0, sizeof(g_bind));
-  memset(g_ipc, 0, sizeof(g_ipc));
-  g_ipc_seq = 0;
-  g_track_overflow = 0;
-  g_track_overflow_what = NULL;
+  g_untracked = 0;
+  g_untracked_why = NULL;
   g_alias_overflow = 0;
   __atomic_store_n(&g_suspended, 0, __ATOMIC_SEQ_CST);
   g_control_started = 0;
@@ -3942,21 +2364,16 @@ static void mcshim_atfork_child(void) {
 __attribute__((constructor)) static void mcshim_init(void) {
   pthread_atfork(NULL, NULL, mcshim_atfork_child);
   if (getenv("MCSHIM_DISABLE")) {
-    /* Silent by design: the disabling parent may be collecting this
-     * process's stderr and parsing it (the sentry disables the shim
-     * in the cuda-checkpoint processes it execs, then reads their
-     * output -- a banner would corrupt e.g. --get-state's "running").
-     */
+    /* Silent: the sentry parses the output of the cuda-checkpoint processes it
+     * runs with MCSHIM_DISABLE. */
     g_disabled = 1;
     return;
   }
   const char* d = getenv("MCSHIM_DIR");
   if (d && *d) snprintf(g_dir, sizeof(g_dir), "%s", d);
-  /* The control dir (which also hosts MCSHIM_LOG) may not exist yet:
-   * the constructor runs before the app's main(). Create it so the
-   * first mclog doesn't silently fall back to stderr. */
+  /* Create the control dir, which may also hold MCSHIM_LOG, before the first
+   * mclog. */
   mkdir(g_dir, 0777);
-  /* Do NOT clear markers here, and do NOT start the control thread yet
-   * (see ensure_control_thread). The runner owns marker hygiene. */
+  /* Markers belong to the sentry; the control thread starts from cuInit. */
   mclog("loaded; control dir=%s", g_dir);
 }

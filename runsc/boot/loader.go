@@ -1558,6 +1558,34 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	return nil
 }
 
+// setupCudaCheckpointJob groups a GPU container's CUDA processes into a
+// cuda-checkpoint job (when --cuda-checkpoint-path is set, nvproxy is enabled,
+// and the driver is R610+) so that CUDA IPC state (cuIpcGetMemHandle) can be
+// checkpointed/restored coherently.
+//
+// It works by prepending `cuda-checkpoint --launch-job` to the container's
+// command. See https://github.com/NVIDIA/cuda-checkpoint#610-features.
+func (l *Loader) setupCudaCheckpointJob(info *containerInfo) error {
+	if info.conf.CUDACheckpointPath == "" || !specutils.NVProxyEnabled(info.spec, info.conf) {
+		return nil
+	}
+	if major := l.k.NvidiaDriverVersion.Major(); major < 610 {
+		log.Warningf("--cuda-checkpoint-path is set but driver R%d is older than R610; not wrapping container %q in a cuda-checkpoint job", major, info.containerName)
+		return nil
+	}
+	if len(info.procArgs.Argv) == 0 {
+		return fmt.Errorf("container has no command to wrap")
+	}
+	// Exec cuda-checkpoint from the container filesystem; it then execs the
+	// original command. Clear any exec-FD entrypoint too (the deferred DecRef
+	// in createContainerProcess still releases it).
+	info.procArgs.File = nil
+	info.procArgs.Filename = ""
+	info.procArgs.Argv = append([]string{info.conf.CUDACheckpointPath, "--launch-job"}, info.procArgs.Argv...)
+	log.Infof("Wrapped container %q command in a cuda-checkpoint job", info.containerName)
+	return nil
+}
+
 // setupCudaMulticastShim LD_PRELOADs the multicast suspend/resume interposer
 // into a GPU container (when --cuda-multicast-shim-path and/or
 // --cuda-multicast-shim-source=EMBEDDED is set, nvproxy is enabled, and the driver
@@ -1579,6 +1607,9 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	if major := l.k.NvidiaDriverVersion.Major(); major < 610 {
 		log.Warningf("the multicast interposer is enabled but driver R%d is older than R610; not preloading it into container %q", major, info.containerName)
 		return nil
+	}
+	if info.conf.CUDACheckpointPath == "" {
+		log.Warningf("the multicast interposer is enabled without --cuda-checkpoint-path; CUDA IPC (cuIpcGetMemHandle) state in container %q will not be checkpointable", info.containerName)
 	}
 	// Materialize the embedded interposer before anything references its
 	// path: if this fails, the container boots without any preload rather
@@ -1621,10 +1652,10 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 		env = append(env, control.CudaMulticastShimDirEnv+"="+shimDir)
 	}
 	// NCCL shares P2P buffers either through the VMM API (cuMemCreate +
-	// cuMemExportToShareableHandle; NCCL_CUMEM_ENABLE=1) or through legacy
-	// CUDA IPC (cuIpcOpenMemHandle). The interposer restores the former
-	// exactly; the latter only through its legacy-IPC promotion. Pin NCCL to
-	// the VMM path unless the user chose otherwise.
+	// cuMemExportToShareableHandle; NCCL_CUMEM_ENABLE=1), which the interposer
+	// restores, or through legacy CUDA IPC, which is left to cuda-checkpoint's
+	// job support. Pin NCCL to the VMM path, the tested one, unless the user
+	// chose otherwise.
 	env = appendEnvIfAbsent(env, "NCCL_CUMEM_ENABLE", "1")
 	info.procArgs.Envv = env
 
@@ -1932,10 +1963,13 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	}
 	info.procArgs.StartupTimeline.Reached("exec user home resolved")
 
-	// If configured, preload the multicast suspend/resume interposer into the
-	// container so that its multicast/IPC state can be checkpointed/restored.
-	// Failure is non-fatal: the container still boots, but checkpoint/restore
-	// of that state may not work.
+	// If configured, run the container in a cuda-checkpoint job and preload the
+	// multicast suspend/resume interposer, so that its CUDA IPC and multicast
+	// state can be checkpointed/restored. Failure is non-fatal: the container
+	// still boots, but checkpoint/restore of that state may not work.
+	if err := l.setupCudaCheckpointJob(info); err != nil {
+		log.Warningf("Failed to set up cuda-checkpoint job for container %q: %v", info.containerName, err)
+	}
 	if err := l.setupCudaMulticastShim(info); err != nil {
 		log.Warningf("Failed to set up multicast interposer for container %q: %v", info.containerName, err)
 	}

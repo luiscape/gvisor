@@ -211,6 +211,21 @@ restore` does not require any special flags. If the snapshot was created with
 `runsc checkpoint --cuda-checkpoint-path`, then the same configuration will
 automatically be used on restore.
 
+### CUDA IPC (multi-process) support
+
+Processes that share GPU memory via CUDA IPC (`cuIpcGetMemHandle`) can only be
+checkpointed and restored when they belong to the same `cuda-checkpoint` *job*.
+This requires driver R610+ (see
+[cuda-checkpoint 610 features](https://github.com/NVIDIA/cuda-checkpoint#610-features)).
+
+To enable this, set the runtime `--cuda-checkpoint-path` flag to the path of the
+`cuda-checkpoint` binary inside the container filesystem. gVisor then wraps each
+GPU container's command in `cuda-checkpoint --launch-job`, so that all of its
+CUDA processes share a job. Jobs must be checkpointed sequentially, which
+`runsc checkpoint` then does automatically; it also uses the same binary unless
+given its own `--cuda-checkpoint-path`. CUDA processes started with `runsc exec`
+are not part of the job.
+
 ### Multicast / NVLS support (multi-GPU)
 
 `cuda-checkpoint` refuses to checkpoint a process that holds live *multicast*
@@ -226,16 +241,16 @@ graphs remain valid.
 To enable it, either:
 
 *   set the runtime `--cuda-multicast-shim-source=EMBEDDED` flag: `runsc` carries
-    `mcshim.so` and its companion `mcshim-helper` inside its own binary and
-    writes them into the container's filesystem at container creation (at
+    `mcshim.so` inside its own binary and writes it into the container's
+    filesystem at container creation (at
     `--cuda-multicast-shim-path` if set, `/usr/local/lib/mcshim.so` by
     default). The container image needs no changes, and because the write
     lands in the container's filesystem (the rootfs overlay under the
     default `--overlay2` configuration), the exact interposer bytes travel
     inside checkpoint images — restores are immune to runsc version skew;
     or
-*   build `mcshim.so` and `mcshim-helper` yourself (`tools/mcshim/build.sh`
-    or the `//tools/mcshim` Bazel targets), place them in the container
+*   build `mcshim.so` yourself (`tools/mcshim/build.sh` or the
+    `//tools/mcshim` Bazel target), place it in the container
     image, and set `--cuda-multicast-shim-path` to the interposer's
     in-container path.
 
@@ -245,15 +260,10 @@ to the container's `/etc/ld.so.preload`, which covers launchers that rewrite
 their children's environment) and drives it automatically during `runsc
 checkpoint` and `runsc restore`.
 
-This works on driver R580+ (validated on 580.173.02), including restoring
-onto *different* GPUs than the workload was checkpointed on. gVisor
-automatically configures the interposer to (a) close and replay every CUDA
-IPC import across the checkpoint (a live import fails the per-process
-restore) and (b) rebuild multicast objects through `mcshim-helper`, a
-short-lived fresh process, because a restored process on these drivers
-cannot create or attach multicast groups itself. Multi-process workloads
-should be checkpointed with `runsc checkpoint --cuda-checkpoint-sequential`,
-which invokes `cuda-checkpoint` sequentially instead of in parallel.
+This requires driver R610+ and works when restoring onto *different* GPUs than
+the workload was checkpointed on. CUDA IPC (used, for example, by the custom
+all-reduce of inference engines) is not handled by the interposer; also set
+`--cuda-checkpoint-path` (see above).
 
 The interposer and gVisor rendezvous through a directory inside the container
 (`/tmp/mcshim` by default, overridable with the `MCSHIM_DIR` container
