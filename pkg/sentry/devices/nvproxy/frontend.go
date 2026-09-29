@@ -1405,9 +1405,6 @@ func rmAllocRootClient(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMET
 	if !ioctlParams.HClass.IsRootClient() {
 		panic(fmt.Sprintf("rmAllocRootClient() was invoked with HClass whose IsRootClient()==false: %#x", ioctlParams.HClass))
 	}
-	if err := fi.fd.dev.nvp.awaitCudaAdmission(fi.t); err != nil {
-		return 0, err
-	}
 	return rmAllocSimpleParams(fi, ioctlParams, isNVOS64, func(fi *frontendIoctlState, _ *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.Handle) {
 		client := newRootClient(fi.fd, ioctlParams, rightsRequested, allocParams, fi.t.ThreadGroup().ID())
 		nvp := fi.fd.dev.nvp

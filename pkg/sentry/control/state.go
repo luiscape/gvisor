@@ -301,9 +301,7 @@ func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *SaveRestoreExec
 	if err := preSave(s.Kernel, saveOpts, execOpts); err != nil {
 		return err
 	}
-	err := saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog)
-	postSaveCuda(s.Kernel)
-	if err != nil {
+	if err := saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog); err != nil {
 		// preSaveCuda has already released the GPU state, gated the
 		// application, and stashed the checkpoint keys; if the kernel will
 		// resume running, undo all of that -- postRestoreCuda is exactly that

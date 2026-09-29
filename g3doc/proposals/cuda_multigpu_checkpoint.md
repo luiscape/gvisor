@@ -85,7 +85,7 @@ flowchart TD
     end
     subgraph Sentry
         S["control: preSaveCuda / postRestoreCuda"] -->|exec| CC[cuda-checkpoint]
-        S --> N["nvproxy: admission gate, blocker inventory, exported objects"]
+        S --> N["nvproxy: blocker inventory, exported objects"]
     end
     subgraph "Container (each rank)"
         A["app: NCCL, PyTorch, engine"] --> M[mcshim.so]
@@ -190,7 +190,7 @@ sequenceDiagram
     participant C as cuda-checkpoint
     participant M as mcshim (each rank)
     Note over S: checkpoint
-    S->>S: close admission gate, collect CUDA processes
+    S->>S: collect CUDA processes
     S->>M: create gate
     M-->>S: gated.pid
     S->>C: lock all ranks in parallel
@@ -200,7 +200,7 @@ sequenceDiagram
     M-->>S: suspended.pid
     S->>S: blocker inventory must be empty
     S->>C: lock, then checkpoint one process at a time
-    S->>S: save sandbox, open admission gate
+    S->>S: save sandbox
     Note over S: restore
     S->>C: one process at a time: toggle, or restore with --device-map, then unlock
     S->>M: remove suspend
@@ -249,15 +249,11 @@ blocker inventory refuses a checkpoint `cuda-checkpoint` would hang on.
 
 This builds on #14525 (merged) and #14817 (approved) for restore onto other
 GPUs, and #14850 (merged), a control libcuda issues on NVSwitch systems when
-allocating and exporting VMM memory. Two nvproxy changes are not proposed yet:
-
--   **CUDA admission gate.** While a checkpoint runs, CUDA initialization is
-    held in processes outside the checkpointed set, which would otherwise
-    hold GPU state `cuda-checkpoint` never saved.
--   **Blocker inventory.** Reports, per process, the live multicast groups and
-    fabric-memory imports that would make `cuda-checkpoint` hang. Without the
-    interposer the sentry refuses such a checkpoint up front; with it, the
-    inventory verifies the teardown.
+allocating and exporting VMM memory. It also uses a checkpoint blocker
+inventory, to be proposed separately: nvproxy reports, per process, the live
+multicast groups and fabric-memory imports that would make `cuda-checkpoint`
+hang. Without the interposer the sentry refuses such a checkpoint up front;
+with it, the inventory verifies the teardown.
 
 ## Validation
 
@@ -331,8 +327,8 @@ restore 10.9 to 12.0 s instead of 8.6 to 9.2 s.
 
 The same engines without the interposer are refused at checkpoint (see
 [Background](#what-cuda-checkpoint-cannot-do)). The new nvproxy code (the
-admission gate, the blocker inventory and exported-object tracking) has unit
-tests, including one that pins the fdinfo line format.
+blocker inventory and exported-object tracking) has unit tests, including one
+that pins the fdinfo line format.
 
 ## Alternatives considered
 
