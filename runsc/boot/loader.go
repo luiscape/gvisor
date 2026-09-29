@@ -1598,7 +1598,7 @@ func (l *Loader) setupCudaCheckpointJob(info *containerInfo) error {
 // objects, which NCCL NVLS and torch _symmetric_memory both create. The
 // interposer releases them before the checkpoint and rebuilds them at
 // byte-identical VAs afterwards; control/state_cuda.go drives both transitions
-// around the cuda-checkpoint phases via the marker directory exported here.
+// around the cuda-checkpoint phases via marker files in /tmp/mcshim.
 func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	shimPath := info.conf.CUDAMulticastShimContainerPath()
 	if shimPath == "" || !specutils.NVProxyEnabled(info.spec, info.conf) {
@@ -1638,19 +1638,6 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	if !preloaded {
 		env = append(env, preloadKey+shimPath)
 	}
-	// The interposer and the sentry rendezvous through this directory. Only
-	// set it if the container has not chosen one itself.
-	shimDir, hasDir := "", false
-	for _, e := range env {
-		if v, ok := strings.CutPrefix(e, control.CudaMulticastShimDirEnv+"="); ok {
-			shimDir, hasDir = v, true
-			break
-		}
-	}
-	if !hasDir {
-		shimDir = control.DefaultCudaMulticastShimDir
-		env = append(env, control.CudaMulticastShimDirEnv+"="+shimDir)
-	}
 	// NCCL shares P2P buffers either through the VMM API (cuMemCreate +
 	// cuMemExportToShareableHandle; NCCL_CUMEM_ENABLE=1), which the interposer
 	// restores, or through legacy CUDA IPC, which is left to cuda-checkpoint's
@@ -1672,22 +1659,13 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	// still covers the common case.
 	//
 	// This does preload the interposer into every binary in the container,
-	// including the cuda-checkpoint processes the sentry execs (which is why
-	// LD_PRELOAD is deliberately NOT put in the spec env below). That is
-	// benign: the interposer only activates when a tracked CUDA symbol is
-	// resolved, which cuda-checkpoint never does.
+	// including the cuda-checkpoint processes the sentry execs, which run it
+	// disabled (MCSHIM_DISABLE). That is benign regardless: the interposer only
+	// activates when a tracked CUDA symbol is resolved.
 	if err := l.writeLdSoPreload(info, shimPath); err != nil {
 		log.Warningf("Could not add the multicast interposer to /etc/ld.so.preload for container %q (continuing with env-based preload only, which a launcher that rewrites LD_PRELOAD can defeat): %v", info.containerName, err)
 	}
-
-	// Record the rendezvous directory in the container spec, which is how
-	// control/state_cuda_shim.go discovers that gVisor owns an interposer
-	// here (it reads SpecEnviron). Note what is deliberately NOT put in the
-	// spec: LD_PRELOAD, because the sentry passes SpecEnviron to the
-	// cuda-checkpoint processes it execs and preloading the interposer into
-	// those would be wrong.
-	injectCudaShimMarkerEnv(info.spec)
-	log.Infof("Preloaded multicast interposer %q into container %q (rendezvous dir %q)", shimPath, info.containerName, shimDir)
+	log.Infof("Preloaded multicast interposer %q into container %q", shimPath, info.containerName)
 	return nil
 }
 
@@ -1765,36 +1743,6 @@ func appendEnvIfAbsent(env []string, key, value string) []string {
 		}
 	}
 	return append(env, key+"="+value)
-}
-
-// injectCudaShimMarkerEnv appends the interposer marker env entry
-// (control.CudaMulticastShimMarkerEnv) to spec.Process.Env if it is not
-// already present, deriving the rendezvous directory the same way
-// setupCudaMulticastShim does: the container's own MCSHIM_DIR if set, else
-// the default. Idempotent.
-//
-// This is called at container creation, and again on the restore path: the
-// restore-side specs come from the user's bundle, which never carried the
-// marker, and without it a checkpoint taken after a restore would not
-// discover the interposer (control's cudaShimDir reads SpecEnviron) and
-// would fail its blocker gate.
-func injectCudaShimMarkerEnv(spec *specs.Spec) {
-	if spec == nil || spec.Process == nil {
-		return
-	}
-	for _, e := range spec.Process.Env {
-		if strings.HasPrefix(e, control.CudaMulticastShimMarkerEnv+"=") {
-			return
-		}
-	}
-	shimDir := control.DefaultCudaMulticastShimDir
-	for _, e := range spec.Process.Env {
-		if v, ok := strings.CutPrefix(e, control.CudaMulticastShimDirEnv+"="); ok {
-			shimDir = v
-			break
-		}
-	}
-	spec.Process.Env = append(spec.Process.Env, control.CudaMulticastShimMarkerEnv+"="+shimDir)
 }
 
 // writeLdSoPreload appends the interposer path (shimPath) to the container's

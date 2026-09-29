@@ -15,6 +15,7 @@
 package control
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -67,27 +68,12 @@ import (
 // stays suspended until gVisor removes it.
 
 const (
-	// CudaMulticastShimDirEnv is the environment variable through which the
-	// interposer learns its rendezvous directory. It is set in the container
-	// process environment only.
-	CudaMulticastShimDirEnv = "MCSHIM_DIR"
-
-	// CudaMulticastShimMarkerEnv records the same directory in the container
-	// *spec*, and is how the sentry discovers that it owns an interposer in
-	// this container. It is deliberately distinct from
-	// CudaMulticastShimDirEnv so that an application setting the latter
-	// itself does not cause gVisor to start driving an interposer it did not
-	// inject.
-	CudaMulticastShimMarkerEnv = "GVISOR_CUDA_MULTICAST_SHIM_DIR"
-
-	// DefaultCudaMulticastShimDir is the rendezvous directory used when the
-	// container does not set CudaMulticastShimDirEnv itself.
-	//
-	// The directory must live on a filesystem that is part of the checkpoint
-	// image: the suspend marker's survival across restore is what keeps the
-	// interposer suspended until the sentry orders the rebuild (see the file
-	// comment). A host bind mount would break that.
-	DefaultCudaMulticastShimDir = "/tmp/mcshim"
+	// cudaShimDir is the rendezvous directory; the interposer uses the same
+	// fixed path. It must be on a filesystem that is part of the checkpoint
+	// image (not a host mount): the suspend marker's survival across restore
+	// is what keeps the interposer suspended until the sentry orders the
+	// rebuild (see the file comment).
+	cudaShimDir = "/tmp/mcshim"
 
 	// cudaShimSuspendMarker is created to request the teardown and removed to
 	// request the rebuild.
@@ -114,42 +100,10 @@ const (
 	// pending CUDA process.
 	cudaShimRunningPollInterval = 500 * time.Millisecond
 
-	// cudaShimDirKey records, in the checkpoint, the rendezvous directory of
-	// an interposer that was suspended. Its presence is what tells
-	// postRestoreCuda that a rebuild is owed, and carrying the directory
-	// itself keeps the rebuild independent of how the container's
-	// environment is reconstructed.
-	cudaShimDirKey = "cuda-multicast-shim-dir"
+	// cudaShimSuspendedKey records, in the checkpoint, that the interposer was
+	// suspended, which tells postRestoreCuda that a rebuild is owed.
+	cudaShimSuspendedKey = "cuda-multicast-shim-suspended"
 )
-
-// cudaShimDir returns the rendezvous directory for cudaProcs, or "" if the
-// interposer is not in use. It is read from the environment gVisor injected
-// into the container spec at creation (and re-injected at restore; see
-// injectCudaShimMarkerEnv in runsc/boot).
-//
-// The first configured container wins: a sandbox whose CUDA processes span
-// multiple containers is assumed to use one shared rendezvous directory. A
-// mixed configuration degrades safely -- the post-suspend blocker verify in
-// checkpointCudaProcs fails the checkpoint rather than saving a bad image.
-func cudaShimDir(k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup) string {
-	for _, tg := range cudaProcs {
-		leader := tg.Leader()
-		if leader == nil {
-			continue
-		}
-		for _, e := range k.Saver().SpecEnviron(k.ContainerName(leader.ContainerID())) {
-			if v, ok := envValue(e, CudaMulticastShimMarkerEnv); ok {
-				return v
-			}
-		}
-	}
-	return ""
-}
-
-// envValue returns the value of entry if it is an assignment to key.
-func envValue(entry, key string) (string, bool) {
-	return strings.CutPrefix(entry, key+"=")
-}
 
 // cudaShimPathOp builds a PathOperation for path within tg's mount namespace.
 // The returned cleanup must be called by the caller.
@@ -186,9 +140,9 @@ func cudaShimCreds(k *kernel.Kernel) *auth.Credentials {
 // cudaShimSetMarker creates (set) or removes (clear) the suspend marker in
 // every distinct mount namespace among cudaProcs. Ranks of a job usually share
 // one namespace, in which case this touches the file once.
-func cudaShimSetMarker(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, dir, marker string, set bool) error {
+func cudaShimSetMarker(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, marker string, set bool) error {
 	creds := cudaShimCreds(k)
-	path := dir + "/" + marker
+	path := cudaShimDir + "/" + marker
 	seen := make(map[*vfs.MountNamespace]bool)
 	var done bool
 	for _, tg := range cudaProcs {
@@ -243,7 +197,7 @@ func markerVerb(set bool) string {
 
 // cudaShimWaitAcks waits until every process in cudaProcs has written its
 // acknowledgement file for the given prefix ("suspended" or "resumed").
-func cudaShimWaitAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, dir, prefix string) error {
+func cudaShimWaitAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, prefix string) error {
 	creds := cudaShimCreds(k)
 	deadline := time.Now().Add(cudaShimAckTimeout)
 	pending := make(map[*kernel.ThreadGroup]bool, len(cudaProcs))
@@ -254,7 +208,7 @@ func cudaShimWaitAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kerne
 		for tg := range pending {
 			// The interposer names its ack after getpid(), which is the
 			// same value gVisor passes to cuda-checkpoint as --pid.
-			path := fmt.Sprintf("%s/%s.%d", dir, prefix, tg.ID())
+			path := fmt.Sprintf("%s/%s.%d", cudaShimDir, prefix, tg.ID())
 			ctx, pop, cleanup, ok := cudaShimPathOp(sctx, tg, path)
 			if !ok {
 				// The process exited; it cannot hold multicast state.
@@ -274,7 +228,7 @@ func cudaShimWaitAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kerne
 			// cudaShimClearErrorAcks -- and the interposer does the same
 			// when it observes the edge, so an error here is from the
 			// transition being waited on.)
-			errPath := fmt.Sprintf("%s/error.%d", dir, tg.ID())
+			errPath := fmt.Sprintf("%s/error.%d", cudaShimDir, tg.ID())
 			ctx, pop, cleanup, ok = cudaShimPathOp(sctx, tg, errPath)
 			if !ok {
 				delete(pending, tg)
@@ -377,10 +331,10 @@ func outputHasLine(out, want string) bool {
 // fast-fails on error acks, and the interposer only clears its own error file
 // when it observes the next marker edge, so an error left over from an
 // earlier, timed-out transition could otherwise fail the new one instantly.
-func cudaShimClearErrorAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, dir string) {
+func cudaShimClearErrorAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup) {
 	creds := cudaShimCreds(k)
 	for _, tg := range cudaProcs {
-		path := fmt.Sprintf("%s/error.%d", dir, tg.ID())
+		path := fmt.Sprintf("%s/error.%d", cudaShimDir, tg.ID())
 		ctx, pop, cleanup, ok := cudaShimPathOp(sctx, tg, path)
 		if !ok {
 			continue
@@ -394,11 +348,11 @@ func cudaShimClearErrorAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []
 
 // cudaShimProcsWith returns the subset of cudaProcs that have written the file
 // "<prefix>.<pid>" in the rendezvous directory.
-func cudaShimProcsWith(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, dir, prefix string) []*kernel.ThreadGroup {
+func cudaShimProcsWith(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, prefix string) []*kernel.ThreadGroup {
 	creds := cudaShimCreds(k)
 	var out []*kernel.ThreadGroup
 	for _, tg := range cudaProcs {
-		path := fmt.Sprintf("%s/%s.%d", dir, prefix, tg.ID())
+		path := fmt.Sprintf("%s/%s.%d", cudaShimDir, prefix, tg.ID())
 		ctx, pop, cleanup, ok := cudaShimPathOp(sctx, tg, path)
 		if !ok {
 			continue
@@ -423,63 +377,57 @@ func cudaShimProcsWith(sctx context.Context, k *kernel.Kernel, cudaProcs []*kern
 //
 // A process that does hold multicast state necessarily resolved a tracked entry
 // point first, so it is always in this set.
-func cudaShimManagedProcs(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, dir string) []*kernel.ThreadGroup {
-	return cudaShimProcsWith(sctx, k, cudaProcs, dir, "present")
+func cudaShimManagedProcs(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup) []*kernel.ThreadGroup {
+	return cudaShimProcsWith(sctx, k, cudaProcs, "present")
 }
 
+// errCudaShimTornDown reports that the interposer's teardown failed. Other
+// processes may already have released state that a rebuild needs from the one
+// that failed, so the application is left blocked rather than unwound.
+var errCudaShimTornDown = errors.New("multicast interposer teardown failed; the application is left blocked and must be restarted")
+
 // unwindCudaMulticastShim returns the application to a runnable state after a
-// checkpoint that failed partway: rebuild whatever was torn down, then release
-// the gate.
+// checkpoint failed before the interposer's teardown, or after it completed on
+// every process: rebuild whatever was torn down, then release the gate.
 //
-// Both halves matter, and the second is easy to lose. The gate is armed before
-// the teardown, so a failure between those two points leaves the application
-// barred from the GPU with nothing recorded to rebuild -- it would hang forever.
-// So this releases the gate unconditionally rather than as a side effect of a
-// successful rebuild.
-//
-// It also copes with a partial teardown. The interposer's protocol is edge
-// triggered, so only the processes that actually acknowledged the teardown will
-// acknowledge a rebuild; waiting on the others would stall until the ack
-// timeout.
-func unwindCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, dir string) {
+// The gate is released unconditionally rather than as a side effect of a
+// successful rebuild: it is armed before the teardown, so a failure between
+// the two leaves the application barred from the GPU with nothing to rebuild.
+// Only processes that acknowledged the teardown will acknowledge a rebuild.
+func unwindCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup) {
 	// Drop any recorded rebuild state: this instance is handling it.
-	k.PopCheckpointState(cudaShimDirKey)
-	tornDown := cudaShimProcsWith(sctx, k, cudaProcs, dir, "suspended")
-	if err := cudaShimSetMarker(sctx, k, cudaProcs, dir, cudaShimSuspendMarker, false /* set */); err != nil {
+	k.PopCheckpointState(cudaShimSuspendedKey)
+	tornDown := cudaShimProcsWith(sctx, k, cudaProcs, "suspended")
+	if err := cudaShimSetMarker(sctx, k, cudaProcs, cudaShimSuspendMarker, false /* set */); err != nil {
 		log.Warningf("Multicast interposer unwind: %v", err)
 	}
 	if len(tornDown) != 0 {
-		if err := cudaShimWaitAcks(sctx, k, tornDown, dir, "resumed"); err != nil {
+		if err := cudaShimWaitAcks(sctx, k, tornDown, "resumed"); err != nil {
 			log.Warningf("Multicast interposer unwind: %v", err)
 		}
 	}
-	if err := cudaShimSetMarker(sctx, k, cudaProcs, dir, cudaShimGateMarker, false /* set */); err != nil {
+	if err := cudaShimSetMarker(sctx, k, cudaProcs, cudaShimGateMarker, false /* set */); err != nil {
 		log.Warningf("Multicast interposer unwind: %v", err)
 	}
 	log.Infof("Multicast interposer unwound (%d process(es) had been torn down)", len(tornDown))
 }
 
 // armCudaMulticastShimGate bars the application from submitting GPU work, and
-// waits until every process confirms it.
-//
-// This makes no CUDA calls in the target processes -- the interposer only flips
-// a flag -- so it is safe to call while they are locked by cuda-checkpoint.
-// That matters: the lock is what quiesces coupled ranks, and gating before the
-// lock would deadlock the drain (a gated rank starves peers already spinning in
-// a collective it has not submitted yet).
-func armCudaMulticastShimGate(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, dir string) error {
+// waits until every process confirms it. It makes no CUDA calls in the target
+// processes; the interposer only flips a flag. A process whose state the
+// interposer could not fully track refuses here, failing the checkpoint before
+// anything is torn down.
+func armCudaMulticastShimGate(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup) error {
 	start := time.Now()
-	// Clear stale error acks here too: the gate wait shares cudaShimWaitAcks'
-	// error fast-fail, and an error.<pid> left standing by an earlier failed
-	// resume (the shim clears its own error file only on suspend/resume
-	// edges) would otherwise fail the arm with a misleading message.
-	cudaShimClearErrorAcks(sctx, k, cudaProcs, dir)
-	if err := cudaShimSetMarker(sctx, k, cudaProcs, dir, cudaShimGateMarker, true /* set */); err != nil {
+	// Clear stale error acks: the gate wait fails fast on them, and the
+	// interposer clears its own only on suspend/resume edges.
+	cudaShimClearErrorAcks(sctx, k, cudaProcs)
+	if err := cudaShimSetMarker(sctx, k, cudaProcs, cudaShimGateMarker, true /* set */); err != nil {
 		return err
 	}
-	managed := cudaShimManagedProcs(sctx, k, cudaProcs, dir)
-	if err := cudaShimWaitAcks(sctx, k, managed, dir, "gated"); err != nil {
-		if rerr := cudaShimSetMarker(sctx, k, cudaProcs, dir, cudaShimGateMarker, false /* set */); rerr != nil {
+	managed := cudaShimManagedProcs(sctx, k, cudaProcs)
+	if err := cudaShimWaitAcks(sctx, k, managed, "gated"); err != nil {
+		if rerr := cudaShimSetMarker(sctx, k, cudaProcs, cudaShimGateMarker, false /* set */); rerr != nil {
 			log.Warningf("Failed to clear multicast interposer gate after arm failure: %v", rerr)
 		}
 		return err
@@ -489,30 +437,23 @@ func armCudaMulticastShimGate(sctx context.Context, k *kernel.Kernel, cudaProcs 
 }
 
 // suspendCudaMulticastShim asks the interposer to release multicast objects and
-// CUDA IPC imports on every process, and waits for all of them to finish.
+// CUDA IPC imports on every process, and waits for all of them to finish. If
+// any fails, it returns errCudaShimTornDown and leaves the markers in place.
 //
 // Precondition: the application is gated (the processes were just unlocked by
 // checkpointCudaProcs so the interposer can issue libcuda calls, and the gate
 // is what keeps the application off the GPU meanwhile).
-func suspendCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, dir string) error {
-	if dir == "" {
-		return nil
-	}
+func suspendCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup) error {
 	start := time.Now()
-	cudaShimClearErrorAcks(sctx, k, cudaProcs, dir)
-	if err := cudaShimSetMarker(sctx, k, cudaProcs, dir, cudaShimSuspendMarker, true /* set */); err != nil {
+	cudaShimClearErrorAcks(sctx, k, cudaProcs)
+	if err := cudaShimSetMarker(sctx, k, cudaProcs, cudaShimSuspendMarker, true /* set */); err != nil {
 		return err
 	}
-	managed := cudaShimManagedProcs(sctx, k, cudaProcs, dir)
-	if err := cudaShimWaitAcks(sctx, k, managed, dir, "suspended"); err != nil {
-		// Undo, so a failed checkpoint leaves the application running.
-		if rerr := cudaShimSetMarker(sctx, k, cudaProcs, dir, cudaShimSuspendMarker, false /* set */); rerr != nil {
-			log.Warningf("Failed to clear multicast interposer marker after suspend failure: %v", rerr)
-		}
-		return err
+	managed := cudaShimManagedProcs(sctx, k, cudaProcs)
+	if err := cudaShimWaitAcks(sctx, k, managed, "suspended"); err != nil {
+		return fmt.Errorf("%w: %v", errCudaShimTornDown, err)
 	}
-	k.AddStateToCheckpoint(cudaShimDirKey, dir)
-	log.Infof("Multicast interposer: recorded rebuild state (dir %q)", dir)
+	k.AddStateToCheckpoint(cudaShimSuspendedKey, true)
 	log.Infof("Multicast interposer suspended on %d of %d CUDA process(es) in %s", len(managed), len(cudaProcs), time.Since(start))
 	return nil
 }
@@ -524,29 +465,27 @@ func suspendCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaProcs 
 // process. Resuming earlier rebuilds on a context whose device state is not
 // restored yet and permanently faults it; see the file comment.
 func resumeCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup) error {
-	v := k.PopCheckpointState(cudaShimDirKey)
-	if v == nil {
+	if k.PopCheckpointState(cudaShimSuspendedKey) == nil {
 		log.Infof("Multicast interposer: no suspend recorded in the checkpoint; nothing to rebuild")
 		return nil
 	}
-	dir := v.(string)
 	start := time.Now()
 	// The restore toggle returning is necessary but not sufficient: wait until
 	// every process actually reports "running" before rebuilding on top of it.
 	if err := waitCudaProcsRunning(sctx, k, cudaCheckpointPath, cudaProcs); err != nil {
 		return err
 	}
-	cudaShimClearErrorAcks(sctx, k, cudaProcs, dir)
-	if err := cudaShimSetMarker(sctx, k, cudaProcs, dir, cudaShimSuspendMarker, false /* set */); err != nil {
+	cudaShimClearErrorAcks(sctx, k, cudaProcs)
+	if err := cudaShimSetMarker(sctx, k, cudaProcs, cudaShimSuspendMarker, false /* set */); err != nil {
 		return err
 	}
-	managed := cudaShimManagedProcs(sctx, k, cudaProcs, dir)
-	if err := cudaShimWaitAcks(sctx, k, managed, dir, "resumed"); err != nil {
+	managed := cudaShimManagedProcs(sctx, k, cudaProcs)
+	if err := cudaShimWaitAcks(sctx, k, managed, "resumed"); err != nil {
 		return err
 	}
 	// The interposer releases the application itself once the rebuild
 	// succeeds; clear the marker too so a later checkpoint starts clean.
-	if err := cudaShimSetMarker(sctx, k, cudaProcs, dir, cudaShimGateMarker, false /* set */); err != nil {
+	if err := cudaShimSetMarker(sctx, k, cudaProcs, cudaShimGateMarker, false /* set */); err != nil {
 		log.Warningf("Failed to clear multicast interposer gate marker: %v", err)
 	}
 	log.Infof("Multicast interposer resumed on %d of %d CUDA process(es) in %s", len(managed), len(cudaProcs), time.Since(start))

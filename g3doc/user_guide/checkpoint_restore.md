@@ -265,17 +265,10 @@ the workload was checkpointed on. CUDA IPC (used, for example, by the custom
 all-reduce of inference engines) is not handled by the interposer; also set
 `--cuda-checkpoint-path` (see above).
 
-The interposer and gVisor rendezvous through a directory inside the container
-(`/tmp/mcshim` by default, overridable with the `MCSHIM_DIR` container
-environment variable). This directory must reside on a filesystem that is part
-of the checkpoint image — not a host bind mount — because a marker file in it
-must survive the restore.
-
-Restoring such a snapshot needs no extra flags. However, to take a *further*
-checkpoint of a restored container, the restoring runtime must also be
-configured with `--cuda-multicast-shim-source=EMBEDDED` (or
-`--cuda-multicast-shim-path`): that is how gVisor re-discovers that the
-container carries the interposer.
+The interposer and gVisor rendezvous through `/tmp/mcshim` inside the
+container. It must reside on a filesystem that is part of the checkpoint image —
+not a host bind mount — because a marker file in it must survive the restore.
+Restoring such a snapshot needs no extra flags.
 
 ### Limitation
 

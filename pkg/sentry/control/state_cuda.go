@@ -100,11 +100,11 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	}
 
 	// cuda-checkpoint hangs indefinitely on processes holding NVLink
-	// multicast memory (e.g. NCCL with NVLS), so refuse up front -- unless the
-	// multicast interposer is present, which releases it before
+	// multicast memory (e.g. NCCL with NVLS), so refuse up front -- unless
+	// they run the multicast interposer, which releases it before
 	// cuda-checkpoint runs (checkpointCudaProcs re-checks afterwards).
-	shimDir := cudaShimDir(k, cudaProcs)
-	if shimDir == "" {
+	shim := len(cudaShimManagedProcs(sctx, k, cudaProcs)) != 0
+	if !shim {
 		if blockers := nvproxy.CheckpointBlockers(k.VFS()); blockers != "" {
 			return fail(fmt.Errorf("cannot checkpoint CUDA processes holding multicast memory (e.g. NCCL_NVLS_ENABLE=0 to disable NVLS): %s", blockers))
 		}
@@ -113,7 +113,7 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	for _, tg := range cudaProcs {
 		tg.SigsegvLock()
 	}
-	err := checkpointCudaProcs(sctx, k, o.CudaCheckpointPath, cudaProcs, o.CudaCheckpointSequential, shimDir)
+	err := checkpointCudaProcs(sctx, k, o.CudaCheckpointPath, cudaProcs, o.CudaCheckpointSequential, shim)
 	if err != nil {
 		// Unwind BEFORE re-pausing (the docker flow): the interposer rebuild
 		// needs the application's shim control threads to run and
@@ -125,9 +125,10 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		for _, tg := range cudaProcs {
 			tg.SigsegvUnlock()
 		}
-		// Bring multicast back and let the application run again.
-		if shimDir != "" {
-			unwindCudaMulticastShim(sctx, k, cudaProcs, shimDir)
+		// Bring multicast back and let the application run again, unless the
+		// teardown failed partway (see errCudaShimTornDown).
+		if shim && !errors.Is(err, errCudaShimTornDown) {
+			unwindCudaMulticastShim(sctx, k, cudaProcs)
 		}
 		return fail(err)
 	}
@@ -511,9 +512,9 @@ func runCudaAction(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath st
 //     the snapshot.
 //  2. Checkpoint all locked processes, releasing their GPU state.
 //
-// On failure it returns the processes to running; the caller unwinds the
+// On failure it leaves the processes unlocked; the caller unwinds the
 // interposer.
-func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, sequential bool, shimDir string) error {
+func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, sequential bool, shim bool) error {
 	start := time.Now()
 	nullFD, cleanup := openCudaCheckpointNullFD(sctx, k)
 	defer cleanup()
@@ -528,8 +529,8 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 	// then lock every process, which drains work in flight. A collective that
 	// straddles the gate starves its peers, and the lock then times out.
 	lockArgs := []string{"--action", "lock", "--timeout", strconv.Itoa(cudaLockTimeoutMS)}
-	if shimDir != "" {
-		if err := armCudaMulticastShimGate(sctx, k, cudaProcs, shimDir); err != nil {
+	if shim {
+		if err := armCudaMulticastShimGate(sctx, k, cudaProcs); err != nil {
 			return err
 		}
 	}
@@ -541,12 +542,12 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 
 	// Interposer teardown, between two locks: it issues libcuda calls, which a
 	// locked process cannot make. The gate keeps the application off the GPU.
-	if shimDir != "" {
+	if shim {
 		if _, err := runCudaAction(sctx, k, cudaCheckpointPath, locked, unlockArgs, true /* parallel */, nullFD); err != nil {
 			unlock(locked)
 			return fmt.Errorf("cuda-checkpoint unlock before multicast teardown failed: %w", err)
 		}
-		if err := suspendCudaMulticastShim(sctx, k, locked, shimDir); err != nil {
+		if err := suspendCudaMulticastShim(sctx, k, locked); err != nil {
 			return err
 		}
 		// cuda-checkpoint would hang on anything the interposer left behind.

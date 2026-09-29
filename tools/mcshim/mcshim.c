@@ -23,7 +23,7 @@
  * keeps its own bookkeeping: freeing the RM objects from nvproxy leaves libcuda
  * inconsistent, and the restore fails.
  *
- * The sentry drives it through marker files in $MCSHIM_DIR (see
+ * The sentry drives it through marker files in /tmp/mcshim (see
  * pkg/sentry/control/state_cuda_shim.go). After a rebuild, exporters publish
  * the re-exported fd under the original export's identity, and importers copy
  * it with pidfd_getfd(2) and re-import it. Unicast device memory stays
@@ -262,10 +262,6 @@ typedef struct {
   /* Contents of a multicast-bound exporter freed across the checkpoint (see
    * do_suspend); NULL if none. */
   void* uc_content;
-  /* Set once suspend has released the object; resume rebuilds only these.
-   * Cleared as soon as the object is live again, so retries after a partial
-   * failure redo exactly the remaining work. */
-  int torn_down;
 } Alloc;
 
 typedef struct {
@@ -279,9 +275,6 @@ typedef struct {
   CUmemAccessDesc access[MAX_ACCESS];
   int naccess;
   CUcontext ctx;
-  /* Set as each unmap succeeds, cleared as each re-map succeeds (see
-   * torn_down). */
-  int suspended;
 } Mapping;
 
 typedef struct {
@@ -295,8 +288,6 @@ typedef struct {
   size_t size;
   CUcontext ctx;
   CUdevice dev; /* device hosting the memory (unbind is per-device) */
-  /* Set as each unbind succeeds, cleared as each re-bind succeeds. */
-  int unbound;
 } Bind;
 
 static Alloc g_alloc[MAXN];
@@ -306,10 +297,14 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 /* All accesses are atomic or under g_gate_lock (see the suspend gate). */
 static int g_suspended;
 
-/* Sticky: some state could not be tracked (a table overflow), so do_suspend
- * refuses. Must hold g_lock. */
+/* Sticky: some state could not be tracked (a table overflow), so arming the
+ * gate refuses. Must hold g_lock. */
 static int g_untracked;
 static const char* g_untracked_why;
+
+/* Sticky: a suspend or resume failed partway, so this process stays gated.
+ * Must hold g_lock. */
+static int g_broken;
 
 static void mark_untracked(const char* why) {
   if (!g_untracked) {
@@ -604,7 +599,6 @@ static void bind_record(int gi, int by_addr, CUmemGenericAllocationHandle mem,
     g_bind[b].memOffset = memOffset;
     g_bind[b].size = size;
     g_bind[b].dev = dev;
-    g_bind[b].unbound = 0;
     r_cuCtxGetCurrent(&g_bind[b].ctx);
     return;
   }
@@ -698,7 +692,6 @@ CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
         g_map[m].offset = offset;
         g_map[m].allocIdx = ai;
         g_map[m].naccess = 0;
-        g_map[m].suspended = 0;
         r_cuCtxGetCurrent(&g_map[m].ctx);
         placed = 1;
         break;
@@ -795,15 +788,14 @@ CUresult cuMemRelease(CUmemGenericAllocationHandle handle) {
 }
 
 /* Cross-rank fd rendezvous. After a restore, each exporter re-exports its
- * object and publishes "<pid> <fd>" in $MCSHIM_DIR under the original export's
+ * object and publishes "<pid> <fd>" in /tmp/mcshim under the original export's
  * identity, and importers copy the fd with pidfd_getfd(2). That needs ptrace
  * access, which YAMA denies between sibling processes, so an exporter allows
  * any tracer (PR_SET_PTRACER_ANY) while it has fds published, which is until
  * the sentry removes the gate after every process has resumed. */
 
-/* Default only; the sentry sets MCSHIM_DIR (see DefaultCudaMulticastShimDir).
- */
-static char g_dir[512] = "/tmp/mcshim";
+/* Fixed; see cudaShimDir in pkg/sentry/control/state_cuda_shim.go. */
+static const char g_dir[] = "/tmp/mcshim";
 static int g_ptracer_any; /* under g_lock */
 
 static void pub_path(const Alloc* a, char* out, size_t n) {
@@ -881,8 +873,6 @@ static int fetch_fd(const Alloc* a, int timeout_ms) {
 static int unmap_alloc(int gi, const char* what, int* unmapped) {
   for (int m = 0; m < MAXN; m++) {
     if (!g_map[m].used || g_map[m].allocIdx != gi) continue;
-    if (g_map[m].suspended)
-      continue; /* already unmapped by an earlier attempt */
     if (g_map[m].ctx) r_cuCtxSetCurrent(g_map[m].ctx);
     CUresult rc = r_cuMemUnmap(g_map[m].va, g_map[m].size);
     if (rc != CUDA_SUCCESS) {
@@ -890,21 +880,17 @@ static int unmap_alloc(int gi, const char* what, int* unmapped) {
             (unsigned long long)g_map[m].va, rc);
       return -1;
     }
-    g_map[m].suspended = 1;
     (*unmapped)++;
   }
   return 0;
 }
 
 /* Must hold g_lock. Re-map every VA of alloc gi at the identical address,
- * backed by h, in the retained reservation. With partial set, gi is still live
- * after a failed suspend, so only what was unmapped is re-mapped. */
+ * backed by h, in the retained reservation. */
 static int remap_alloc(int gi, CUmemGenericAllocationHandle h, const char* what,
-                       int partial, int* remapped) {
+                       int* remapped) {
   for (int m = 0; m < MAXN; m++) {
     if (!g_map[m].used || g_map[m].allocIdx != gi) continue;
-    if (partial && !g_map[m].suspended)
-      continue; /* still mapped; nothing to redo */
     if (g_map[m].ctx) r_cuCtxSetCurrent(g_map[m].ctx);
     CUresult rc = r_cuMemMap(g_map[m].va, g_map[m].size, g_map[m].offset, h, 0);
     if (rc != CUDA_SUCCESS) {
@@ -934,7 +920,6 @@ static int remap_alloc(int gi, CUmemGenericAllocationHandle h, const char* what,
             (unsigned long long)g_map[m].va, ac);
       return -1;
     }
-    g_map[m].suspended = 0;
     (*remapped)++;
   }
   return 0;
@@ -1060,17 +1045,13 @@ static int do_suspend(void) {
    * checkpoint. */
   unpublish_all();
 
-  /* Multicast groups: unmap, unbind each device, release. Per-entry flags make
-   * a retried suspend skip finished work. */
+  /* Multicast groups: unmap, unbind each device, release. */
   for (int gi = 0; gi < MAXN; gi++) {
     if (g_alloc[gi].kind != KIND_MC) continue;
-    if (g_alloc[gi].torn_down) continue; /* fully done by an earlier attempt */
     groups++;
     if (unmap_alloc(gi, "MC", &unmapped) != 0) return -1;
     for (int b = 0; b < MAXN; b++) {
       if (!g_bind[b].used || g_bind[b].groupIdx != gi) continue;
-      if (g_bind[b].unbound)
-        continue; /* already unbound by an earlier attempt */
       if (g_bind[b].dev < 0) {
         mclog("SUSPEND: bind %d has unknown device", b);
         return -1;
@@ -1086,7 +1067,6 @@ static int do_suspend(void) {
             g_bind[b].mcOffset, g_bind[b].size, rc);
         return -1;
       }
-      g_bind[b].unbound = 1;
       unbound++;
     }
     CUresult rc = r_cuMemRelease(g_alloc[gi].handle);
@@ -1095,7 +1075,6 @@ static int do_suspend(void) {
             (unsigned long long)g_alloc[gi].handle, rc);
       return -1;
     }
-    g_alloc[gi].torn_down = 1;
     released++;
   }
 
@@ -1106,41 +1085,33 @@ static int do_suspend(void) {
   int uc_freed = 0;
   for (int gi = 0; gi < MAXN; gi++) {
     if (g_alloc[gi].kind != KIND_UC || !g_alloc[gi].has_key) continue;
-    if (g_alloc[gi].torn_down) continue; /* fully done by an earlier attempt */
     if (!uc_is_mc_bound(gi)) continue;
-    if (!g_alloc[gi].uc_content) {
-      void* buf = malloc(g_alloc[gi].size);
-      if (!buf) {
-        mclog(
-            "SUSPEND: no memory for UC-export backup "
-            "(0x%zx bytes)",
+    void* buf = malloc(g_alloc[gi].size);
+    if (!buf) {
+      mclog("SUSPEND: no memory for UC-export backup (0x%zx bytes)",
             g_alloc[gi].size);
-        return -1;
-      }
-      int copied = 0;
-      for (int m = 0; m < MAXN; m++) {
-        if (!g_map[m].used || g_map[m].allocIdx != gi || g_map[m].suspended)
-          continue;
-        if (g_map[m].ctx) r_cuCtxSetCurrent(g_map[m].ctx);
-        CUresult rc = r_cuMemcpyDtoH((char*)buf + g_map[m].offset, g_map[m].va,
-                                     g_map[m].size);
-        if (rc != CUDA_SUCCESS) {
-          mclog(
-              "SUSPEND: UC-export backup copy "
-              "(va=0x%llx size=0x%zx) rc=%d",
-              (unsigned long long)g_map[m].va, g_map[m].size, rc);
-          free(buf);
-          return -1;
-        }
-        copied++;
-      }
-      if (!copied) {
-        free(buf);
-        mclog("SUSPEND: UC-export idx=%d has no mapping to save", gi);
-        return -1;
-      }
-      g_alloc[gi].uc_content = buf;
+      return -1;
     }
+    int copied = 0;
+    for (int m = 0; m < MAXN; m++) {
+      if (!g_map[m].used || g_map[m].allocIdx != gi) continue;
+      if (g_map[m].ctx) r_cuCtxSetCurrent(g_map[m].ctx);
+      CUresult rc = r_cuMemcpyDtoH((char*)buf + g_map[m].offset, g_map[m].va,
+                                   g_map[m].size);
+      if (rc != CUDA_SUCCESS) {
+        mclog("SUSPEND: UC-export backup copy (va=0x%llx size=0x%zx) rc=%d",
+              (unsigned long long)g_map[m].va, g_map[m].size, rc);
+        free(buf);
+        return -1;
+      }
+      copied++;
+    }
+    if (!copied) {
+      free(buf);
+      mclog("SUSPEND: UC-export idx=%d has no mapping to save", gi);
+      return -1;
+    }
+    g_alloc[gi].uc_content = buf;
     if (unmap_alloc(gi, "UC-export", &unmapped) != 0) return -1;
     CUresult rc = r_cuMemRelease(g_alloc[gi].handle);
     if (rc != CUDA_SUCCESS) {
@@ -1148,7 +1119,6 @@ static int do_suspend(void) {
             (unsigned long long)g_alloc[gi].handle, rc);
       return -1;
     }
-    g_alloc[gi].torn_down = 1;
     released++;
     uc_freed++;
   }
@@ -1158,7 +1128,6 @@ static int do_suspend(void) {
    * since cuda-checkpoint cannot restore it. */
   for (int ii = 0; ii < MAXN; ii++) {
     if (g_alloc[ii].kind != KIND_IMP) continue;
-    if (g_alloc[ii].torn_down) continue; /* fully done by an earlier attempt */
     imports++;
     if (unmap_alloc(ii, "UC-import", &unmapped) != 0) return -1;
     CUresult rc = r_cuMemRelease(g_alloc[ii].handle);
@@ -1167,7 +1136,6 @@ static int do_suspend(void) {
             (unsigned long long)g_alloc[ii].handle, rc);
       return -1;
     }
-    g_alloc[ii].torn_down = 1;
     released++;
   }
 
@@ -1180,20 +1148,16 @@ static int do_suspend(void) {
   return 0;
 }
 
-/* Resume. A rank both exports and imports, so every exporter publishes (phase
- * 1) before anyone fetches (phase 2), which avoids deadlock; binds and mappings
- * follow (phase 3). */
+/* Resume: rebuild everything a completed do_suspend released. A rank both
+ * exports and imports, so every exporter publishes (phase 1) before anyone
+ * fetches (phase 2), which avoids deadlock; binds and mappings follow (phase
+ * 3). */
 
 /* Must hold g_lock. */
 static int do_resume(void) {
   int groups = 0, imports = 0, remapped = 0, rebound = 0, published = 0;
   CUcontext saved = NULL;
   r_cuCtxGetCurrent(&saved);
-
-  /* Snapshot which objects need a full rebuild. torn_down is cleared as each
-   * object comes back, so phases 2 and 3 use this snapshot. */
-  char full[MAXN];
-  for (int gi = 0; gi < MAXN; gi++) full[gi] = (char)g_alloc[gi].torn_down;
 
   /* Phase 0: the first VMM call on a freshly restored context can fail with
    * CUDA_ERROR_UNKNOWN until the context is synchronized. */
@@ -1210,26 +1174,17 @@ static int do_resume(void) {
      * a stale one. */
     if (g_alloc[gi].kind == KIND_MC && !g_alloc[gi].imported) {
       if (g_alloc[gi].ctx) r_cuCtxSetCurrent(g_alloc[gi].ctx);
-      /* Multicast creator. After a partial suspend the group may still be live;
-       * publish its existing handle so peers that did tear down can refetch. */
-      CUmemGenericAllocationHandle newmc = g_alloc[gi].handle;
-      if (full[gi]) {
-        if (r_cuMulticastCreate(&newmc, &g_alloc[gi].mprop) != CUDA_SUCCESS) {
-          mclog(
-              "RESUME: cuMulticastCreate idx=%d "
-              "failed",
-              gi);
-          return -1;
-        }
-        set_handle(&g_alloc[gi], newmc);
-        /* Live again: a retried suspend must tear it down. */
-        g_alloc[gi].torn_down = 0;
+      CUmemGenericAllocationHandle newmc = 0;
+      if (r_cuMulticastCreate(&newmc, &g_alloc[gi].mprop) != CUDA_SUCCESS) {
+        mclog("RESUME: cuMulticastCreate idx=%d failed", gi);
+        return -1;
       }
+      set_handle(&g_alloc[gi], newmc);
       if (g_alloc[gi].has_key && reexport(gi, newmc) != 0) return -1;
       groups++;
     } else if (g_alloc[gi].kind == KIND_UC) {
       CUmemGenericAllocationHandle h = g_alloc[gi].handle;
-      if (g_alloc[gi].uc_content && full[gi]) {
+      if (g_alloc[gi].uc_content) {
         /* Freed across the checkpoint (see do_suspend): recreate, re-map at the
          * identical VAs and restore the contents, before the re-export below
          * and the phase 3 binds. */
@@ -1245,10 +1200,8 @@ static int do_resume(void) {
           return -1;
         }
         set_handle(&g_alloc[gi], nh);
-        g_alloc[gi].torn_down = 0;
         h = nh;
-        if (remap_alloc(gi, nh, "UC-export", 0 /* full */, &remapped) != 0)
-          return -1;
+        if (remap_alloc(gi, nh, "UC-export", &remapped) != 0) return -1;
         for (int m = 0; m < MAXN; m++) {
           if (!g_map[m].used || g_map[m].allocIdx != gi) continue;
           if (g_map[m].ctx) r_cuCtxSetCurrent(g_map[m].ctx);
@@ -1265,13 +1218,6 @@ static int do_resume(void) {
         }
         free(g_alloc[gi].uc_content);
         g_alloc[gi].uc_content = NULL;
-      } else if (g_alloc[gi].uc_content) {
-        /* Partial suspend: still live, so the device contents are
-         * authoritative. Re-map what was unmapped and drop the backup. */
-        if (remap_alloc(gi, h, "UC-export", 1 /* partial */, &remapped) != 0)
-          return -1;
-        free(g_alloc[gi].uc_content);
-        g_alloc[gi].uc_content = NULL;
       }
       if (g_alloc[gi].has_key) {
         if (g_alloc[gi].ctx) r_cuCtxSetCurrent(g_alloc[gi].ctx);
@@ -1284,48 +1230,37 @@ static int do_resume(void) {
 
   /* Phase 2: importers fetch and re-import (new handles). */
   for (int gi = 0; gi < MAXN; gi++) {
-    if (!full[gi]) continue; /* still live (partial suspend); nothing to redo */
     if (g_alloc[gi].kind == KIND_MC && g_alloc[gi].imported) {
       if (g_alloc[gi].ctx) r_cuCtxSetCurrent(g_alloc[gi].ctx);
       CUmemGenericAllocationHandle newmc = 0;
       if (reimport(gi, &newmc) != 0) return -1;
       set_handle(&g_alloc[gi], newmc);
-      g_alloc[gi].torn_down = 0; /* live again */
       groups++;
     } else if (g_alloc[gi].kind == KIND_IMP) {
       if (g_alloc[gi].ctx) r_cuCtxSetCurrent(g_alloc[gi].ctx);
       CUmemGenericAllocationHandle newh = 0;
       if (reimport(gi, &newh) != 0) return -1;
       set_handle(&g_alloc[gi], newh);
-      g_alloc[gi].torn_down = 0; /* live again */
       imports++;
     }
   }
 
-  /* Phase 3: rebuild binds and re-map every VA at its identical address.
-   * Torn-down objects replay AddDevice, binds and mappings; objects a partial
-   * suspend left live only redo what it undid. */
+  /* Phase 3: replay AddDevice and binds, and re-map every VA at its identical
+   * address. */
   for (int gi = 0; gi < MAXN; gi++) {
     if (g_alloc[gi].kind != KIND_MC && g_alloc[gi].kind != KIND_IMP) continue;
-    int partial = !full[gi];
     if (g_alloc[gi].ctx) r_cuCtxSetCurrent(g_alloc[gi].ctx);
     if (g_alloc[gi].kind == KIND_MC) {
       CUmemGenericAllocationHandle mc = g_alloc[gi].handle;
-      if (!partial)
-        for (int d = 0; d < g_alloc[gi].ndev; d++)
-          if (r_cuMulticastAddDevice(mc, g_alloc[gi].devs[d]) != CUDA_SUCCESS) {
-            mclog(
-                "RESUME: AddDevice dev=%d "
-                "failed",
-                g_alloc[gi].devs[d]);
-            return -1;
-          }
+      for (int d = 0; d < g_alloc[gi].ndev; d++)
+        if (r_cuMulticastAddDevice(mc, g_alloc[gi].devs[d]) != CUDA_SUCCESS) {
+          mclog("RESUME: AddDevice dev=%d failed", g_alloc[gi].devs[d]);
+          return -1;
+        }
       /* cuMulticastBindMem blocks until every device joins: the binds are the
        * cross-rank barrier. */
       for (int b = 0; b < MAXN; b++) {
         if (!g_bind[b].used || g_bind[b].groupIdx != gi) continue;
-        if (partial && !g_bind[b].unbound)
-          continue; /* still bound; nothing to redo */
         if (g_bind[b].ctx) r_cuCtxSetCurrent(g_bind[b].ctx);
         CUresult rc =
             g_bind[b].by_addr
@@ -1339,21 +1274,14 @@ static int do_resume(void) {
                 g_bind[b].by_addr ? "addr" : "mem", rc);
           return -1;
         }
-        g_bind[b].unbound = 0;
         rebound++;
       }
-      if (remap_alloc(gi, mc, "MC", partial, &remapped) != 0) return -1;
+      if (remap_alloc(gi, mc, "MC", &remapped) != 0) return -1;
     } else {
-      if (remap_alloc(gi, g_alloc[gi].handle, "UC-import", partial,
-                      &remapped) != 0)
+      if (remap_alloc(gi, g_alloc[gi].handle, "UC-import", &remapped) != 0)
         return -1;
     }
   }
-
-  /* Everything is rebuilt; reset every flag for the next suspend. */
-  for (int gi = 0; gi < MAXN; gi++) g_alloc[gi].torn_down = 0;
-  for (int b = 0; b < MAXN; b++) g_bind[b].unbound = 0;
-  for (int m = 0; m < MAXN; m++) g_map[m].suspended = 0;
 
   if (saved) r_cuCtxSetCurrent(saved);
   if (r_cuCtxSynchronize) r_cuCtxSynchronize();
@@ -1364,7 +1292,7 @@ static int do_resume(void) {
   return 0;
 }
 
-/* Control thread: polls $MCSHIM_DIR for markers. */
+/* Control thread: polls /tmp/mcshim for markers. */
 
 static void marker(const char* name, char* out, size_t n) {
   snprintf(out, n, "%s/%s", g_dir, name);
@@ -1795,36 +1723,29 @@ static void* control_thread(void* arg) {
     int wgate = marker_exists("gate");
     if (wgate != prev_gate) {
       prev_gate = wgate;
-      if (wgate) {
+      pthread_mutex_lock(&g_lock);
+      const char* untracked = g_untracked ? g_untracked_why : NULL;
+      int broken = g_broken;
+      pthread_mutex_unlock(&g_lock);
+      if (wgate && untracked) {
+        /* Refuse before any process tears anything down, so the sentry can
+         * still unwind: untracked state cannot be rebuilt. */
+        mclog("GATE: refusing: untracked state (%s)", untracked);
+        marker_write(ack_e, "untracked state");
+      } else if (wgate) {
         gate_arm();
         marker_write(ack_g, "ok");
+      } else if (broken) {
+        mclog(
+            "FATAL: refusing to release the gate after a failed transition; "
+            "the application would run over unmapped GPU state");
       } else {
-        /* Refuse to ungate while teardown state is outstanding (a failed
-         * resume): the app would fault every coupled rank. Only a successful
-         * resume clears it. */
-        int torn = 0;
+        gate_disarm();
+        marker_rm(ack_g);
+        /* Every process has resumed: withdraw the published fds. */
         pthread_mutex_lock(&g_lock);
-        for (int i = 0; i < MAXN; i++) {
-          if (g_alloc[i].kind != KIND_FREE && g_alloc[i].torn_down) torn++;
-          if (g_map[i].used && g_map[i].suspended) torn++;
-        }
+        unpublish_all();
         pthread_mutex_unlock(&g_lock);
-        if (torn) {
-          mclog(
-              "FATAL: refusing to release the "
-              "gate: %d object(s) still torn down "
-              "after a failed resume; the "
-              "application would run over unmapped "
-              "GPU state",
-              torn);
-        } else {
-          gate_disarm();
-          marker_rm(ack_g);
-          /* Every process has resumed: withdraw the published fds. */
-          pthread_mutex_lock(&g_lock);
-          unpublish_all();
-          pthread_mutex_unlock(&g_lock);
-        }
       }
     }
     int want = marker_exists("suspend");
@@ -1834,23 +1755,21 @@ static void* control_thread(void* arg) {
       marker_rm(ack_e);
       pthread_mutex_lock(&g_lock);
       resolve_reals();
-      int rc;
-      if (want) {
+      int rc = -1;
+      if (g_broken) {
+        mclog("refusing: an earlier transition failed");
+      } else if (want) {
         /* Arm first: no app thread may reach the GPU before the last unmap. */
         gate_arm();
         rc = do_suspend();
-        if (rc != 0)
-          /* A failed suspend leaves the app running, not blocked. The sentry's
-           * unwind removes the marker, and the resume edge rebuilds any partial
-           * teardown. */
-          gate_disarm();
       } else {
-        /* A failed resume keeps the gate armed: better blocked than corrupt.
-         * Teardown and rebuild are re-enterable, so a retried edge converges.
-         */
         rc = do_resume();
         if (rc == 0) gate_disarm();
       }
+      /* A failure leaves this process torn down partway, and its peers may
+       * have released state it needs, so it stays gated for good: better
+       * blocked than corrupt. The sentry does not unwind it. */
+      if (rc != 0) g_broken = 1;
       pthread_mutex_unlock(&g_lock);
       if (rc != 0) {
         marker_write(ack_e, want ? "suspend failed" : "resume failed");
@@ -1927,8 +1846,6 @@ __attribute__((constructor)) static void mcshim_init(void) {
     g_disabled = 1;
     return;
   }
-  const char* d = getenv("MCSHIM_DIR");
-  if (d && *d) snprintf(g_dir, sizeof(g_dir), "%s", d);
   /* Create the control dir, which may also hold MCSHIM_LOG, before the first
    * mclog. */
   mkdir(g_dir, 0777);

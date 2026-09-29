@@ -38,11 +38,12 @@ filesystem at that path (default
     `/etc/ld.so.preload` through the container's VFS (launchers like SGLang's
     `torch_memory_saver` rewrite `LD_PRELOAD` for exactly the worker processes
     that matter; `ld.so.preload` is immune),
-*   sets `MCSHIM_DIR` in the container environment (default `/tmp/mcshim`)
-    unless the container chose its own,
-*   records `GVISOR_CUDA_MULTICAST_SHIM_DIR` in the container *spec*, which is
-    how the sentry (`pkg/sentry/control/state_cuda_shim.go`) later discovers
-    that it owns an interposer in this container.
+*   sets `NCCL_CUMEM_ENABLE=1` unless the container sets it.
+
+The shim and the sentry (`pkg/sentry/control/state_cuda_shim.go`)
+rendezvous in `/tmp/mcshim`, which must be part of the checkpoint image (not
+a host mount). The sentry drives the shim in every process that announced
+itself there (`present.<pid>`).
 
 The shim is inert until a process resolves a tracked CUDA entry point and
 calls `cuInit`; only then does it start its control thread and participate in
@@ -51,14 +52,14 @@ the protocol. Helpers that merely inherit the preload (shells,
 
 ## Control protocol
 
-Everything goes through `$MCSHIM_DIR`. Markers are **existence-based and
+Everything goes through `/tmp/mcshim`. Markers are **existence-based and
 edge-triggered**: the shim reacts to a marker appearing or disappearing, never
 to its content, which keeps the protocol race-free for any number of rank
 processes sharing one directory.
 
 | File                  | Written by | Meaning                                                        |
 | :-------------------- | :--------- | :------------------------------------------------------------- |
-| `gate`                | sentry     | created: block GPU submission; removed: unblock (refused while teardown state is outstanding) |
+| `gate`                | sentry     | created: block GPU submission (refused with `error.<pid>` if state is untracked); removed: unblock (refused after a failed transition) |
 | `suspend`             | sentry     | created: tear down tracked state; removed: rebuild it          |
 | `present.<pid>`       | shim       | this pid runs a control thread and will ack transitions        |
 | `gated.<pid>`         | shim       | gate armed                                                     |
@@ -99,7 +100,6 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 
 | Variable                 | Default         | Effect                                                            |
 | :----------------------- | :-------------- | :---------------------------------------------------------------- |
-| `MCSHIM_DIR`             | `/tmp/mcshim`   | control/rendezvous directory (the sentry normally sets it)        |
 | `MCSHIM_LOG`             | stderr          | append log to this path instead of stderr                         |
 | `MCSHIM_DISABLE`         | unset           | silent: no control thread, acks, or gate (interposition/tracking stay active) |
 | `MCSHIM_HOST_BUILD`      | unset           | build.sh: build with the host toolchain instead of docker         |
@@ -118,11 +118,9 @@ new devices; the interposer's rebuild then runs against them.
     (`g_alloc`, with per-object `torn_down`), mappings (`g_map`, per-mapping
     `suspended`), multicast binds (`g_bind`, per-bind `unbound`). This is
     live state: app-initiated frees drop entries out of the replay set. Any
-    overflow is loud and sticky (`g_untracked`): suspend refuses thereafter,
-    failing the checkpoint up front instead of corrupting the restore. The
-    per-entry flags clear as each entry is torn down or rebuilt, making both
-    directions re-enterable after partial failures: a retried edge does
-    exactly the remaining work.
+    overflow is loud and sticky (`g_untracked`): arming the gate refuses
+    thereafter, failing the checkpoint before anything is torn down instead
+    of corrupting the restore.
 *   **Identical-VA guarantee.** Suspend unmaps with `cuMemUnmap` only, never
     `cuMemAddressFree`, so the VA reservations survive the checkpoint; resume
     maps back into them.
@@ -134,7 +132,7 @@ new devices; the interposer's rebuild then runs against them.
     VAs, restores contents, and re-exports. Costs a device-host-device copy
     and checkpoint growth of the same size.
 *   **Three-phase cross-rank resume.** (1) every exporter re-creates its
-    object, re-exports it and publishes `<pid> <fd>` in `$MCSHIM_DIR` under
+    object, re-exports it and publishes `<pid> <fd>` in `/tmp/mcshim` under
     the original export's identity (nvproxy's fdinfo line); (2) importers
     copy the fd with `pidfd_getfd(2)` and re-import; (3) binds and mappings
     are rebuilt. `cuMulticastBindMem` blocks until every device has joined
@@ -150,9 +148,8 @@ new devices; the interposer's rebuild then runs against them.
     gated too: a thread reaching one in the unlocked teardown
     window would create or free shared state after the strict blocker gate
     verified there was none. The shim's own teardown/rebuild calls the real
-    entry points and is never gated. While teardown state is outstanding (a
-    resume failed partway), the shim refuses to release the gate even if
-    the `gate` marker is removed.
+    entry points and is never gated. After a failed teardown or rebuild, the
+    shim refuses to release the gate even if the `gate` marker is removed.
 *   **Handle translation.** Rebuilds rotate opaque handles; each object keeps
     the original handle the application holds, and calls using it are
     translated (`xlate_mc`). Because the driver reuses handle values, an
@@ -172,8 +169,9 @@ inside the container's trust domain, not gVisor's:
 *   The shim never trusts marker *content*, only existence, so nothing parses
     attacker-controlled bytes out of the control directory.
 *   While fds are published after a restore, any process in the container
-    may ptrace the exporters (`PR_SET_PTRACER_ANY`). Do **not** share one
-    `MCSHIM_DIR` volume across jobs: rendezvous keys could collide.
+    may ptrace the exporters (`PR_SET_PTRACER_ANY`). Do **not** share
+    `/tmp/mcshim` across jobs (e.g. through a volume): rendezvous keys could
+    collide.
 *   The sentry side (`state_cuda_shim.go`) treats acks as liveness signals
     with timeouts, never as data.
 
@@ -185,13 +183,10 @@ inside the container's trust domain, not gVisor's:
     not gated on those entries.
 *   **Fork.** A child forked after `cuInit` cannot use CUDA, so the shim
     stays inactive in it; inherited published fds are closed.
-*   **A failed resume leaves the application gated.** Deliberately: better
-    blocked than corrupt. The shim refuses to release the gate while
-    teardown state is outstanding -- the sentry's unwind removing the `gate`
-    marker does not override it. Per-entry flags clear as each object is
-    rebuilt, so a retried suspend/resume edge converges once the underlying
-    cause clears; until then the orchestrator must treat the workload as
-    unhealthy.
+*   **A failed teardown or rebuild leaves the application gated for good.**
+    Deliberately: better blocked than corrupt. Peers may already have
+    released state the failed process needs, so nothing is rolled back; the
+    sentry fails the checkpoint and the workload must be restarted.
 *   **Fixed table sizes.** `MAXN` = 4096 entries per table, with loud +
     sticky refusal on overflow rather than silent partial tracking.
 *   **Legacy CUDA IPC needs job mode.** Without `--cuda-checkpoint-path`,

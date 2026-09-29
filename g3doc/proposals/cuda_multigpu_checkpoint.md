@@ -81,7 +81,7 @@ sentry free or recreate RM objects on the application's behalf.
 ```mermaid
 flowchart TD
     subgraph runsc
-        F["flags: --cuda-checkpoint-path, --cuda-multicast-shim-path, --cuda-multicast-shim-source"] --> L["Loader: cuda-checkpoint job wrap, install and preload mcshim.so, set MCSHIM_DIR"]
+        F["flags: --cuda-checkpoint-path, --cuda-multicast-shim-path, --cuda-multicast-shim-source"] --> L["Loader: cuda-checkpoint job wrap, install and preload mcshim.so"]
     end
     subgraph Sentry
         S["control: preSaveCuda / postRestoreCuda"] -->|exec| CC[cuda-checkpoint]
@@ -92,7 +92,7 @@ flowchart TD
         M --> LC[libcuda]
     end
     L --> M
-    S <-->|"marker files in MCSHIM_DIR"| M
+    S <-->|"marker files in /tmp/mcshim"| M
     M <-->|"pidfd_getfd: re-exported fds"| P["peer ranks' mcshim"]
     LC -->|ioctls| N
     CC -->|ioctls| N
@@ -134,10 +134,11 @@ until a process calls `cuInit`.
 
 -   **Gate.** While suspended, submission entry points and tracked mutators
     block, so the application cannot touch unmapped VAs or create shared
-    state after the sentry verified there is none. A failed resume leaves the
-    application gated rather than running on inconsistent state.
+    state after the sentry verified there is none. A teardown or rebuild that
+    fails partway leaves the application gated rather than running on
+    inconsistent state.
 
-Settings: `MCSHIM_DIR`, `MCSHIM_LOG`, `MCSHIM_DISABLE`, `MCSHIM_ALLOW_FABRIC`
+Settings: `MCSHIM_LOG`, `MCSHIM_DISABLE`, `MCSHIM_ALLOW_FABRIC`
 (fabric-handle support is reported as absent by default, so frameworks choose
 POSIX fds).
 
@@ -160,17 +161,14 @@ POSIX fds).
     `LD_PRELOAD` for exactly the worker processes that hold GPU state (SGLang's
     `torch_memory_saver`), and the failure is silent: the checkpoint succeeds
     and the restore fails.
--   It sets `MCSHIM_DIR` (default `/tmp/mcshim`) and `NCCL_CUMEM_ENABLE=1`
-    unless the container sets them, and records
-    `GVISOR_CUDA_MULTICAST_SHIM_DIR` in the container spec (not the process
-    environment), which is how the sentry learns an interposer is present. The
-    marker is re-injected on restore, because the restore bundle does not have
-    it.
+-   It sets `NCCL_CUMEM_ENABLE=1` unless the container sets it.
 
 ### Control protocol
 
-The sentry and the interposer communicate through files in `$MCSHIM_DIR`.
-Markers are existence-based and edge-triggered; content is never parsed.
+The sentry and the interposer communicate through files in `/tmp/mcshim`,
+which must be part of the checkpoint image (not a host mount). Markers are
+existence-based and edge-triggered; content is never parsed. The sentry drives
+the interposer in the processes that announced themselves (`present.<pid>`).
 
 File                                | Writer      | Meaning
 ----------------------------------- | ----------- | -------
@@ -218,8 +216,13 @@ lock then times out and the checkpoint fails. Checkpoints are therefore taken
 of a quiesced (asleep or idle) engine. The teardown runs between an unlock and
 a re-lock because it has to call libcuda, which a locked process cannot do.
 
-Every failure before the save unwinds: unlock, rebuild, release the gate, and
-the application keeps running.
+A failure before the teardown, or after it completed on every process,
+unwinds: unlock, rebuild, release the gate, and the application keeps running.
+A process that could not track all of its state refuses the gate, before
+anything is torn down. If the teardown itself fails partway, peers may already
+have released state the failed process needs, so nothing is rolled back: the
+application stays blocked, the checkpoint fails, and the workload must be
+restarted.
 
 Without an interposer there is no gate or teardown, and two things still
 differ from today: the checkpoint uses `cuda-checkpoint`'s two-phase
