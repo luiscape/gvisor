@@ -37,7 +37,17 @@ branches removes this directory, which would break a running gate.
     `ln -s /data/cache/bazel ~/.cache/bazel`.
 4.  `echo always | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled`
     (restore performance; not persistent).
-5.  `bash pull.sh`.
+5.  Stop the OS from restarting the fabric manager: `unattended-upgrades` runs
+    `needrestart`, which restarts `nvidia-fabricmanager` mid-run. That
+    desyncs the NVLink fabric (Xid 145, then `NV_ERR_FABRIC_STATE_OUT_OF_SYNC`
+    on every multicast setup) until all GPUs are reset:
+
+        sudo systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer
+        echo '$nrconf{override_rc}{qr(^nvidia-)} = 0;' | sudo tee /etc/needrestart/conf.d/90-gpu.conf
+
+    To recover: stop the fabric manager and persistenced, `nvidia-smi -r`,
+    then start them again.
+6.  `bash pull.sh`.
 
 ## Build and run
 
