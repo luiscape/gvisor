@@ -35,23 +35,3 @@ func TestProcFDInfoExtraFormat(t *testing.T) {
 		t.Errorf("fdinfo line = %q, want %q", got, want)
 	}
 }
-
-func TestExportedObjSlots(t *testing.T) {
-	fd := &frontendFD{}
-	if _, ok := fd.exportedObjInfoLocked(); ok {
-		t.Fatal("empty fd reported an exported object")
-	}
-	fd.exportedObjs = map[uint16]exportedObjInfo{
-		2: {object: nvgpu.Handle{Val: 2}},
-		0: {object: nvgpu.Handle{Val: 0xa}},
-		1: {object: nvgpu.Handle{Val: 1}},
-	}
-	// The identity is the lowest slot (libcuda's single export lands in 0).
-	if exp, ok := fd.exportedObjInfoLocked(); !ok || exp.object.Val != 0xa {
-		t.Errorf("exportedObjInfoLocked() = %v, %v; want slot 0 (object 0xa)", exp, ok)
-	}
-	delete(fd.exportedObjs, 0)
-	if exp, ok := fd.exportedObjInfoLocked(); !ok || exp.object.Val != 1 {
-		t.Errorf("after unexporting slot 0, exportedObjInfoLocked() = %v, %v; want slot 1", exp, ok)
-	}
-}

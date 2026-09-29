@@ -1863,8 +1863,7 @@ static void* control_thread(void* arg) {
       }
     }
     /* Poll every 5 ms: the spread in when ranks see the gate bounds how often a
-     * collective straddles it. At 100 ms, busy workloads exhausted the sentry's
-     * lock retries. */
+     * collective straddles it, which fails the sentry's lock. */
     struct timespec ts = {0, 5 * 1000 * 1000}; /* 5ms */
     nanosleep(&ts, NULL);
   }

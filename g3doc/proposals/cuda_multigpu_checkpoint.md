@@ -213,10 +213,10 @@ sequenceDiagram
 
 The gate and the lock handle different halves of quiescing: the gate stops
 new submissions, and `cuda-checkpoint --action lock` drains work in flight. A
-rank gated just before a collective can starve peers already inside it, so if
-the parallel lock fails the sentry releases the gate and retries, up to 8
-times. The teardown runs between an unlock and a re-lock because it has to
-call libcuda, which a locked process cannot do.
+rank gated just before a collective can starve peers already inside it; the
+lock then times out and the checkpoint fails. Checkpoints are therefore taken
+of a quiesced (asleep or idle) engine. The teardown runs between an unlock and
+a re-lock because it has to call libcuda, which a locked process cannot do.
 
 Every failure before the save unwinds: unlock, rebuild, release the gate, and
 the application keeps running.
@@ -243,11 +243,6 @@ blocker inventory refuses a checkpoint `cuda-checkpoint` would hang on.
     This is the rendezvous key exporters and importers agree on after
     restore. Linux precedent: dmabuf and DRM `show_fdinfo`. Without it the
     interposer refuses the checkpoint.
-
--   **Device-mapping tracking** on `frontendFD` / `uvmFD` so
-    `InvalidateUnsavable` drops device pmas before save (previously #14863,
-    closed pending a motivating case). Whether the interposer flow needs it on
-    R610 has not been re-measured; it will be justified separately or dropped.
 
 This builds on changes proposed separately: #14525 (merged) and #14817
 (approved) for restore onto other GPUs, the CUDA admission gate, and the
@@ -364,8 +359,8 @@ the interposer flag is set:
 -   vLLM and SGLang are checkpointed after putting the engine to sleep (vLLM
     `/sleep?level=1`; SGLang `release_memory_occupation` with
     `--enable-memory-saver --enable-weights-cpu-backup`; without the backup
-    flag the restored engine produced garbage output). Checkpointing a busy
-    engine relies on the gate/lock retry and is less exercised.
+    flag the restored engine produced garbage output). A checkpoint under
+    load may fail the lock phase; the application keeps running.
 -   Only a single checkpoint then restore is validated. Chained restores,
     resuming after a successful save, and the failure unwinds have not been
     re-validated on R610.

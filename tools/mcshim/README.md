@@ -81,8 +81,8 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 1.  create `gate`, wait for `gated.<pid>` (no CUDA calls involved, so this is
     safe at any point; it stops *new* submissions),
 2.  `cuda-checkpoint --action lock` on all ranks in parallel (drains in-flight
-    work; on failure the gate is released and the pair retried, since gating
-    mid-collective can starve peers),
+    work; gating mid-collective can starve peers, which fails the lock and
+    with it the checkpoint),
 3.  `--action unlock` (the teardown must issue CUDA calls, which a locked
     process cannot),
 4.  create `suspend`, wait for `suspended.<pid>`,
