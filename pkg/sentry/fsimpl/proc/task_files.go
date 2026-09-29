@@ -552,8 +552,9 @@ type memFD struct {
 
 	inode *memInode
 	mm    *mm.MemoryManager
-	// mu guards the fields below.
-	mu     sync.Mutex `state:"nosave"`
+	mu    sync.Mutex `state:"nosave"`
+
+	// +checklocks:mu
 	offset int64
 }
 
@@ -568,6 +569,8 @@ func (fd *memFD) Init(m *vfs.Mount, d *kernfs.Dentry, inode *memInode, flags uin
 }
 
 // Seek implements vfs.FileDescriptionImpl.Seek.
+//
+// +checklocksexclude:fd.mu
 func (fd *memFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
@@ -638,6 +641,8 @@ func (fd *memFD) PRead(ctx context.Context, dst usermem.IOSequence, offset int64
 }
 
 // Write implements vfs.FileDescriptionImpl.Write.
+//
+// +checklocksexclude:fd.mu
 func (fd *memFD) Write(ctx context.Context, dst usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
 	fd.mu.Lock()
 	n, err := fd.PWrite(ctx, dst, fd.offset, opts)
@@ -647,6 +652,8 @@ func (fd *memFD) Write(ctx context.Context, dst usermem.IOSequence, opts vfs.Wri
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.
+//
+// +checklocksexclude:fd.mu
 func (fd *memFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
 	fd.mu.Lock()
 	n, err := fd.PRead(ctx, dst, fd.offset, opts)
@@ -1057,6 +1064,15 @@ func (s *statusFD) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	fmt.Fprintf(buf, "VmData:\t%d kB\n", data>>10)
 
 	fmt.Fprintf(buf, "Threads:\t%d\n", s.task.ThreadGroup().Count())
+	// Signal masks are rendered as in Linux's fs/proc/array.c:task_sig().
+	// SigQ is omitted since the sentry does not account queued signals per
+	// user.
+	fmt.Fprintf(buf, "SigPnd:\t%016x\n", s.task.TaskPendingSignals())
+	fmt.Fprintf(buf, "ShdPnd:\t%016x\n", s.task.ThreadGroup().PendingSignals())
+	fmt.Fprintf(buf, "SigBlk:\t%016x\n", s.task.SignalMask())
+	ignored, caught := s.task.ThreadGroup().IgnoredAndCaughtSignals()
+	fmt.Fprintf(buf, "SigIgn:\t%016x\n", ignored)
+	fmt.Fprintf(buf, "SigCgt:\t%016x\n", caught)
 	fmt.Fprintf(buf, "CapInh:\t%016x\n", creds.InheritableCaps)
 	fmt.Fprintf(buf, "CapPrm:\t%016x\n", creds.PermittedCaps)
 	fmt.Fprintf(buf, "CapEff:\t%016x\n", creds.EffectiveCaps)

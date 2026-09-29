@@ -89,17 +89,20 @@ type Writer struct {
 	// Next is where output is written.
 	Next io.Writer
 
-	// mu protects fields below.
 	mu sync.Mutex
 
-	// errors counts failures to write log messages so it can be reported
-	// when writer start to work again. Needs to be accessed using atomics
-	// to make race detector happy because it's read outside the mutex.
-	// +checklocks
+	// atomicErrors counts failed log messages so the count can be reported
+	// when the writer works again.
+	// Atomic reads allow checking for errors without taking mu.
+	//
+	// +checklocks:mu
+	// +checkatomic
 	atomicErrors int32
 }
 
 // Write writes out the given bytes, handling non-blocking sockets.
+//
+// +checklocksexclude:l.mu
 func (l *Writer) Write(data []byte) (int, error) {
 	n := 0
 
@@ -145,6 +148,8 @@ func (l *Writer) Write(data []byte) (int, error) {
 }
 
 // Emit emits the message.
+//
+// +checklocksexclude:l.mu
 func (l *Writer) Emit(_ int, _ Level, _ time.Time, format string, args ...any) {
 	fmt.Fprintf(l, format, args...)
 }
@@ -195,7 +200,12 @@ type Logger interface {
 
 // BasicLogger is the default implementation of Logger.
 type BasicLogger struct {
+	// +checkatomic
 	Level
+
+	// Emitter receives enabled log messages. BasicLogger does not synchronize
+	// access to it. Callers must synchronize field replacement with logging
+	// calls and provide any synchronization needed for concurrent Emit calls.
 	Emitter
 }
 
@@ -257,17 +267,19 @@ func Log() *BasicLogger {
 	return log.Load()
 }
 
-// SetTarget sets the log target.
+// SetTarget atomically replaces the default logger, using target and a snapshot
+// of the previous logger's level. Existing loggers returned by Log retain their
+// target; a concurrent SetLevel may affect only the previous logger.
 //
-// This is not thread safe and shouldn't be called concurrently with any
-// logging calls.
-//
-// SetTarget should be called before any instances of log.Log() to avoid race conditions
+// Set the target before creating loggers that should use it. Callers remain
+// responsible for emitter synchronization and for keeping old targets usable
+// while loggers may still use them.
 func SetTarget(target Emitter) {
 	logMu.Lock()
 	defer logMu.Unlock()
 	oldLog := Log()
-	log.Store(&BasicLogger{Level: oldLog.Level, Emitter: target})
+	level := Level(atomic.LoadUint32((*uint32)(&oldLog.Level)))
+	log.Store(&BasicLogger{Level: level, Emitter: target})
 }
 
 // SetLevel sets the log level.
@@ -397,5 +409,6 @@ func init() {
 	// Store the initial value for the log.
 	log.Store(&BasicLogger{Level: Info, Emitter: GoogleEmitter{&Writer{Next: os.Stderr}}})
 
-	warnedSet = make(map[string]struct{})
+	// Package initialization is exclusive, which checklocks does not model.
+	warnedSet = make(map[string]struct{}) // +checklocksignore
 }

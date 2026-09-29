@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
@@ -1028,6 +1029,60 @@ TEST_F(PtyTest, TCSETSFTermiosONLCR) {
   char buf[3] = {};
   ExpectReadable(master_, 2, buf);
   EXPECT_STREQ(buf, "\r\n");
+
+  ExpectFinished(replica_);
+}
+
+TEST_F(PtyTest, TCSETSFFlushesOnlyReplicaInput) {
+  DisableCanonicalAndEcho();
+
+  constexpr char kInput[] = "input";
+  constexpr char kOutput[] = "output";
+  ASSERT_THAT(WriteFd(master_.get(), kInput, sizeof(kInput) - 1),
+              SyscallSucceedsWithValue(sizeof(kInput) - 1));
+  ASSERT_THAT(WriteFd(replica_.get(), kOutput, sizeof(kOutput) - 1),
+              SyscallSucceedsWithValue(sizeof(kOutput) - 1));
+  ASSERT_NO_ERRNO(WaitUntilReceived(replica_.get(), sizeof(kInput) - 1));
+  ASSERT_NO_ERRNO(WaitUntilReceived(master_.get(), sizeof(kOutput) - 1));
+
+  struct kernel_termios t = {};
+  ASSERT_THAT(ioctl(replica_.get(), TCGETS, &t), SyscallSucceeds());
+  ASSERT_THAT(ioctl(replica_.get(), TCSETSF, &t), SyscallSucceeds());
+
+  char buf[sizeof(kOutput)] = {};
+  ExpectFinished(replica_);
+  EXPECT_THAT(ReadFd(master_.get(), buf, sizeof(kOutput) - 1),
+              SyscallSucceedsWithValue(sizeof(kOutput) - 1));
+  EXPECT_EQ(memcmp(buf, kOutput, sizeof(kOutput) - 1), 0);
+  ExpectFinished(master_);
+}
+
+TEST_F(PtyTest, TCSETSFOnMasterFlushesReplicaInput) {
+  DisableCanonicalAndEcho();
+
+  constexpr char kInput[] = "pending";
+  ASSERT_THAT(WriteFd(master_.get(), kInput, sizeof(kInput) - 1),
+              SyscallSucceedsWithValue(sizeof(kInput) - 1));
+  ASSERT_NO_ERRNO(WaitUntilReceived(replica_.get(), sizeof(kInput) - 1));
+
+  struct kernel_termios t = {};
+  ASSERT_THAT(ioctl(master_.get(), TCGETS, &t), SyscallSucceeds());
+  ASSERT_THAT(ioctl(master_.get(), TCSETSF, &t), SyscallSucceeds());
+
+  ExpectFinished(replica_);
+}
+
+TEST_F(PtyTest, TCSETSF2FlushesReplicaInput) {
+  DisableCanonicalAndEcho();
+
+  constexpr char kInput[] = "pending";
+  ASSERT_THAT(WriteFd(master_.get(), kInput, sizeof(kInput) - 1),
+              SyscallSucceedsWithValue(sizeof(kInput) - 1));
+  ASSERT_NO_ERRNO(WaitUntilReceived(replica_.get(), sizeof(kInput) - 1));
+
+  struct kernel_termios2 t = {};
+  ASSERT_THAT(ioctl(replica_.get(), TCGETS2, &t), SyscallSucceeds());
+  ASSERT_THAT(ioctl(replica_.get(), TCSETSF2, &t), SyscallSucceeds());
 
   ExpectFinished(replica_);
 }
@@ -2848,6 +2903,33 @@ TEST_F(JobControlTest, SigwinchOnWindowSizeChange) {
   ASSERT_THAT(waitpid(child, &wstatus, 0), SyscallSucceedsWithValue(child));
   ASSERT_TRUE(WIFEXITED(wstatus));
   EXPECT_EQ(WEXITSTATUS(wstatus), 42);
+}
+
+TEST_F(PtyTest, PositionalIO) {
+  char buf[32] = {};
+  struct iovec iov = {
+      .iov_base = buf,
+      .iov_len = sizeof(buf),
+  };
+
+  // Positional I/O on master should return ESPIPE.
+  EXPECT_THAT(pread(master_.get(), buf, sizeof(buf), 0),
+              SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(pwrite(master_.get(), buf, sizeof(buf), 0),
+              SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(preadv(master_.get(), &iov, 1, 0), SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(pwritev(master_.get(), &iov, 1, 0),
+              SyscallFailsWithErrno(ESPIPE));
+
+  // Positional I/O on replica should return ESPIPE.
+  EXPECT_THAT(pread(replica_.get(), buf, sizeof(buf), 0),
+              SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(pwrite(replica_.get(), buf, sizeof(buf), 0),
+              SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(preadv(replica_.get(), &iov, 1, 0),
+              SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(pwritev(replica_.get(), &iov, 1, 0),
+              SyscallFailsWithErrno(ESPIPE));
 }
 
 }  // namespace

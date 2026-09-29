@@ -55,14 +55,44 @@ type virtualOwner struct {
 	// This field is initialized at creation time and is immutable.
 	enabled bool
 
-	// mu protects the fields below and they can be accessed using atomic memory
-	// operations.
-	mu  sync.Mutex `state:"nosave"`
+	// mu serializes virtual-owner updates and their permission checks.
+	// Readers access the fields below atomically without holding mu.
+	mu sync.Mutex `state:"nosave"`
+
+	// +checkatomic
+	// +checklocks:mu
 	uid atomicbitops.Uint32
+
+	// +checkatomic
+	// +checklocks:mu
 	gid atomicbitops.Uint32
+
 	// mode is also stored, otherwise setting the host file to `0000` could remove
 	// access to the file.
+	//
+	// +checkatomic
+	// +checklocks:mu
 	mode atomicbitops.Uint32
+}
+
+// setModeLocked changes permissions without changing the file type.
+//
+// +checklocks:v.mu
+func (v *virtualOwner) setModeLocked(mode uint16) {
+	newMode := v.mode.Load()&linux.S_IFMT | uint32(mode)&^linux.S_IFMT
+	v.mode.Store(newMode)
+}
+
+// setIDsLocked updates the IDs selected by mask.
+//
+// +checklocks:v.mu
+func (v *virtualOwner) setIDsLocked(mask, uid, gid uint32) {
+	if mask&linux.STATX_UID != 0 {
+		v.uid.Store(uid)
+	}
+	if mask&linux.STATX_GID != 0 {
+		v.gid.Store(gid)
+	}
 }
 
 func (v *virtualOwner) atomicUID() uint32 {
@@ -166,33 +196,43 @@ type inode struct {
 	queue waiter.Queue
 
 	// virtualOwner caches ownership and permission information to override the
-	// underlying file owner and permission. This is used to allow the unstrusted
+	// underlying file owner and permission. This is used to allow the untrusted
 	// application to change these fields without affecting the host.
 	virtualOwner virtualOwner
 
-	// maps holds application memory mappings of the inode. maps is protected
-	// by mapsMu.
-	mapsMu   sync.Mutex `state:"nosave"`
+	mapsMu sync.Mutex `state:"nosave"`
+
+	// mappings holds application memory mappings of the inode.
+	//
+	// +checklocks:mapsMu
 	mappings memmap.MappingSet
 
 	// mmapFile implements memmap.File for hostFD.
 	mmapFile fsutil.MmapCachedFile
 
+	bufMu sync.Mutex `state:"nosave"`
+
 	// If haveBuf is non-zero, hostFD represents a pipe, and buf contains data
-	// read from the pipe from previous calls to inode.beforeSave(). haveBuf
-	// and buf are protected by bufMu.
-	bufMu   sync.Mutex `state:"nosave"`
+	// read from the pipe from previous calls to inode.beforeSave().
+	//
+	// +checklocks:bufMu
+	// +checkatomic
 	haveBuf atomicbitops.Uint32
-	buf     []byte
+
+	// +checklocks:bufMu
+	buf []byte
 
 	// If the inode corresponds to a TTY, tty is the kernel.TTY.
 	//
 	// This pointer is initialized at creation time and is immutable.
 	tty *kernel.TTY
-	// If the inode corresponds to a TTY, termios is the cached termios
-	// struct. It is protected by termiosMu.
+
 	termiosMu sync.Mutex `state:"nosave"`
-	termios   linux.KernelTermios
+
+	// If the inode corresponds to a TTY, termios is the cached termios struct.
+	//
+	// +checklocks:termiosMu
+	termios linux.KernelTermios
 }
 
 func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, restoreKey checkpoint.ResourceID, fileType linux.FileMode, isTTY bool, readonly bool) (*inode, error) {
@@ -327,10 +367,12 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 		return nil, err
 	}
 	if opts.VirtualOwner {
-		i.virtualOwner.enabled = true
-		i.virtualOwner.uid = atomicbitops.FromUint32(uint32(opts.UID))
-		i.virtualOwner.gid = atomicbitops.FromUint32(uint32(opts.GID))
-		i.virtualOwner.mode = atomicbitops.FromUint32(stat.Mode)
+		i.virtualOwner = virtualOwner{
+			enabled: true,
+			uid:     atomicbitops.FromUint32(uint32(opts.UID)),
+			gid:     atomicbitops.FromUint32(uint32(opts.GID)),
+			mode:    atomicbitops.FromUint32(stat.Mode),
+		}
 	}
 	i.restorable = opts.Restorable
 
@@ -581,7 +623,9 @@ func (i *inode) stat(stat *unix.Stat_t) error {
 
 // SetStat implements kernfs.Inode.SetStat.
 //
-// +checklocksignore
+// +checklocksexclude:i.virtualOwner.mu
+// +checklocksexclude:i.mapsMu
+// +checklocksexclude:creds.UserNamespace.mu
 func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Credentials, opts vfs.SetStatOptions) error {
 	if i.readonly {
 		return linuxerr.EPERM
@@ -617,8 +661,9 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 
 	if m&linux.STATX_MODE != 0 {
 		if i.virtualOwner.enabled {
-			// We hold i.virtualOwner.mu.
-			i.virtualOwner.mode = atomicbitops.FromUint32(uint32(opts.Stat.Mode))
+			// MODE implies the earlier virtualOwnerModes test acquired mu.
+			// checklocks cannot correlate these repeated mask tests.
+			i.virtualOwner.setModeLocked(opts.Stat.Mode) // +checklocksignore
 		} else {
 			log.Warningf("sentry seccomp filters don't allow making fchmod(2) syscall")
 			return unix.EPERM
@@ -656,20 +701,17 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 			return err
 		}
 	}
-	if i.virtualOwner.enabled {
-		if m&linux.STATX_UID != 0 {
-			// We hold i.virtualOwner.mu.
-			i.virtualOwner.uid = atomicbitops.FromUint32(opts.Stat.UID)
-		}
-		if m&linux.STATX_GID != 0 {
-			// We hold i.virtualOwner.mu.
-			i.virtualOwner.gid = atomicbitops.FromUint32(opts.Stat.GID)
-		}
+	if i.virtualOwner.enabled && m&(linux.STATX_UID|linux.STATX_GID) != 0 {
+		// UID or GID implies the earlier virtualOwnerModes test acquired mu.
+		// checklocks cannot correlate these repeated mask tests.
+		i.virtualOwner.setIDsLocked(m, opts.Stat.UID, opts.Stat.GID) // +checklocksignore
 	}
 	return nil
 }
 
 // DecRef implements kernfs.Inode.DecRef.
+//
+// +checklocksexclude:i.queue.mu
 func (i *inode) DecRef(ctx context.Context) {
 	i.inodeRefs.DecRef(func() {
 		if i.hostFD >= 0 {
@@ -793,15 +835,22 @@ type fileDescription struct {
 	// inode is immutable after fileDescription creation.
 	inode *inode
 
-	// offsetMu protects offset.
 	offsetMu sync.Mutex `state:"nosave"`
 
 	// offset specifies the current file offset. It is only meaningful when
 	// inode.seekable is true.
+	//
+	// +checklocks:offsetMu
 	offset int64
 }
 
 // SetStat implements vfs.FileDescriptionImpl.SetStat.
+//
+// Callers must not hold the user-namespace mutex for credentials in ctx.
+// checklocks cannot follow CredentialsFromContext to that mutex.
+//
+// +checklocksexclude:f.inode.virtualOwner.mu
+// +checklocksexclude:f.inode.mapsMu
 func (f *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
 	creds := auth.CredentialsFromContext(ctx)
 	return f.inode.SetStat(ctx, f.vfsfd.Mount().Filesystem(), creds, opts)
@@ -853,6 +902,9 @@ func (f *fileDescription) PRead(ctx context.Context, dst usermem.IOSequence, off
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.
+//
+// +checklocksexclude:f.offsetMu
+// +checklocksexclude:f.inode.bufMu
 func (f *fileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
 	// Check that flags are supported.
 	//
@@ -888,6 +940,7 @@ func (f *fileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts
 	return n, err
 }
 
+// +checklocksexclude:i.bufMu
 func (i *inode) readFromBuf(ctx context.Context, dst *usermem.IOSequence) (int64, error) {
 	if i.haveBuf.Load() == 0 {
 		return 0, nil
@@ -924,6 +977,8 @@ func (f *fileDescription) PWrite(ctx context.Context, src usermem.IOSequence, of
 }
 
 // Write implements vfs.FileDescriptionImpl.Write.
+//
+// +checklocksexclude:f.offsetMu
 func (f *fileDescription) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
 	i := f.inode
 	if !i.seekable {
@@ -984,6 +1039,8 @@ func (f *fileDescription) writeToHostFD(ctx context.Context, src usermem.IOSeque
 //
 // Note that we do not support seeking on directories, since we do not even
 // allow directory fds to be imported at all.
+//
+// +checklocksexclude:f.offsetMu
 func (f *fileDescription) Seek(_ context.Context, offset int64, whence int32) (int64, error) {
 	i := f.inode
 	if !i.seekable {
@@ -1067,6 +1124,8 @@ func (f *fileDescription) ConfigureMMap(_ context.Context, opts *memmap.MMapOpts
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
+//
+// +checklocksexclude:i.mapsMu
 func (i *inode) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
 	i.mmapFile.AddMapping(ar, offset)
 	i.mapsMu.Lock()
@@ -1076,6 +1135,8 @@ func (i *inode) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hosta
 }
 
 // RemoveMapping implements memmap.Mappable.RemoveMapping.
+//
+// +checklocksexclude:i.mapsMu
 func (i *inode) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
 	i.mmapFile.RemoveMapping(ar, offset)
 	i.mapsMu.Lock()
@@ -1084,6 +1145,8 @@ func (i *inode) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar ho
 }
 
 // CopyMapping implements memmap.Mappable.CopyMapping.
+//
+// +checklocksexclude:i.mapsMu
 func (i *inode) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
 	return i.AddMapping(ctx, ms, dstAR, offset, writable)
 }
@@ -1109,6 +1172,8 @@ func (i *inode) InvalidateUnsavable(ctx context.Context) error {
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
+//
+// +checklocksexclude:f.inode.queue.mu
 func (f *fileDescription) EventRegister(e *waiter.Entry) error {
 	f.inode.queue.EventRegister(e)
 	if f.inode.epollable {
@@ -1121,6 +1186,8 @@ func (f *fileDescription) EventRegister(e *waiter.Entry) error {
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
+//
+// +checklocksexclude:f.inode.queue.mu
 func (f *fileDescription) EventUnregister(e *waiter.Entry) {
 	f.inode.queue.EventUnregister(e)
 	if f.inode.epollable {
