@@ -1,6 +1,6 @@
 # Multi-GPU CUDA Checkpoint/Restore
 
-Status as of 2026-09-27: Draft, seeking feedback on the
+Status as of 2026-09-29: Draft, seeking feedback on the
 [open questions](#open-questions).
 
 ## Synopsis
@@ -247,46 +247,77 @@ blocker inventory refuses a checkpoint `cuda-checkpoint` would hang on.
     restore. Linux precedent: dmabuf and DRM `show_fdinfo`. Without it the
     interposer refuses the checkpoint.
 
-This builds on changes proposed separately: #14525 (merged) and #14817
-(approved) for restore onto other GPUs, the CUDA admission gate, and the
-checkpoint blocker inventory.
+This builds on #14525 (merged) and #14817 (approved) for restore onto other
+GPUs, and #14850 (merged), a control libcuda issues on NVSwitch systems when
+allocating and exporting VMM memory. Two nvproxy changes are not proposed yet:
+
+-   **CUDA admission gate.** While a checkpoint runs, CUDA initialization is
+    held in processes outside the checkpointed set, which would otherwise
+    hold GPU state `cuda-checkpoint` never saved.
+-   **Blocker inventory.** Reports, per process, the live multicast groups and
+    fabric-memory imports that would make `cuda-checkpoint` hang. Without the
+    interposer the sentry refuses such a checkpoint up front; with it, the
+    inventory verifies the teardown.
 
 ## Validation
 
-8x H100 80GB with NVSwitch, driver and fabric manager 610.57.04; vLLM 0.29.0
-and SGLang 0.5.20 serving Qwen2.5-1.5B-Instruct in their default
-configurations plus the listed flags. Each run boots the engine, records a
-completion at temperature 0, puts the engine to sleep, checkpoints, restores
-(onto other GPUs where listed), wakes it, and repeats the completion. A run
-passes if the output is identical and the sandbox is on the requested GPUs.
+Two hosts, both with driver and fabric manager 610.57.04: 8x H100 80GB with
+NVSwitch, and 8x B300 (NVLink 5). vLLM 0.29.0 and SGLang 0.5.20 serve
+Qwen2.5-1.5B-Instruct in their default configurations plus the listed flags.
+Each run boots the engine, records a completion at temperature 0, puts the
+engine to sleep, checkpoints, restores (onto other GPUs where listed), wakes
+it, and repeats the completion. A run passes if the output is identical and
+the sandbox is on the requested GPUs.
 
 All runs use `--cuda-checkpoint-path` (job mode) and the engines' custom
 all-reduce. TP=8 serves Qwen2.5-3B-Instruct, since the 1.5B model's 12
 attention heads do not split 8 ways.
 
+H100:
+
 Workload                                  | GPUs       | Checkpoint (image) | Restore | First inference after restore | vs. cold boot
 ----------------------------------------- | ---------- | ------------------ | ------- | ----------------------------- | -------------
-vLLM TP=2                                 | 0,1        | 8.4 s (12G)        | 1.9 s   | 6.1 s                         | 35x
-vLLM TP=4                                 | 0-3        | 14.4 s (18G)       | 2.8 s   | 11.1 s                        | 22x
-vLLM TP=8                                 | 0-7        | 38.7 s (35G)       | 5.4 s   | 27.1 s                        | 11x
-vLLM TP=2                                 | 0,1 -> 4,5 | 8.5 s (12G)        | 2.0 s   | 6.4 s                         | 34x
-vLLM TP=4                                 | 0-3 -> 4-7 | 14.4 s (18G)       | 2.9 s   | 12.1 s                        | 20x
-vLLM TP=2                                 | 0,1 -> 1,2 | 8.5 s (12G)        | 1.9 s   | 6.3 s                         | 34x
-SGLang TP=4                               | 0-3        | 14.5 s (17G)       | 2.7 s   | 10.9 s                        | 15x
-SGLang TP=4                               | 0-3 -> 4-7 | 14.6 s (17G)       | 2.7 s   | 11.8 s                        | 14x
-SGLang TP=4 `--enable-nccl-nvls`          | 0-3        | 14.7 s (17G)       | 2.7 s   | 11.1 s                        | 15x
-SGLang TP=4 `--enable-torch-symm-mem`     | 0-3        | 14.8 s (17G)       | 2.7 s   | 11.1 s                        | 15x
-SGLang TP=4 FlashInfer all-reduce fusion  | 0-3        | 16.1 s (18G)       | 2.8 s   | 12.0 s                        | 14x
-SGLang TP=4 FlashInfer all-reduce fusion  | 0-3 -> 4-7 | 16.2 s (18G)       | 2.8 s   | 13.0 s                        | 13x
-SGLang TP=4 `--enable-nccl-nvls`          | 0-3 -> 4-7 | 14.6 s (17G)       | 2.7 s   | 12.1 s                        | 14x
-SGLang TP=4 `--enable-torch-symm-mem`     | 0-3 -> 4-7 | 14.8 s (17G)       | 2.7 s   | 11.9 s                        | 14x
-SGLang TP=8                               | 0-7        | 41.3 s (33G)       | 5.2 s   | 26.7 s                        | 7x
+vLLM TP=2                                 | 0,1        | 8.6 s (12G)        | 2.0 s   | 6.2 s                         | 36x
+vLLM TP=4                                 | 0-3        | 14.2 s (18G)       | 2.8 s   | 11.0 s                        | 23x
+vLLM TP=8                                 | 0-7        | 36.2 s (35G)       | 5.4 s   | 27.0 s                        | 12x
+vLLM TP=2                                 | 0,1 -> 4,5 | 8.6 s (12G)        | 2.0 s   | 7.2 s                         | 31x
+vLLM TP=4                                 | 0-3 -> 4-7 | 14.3 s (18G)       | 2.9 s   | 12.0 s                        | 21x
+vLLM TP=2                                 | 0,1 -> 1,2 | 8.6 s (12G)        | 2.0 s   | 6.5 s                         | 35x
+SGLang TP=4                               | 0-3        | 14.9 s (17G)       | 2.8 s   | 11.5 s                        | 16x
+SGLang TP=4                               | 0-3 -> 4-7 | 15.0 s (17G)       | 2.8 s   | 12.4 s                        | 14x
+SGLang TP=4 `--enable-nccl-nvls`          | 0-3        | 15.0 s (17G)       | 2.8 s   | 11.5 s                        | 16x
+SGLang TP=4 `--enable-torch-symm-mem`     | 0-3        | 15.2 s (17G)       | 2.8 s   | 11.6 s                        | 16x
+SGLang TP=4 FlashInfer all-reduce fusion  | 0-3        | 16.5 s (18G)       | 2.8 s   | 12.4 s                        | 14x
+SGLang TP=4 FlashInfer all-reduce fusion  | 0-3 -> 4-7 | 16.6 s (18G)       | 2.9 s   | 13.6 s                        | 13x
+SGLang TP=4 `--enable-nccl-nvls`          | 0-3 -> 4-7 | 15.1 s (17G)       | 3.0 s   | 12.8 s                        | 14x
+SGLang TP=4 `--enable-torch-symm-mem`     | 0-3 -> 4-7 | 15.3 s (17G)       | 2.8 s   | 12.7 s                        | 14x
+SGLang TP=8                               | 0-7        | 42.1 s (33G)       | 5.2 s   | 27.5 s                        | 8x
 
-Timings are from a single run; repeat runs on this host varied by up to about
-30%. The interposer's share is small: arming the gate takes about 0.1 s,
-teardown 0.1 to 0.7 s, and the rebuild 0.9 to 1.6 s at TP=2 and TP=4 and
-about 4 s at TP=8. vLLM TP=4, SGLang TP=4 with symmetric memory, and the
-vLLM TP=2 cross-GPU restore also pass in containers without
+B300:
+
+Workload                                  | GPUs       | Checkpoint (image) | Restore | First inference after restore | vs. cold boot
+----------------------------------------- | ---------- | ------------------ | ------- | ----------------------------- | -------------
+vLLM TP=2                                 | 0,1        | 8.6 s (14G)        | 1.6 s   | 6.3 s                         | 26x
+vLLM TP=4                                 | 0-3        | 15.2 s (21G)       | 2.1 s   | 12.0 s                        | 15x
+vLLM TP=8                                 | 0-7        | 37.0 s (41G)       | 3.7 s   | 32.1 s                        | 8x
+vLLM TP=2                                 | 0,1 -> 4,5 | 8.6 s (14G)        | 1.6 s   | 6.4 s                         | 25x
+vLLM TP=4                                 | 0-3 -> 4-7 | 15.1 s (21G)       | 2.0 s   | 12.8 s                        | 14x
+vLLM TP=2                                 | 0,1 -> 1,2 | 8.6 s (14G)        | 1.6 s   | 6.5 s                         | 25x
+SGLang TP=4                               | 0-3        | 18.2 s (19G)       | 2.1 s   | 13.8 s                        | 13x
+SGLang TP=4                               | 0-3 -> 4-7 | 18.0 s (19G)       | 2.1 s   | 14.5 s                        | 12x
+SGLang TP=4 `--enable-nccl-nvls`          | 0-3        | 18.4 s (19G)       | 2.1 s   | 13.7 s                        | 13x
+SGLang TP=4 `--enable-torch-symm-mem`     | 0-3        | 18.5 s (19G)       | 2.1 s   | 13.9 s                        | 13x
+SGLang TP=4 FlashInfer all-reduce fusion  | 0-3        | 20.7 s (20G)       | 2.2 s   | 14.5 s                        | 12x
+SGLang TP=4 FlashInfer all-reduce fusion  | 0-3 -> 4-7 | 20.6 s (20G)       | 2.1 s   | 15.1 s                        | 12x
+SGLang TP=4 `--enable-nccl-nvls`          | 0-3 -> 4-7 | 18.5 s (19G)       | 2.0 s   | 14.5 s                        | 12x
+SGLang TP=4 `--enable-torch-symm-mem`     | 0-3 -> 4-7 | 18.7 s (19G)       | 2.1 s   | 14.5 s                        | 12x
+SGLang TP=8                               | 0-7        | 43.9 s (37G)       | 3.4 s   | 34.3 s                        | 6x
+
+Timings are from a single run per host; repeat runs varied by up to about
+30%. The interposer's share is small: on H100, arming the gate takes about
+0.1 s, the teardown 0.1 to 0.7 s, and the rebuild 0.9 to 1.7 s at TP=2 and
+TP=4 and about 4 s at TP=8. vLLM TP=4, SGLang TP=4 with symmetric memory, and
+the vLLM TP=2 cross-GPU restore also pass on H100 in containers without
 `CAP_SYS_PTRACE`, where `pidfd_getfd` relies on the exporters'
 `PR_SET_PTRACER_ANY`.
 
@@ -299,8 +330,8 @@ each of vLLM TP=4 and SGLang TP=4 with and without fusion), checkpoints took
 restore 10.9 to 12.0 s instead of 8.6 to 9.2 s.
 
 The same engines without the interposer are refused at checkpoint (see
-[Background](#what-cuda-checkpoint-cannot-do)). The admission gate and blocker
-inventory are validated in their own PRs, and the new nvproxy code has unit
+[Background](#what-cuda-checkpoint-cannot-do)). The new nvproxy code (the
+admission gate, the blocker inventory and exported-object tracking) has unit
 tests, including one that pins the fdinfo line format.
 
 ## Alternatives considered
