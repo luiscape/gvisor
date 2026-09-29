@@ -20,7 +20,6 @@ import (
 	"maps"
 	"regexp"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -136,39 +135,25 @@ func cudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string
 	var procs []*kernel.ThreadGroup
 	k.TaskSet().ForEachThreadGroup(func(tg *kernel.ThreadGroup, tgLeader *kernel.Task) {
 		found := false
-		// Tasks in a thread group can have distinct FD tables (clone(2) with
-		// CLONE_THREAD but not CLONE_FILES), so a CUDA-using thread's device
-		// FDs may be invisible from the leader's table. Rare, but missing a
-		// process here is silent: its GPU state is left out of the snapshot
-		// (the straggler guard in checkpointCudaProcs catches it late, at the
-		// cost of a failed checkpoint). Tables are shared in the common case,
-		// so skip ones already inspected.
-		seen := make(map[*kernel.FDTable]struct{}, 1)
-		// ForEachThreadGroup holds the TaskSet lock, hence the Locked variant.
-		tg.ForEachTaskLocked(func(t *kernel.Task) bool {
-			t.WithMuLocked(func(t *kernel.Task) {
-				fdt := t.FDTable()
-				if fdt == nil {
-					return
+		// Note that it is possible for tasks in a thread group to have various FD
+		// tables (via clone(2) with CLONE_THREAD set and CLONE_FILES *not* set).
+		// However, we don't expect this to happen in practice for CUDA processes.
+		// So for efficiency, we just check the tgLeader's FD table, instead of
+		// iterating over all tasks' FD tables in all thread groups.
+		tgLeader.WithMuLocked(func(t *kernel.Task) {
+			t.FDTable().ForEach(sctx, func(_ int32, file *vfs.FileDescription, _ kernel.FDFlags) bool {
+				if _, ok := file.Impl().(nvproxy.NvidiaDeviceFD); ok {
+					found = true
+					return false
 				}
-				if _, dup := seen[fdt]; dup {
-					return
-				}
-				seen[fdt] = struct{}{}
-				fdt.ForEach(sctx, func(_ int32, file *vfs.FileDescription, _ kernel.FDFlags) bool {
-					if _, ok := file.Impl().(nvproxy.NvidiaDeviceFD); ok {
-						found = true
-						return false
-					}
-					return true
-				})
+				return true
 			})
-			return !found
 		})
 		if found {
 			procs = append(procs, tg)
 		}
 	})
+
 	// procs may contain NVML-only processes, which don't use CUDA. As of
 	// writing, calling cuda-checkpoint on them will fail for all tested drivers.
 	// This includes R570, which supposedly has "NVML support". We suspect this
@@ -191,15 +176,6 @@ func cudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string
 	} else {
 		procs = filterCudaProcsUsingGetState(sctx, k, cudaCheckpointPath, procs)
 	}
-	// ForEachThreadGroup above iterates a map, so without this the order in
-	// which cuda-checkpoint actions are issued -- and therefore which process
-	// is toggled first on restore -- would differ on every run. That never
-	// caused a failure by itself (measured: no ordering rule fits the observed
-	// toggle failures, and parallel toggling is no better), but it makes any
-	// failure unreproducible run to run, which is a debugging tax on every
-	// investigation downstream of this list. Sorting last keeps the invariant
-	// local: nothing after this line may reorder the slice.
-	sort.Slice(procs, func(i, j int) bool { return procs[i].ID() < procs[j].ID() })
 	return procs
 }
 
@@ -380,14 +356,9 @@ func filterCudaProcsUsingGetState(sctx context.Context, k *kernel.Kernel, cudaCh
 		defer cleanup()
 	}
 	// Check the output of all cuda-checkpoint processes. We want the ones with
-	// output "running". Iterate the input slice rather than the map so the
-	// caller's order is preserved.
+	// output "running".
 	var res []*kernel.ThreadGroup
-	for _, cudaProc := range cudaProcs {
-		ckptProc, ok := ckptProcs[cudaProc]
-		if !ok {
-			continue
-		}
+	for cudaProc, ckptProc := range ckptProcs {
 		ckptProc.tg.WaitExited()
 		if status := ckptProc.tg.ExitStatus(); status == 0 {
 			res = append(res, cudaProc)
@@ -450,9 +421,8 @@ func runCudaAction(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath st
 			ckptProc.tg.WaitExited()
 		}
 	}
-	// Collect results by iterating the input slice, not the map: succeeded
-	// feeds later sequential phases, and map iteration order would silently
-	// re-randomize the deterministic order cudaProcs() established.
+	// Collect results in input order, not map order, so that later phases
+	// handle the processes in the same order.
 	var succeeded []*kernel.ThreadGroup
 	for _, cudaProc := range cudaProcs {
 		ckptProc, ok := ckptProcs[cudaProc]
