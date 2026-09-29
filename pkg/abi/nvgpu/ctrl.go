@@ -631,6 +631,11 @@ const (
 	NV2080_CTRL_FIFO_DISABLE_CHANNELS_MAX_ENTRIES = 64
 )
 
+// From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fla.h:
+const (
+	NV2080_CTRL_CMD_FLA_GET_FABRIC_MEM_STATS = 0x20803504
+)
+
 // From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080flcn.h:
 const (
 	NV2080_CTRL_CMD_FLCN_GET_CTX_BUFFER_SIZE = 0x20803125
@@ -967,6 +972,12 @@ const (
 	NV_CONF_COMPUTE_CTRL_CMD_SYSTEM_GET_GPUS_STATE       = 0xcb330104
 	NV_CONF_COMPUTE_CTRL_CMD_GPU_GET_NUM_SECURE_CHANNELS = 0xcb33010b
 	NV_CONF_COMPUTE_CTRL_CMD_GPU_GET_KEY_ROTATION_STATE  = 0xcb33010c
+)
+
+// From src/common/sdk/nvidia/inc/ctrl/ctrl00fe.h:
+const (
+	NV00FE_CTRL_CMD_SUBMIT_OPERATIONS = 0xfe0101
+	NV00FE_CTRL_CMD_RESIZE_QUEUE      = 0xfe0102
 )
 
 // The following IOCTLs are not found in the OSS repo.

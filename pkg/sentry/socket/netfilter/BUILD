@@ -8,6 +8,7 @@ package(
 go_library(
     name = "netfilter",
     srcs = [
+        "comment_matcher.go",
         "ct_target.go",
         "dnat.go",
         "extensions.go",
@@ -69,6 +70,7 @@ go_test(
         "//pkg/abi/linux",
         "//pkg/marshal",
         "//pkg/syserr",
+        "//pkg/tcpip/header",
         "//pkg/tcpip/stack",
     ],
 )

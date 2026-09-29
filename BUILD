@@ -1,6 +1,6 @@
 load("@rules_license//rules:license.bzl", "license")
 load("//tools:defs.bzl", "build_test", "gazelle", "go_path")
-load("//tools:release.bzl", "SIDECARS", "release_files")
+load("//tools:release.bzl", "RELEASE_RUNSC", "RELEASE_SIDECARS", "release_files")
 load("//tools/nogo:defs.bzl", "nogo_config")
 load("//tools/yamltest:defs.bzl", "yaml_test")
 load("//website:defs.bzl", "doc")
@@ -27,10 +27,10 @@ exports_files([
 release_files(
     name = "release",
     bins = [
-        "//runsc",
         "//shim:containerd-shim-runsc-v1",
     ],
-    sidecars = SIDECARS,
+    runsc = RELEASE_RUNSC,
+    sidecars = RELEASE_SIDECARS,
     visibility = ["//visibility:public"],
 )
 
@@ -127,6 +127,7 @@ build_test(
     targets = [
         "//test/e2e:integration_test",
         "//test/image:image_test",
+        "//test/root:crictl_test",
         "//test/root:root_test",
         "//test/benchmarks/base:startup_test",
         "//test/benchmarks/base:size_test",

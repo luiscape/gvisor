@@ -150,8 +150,10 @@ func (p *Pid) MarshalJSON() ([]byte, error) {
 // gofers), as well as for running and manipulating containers inside a running
 // sandbox.
 //
-// Note: Sandbox must be immutable because a copy of it is saved for each
-// container and changes would not be synchronized to all of them.
+// A copy is saved for each container; configuration changes are not
+// synchronized across copies. Mutable caches such as restore-time savings
+// are synchronized within each instance. Saving or loading an instance
+// requires exclusive access to its serialized fields.
 type Sandbox struct {
 	// ID is the id of the sandbox (immutable). By convention, this is the same
 	// ID as the first container run in the sandbox.
@@ -243,10 +245,17 @@ type Sandbox struct {
 	// Restored will be true when the sandbox has been restored.
 	Restored bool `json:"restored"`
 
+	// savingsMu protects the cached time saved by restoration.
+	savingsMu sync.Mutex `nojson:"true"`
+
 	// CPUTimeSaved contains the CPU time saved when the sandbox has been restored.
+	//
+	// +checklocks:savingsMu
 	CPUTimeSaved time.Duration `json:"cpuTimeSaved"`
 
 	// WallTimeSaved contains the wall time saved when the sandbox has been restored.
+	//
+	// +checklocks:savingsMu
 	WallTimeSaved time.Duration `json:"wallTimeSaved"`
 }
 
@@ -896,6 +905,37 @@ func (s *Sandbox) connError(err error) error {
 	return fmt.Errorf("connecting to control server at PID %d: %v", s.Pid.Load(), err)
 }
 
+type sandboxProcessEnvOptions struct {
+	enforceRelease bool
+	sentryUsesCgo  bool
+}
+
+func sandboxProcessEnv(conf *config.Config, opts sandboxProcessEnvOptions) []string {
+	var env []string
+	if conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+		// --TESTONLY-unsafe-nonroot is set, so keep env.
+		env = os.Environ()
+	} else {
+		// Setting cmd.Env = nil causes cmd to inherit the current process's env.
+		// Clear it, except for TMPDIR which must match the parent runsc process
+		// because the sandbox uses os.TempDir() to set up its chroot.
+		env = []string{}
+		if tmpDir := os.Getenv("TMPDIR"); tmpDir != "" {
+			env = append(env, "TMPDIR="+tmpDir)
+		}
+	}
+	if opts.enforceRelease {
+		env = gvisorbinaries.WithEnforceRelease(env)
+	}
+	if opts.sentryUsesCgo {
+		// Platforms that use stub processes are not compatible with
+		// the glibc rseq, because they unmap everything from a process
+		// address space.
+		env = append(env, "GLIBC_TUNABLES=glibc.pthread.rseq=0")
+	}
+	return env
+}
+
 // createSandboxProcess starts the sandbox as a subprocess by running the "boot"
 // command, passing in the bundle dir.
 func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyncFile *os.File) error {
@@ -966,7 +1006,13 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	lfOpts.Command = "boot" // Revert command to "boot".
 
 	sentryBin := &gvisorbinaries.GvisorSentry
-	sentryUsesCgo := false
+	// runsc cannot tell whether the Sentry sidecar uses cgo, so assume it
+	// does if runsc does: race builds pair a race runsc with a race Sentry.
+	// Caveats: a cgo runsc booting a pure Sentry (e.g. a cgo test binary)
+	// sets GLIBC_TUNABLES needlessly, which is harmless. A pure runsc
+	// booting a cgo Sentry other than the plugin stack does not set it,
+	// so that Sentry's stubs would crash; no build pairs them today.
+	sentryUsesCgo := config.CgoEnabled
 	if conf.Network == config.NetworkPlugin {
 		sentryBin = &gvisorbinaries.GvisorSentryPluginStack
 		sentryUsesCgo = true
@@ -1017,22 +1063,10 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	// All flags after this must be for the boot command
 	cmd.Args = append(cmd.Args, "boot", "--bundle="+args.BundleDir)
 
-	if conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
-		// --TESTONLY-unsafe-nonroot is set, so keep env.
-		cmd.Env = os.Environ()
-	} else {
-		// Clear environment variables, unless --TESTONLY-unsafe-nonroot is set.
-		cmd.Env = []string{}
-	}
-	if bootBinPath != specutils.ExePath {
-		cmd.Env = gvisorbinaries.WithEnforceRelease(cmd.Env)
-	}
-	if sentryUsesCgo {
-		// Platforms that use stub processes are not compatible with
-		// the glibc rseq, because they unmap everything from a process
-		// address space.
-		cmd.Env = append(cmd.Env, "GLIBC_TUNABLES=glibc.pthread.rseq=0")
-	}
+	cmd.Env = sandboxProcessEnv(conf, sandboxProcessEnvOptions{
+		enforceRelease: bootBinPath != specutils.ExePath,
+		sentryUsesCgo:  sentryUsesCgo,
+	})
 
 	// If there is a gofer, sends all socket ends to the sandbox.
 	donations.DonateAndClose("io-fds", args.IOFiles...)
@@ -2257,20 +2291,40 @@ func (s *Sandbox) GetRegisteredMetrics() (*metricpb.MetricRegistration, error) {
 	return s.RegisteredMetrics, nil
 }
 
+// TimeSaved returns the cached CPU and wall time saved by restoration.
+//
+// +checklocksexclude:s.savingsMu
+func (s *Sandbox) TimeSaved() (cpu, wall time.Duration) {
+	s.savingsMu.Lock()
+	defer s.savingsMu.Unlock()
+	return s.CPUTimeSaved, s.WallTimeSaved
+}
+
 // ExportMetrics returns a snapshot of metric values from the sandbox in Prometheus format.
+//
+// +checklocksexclude:s.savingsMu
 func (s *Sandbox) ExportMetrics(opts control.MetricsExportOpts) (*prometheus.Snapshot, error) {
 	log.Debugf("Metrics export sandbox %q", s.ID)
 
 	// Update time saved metrics before exporting, if not exported already for
 	// restored sandboxes.
-	if s.Restored && s.CPUTimeSaved == 0 && s.WallTimeSaved == 0 {
-		var savings boot.Savings
-		err := s.call(boot.ContMgrGetSavings, nil, &savings)
-		if err != nil {
-			log.Warningf("Failed to get time saved metrics")
-		} else {
-			s.CPUTimeSaved = savings.CPUTimeSaved
-			s.WallTimeSaved = savings.WallTimeSaved
+	if s.Restored {
+		cpu, wall := s.TimeSaved()
+		if cpu == 0 && wall == 0 {
+			var savings boot.Savings
+			if err := s.call(boot.ContMgrGetSavings, nil, &savings); err != nil {
+				log.Warningf("Failed to get time saved metrics")
+			} else {
+				// Do not hold savingsMu across the RPC: another export may
+				// time out and still need to read the cached pair. Publish
+				// only if a concurrent export has not already populated it.
+				s.savingsMu.Lock()
+				if s.CPUTimeSaved == 0 && s.WallTimeSaved == 0 {
+					s.CPUTimeSaved = savings.CPUTimeSaved
+					s.WallTimeSaved = savings.WallTimeSaved
+				}
+				s.savingsMu.Unlock()
+			}
 		}
 	}
 

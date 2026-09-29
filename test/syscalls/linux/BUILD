@@ -1,3 +1,4 @@
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("//tools:arch.bzl", "select_arch")
 load("//tools:defs.bzl", "cc_binary", "cc_library", "gbenchmark", "select_gtest", "select_system")
 
@@ -931,6 +932,7 @@ cc_binary(
         "//test/util:fs_util",
         "//test/util:logging",
         "//test/util:memory_util",
+        "//test/util:mount_util",
         "//test/util:multiprocess_util",
         "//test/util:posix_error",
         "//test/util:save_util",
@@ -1428,6 +1430,7 @@ cc_binary(
     malloc = "//test/util:errno_safe_allocator",
     deps = select_gtest() + [
         "//test/util:capability_util",
+        "//test/util:cleanup",
         "//test/util:file_descriptor",
         "//test/util:logging",
         "//test/util:posix_error",
@@ -2363,6 +2366,7 @@ cc_binary(
         "//test/util:posix_error",
         "//test/util:proc_util",
         "//test/util:save_util",
+        "//test/util:signal_util",
         "//test/util:temp_path",
         "//test/util:test_util",
         "//test/util:thread_util",
@@ -5461,6 +5465,7 @@ cc_binary(
         "//test/util:test_main",
         "//test/util:test_util",
         "//test/util:thread_util",
+        "//test/util:time_util",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/strings",
@@ -5556,6 +5561,7 @@ cc_binary(
     linkstatic = 1,
     malloc = "//test/util:errno_safe_allocator",
     deps = select_gtest() + [
+        "//test/util:cleanup",
         "//test/util:logging",
         "//test/util:pty_util",
         "//test/util:test_main",

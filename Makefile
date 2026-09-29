@@ -259,12 +259,8 @@ nogo-tests:
 # pull in all directories in runsc except runsc/container.
 #
 # FIXME(gvisor.dev/issue/10045): Need to fix broken tests.
-#
-# examples/sandboxexec/go:doc_processor_test embeds the doc_processor go_binary
-# via library=, which rules_go rejects (no GoInfo). Re-enable once the example
-# is split into a go_library.
 unit-tests: ## Local package unit tests in pkg/..., tools/.., etc.
-	@$(call test,--test_tag_filters=-nogo$(COMMA)-requires-kvm --build_tag_filters=-network_plugins --test_env=CGROUPV2=$(CGROUPV2) -- //:all pkg/... tools/... runsc/... vdso/... sandboxexec/... examples/... test/trace/... -//pkg/metric:metric_test -//pkg/coretag:coretag_test -//tools/tracereplay:tracereplay_test -//examples/sandboxexec/go:doc_processor_test -//test/trace:trace_test)
+	@$(call test,--test_tag_filters=-nogo$(COMMA)-requires-kvm --build_tag_filters=-network_plugins --test_env=CGROUPV2=$(CGROUPV2) -- //:all pkg/... tools/... runsc/... vdso/... sandboxexec/... test/trace/... -//pkg/metric:metric_test -//pkg/coretag:coretag_test -//tools/tracereplay:tracereplay_test -//test/trace:trace_test)
 .PHONY: unit-tests
 
 # See unit-tests: this includes runsc/container.
@@ -279,7 +275,7 @@ tests: unit-tests nogo-tests container-tests syscall-tests
 integration-tests: ## Run all standard integration tests.
 integration-tests: docker-tests overlay-tests hostnet-tests swgso-tests
 integration-tests: do-tests kvm-tests containerd-tests-min
-integration-tests: sandbox-posture-tests
+integration-tests: root-tests sandbox-posture-tests
 .PHONY: integration-tests
 
 integration-test-images: load-image-test load-basic load-systemd-integ load-systemd-services load-ubi10-init $(if $(filter x86_64,$(ARCH)),load-arch-systemd)
@@ -289,16 +285,43 @@ network-tests: ## Run all networking integration tests.
 network-tests: iptables-tests packetdrill-tests packetimpact-tests
 .PHONY: network-tests
 
-# `make syscall-tests` runs all system call tests.
+HOST_KERNEL ?= $(shell uname -r)
+
+# To run all system call tests:
+#   make syscall-tests
 # To run a single syscall test:
 #   make syscall-tests TARGETS=//test/syscalls:signalfd_test_runsc_systrap_shared
 # To run a single syscall test without caching:
 #   make syscall-tests TARGETS=//test/syscalls:signalfd_test_runsc_systrap_shared OPTIONS=--nocache_test_results
 # To run multiple specific syscall tests:
 #   make syscall-tests TARGETS="//test/syscalls:signalfd_test_runsc_systrap_shared //test/syscalls:link_test_runsc_systrap_shared"
+# To run a single syscall test with the lockdep lock-order checker (use
+# BAZEL_OPTIONS, not OPTIONS, so the runtime under test is rebuilt):
+#   make syscall-tests TARGETS=//test/syscalls:signalfd_test_runsc_systrap_shared BAZEL_OPTIONS=--config=lockdep OPTIONS=--nocache_test_results
+# To run a single syscall test with the Go race detector in runsc and the Sentry:
+#   make syscall-tests TARGETS=//test/syscalls:signalfd_test_runsc_systrap_shared BAZEL_OPTIONS=--config=race OPTIONS=--nocache_test_results
+# To also stop the Sentry at the first race it finds:
+#   make syscall-tests TARGETS=//test/syscalls:signalfd_test_runsc_systrap_shared BAZEL_OPTIONS=--config=race OPTIONS="--nocache_test_results --test_env=GORACE=halt_on_error=1"
+# To find the boot log of a run (e.g. to read a sentry panic). TEST= is a
+# substring of the test name, so a prefix like "signalfd" matches
+# signalfd_test_runsc_systrap_shared:
+#   make syscall-test-boot-log TEST=signalfd
+# To run a native (non-runsc) test's root cases as real root on the host
+# (sudo make syscall-tests strips privileges, so use the sudo rule; ARGS are
+# gtest flags):
+#   make sudo TARGETS=//test/syscalls/linux:chown_test ARGS='--gtest_filter=*Root*'
 syscall-tests: $(RUNTIME_BIN)
-	@$(call test,$(OPTIONS) --test_env=RUNTIME=$(RUNTIME_BIN) --test_env=GVISOR_SIDECAR_BINARIES_DIR=$(RUNTIME_DIR)/gvisor-bin --cxxopt=-Werror $(PARTITIONS) $(if $(TARGETS),-- $(TARGETS),test/syscalls/... test/rtnetlink/...))
+	@$(call test,$(OPTIONS) --test_env=RUNTIME=$(RUNTIME_BIN) --test_env=GVISOR_SIDECAR_BINARIES_DIR=$(RUNTIME_DIR)/gvisor-bin --test_env=HOST_KERNEL=$(HOST_KERNEL) --cxxopt=-Werror $(PARTITIONS) $(if $(TARGETS),-- $(TARGETS),test/syscalls/... test/rtnetlink/...))
 .PHONY: syscall-tests
+
+# `make syscall-test-boot-log` prints the newest runsc boot log written by a
+# syscall test, so you can inspect a sentry panic or crash. Optionally filter by
+# TEST=, a substring of the test name, e.g.
+# `make syscall-test-boot-log TEST=uidgid`.
+syscall-test-boot-log: ## Print the path to the newest runsc boot log. Usage: make syscall-test-boot-log [TEST=<name>].
+	@find $(HOME)/.cache/bazel/*/*/execroot/_main/bazel-out/*/testlogs/test/syscalls/*$(TEST)*/test.outputs \
+	  -name 'runsc.log.*.boot.txt' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-
+.PHONY: syscall-test-boot-log
 
 packetimpact-tests:
 	@$(call test,--jobs=HOST_CPUS*3 --local_test_jobs=HOST_CPUS*3 //test/packetimpact/tests:all_tests)
@@ -434,6 +457,11 @@ sandbox-posture-tests: load-basic_alpine $(RUNTIME_BIN)
 	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME)-posture-kvm --platform=kvm $(POSTURE_TEST_ARGS) $(ARGS))
 .PHONY: sandbox-posture-tests
 
+root-tests: load-basic_alpine $(RUNTIME_BIN)
+	@$(call install_runtime,$(RUNTIME),) # Clear flags.
+	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME) -test.v $(ARGS))
+.PHONY: root-tests
+
 # Standard integration targets.
 INTEGRATION_TARGETS := //test/image:image_test //test/e2e:integration_test
 
@@ -549,21 +577,14 @@ install_containerd = \
 	sudo -H "PATH=$$PATH" $$T/install_containerd.sh $(1); \
 	rm -rf $$T)
 
-# Specific containerd version tests.
-containerd-test-%: load-basic_alpine load-basic_python load-basic_busybox load-basic_symlink-resolv load-basic_httpd load-basic_ubuntu $(RUNTIME_BIN)
-	@$(call install_runtime,$(RUNTIME),) # Clear flags.
-	@$(call install_containerd,$*)
-ifeq (,$(STAGED_BINARIES))
-	@sudo cp -fa "$(RUNTIME_DIR)"/* "$$(dirname $$(which containerd))/"
-else
-	@gcloud storage cat "$(STAGED_BINARIES)" | \
-		sudo tar -C "$$(dirname $$(which containerd))" -zxvf -
-endif
-	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME) -test.v)
+containerd-test-%: load-containerd_harness load-basic_alpine load-basic_python load-basic_busybox load-basic_symlink-resolv load-basic_httpd load-basic_ubuntu
+	@$(call test_runtime,$(RUNTIME),--test_output=streamed --test_arg=-test.v --test_arg=--containerd_version=$* $(ARGS) -- //test/root:crictl_test)
 containerd-tests-min: containerd-test-1.7.31
+containerd-tests: containerd-test-1.7.31 containerd-test-2.0.8 containerd-test-2.1.7 containerd-test-2.2.3
+.PHONY: containerd-test-% containerd-tests-min containerd-tests
 
 containerd-performance-test-%:
-	@export RUN_SHIM_GROUPING_PERFORMANCE_TEST=true; $(MAKE) containerd-test-$*
+	@$(call test_runtime,$(RUNTIME),--test_output=streamed --test_arg=-test.v --test_arg=--containerd_version=$* --test_env=RUN_SHIM_GROUPING_PERFORMANCE_TEST=true $(ARGS) -- //test/root:crictl_test)
 .PHONY: containerd-performance-test-%
 
 
