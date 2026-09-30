@@ -238,7 +238,8 @@ releases this state before the checkpoint and rebuilds it at identical GPU
 virtual addresses after restore, so application pointers and captured CUDA
 graphs remain valid.
 
-To enable it, either:
+The interposer requires job mode (`--cuda-checkpoint-path`, above). To enable
+it, either:
 
 *   set the runtime `--cuda-multicast-shim-source=EMBEDDED` flag: `runsc` carries
     `mcshim.so` inside its own binary and writes it into the container's

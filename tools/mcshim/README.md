@@ -17,21 +17,23 @@ can checkpoint and restore workloads it otherwise refuses:
 Legacy CUDA IPC (`cuIpcGetMemHandle` / `cuIpcOpenMemHandle`, used by the
 engines' custom all-reduce) is not the shim's concern: `cuda-checkpoint`
 carries it when the processes share a job, which runsc arranges with
-`--cuda-checkpoint-path`.
+`--cuda-checkpoint-path`. runsc therefore rejects the interposer flags without
+it.
 
 Build with `./build.sh` (toolkit-free; runs in a pinned ubuntu:22.04 container
-by default so the result loads under older glibc). The Bazel targets
-`//tools/mcshim:mcshim` builds the same artifact, and `//runsc` embeds it (through `//runsc/mcshimbin`) so that a
-stock runsc binary can inject the interposer into containers whose images do
-not carry it (`--cuda-multicast-shim-source=EMBEDDED`).
+by default so the result loads under older glibc). The Bazel target
+`//tools/mcshim:mcshim` builds the same artifact, and `//runsc` embeds it
+(through `//runsc/mcshimbin`) so that a stock runsc binary can inject the
+interposer into containers whose images do not carry it
+(`--cuda-multicast-shim-source=EMBEDDED`).
 
 ## How it gets into a container
 
-With `runsc --cuda-multicast-shim-path=/path/to/mcshim.so` (plus nvproxy and
-an R610+ driver) -- or with `--cuda-multicast-shim-source=EMBEDDED`, in which case
-runsc first writes its embedded copy of `mcshim.so` into the container
-filesystem at that path (default
-`/usr/local/lib/mcshim.so`) -- `Loader.setupCudaMulticastShim`
+With `runsc --cuda-checkpoint-path=... --cuda-multicast-shim-path=/path/to/mcshim.so`
+(plus nvproxy and an R610+ driver) -- or with
+`--cuda-multicast-shim-source=EMBEDDED`, in which case runsc first writes its
+embedded copy of `mcshim.so` into the container filesystem at that path
+(default `/usr/local/lib/mcshim.so`) -- `Loader.setupCudaMulticastShim`
 (`runsc/boot/loader.go`):
 
 *   prepends the shim to the container's `LD_PRELOAD` **and** appends it to
@@ -45,10 +47,9 @@ rendezvous in `/tmp/mcshim`, which must be part of the checkpoint image (not
 a host mount). The sentry drives the shim in every process that announced
 itself there (`present.<pid>`).
 
-The shim is inert until a process resolves a tracked CUDA entry point and
-calls `cuInit`; only then does it start its control thread and participate in
-the protocol. Helpers that merely inherit the preload (shells,
-`cuda-checkpoint` itself) never ack anything.
+The shim is inert until a process calls `cuInit`; only then does it start its
+control thread and participate in the protocol. Helpers that merely inherit
+the preload (shells, `cuda-checkpoint` itself) never ack anything.
 
 ## Control protocol
 
@@ -59,10 +60,10 @@ processes sharing one directory.
 
 | File                  | Written by | Meaning                                                        |
 | :-------------------- | :--------- | :------------------------------------------------------------- |
-| `gate`                | sentry     | created: block GPU submission (refused with `error.<pid>` if state is untracked); removed: unblock (refused after a failed transition) |
+| `gate`                | sentry     | created: arm the gate, wait for tracked calls in flight, check the state can be carried (else `error.<pid>` and disarm); removed: unblock (refused after a failed transition) |
 | `suspend`             | sentry     | created: tear down tracked state; removed: rebuild it          |
 | `present.<pid>`       | shim       | this pid runs a control thread and will ack transitions        |
-| `gated.<pid>`         | shim       | gate armed                                                     |
+| `gated.<pid>`         | shim       | gate armed and drained                                         |
 | `suspended.<pid>` / `resumed.<pid>` | shim | teardown / rebuild finished                      |
 | `error.<pid>`         | shim       | the transition in flight failed (sentry fails fast on this)    |
 
@@ -70,18 +71,19 @@ The sentry waits up to 5 minutes for acks. On startup the control thread
 removes any stale acks a dead predecessor with the same (reused) pid left
 behind, then writes `present.<pid>`.
 
-The `suspend` marker lives in the container filesystem, so it is **part of the
-checkpoint image**: after a restore it still exists, the shim stays suspended
-(and the gate stays armed), until the sentry removes it to trigger the
-rebuild.
+The markers live in the container filesystem, so they are **part of the
+checkpoint image**: after a restore they still exist, and the shim stays
+suspended (and the gate armed) until the sentry removes `suspend` to trigger
+the rebuild.
 
 ## The sentry's sequence
 
 From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 
-1.  create `gate`, wait for `gated.<pid>` (no CUDA calls involved, so this is
-    safe at any point; it stops *new* submissions),
-2.  `cuda-checkpoint --action lock` on all ranks in parallel (drains in-flight
+1.  create `gate`, wait for `gated.<pid>`. Arming waits (up to 30 s) for
+    application threads to leave tracked calls, so it must precede the lock;
+    a refusal here fails the checkpoint before anything is torn down,
+2.  `cuda-checkpoint --action lock` on all ranks in parallel (drains GPU
     work; gating mid-collective can starve peers, which fails the lock and
     with it the checkpoint),
 3.  `--action unlock` (the teardown must issue CUDA calls, which a locked
@@ -90,8 +92,7 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 5.  verify the checkpoint-blocker set is empty (trust but verify),
 6.  re-lock, `--action checkpoint` (one process at a time in job mode), save
     the sandbox;
-7.  on restore: `--toggle` each process (`--action restore --device-map`
-    then `--action unlock` when the GPUs changed),
+7.  on restore: `--action restore --device-map`, then `--action unlock`,
 8.  remove `suspend`, wait for `resumed.<pid>`,
 9.  remove `gate` (the shim also releases the gate itself on a successful
     resume).
@@ -102,6 +103,7 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 | :----------------------- | :-------------- | :---------------------------------------------------------------- |
 | `MCSHIM_LOG`             | stderr          | append log to this path instead of stderr                         |
 | `MCSHIM_DISABLE`         | unset           | silent: no control thread, acks, or gate (interposition/tracking stay active) |
+| `MCSHIM_ALLOW_FABRIC`    | unset           | keep fabric handle types (not checkpointable; see below)          |
 | `MCSHIM_HOST_BUILD`      | unset           | build.sh: build with the host toolchain instead of docker         |
 | `MCSHIM_BUILD_IMAGE`     | pinned 22.04    | build.sh: alternative base image                                  |
 
@@ -110,20 +112,44 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 The interposer needs nothing special. runsc creates `/dev/nvidia#` files for
 the GPUs the restored container is given, rebinds open device FDs to them,
 and passes `cuda-checkpoint --device-map` so CUDA state is restored onto the
-new devices; the interposer's rebuild then runs against them.
+new devices. Device ordinals inside the sandbox do not change, so the
+interposer's rebuild runs against the same ordinals it recorded.
 
 ## Design summary
 
-*   **Tracking tables.** Fixed-size (`MAXN` = 4096 each): allocations/groups
-    (`g_alloc`, with per-object `torn_down`), mappings (`g_map`, per-mapping
-    `suspended`), multicast binds (`g_bind`, per-bind `unbound`). This is
-    live state: app-initiated frees drop entries out of the replay set. Any
-    overflow is loud and sticky (`g_untracked`): arming the gate refuses
-    thereafter, failing the checkpoint before anything is torn down instead
-    of corrupting the restore.
+*   **Lookup redirection.** torch, NCCL and ctypes resolve driver entry
+    points through `dlsym`, `cuGetProcAddress` or cudart's
+    `cudaGetDriverEntryPoint*`, bypassing symbol interposition. The shim
+    interposes those resolvers and redirects by the **address** the lookup
+    returned: that identifies the exact exported symbol, and so its ABI (for
+    example `cuMulticastBindMem` resolves to the 7-argument
+    `cuMulticastBindMem_v2` at CUDA 13.1+, and PTDS lookups to `_ptsz` /
+    `_ptds`). Every exported variant has a wrapper with its own prototype. A
+    lookup of a tracked entry point that returns a symbol the shim has no
+    wrapper for (a future `_v3`) refuses checkpoints.
+*   **Tracking tables.** Fixed-size (`MAXN` = 4096 each): objects (`g_alloc`),
+    mappings (`g_map`), multicast binds (`g_bind`). This is live state: an
+    object is forgotten once it has no application reference, mapping or
+    bind. Any overflow is loud and sticky (`g_untracked`): arming the gate
+    refuses thereafter, failing the checkpoint before anything is torn down.
+*   **Handles.** The application only ever sees the handle values it was
+    given. A rebuild gives objects new driver handles, and every
+    handle-taking entry point translates (`xlate`), including
+    `cuMemRetainAllocationHandle`'s result. The driver reuses values a
+    rebuild freed, so a new object whose driver handle equals a live object's
+    application value is given a synthetic value instead.
+*   **References.** The shim counts the application's references (1 per
+    create or import, +1 per retain, -1 per release). Suspend drops them;
+    resume holds one while it rebuilds, then returns the count to the
+    application's (releasing it if the application held none, or retaining
+    more from a mapping).
+*   **Contexts.** Calls are issued from each recorded device's primary
+    context, retained for the duration of a transition. The gate refuses if
+    the application no longer holds a device's primary context.
 *   **Identical-VA guarantee.** Suspend unmaps with `cuMemUnmap` only, never
     `cuMemAddressFree`, so the VA reservations survive the checkpoint; resume
-    maps back into them.
+    maps back into them and replays each mapping's access set, merged by
+    location across `cuMemSetAccess` calls.
 *   **Freed UC exporters.** A multicast-bound exporter allocation left
     resident across the checkpoint fails its next export after restore with
     OBJECT_NOT_FOUND (measured on R610: vLLM TP=4, torch `_symmetric_memory`).
@@ -131,30 +157,60 @@ new devices; the interposer's rebuild then runs against them.
     checkpoint) and releases it; resume recreates it, re-maps at the identical
     VAs, restores contents, and re-exports. Costs a device-host-device copy
     and checkpoint growth of the same size.
-*   **Three-phase cross-rank resume.** (1) every exporter re-creates its
-    object, re-exports it and publishes `<pid> <fd>` in `/tmp/mcshim` under
-    the original export's identity (nvproxy's fdinfo line); (2) importers
-    copy the fd with `pidfd_getfd(2)` and re-import; (3) binds and mappings
-    are rebuilt. `cuMulticastBindMem` blocks until every device has joined
-    the group, so the binds are the cross-rank barrier. Publishing strictly
-    before fetching prevents rank-pair deadlock. `pidfd_getfd` needs ptrace
+*   **Cross-rank resume.** (1) every exporter re-creates its object,
+    re-exports it and publishes `<pid> <fd>` in `/tmp/mcshim` under the
+    original export's identity (nvproxy's fdinfo line); (2) importers copy
+    the fd with `pidfd_getfd(2)` and re-import; (3a) every group gets its
+    devices back, (3b) then every bind, which blocks until all devices have
+    joined, (3c) then every mapping; (4) references are restored. Publishing
+    before fetching, and adding devices before binding, keep ranks that hold
+    objects in different orders from deadlocking. `pidfd_getfd` needs ptrace
     access, which YAMA denies between sibling processes, so an exporter sets
     `PR_SET_PTRACER_ANY` while it has fds published: until the sentry removes
     the `gate` marker after every process has resumed.
-*   **The gate.** While suspended, interposed submission entry points
-    (launch/memcpy/memset/stream) block on a condvar instead of touching
-    unmapped VAs and faulting the context. All tracked mutators
-    (`cuMemCreate`, `cuMulticast*`, export/import, map/unmap, release) are
-    gated too: a thread reaching one in the unlocked teardown
-    window would create or free shared state after the strict blocker gate
-    verified there was none. The shim's own teardown/rebuild calls the real
-    entry points and is never gated. After a failed teardown or rebuild, the
-    shim refuses to release the gate even if the `gate` marker is removed.
-*   **Handle translation.** Rebuilds rotate opaque handles; each object keeps
-    the original handle the application holds, and calls using it are
-    translated (`xlate_mc`). Because the driver reuses handle values, an
-    object whose original handle is issued anew stops translating it, so the
-    value can never be misrouted to a dead object.
+*   **The gate.** While armed, entry points that submit GPU work (launches,
+    copies, memsets, stream memory operations, batches) and every tracked
+    mutator block. Calls are counted from entry to return, and arming waits
+    for the count to drain, so once `gated.<pid>` is written no application
+    thread is inside a tracked call and none can complete one over the
+    teardown. Stream synchronization blocks but is not counted: it may wait
+    on a peer that is already gated. The shim's own teardown/rebuild calls the
+    real entry points and is never gated. After a failed teardown or rebuild,
+    the shim refuses to release the gate even if the `gate` marker is
+    removed.
+*   **Fabric handles.** Fabric handle types create `NV_MEMORY_FABRIC` (0x00f8)
+    objects that `cuda-checkpoint` cannot serialize. Unless
+    `MCSHIM_ALLOW_FABRIC=1`, the shim strips them from `cuMemCreate` and
+    `cuMulticastCreate`, refuses fabric exports and reports
+    `CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED` as 0; on a single node
+    POSIX fds are equivalent.
+
+## What refuses a checkpoint
+
+The gate refuses, before anything is torn down, when a process has:
+
+*   overflowed a tracking table, or resolved an unknown ABI of a tracked
+    entry point;
+*   exported or imported a memory pool (`cuMemPool{Export,Import}*`), created
+    or imported a logical endpoint, exported or imported a handle type other
+    than POSIX fds, or mapped a sparse array (`cuMemMapArrayAsync`);
+*   an export without nvproxy's identity (not running under nvproxy);
+*   set access on part of a mapping, or on more than 16 locations;
+*   several references to an object it must tear down but has not mapped, or
+    multicast-bound memory that is not mapped;
+*   released a device's primary context while holding tracked state;
+*   tracked calls still in flight after 30 s.
+
+## Testing
+
+`test/run.sh [-r /path/to/runsc] [test...]` runs `test/mcshim_test.c` on a
+host with two NVLS-capable GPUs. Each test plays the sentry's side of the
+protocol, with a suspend and resume in place of a checkpoint and restore:
+`abi` (every lookup returns the wrapper of the symbol the driver returned),
+`gate` (submissions block; arming waits for a synchronous call in flight),
+`mc` (v1 and v2 binds, merged access, retained and colliding handles),
+`refcount` (objects held only by mappings), `refuse`, and `ipc` (two
+processes importing exported groups in opposite order; needs runsc).
 
 ## Threat model
 
@@ -177,22 +233,21 @@ inside the container's trust domain, not gVisor's:
 
 ## Known limitations
 
-*   **PTDS apps.** For `cuGetProcAddress` lookups with the per-thread-default-
-    stream flag, the shim declines to redirect stream-semantics-sensitive
-    entries (its wrappers forward to the legacy-stream reals). Such apps are
-    not gated on those entries.
+*   **Quiescing is not a cut.** The gate stops submissions at slightly
+    different times on each rank (the control thread polls every 5 ms), so a
+    collective can straddle it; the lock then times out and the checkpoint
+    fails cleanly. Checkpoint idle engines (sleeping or paused).
+*   **One checkpoint per restore.** An object re-exported after a restore
+    keeps its original rendezvous identity, so checkpointing a restored
+    process whose importers re-imported a *new* export is not supported.
 *   **Fork.** A child forked after `cuInit` cannot use CUDA, so the shim
     stays inactive in it; inherited published fds are closed.
 *   **A failed teardown or rebuild leaves the application gated for good.**
     Deliberately: better blocked than corrupt. Peers may already have
     released state the failed process needs, so nothing is rolled back; the
     sentry fails the checkpoint and the workload must be restarted.
-*   **Fixed table sizes.** `MAXN` = 4096 entries per table, with loud +
-    sticky refusal on overflow rather than silent partial tracking.
-*   **Legacy CUDA IPC needs job mode.** Without `--cuda-checkpoint-path`,
-    `cuda-checkpoint --action checkpoint` hangs on processes holding legacy
-    IPC imports (measured: vLLM TP=4 with custom all-reduce). runsc logs a
-    warning at container creation when the interposer is enabled without it.
+*   **Not refused, not carried:** managed memory, IPC events and dma-buf
+    exports (`cuMemGetHandleForAddressRange`) are left to `cuda-checkpoint`.
 *   **Multicast slot contention on restore** manifests as a re-bind timeout
     (binds are the cross-rank barrier, so one rank failing to join blocks
     the rest until the deadline).

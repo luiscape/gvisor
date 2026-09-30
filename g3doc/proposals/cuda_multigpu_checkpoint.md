@@ -101,42 +101,57 @@ flowchart TD
 
 ### The interposer (`tools/mcshim`)
 
-A single C file (~1,950 lines, no CUDA toolkit dependency) that interposes 39
-CUDA driver entry points, directly and through `cuGetProcAddress`: 23
-submission entry points (launches, copies, memsets) that the gate can block,
-and 16 that track state, initialize, or resolve entry points. It is inert
-until a process calls `cuInit`.
+A single C file (~2,400 lines, no CUDA toolkit dependency) that interposes 146
+exported CUDA driver symbols: 118 that submit GPU work or wait on it
+(launches, copies, memsets, stream memory operations and batches, with their
+per-thread-stream variants), which the gate blocks, and 28 that track state,
+refuse checkpoints, initialize, or resolve entry points. It is inert until a
+process calls `cuInit`.
 
+-   **Lookups.** torch, NCCL and ctypes resolve entry points with `dlsym`,
+    `cuGetProcAddress` or cudart's `cudaGetDriverEntryPoint*`. The
+    interposer redirects by the address a lookup returns, which identifies
+    the exact exported symbol and so its ABI: `cuMulticastBindMem` resolves
+    to the 7-argument `cuMulticastBindMem_v2` from CUDA 13.1, for example.
+    A lookup of a tracked entry point that returns a symbol without a
+    wrapper refuses checkpoints.
 -   **Tracking.** VMM allocations, mappings and access (`cuMemCreate`,
-    `cuMemMap`, `cuMemSetAccess`, `cuMemUnmap`, `cuMemRelease`), multicast
-    groups (`cuMulticastCreate`, `AddDevice`, `BindMem`, `BindAddr`,
-    `Unbind`), and VMM export/import. Legacy IPC is not interposed. Tracking
-    is live state: an application free removes the entry. Tables are
-    fixed-size (4096 entries); overflow makes every later checkpoint fail up
-    front.
+    `cuMemMap`, `cuMemSetAccess`, `cuMemUnmap`, `cuMemRetainAllocationHandle`,
+    `cuMemRelease`), multicast groups (`cuMulticastCreate`, `AddDevice`,
+    `BindMem`, `BindAddr` and their `_v2` forms, `Unbind`), and VMM
+    export/import. Legacy IPC is not interposed. Tracking is live state: an
+    object is forgotten once it has no application reference, mapping or
+    bind. Tables are fixed-size (4096 entries); overflow makes every later
+    checkpoint fail up front.
 -   **Suspend.** Unbind and release multicast groups, unmap (keeping the VA
     reservations), and release imports.
     Multicast-bound exporter allocations are copied to host memory (which the
     checkpoint carries) and released, because a resident one fails its next
     export after restore.
--   **Resume**, in three phases across ranks: every exporter recreates its
-    object, re-exports it, and publishes the new fd number under the original
+-   **Resume**, in phases across ranks: every exporter recreates its object,
+    re-exports it, and publishes the new fd number under the original
     export's identity; importers copy the fd with `pidfd_getfd` and re-import;
-    binds and mappings are rebuilt at the original VAs. `cuMulticastBindMem`
-    blocks until every device has joined, so the binds are the cross-rank
-    barrier. Publishing strictly before fetching avoids rank-pair deadlock.
-    `pidfd_getfd` needs ptrace access, which YAMA denies between sibling
-    processes, so exporters set `PR_SET_PTRACER_ANY` until the sentry removes
-    the gate after every process has resumed.
--   **Handle aliasing.** Rebuilt objects get new opaque handles; the
-    interposer translates the stale handles NCCL and PyTorch keep in their own
-    structs.
-
--   **Gate.** While suspended, submission entry points and tracked mutators
-    block, so the application cannot touch unmapped VAs or create shared
-    state after the sentry verified there is none. A teardown or rebuild that
-    fails partway leaves the application gated rather than running on
-    inconsistent state.
+    every group gets its devices back, then every bind, then every mapping at
+    its original VA; finally the reference counts are restored.
+    `cuMulticastBindMem` blocks until every device has joined, so adding all
+    devices before any bind keeps ranks that hold groups in different orders
+    from deadlocking, and publishing before fetching does the same for
+    exports. `pidfd_getfd` needs ptrace access, which YAMA denies between
+    sibling processes, so exporters set `PR_SET_PTRACER_ANY` until the sentry
+    removes the gate after every process has resumed.
+-   **Handles and references.** The application only sees the handle values
+    it was given: rebuilt objects get new driver handles, and every
+    handle-taking entry point translates. A new object whose driver handle
+    equals a live object's application value gets a synthetic value. The
+    interposer counts the application's references (create, import, retain,
+    release) and restores that count after a rebuild. Calls are issued from
+    each recorded device's primary context.
+-   **Gate.** While armed, submission entry points and tracked mutators
+    block. Calls are counted from entry to return and arming waits for them
+    to drain, so no application thread can finish a call over the teardown
+    or create shared state after the sentry verified there is none. A
+    teardown or rebuild that fails partway leaves the application gated
+    rather than running on inconsistent state.
 
 Settings: `MCSHIM_LOG`, `MCSHIM_DISABLE`, `MCSHIM_ALLOW_FABRIC`
 (fabric-handle support is reported as absent by default, so frameworks choose
@@ -154,6 +169,8 @@ POSIX fds).
     at container creation, through the container's VFS, so it lands in the
     rootfs overlay and is part of the checkpoint. `IMAGE` (the default) expects
     the image to carry it.
+-   It requires `--cuda-checkpoint-path`: the interposer leaves legacy CUDA
+    IPC to `cuda-checkpoint`, which carries it only for processes in a job.
 -   It does nothing without nvproxy, and logs a warning and does nothing on
     drivers older than R610.
 -   The loader prepends the interposer to `LD_PRELOAD` and appends it to
@@ -172,10 +189,10 @@ the interposer in the processes that announced themselves (`present.<pid>`).
 
 File                                | Writer      | Meaning
 ----------------------------------- | ----------- | -------
-`gate`                              | sentry      | created: block GPU submission; removed: unblock
+`gate`                              | sentry      | created: block GPU submission, drain calls in flight, check the state can be carried; removed: unblock
 `suspend`                           | sentry      | created: tear down; removed: rebuild
 `present.<pid>`                     | interposer  | this process participates
-`gated.<pid>`                       | interposer  | gate armed
+`gated.<pid>`                       | interposer  | gate armed and drained
 `suspended.<pid>`, `resumed.<pid>`  | interposer  | teardown / rebuild finished
 `error.<pid>`                       | interposer  | the transition failed; the sentry fails fast
 
@@ -218,8 +235,10 @@ a re-lock because it has to call libcuda, which a locked process cannot do.
 
 A failure before the teardown, or after it completed on every process,
 unwinds: unlock, rebuild, release the gate, and the application keeps running.
-A process that could not track all of its state refuses the gate, before
-anything is torn down. If the teardown itself fails partway, peers may already
+A process whose state cannot be carried refuses the gate, before anything is
+torn down: a table overflow, an unknown entry-point ABI, memory-pool IPC,
+logical endpoints, non-POSIX-fd handles, sparse array mappings, or references
+it could not restore (see `tools/mcshim/README.md`). If the teardown itself fails partway, peers may already
 have released state the failed process needs, so nothing is rolled back: the
 application stays blocked, the checkpoint fails, and the workload must be
 restarted.
@@ -368,9 +387,11 @@ that pins the fdinfo line format.
     sentry-provided device or socket be preferred?
 4.  **The fdinfo line as a `/proc` contract.** Acceptable as is, or behind a
     flag?
-5.  **Testing.** End-to-end coverage needs multiple GPUs on an NVSwitch host.
-    Is a hardware-gated `test/gpu` target acceptable, with unit tests for the
-    rest?
+5.  **Testing.** `tools/mcshim/test` drives the interposer through the marker
+    protocol on two NVLS GPUs (lookup ABIs, gate draining, multicast rebuild,
+    references, refusals, two-process imports). End-to-end coverage needs
+    multiple GPUs on an NVSwitch host. Is a hardware-gated `test/gpu` target
+    acceptable, with unit tests for the rest?
 
 ## Rollout
 
