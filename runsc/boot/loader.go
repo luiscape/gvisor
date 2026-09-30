@@ -1608,9 +1608,7 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 		log.Warningf("the multicast interposer is enabled but driver R%d is older than R610; not preloading it into container %q", major, info.containerName)
 		return nil
 	}
-	if info.conf.CUDACheckpointPath == "" {
-		log.Warningf("the multicast interposer is enabled without --cuda-checkpoint-path; CUDA IPC (cuIpcGetMemHandle) state in container %q will not be checkpointable", info.containerName)
-	}
+
 	// Materialize the embedded interposer before anything references its
 	// path: if this fails, the container boots without any preload rather
 	// than with a dangling one.

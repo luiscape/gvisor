@@ -584,6 +584,11 @@ func (c *Config) Validate() error {
 	if len(c.ProfilingMetrics) > 0 && len(c.ProfilingMetricsLog) == 0 {
 		return fmt.Errorf("profiling-metrics flag requires defining a profiling-metrics-log for output")
 	}
+	// The interposer leaves CUDA IPC (cuIpc*) to cuda-checkpoint, which carries
+	// it only for processes in a job.
+	if c.CUDAMulticastShimContainerPath() != "" && c.CUDACheckpointPath == "" {
+		return fmt.Errorf("the multicast interposer (--cuda-multicast-shim-path or --cuda-multicast-shim-source=EMBEDDED) requires --cuda-checkpoint-path")
+	}
 	allowedCaps, _, err := nvconf.DriverCapsFromString(c.NVProxyAllowedDriverCapabilities)
 	if err != nil {
 		return fmt.Errorf("--nvproxy-allowed-driver-capabilities=%q: %w", c.NVProxyAllowedDriverCapabilities, err)

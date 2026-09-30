@@ -315,6 +315,20 @@ func TestValidationFail(t *testing.T) {
 			error: "qdisc=tbf requires setting qdisc-tbf-burst",
 		},
 		{
+			name: "cuda-multicast-shim-path-without-cuda-checkpoint-path",
+			flags: map[string]string{
+				"cuda-multicast-shim-path": "/usr/local/lib/mcshim.so",
+			},
+			error: "requires --cuda-checkpoint-path",
+		},
+		{
+			name: "cuda-multicast-shim-embedded-without-cuda-checkpoint-path",
+			flags: map[string]string{
+				"cuda-multicast-shim-source": "EMBEDDED",
+			},
+			error: "requires --cuda-checkpoint-path",
+		},
+		{
 			name: "fsgofer-host-uds+host-uds:open",
 			flags: map[string]string{
 				"fsgofer-host-uds": "true",
