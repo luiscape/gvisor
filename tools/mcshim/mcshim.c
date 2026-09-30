@@ -159,25 +159,26 @@ static FILE* g_log;
 static pthread_mutex_t g_loglock = PTHREAD_MUTEX_INITIALIZER;
 
 static void mclog(const char* fmt, ...) {
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  struct tm tm;
+  localtime_r(&ts.tv_sec, &tm);
+  char t[32], line[1024];
+  strftime(t, sizeof(t), "%H:%M:%S", &tm);
+  int n = snprintf(line, sizeof(line), "[mcshim %s.%03ld pid=%d] ", t,
+                   ts.tv_nsec / 1000000, (int)getpid());
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(line + n, sizeof(line) - n, fmt, ap);
+  va_end(ap);
   pthread_mutex_lock(&g_loglock);
   if (!g_log) {
     const char* p = getenv("MCSHIM_LOG");
     g_log = p && *p ? fopen(p, "a") : stderr;
     if (!g_log) g_log = stderr;
   }
-  struct timespec ts;
-  clock_gettime(CLOCK_REALTIME, &ts);
-  struct tm tm;
-  localtime_r(&ts.tv_sec, &tm);
-  char t[32];
-  strftime(t, sizeof(t), "%H:%M:%S", &tm);
-  fprintf(g_log, "[mcshim %s.%03ld pid=%d] ", t, ts.tv_nsec / 1000000,
-          (int)getpid());
-  va_list ap;
-  va_start(ap, fmt);
-  vfprintf(g_log, fmt, ap);
-  va_end(ap);
-  fputc('\n', g_log);
+  /* One write per line: ranks share the log file. */
+  fprintf(g_log, "%s\n", line);
   fflush(g_log);
   pthread_mutex_unlock(&g_loglock);
 }
@@ -642,7 +643,6 @@ static int track_new(int kind, CUmemGenericAllocationHandle h, CUdevice dev,
   a->app_refs = 1;
   a->dev = dev;
   a->pub_fd = -1;
-  if (dev < 0 || dev >= MAX_DEV) mark_untracked("object on an unknown device");
   *app = v;
   return i;
 }
@@ -1171,6 +1171,8 @@ CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
     while (m < MAXN && g_map[m].used) m++;
     if (m < MAXN) {
       CUdevice d = cur_dev();
+      /* Created without a current context: adopt the mapping's device. */
+      if (g_alloc[ai].dev < 0) g_alloc[ai].dev = d;
       g_map[m] = (Mapping){.used = 1,
                            .va = ptr,
                            .size = size,
@@ -1490,6 +1492,9 @@ static const char* can_carry(void) {
     const Alloc* a = &g_alloc[i];
     if (a->kind == KIND_FREE) continue;
     int maps = has_maps(i), torn = torn_down(i);
+    if ((a->dev < 0 || a->dev >= MAX_DEV) &&
+        (torn || a->has_key || bound_as_mem(i)))
+      return "an object on an unknown device";
     /* Restoring more than one reference needs a mapped VA to retain from. */
     if (torn && a->app_refs > 1 && !maps)
       return "several references to an unmapped object";
