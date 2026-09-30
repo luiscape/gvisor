@@ -31,9 +31,12 @@
  * which cuda-checkpoint carries when the processes share a job (runsc
  * --cuda-checkpoint-path).
  *
- * Besides symbol interposition, the shim interposes dlsym, cuGetProcAddress and
- * cudart's cudaGetDriverEntryPoint* resolvers, through which torch, NCCL and
- * ctypes resolve driver entry points. */
+ * The application only ever sees the handle values it was given: a rebuild
+ * gives objects new driver handles, and every handle-taking entry point
+ * translates. Besides symbol interposition, the shim interposes dlsym,
+ * cuGetProcAddress and cudart's cudaGetDriverEntryPoint* resolvers, and
+ * redirects by the address they return, so each ABI version of an entry point
+ * gets the wrapper with its own signature. */
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -63,13 +66,33 @@
 typedef int CUresult;
 typedef int CUdevice;
 typedef void* CUcontext;
+typedef void* CUstream;
+typedef void* CUfunction;
+typedef void* CUgraphExec;
+typedef void* CUhostFn;
+typedef void* CUarray;
+typedef void* CUmemoryPool;
+typedef unsigned int cuuint32_t;
+typedef unsigned long long cuuint64_t;
 typedef unsigned long long CUdeviceptr;
 typedef unsigned long long CUmemGenericAllocationHandle;
 
 #define CUDA_SUCCESS 0
+#define CUDA_ERROR_OUT_OF_MEMORY 2
+#define CUDA_ERROR_NOT_INITIALIZED 3
 /* Returned by an import when the process cannot address the exporting device.
  */
 #define CUDA_ERROR_INVALID_DEVICE 101
+#define CUDA_ERROR_NOT_FOUND 500
+#define CUDA_ERROR_NOT_SUPPORTED 801
+
+#define CU_MEM_HANDLE_TYPE_POSIX_FD 0x1
+#define CU_MEM_HANDLE_TYPE_FABRIC 0x8
+#define CU_MEM_LOCATION_TYPE_DEVICE 1
+#define CU_MEM_ACCESS_FLAGS_PROT_READWRITE 3
+#define CU_MEM_OPERATION_TYPE_MAP 1
+#define CU_MEM_HANDLE_TYPE_GENERIC 0
+#define CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED 128
 
 typedef struct {
   int type;
@@ -103,14 +126,37 @@ typedef struct {
   unsigned long long flags;
 } CUmulticastObjectProp;
 
+typedef struct {
+  int resourceType;
+  union {
+    void* mipmap;
+    CUarray array;
+  } resource;
+  int subresourceType;
+  union {
+    struct {
+      unsigned level, layer, offsetX, offsetY, offsetZ;
+      unsigned extentWidth, extentHeight, extentDepth;
+    } sparseLevel;
+    struct {
+      unsigned layer;
+      unsigned long long offset, size;
+    } miptail;
+  } subresource;
+  int memOperationType;
+  int memHandleType;
+  union {
+    CUmemGenericAllocationHandle memHandle;
+  } memHandle;
+  unsigned long long offset;
+  unsigned int deviceBitMask, flags, reserved[2];
+} CUarrayMapInfo;
+_Static_assert(sizeof(CUarrayMapInfo) == 96, "CUarrayMapInfo layout");
+
 /* Logging. */
 
 static FILE* g_log;
 static pthread_mutex_t g_loglock = PTHREAD_MUTEX_INITIALIZER;
-
-/* Started lazily from cuInit, so only CUDA users poll for markers. */
-static void ensure_control_thread(void);
-static void gate_wait(void);
 
 static void mclog(const char* fmt, ...) {
   pthread_mutex_lock(&g_loglock);
@@ -135,6 +181,8 @@ static void mclog(const char* fmt, ...) {
   fflush(g_log);
   pthread_mutex_unlock(&g_loglock);
 }
+
+static int allow_fabric(void) { return getenv("MCSHIM_ALLOW_FABRIC") != NULL; }
 
 /* The real dlsym, resolved via dlvsym (not interposed) so that the dlsym
  * wrapper can delegate without recursing. */
@@ -162,6 +210,17 @@ static void* libcuda_handle(void) {
   return h;
 }
 
+/* Whether libcuda is loaded, without loading it. */
+static int libcuda_loaded(void) {
+  static int loaded;
+  if (__atomic_load_n(&loaded, __ATOMIC_ACQUIRE)) return 1;
+  void* h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
+  if (!h) return 0;
+  dlclose(h);
+  __atomic_store_n(&loaded, 1, __ATOMIC_RELEASE);
+  return 1;
+}
+
 #define REAL(var, name)                                               \
   do {                                                                \
     if (!(var)) {                                                     \
@@ -171,89 +230,306 @@ static void* libcuda_handle(void) {
     }                                                                 \
   } while (0)
 
-static CUresult (*r_cuMemCreate)(CUmemGenericAllocationHandle*, size_t,
-                                 const CUmemAllocationProp*,
-                                 unsigned long long);
-static CUresult (*r_cuMemRelease)(CUmemGenericAllocationHandle);
-static CUresult (*r_cuMemMap)(CUdeviceptr, size_t, size_t,
-                              CUmemGenericAllocationHandle, unsigned long long);
-static CUresult (*r_cuMemUnmap)(CUdeviceptr, size_t);
-static CUresult (*r_cuMemSetAccess)(CUdeviceptr, size_t, const CUmemAccessDesc*,
-                                    size_t);
-static CUresult (*r_cuMulticastCreate)(CUmemGenericAllocationHandle*,
-                                       const CUmulticastObjectProp*);
-static CUresult (*r_cuMulticastAddDevice)(CUmemGenericAllocationHandle,
-                                          CUdevice);
-static CUresult (*r_cuMulticastBindMem)(CUmemGenericAllocationHandle, size_t,
-                                        CUmemGenericAllocationHandle, size_t,
-                                        size_t, unsigned long long);
-static CUresult (*r_cuMulticastBindAddr)(CUmemGenericAllocationHandle, size_t,
-                                         CUdeviceptr, size_t,
-                                         unsigned long long);
-static CUresult (*r_cuMulticastUnbind)(CUmemGenericAllocationHandle, CUdevice,
-                                       size_t, size_t);
+/* Reals the shim calls but does not interpose. */
 static CUresult (*r_cuCtxGetDevice)(CUdevice*);
-static CUresult (*r_cuMemExportToShareableHandle)(void*,
-                                                  CUmemGenericAllocationHandle,
-                                                  int, unsigned long long);
-static CUresult (*r_cuMemImportFromShareableHandle)(
-    CUmemGenericAllocationHandle*, void*, int);
 static CUresult (*r_cuCtxGetCurrent)(CUcontext*);
 static CUresult (*r_cuCtxSetCurrent)(CUcontext);
 static CUresult (*r_cuCtxSynchronize)(void);
-static CUresult (*r_cuMemcpyDtoH)(void*, CUdeviceptr, size_t);
-static CUresult (*r_cuMemcpyHtoD)(CUdeviceptr, const void*, size_t);
-static CUresult (*r_cuDeviceGetAttribute)(int*, int, CUdevice);
+static CUresult (*r_cuDevicePrimaryCtxRetain)(CUcontext*, CUdevice);
+static CUresult (*r_cuDevicePrimaryCtxRelease)(CUdevice);
+static CUresult (*r_cuDevicePrimaryCtxGetState)(CUdevice, unsigned int*, int*);
 
-#define CU_MEM_HANDLE_TYPE_POSIX_FD 0x1
-#define CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED 128
-
-static void resolve_reals(void) {
-  REAL(r_cuMemCreate, "cuMemCreate");
-  REAL(r_cuMemRelease, "cuMemRelease");
-  REAL(r_cuMemMap, "cuMemMap");
-  REAL(r_cuMemUnmap, "cuMemUnmap");
-  REAL(r_cuMemSetAccess, "cuMemSetAccess");
-  REAL(r_cuMulticastCreate, "cuMulticastCreate");
-  REAL(r_cuMulticastAddDevice, "cuMulticastAddDevice");
-  REAL(r_cuMulticastBindMem, "cuMulticastBindMem");
-  REAL(r_cuMulticastBindAddr, "cuMulticastBindAddr");
-  REAL(r_cuMulticastUnbind, "cuMulticastUnbind");
+static void resolve_internal(void) {
   REAL(r_cuCtxGetDevice, "cuCtxGetDevice");
-  REAL(r_cuMemExportToShareableHandle, "cuMemExportToShareableHandle");
-  REAL(r_cuMemImportFromShareableHandle, "cuMemImportFromShareableHandle");
   REAL(r_cuCtxGetCurrent, "cuCtxGetCurrent");
   REAL(r_cuCtxSetCurrent, "cuCtxSetCurrent");
   REAL(r_cuCtxSynchronize, "cuCtxSynchronize");
-  REAL(r_cuDeviceGetAttribute, "cuDeviceGetAttribute");
-  REAL(r_cuMemcpyDtoH, "cuMemcpyDtoH_v2");
-  REAL(r_cuMemcpyHtoD, "cuMemcpyHtoD_v2");
+  REAL(r_cuDevicePrimaryCtxRetain, "cuDevicePrimaryCtxRetain");
+  REAL(r_cuDevicePrimaryCtxRelease, "cuDevicePrimaryCtxRelease_v2");
+  REAL(r_cuDevicePrimaryCtxGetState, "cuDevicePrimaryCtxGetState");
 }
 
-/* Tracked state: the live object graph. Frees remove entries, so freed objects
- * drop out of the replay set. */
+/* Suspend gate. While suspended, multicast groups and imports are released and
+ * their VAs unmapped: an app thread touching the GPU then faults its context
+ * (700), and through a shared group every rank. cuda-checkpoint --toggle
+ * restores and unlocks the app before the rebuild, so the entry points that
+ * submit GPU work or change tracked state block until it completes. The shim's
+ * own work calls the reals.
+ *
+ * Calls that enter through gate_enter are counted until they return, and
+ * gate_arm waits for the count to drain: once it returns, no app thread is
+ * inside a tracked call, so none can finish one over the teardown. */
+
+static pthread_mutex_t g_gate_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_gate_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_drain_cv = PTHREAD_COND_INITIALIZER;
+static int g_suspended; /* atomic */
+static int g_inflight;  /* atomic */
+
+#define GATE_DRAIN_SECS 30
+
+static void gate_wait(void) {
+  /* fast path: one load on every GPU submission */
+  if (!__atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST)) return;
+  static __thread int logged;
+  pthread_mutex_lock(&g_gate_lock);
+  if (g_suspended && !logged) {
+    logged = 1;
+    mclog("GATE: app thread blocked until resume");
+  }
+  while (g_suspended) pthread_cond_wait(&g_gate_cv, &g_gate_lock);
+  pthread_mutex_unlock(&g_gate_lock);
+}
+
+static void gate_exit(void) {
+  if (__atomic_sub_fetch(&g_inflight, 1, __ATOMIC_SEQ_CST) == 0 &&
+      __atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST)) {
+    pthread_mutex_lock(&g_gate_lock);
+    pthread_cond_broadcast(&g_drain_cv);
+    pthread_mutex_unlock(&g_gate_lock);
+  }
+}
+
+/* Paired with gate_arm (Dekker): either the arming thread sees the count, or
+ * this thread sees the gate. */
+static void gate_enter(void) {
+  for (;;) {
+    gate_wait();
+    __atomic_add_fetch(&g_inflight, 1, __ATOMIC_SEQ_CST);
+    if (!__atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST)) return;
+    gate_exit();
+  }
+}
+
+/* Arm and drain. Returns -1 if calls are still in flight after
+ * GATE_DRAIN_SECS; the gate stays armed. Must not hold g_lock: a draining
+ * call may need it. */
+static int gate_arm(void) {
+  struct timespec dl;
+  clock_gettime(CLOCK_REALTIME, &dl);
+  dl.tv_sec += GATE_DRAIN_SECS;
+  int rc = 0;
+  pthread_mutex_lock(&g_gate_lock);
+  __atomic_store_n(&g_suspended, 1, __ATOMIC_SEQ_CST);
+  while (__atomic_load_n(&g_inflight, __ATOMIC_SEQ_CST) > 0) {
+    if (pthread_cond_timedwait(&g_drain_cv, &g_gate_lock, &dl) == ETIMEDOUT &&
+        __atomic_load_n(&g_inflight, __ATOMIC_SEQ_CST) > 0) {
+      rc = -1;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&g_gate_lock);
+  return rc;
+}
+
+static void gate_disarm(void) {
+  pthread_mutex_lock(&g_gate_lock);
+  __atomic_store_n(&g_suspended, 0, __ATOMIC_SEQ_CST);
+  pthread_cond_broadcast(&g_gate_cv);
+  pthread_mutex_unlock(&g_gate_lock);
+}
+
+/* Entry points that submit GPU work: counted and gated. Each entry is an
+ * exported symbol and its per-thread-stream twin, which share a prototype
+ * (cudaTypedefs.h, CUDA 13.4); every exported name is its own ABI. */
+#define GATED_LIST(X)                                                         \
+  X(cuLaunchKernel, _ptsz,                                                    \
+    (CUfunction f, unsigned gx, unsigned gy, unsigned gz, unsigned bx,        \
+     unsigned by, unsigned bz, unsigned shmem, CUstream st, void** kp,        \
+     void** extra),                                                           \
+    (f, gx, gy, gz, bx, by, bz, shmem, st, kp, extra))                        \
+  X(cuLaunchKernelEx, _ptsz,                                                  \
+    (const void* cfg, CUfunction f, void** kp, void** extra),                 \
+    (cfg, f, kp, extra))                                                      \
+  X(cuLaunchCooperativeKernel, _ptsz,                                         \
+    (CUfunction f, unsigned gx, unsigned gy, unsigned gz, unsigned bx,        \
+     unsigned by, unsigned bz, unsigned shmem, CUstream st, void** kp),       \
+    (f, gx, gy, gz, bx, by, bz, shmem, st, kp))                               \
+  X(cuLaunchHostFunc, _ptsz, (CUstream st, CUhostFn fn, void* ud),            \
+    (st, fn, ud))                                                             \
+  X(cuLaunchHostFunc_v2, _ptsz,                                               \
+    (CUstream st, CUhostFn fn, void* ud, unsigned mode), (st, fn, ud, mode))  \
+  X(cuGraphLaunch, _ptsz, (CUgraphExec g, CUstream st), (g, st))              \
+  X(cuMemsetD8_v2, _ptds, (CUdeviceptr d, unsigned char v, size_t n),         \
+    (d, v, n))                                                                \
+  X(cuMemsetD16_v2, _ptds, (CUdeviceptr d, unsigned short v, size_t n),       \
+    (d, v, n))                                                                \
+  X(cuMemsetD32_v2, _ptds, (CUdeviceptr d, unsigned v, size_t n), (d, v, n))  \
+  X(cuMemsetD8Async, _ptsz,                                                   \
+    (CUdeviceptr d, unsigned char v, size_t n, CUstream st), (d, v, n, st))   \
+  X(cuMemsetD16Async, _ptsz,                                                  \
+    (CUdeviceptr d, unsigned short v, size_t n, CUstream st), (d, v, n, st))  \
+  X(cuMemsetD32Async, _ptsz,                                                  \
+    (CUdeviceptr d, unsigned v, size_t n, CUstream st), (d, v, n, st))        \
+  X(cuMemsetD2D8_v2, _ptds,                                                   \
+    (CUdeviceptr d, size_t p, unsigned char v, size_t w, size_t h),           \
+    (d, p, v, w, h))                                                          \
+  X(cuMemsetD2D16_v2, _ptds,                                                  \
+    (CUdeviceptr d, size_t p, unsigned short v, size_t w, size_t h),          \
+    (d, p, v, w, h))                                                          \
+  X(cuMemsetD2D32_v2, _ptds,                                                  \
+    (CUdeviceptr d, size_t p, unsigned v, size_t w, size_t h),                \
+    (d, p, v, w, h))                                                          \
+  X(cuMemsetD2D8Async, _ptsz,                                                 \
+    (CUdeviceptr d, size_t p, unsigned char v, size_t w, size_t h,            \
+     CUstream st),                                                            \
+    (d, p, v, w, h, st))                                                      \
+  X(cuMemsetD2D16Async, _ptsz,                                                \
+    (CUdeviceptr d, size_t p, unsigned short v, size_t w, size_t h,           \
+     CUstream st),                                                            \
+    (d, p, v, w, h, st))                                                      \
+  X(cuMemsetD2D32Async, _ptsz,                                                \
+    (CUdeviceptr d, size_t p, unsigned v, size_t w, size_t h, CUstream st),   \
+    (d, p, v, w, h, st))                                                      \
+  X(cuMemcpy, _ptds, (CUdeviceptr dst, CUdeviceptr src, size_t n),            \
+    (dst, src, n))                                                            \
+  X(cuMemcpyAsync, _ptsz,                                                     \
+    (CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream st),                \
+    (dst, src, n, st))                                                        \
+  X(cuMemcpyPeer, _ptds,                                                      \
+    (CUdeviceptr dst, CUcontext dc, CUdeviceptr src, CUcontext sc, size_t n), \
+    (dst, dc, src, sc, n))                                                    \
+  X(cuMemcpyPeerAsync, _ptsz,                                                 \
+    (CUdeviceptr dst, CUcontext dc, CUdeviceptr src, CUcontext sc, size_t n,  \
+     CUstream st),                                                            \
+    (dst, dc, src, sc, n, st))                                                \
+  X(cuMemcpyHtoD_v2, _ptds, (CUdeviceptr dst, const void* src, size_t n),     \
+    (dst, src, n))                                                            \
+  X(cuMemcpyDtoH_v2, _ptds, (void* dst, CUdeviceptr src, size_t n),           \
+    (dst, src, n))                                                            \
+  X(cuMemcpyDtoD_v2, _ptds, (CUdeviceptr dst, CUdeviceptr src, size_t n),     \
+    (dst, src, n))                                                            \
+  X(cuMemcpyHtoDAsync_v2, _ptsz,                                              \
+    (CUdeviceptr dst, const void* src, size_t n, CUstream st),                \
+    (dst, src, n, st))                                                        \
+  X(cuMemcpyDtoHAsync_v2, _ptsz,                                              \
+    (void* dst, CUdeviceptr src, size_t n, CUstream st), (dst, src, n, st))   \
+  X(cuMemcpyDtoDAsync_v2, _ptsz,                                              \
+    (CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream st),                \
+    (dst, src, n, st))                                                        \
+  X(cuMemcpyAtoD_v2, _ptds,                                                   \
+    (CUdeviceptr dst, CUarray src, size_t off, size_t n), (dst, src, off, n)) \
+  X(cuMemcpyDtoA_v2, _ptds,                                                   \
+    (CUarray dst, size_t off, CUdeviceptr src, size_t n), (dst, off, src, n)) \
+  X(cuMemcpyAtoH_v2, _ptds, (void* dst, CUarray src, size_t off, size_t n),   \
+    (dst, src, off, n))                                                       \
+  X(cuMemcpyHtoA_v2, _ptds,                                                   \
+    (CUarray dst, size_t off, const void* src, size_t n), (dst, off, src, n)) \
+  X(cuMemcpyAtoA_v2, _ptds,                                                   \
+    (CUarray dst, size_t doff, CUarray src, size_t soff, size_t n),           \
+    (dst, doff, src, soff, n))                                                \
+  X(cuMemcpyHtoAAsync_v2, _ptsz,                                              \
+    (CUarray dst, size_t off, const void* src, size_t n, CUstream st),        \
+    (dst, off, src, n, st))                                                   \
+  X(cuMemcpyAtoHAsync_v2, _ptsz,                                              \
+    (void* dst, CUarray src, size_t off, size_t n, CUstream st),              \
+    (dst, src, off, n, st))                                                   \
+  X(cuMemcpy2D_v2, _ptds, (const void* p), (p))                               \
+  X(cuMemcpy2DUnaligned_v2, _ptds, (const void* p), (p))                      \
+  X(cuMemcpy2DAsync_v2, _ptsz, (const void* p, CUstream st), (p, st))         \
+  X(cuMemcpy3D_v2, _ptds, (const void* p), (p))                               \
+  X(cuMemcpy3DAsync_v2, _ptsz, (const void* p, CUstream st), (p, st))         \
+  X(cuMemcpy3DPeer, _ptds, (const void* p), (p))                              \
+  X(cuMemcpy3DPeerAsync, _ptsz, (const void* p, CUstream st), (p, st))        \
+  X(cuMemcpyBatchAsync, _ptsz,                                                \
+    (CUdeviceptr * dsts, CUdeviceptr * srcs, size_t* sizes, size_t count,     \
+     void* attrs, size_t* attrIdxs, size_t numAttrs, size_t* failIdx,         \
+     CUstream st),                                                            \
+    (dsts, srcs, sizes, count, attrs, attrIdxs, numAttrs, failIdx, st))       \
+  X(cuMemcpyBatchAsync_v2, _ptsz,                                             \
+    (CUdeviceptr * dsts, CUdeviceptr * srcs, size_t* sizes, size_t count,     \
+     void* attrs, size_t* attrIdxs, size_t numAttrs, CUstream st),            \
+    (dsts, srcs, sizes, count, attrs, attrIdxs, numAttrs, st))                \
+  X(cuMemcpy3DBatchAsync, _ptsz,                                              \
+    (size_t n, void* ops, size_t* failIdx, unsigned long long fl,             \
+     CUstream st),                                                            \
+    (n, ops, failIdx, fl, st))                                                \
+  X(cuMemcpy3DBatchAsync_v2, _ptsz,                                           \
+    (size_t n, void* ops, unsigned long long fl, CUstream st),                \
+    (n, ops, fl, st))                                                         \
+  X(cuMemcpyWithAttributesAsync, _ptsz,                                       \
+    (CUdeviceptr dst, CUdeviceptr src, size_t n, void* attr, CUstream st),    \
+    (dst, src, n, attr, st))                                                  \
+  X(cuMemcpy3DWithAttributesAsync, _ptsz,                                     \
+    (void* op, unsigned long long fl, CUstream st), (op, fl, st))             \
+  MEMOP(X, cuStreamWaitValue32, cuuint32_t)                                   \
+  MEMOP(X, cuStreamWaitValue32_v2, cuuint32_t)                                \
+  MEMOP(X, cuStreamWaitValue64, cuuint64_t)                                   \
+  MEMOP(X, cuStreamWaitValue64_v2, cuuint64_t)                                \
+  MEMOP(X, cuStreamWriteValue32, cuuint32_t)                                  \
+  MEMOP(X, cuStreamWriteValue32_v2, cuuint32_t)                               \
+  MEMOP(X, cuStreamWriteValue64, cuuint64_t)                                  \
+  MEMOP(X, cuStreamWriteValue64_v2, cuuint64_t)                               \
+  X(cuStreamBatchMemOp, _ptsz,                                                \
+    (CUstream st, unsigned n, void* ops, unsigned fl), (st, n, ops, fl))      \
+  X(cuStreamBatchMemOp_v2, _ptsz,                                             \
+    (CUstream st, unsigned n, void* ops, unsigned fl), (st, n, ops, fl))
+
+#define MEMOP(X, name, T) \
+  X(name, _ptsz, (CUstream st, CUdeviceptr a, T v, unsigned fl), (st, a, v, fl))
+
+/* Waits: blocked while suspended, but not counted, since a wait may depend on
+ * a peer that is already gated. */
+#define WAIT_LIST(X) X(cuStreamSynchronize, _ptsz, (CUstream st), (st))
+
+#define GATED_ONE(name, proto, args)            \
+  static CUresult(*r_##name) proto;             \
+  CUresult name proto;                          \
+  CUresult name proto {                         \
+    REAL(r_##name, #name);                      \
+    if (!r_##name) return CUDA_ERROR_NOT_FOUND; \
+    gate_enter();                               \
+    CUresult rc = r_##name args;                \
+    gate_exit();                                \
+    return rc;                                  \
+  }
+
+#define WAIT_ONE(name, proto, args)             \
+  static CUresult(*r_##name) proto;             \
+  CUresult name proto;                          \
+  CUresult name proto {                         \
+    REAL(r_##name, #name);                      \
+    if (!r_##name) return CUDA_ERROR_NOT_FOUND; \
+    gate_wait();                                \
+    return r_##name args;                       \
+  }
+
+#define GATED_DEF(name, sfx, proto, args) \
+  GATED_ONE(name, proto, args) GATED_ONE(name##sfx, proto, args)
+#define WAIT_DEF(name, sfx, proto, args) \
+  WAIT_ONE(name, proto, args) WAIT_ONE(name##sfx, proto, args)
+
+GATED_LIST(GATED_DEF)
+WAIT_LIST(WAIT_DEF)
+
+/* Tracked state: the live object graph. */
 
 /* Static tables (about 3 MB per process) keep hot paths allocation-free. An
  * SGLang TP=8 rank tracks more than 512 objects. */
 #define MAXN 4096
 #define MAX_DEV 16
+#define MAX_ACCESS 16
 
-/* KIND_IMP is an import; cuMulticastAddDevice on it proves it a multicast group
- * and makes it KIND_MC. */
+/* KIND_IMP is an import; cuMulticastAddDevice or a bind on it proves it a
+ * multicast group and makes it KIND_MC. */
 enum { KIND_FREE = 0, KIND_UC = 1, KIND_MC = 2, KIND_IMP = 3 };
 
 typedef struct {
   int kind;
-  CUmemGenericAllocationHandle handle; /* current handle */
-  CUmemGenericAllocationHandle orig;   /* the handle the application holds */
+  CUmemGenericAllocationHandle handle; /* driver handle; 0 while torn down */
+  CUmemGenericAllocationHandle app;    /* the value the application holds */
+  /* Application references: 1 for the create or import, +1 per retain, -1
+   * per release. The object lives while referenced, mapped or bound. */
+  int app_refs;
+  int shim_ref; /* the shim holds one reference (resume, until phase 4) */
+  CUdevice dev; /* device whose primary context issues calls on the object */
   size_t size;
-  CUcontext ctx;
   CUmemAllocationProp uprop;   /* KIND_UC */
   CUmulticastObjectProp mprop; /* KIND_MC */
-  int devs[MAX_DEV];           /* KIND_MC: added devices */
+  CUdevice devs[MAX_DEV];      /* KIND_MC: devices this process added */
   int ndev;
+  int imported;
   /* Rendezvous identity of the export (see record_key). */
-  int imported; /* 1 = handle came from an import */
   int has_key;
   unsigned long key_client, key_object;
   /* After a resume: the re-exported fd, published until the gate is removed
@@ -269,38 +545,39 @@ typedef struct {
   CUdeviceptr va;
   size_t size;
   size_t offset;
-  int allocIdx; /* index into g_alloc of the mapped handle */
-  /* Access set last applied to this mapping, replayed at resume. */
-#define MAX_ACCESS 16
+  int allocIdx;
+  /* Access set applied to this mapping, merged by location. */
   CUmemAccessDesc access[MAX_ACCESS];
   int naccess;
-  CUcontext ctx;
+  CUdevice dev;
 } Mapping;
 
 typedef struct {
   int used;
-  int groupIdx; /* index into g_alloc of the MC group */
-  int by_addr;  /* 1 = cuMulticastBindAddr (replay by VA), 0 = BindMem */
-  CUmemGenericAllocationHandle mem; /* BindMem: UC handle (stable) */
-  CUdeviceptr va; /* BindAddr: bound VA (stable across restore) */
+  int groupIdx;
+  int v2;      /* bound through the _v2 entry point (explicit device) */
+  int by_addr; /* cuMulticastBindAddr: replayed by VA */
+  int memIdx;  /* BindMem: the bound allocation */
+  CUdeviceptr va;
   size_t mcOffset;
   size_t memOffset;
   size_t size;
-  CUcontext ctx;
-  CUdevice dev; /* device hosting the memory (unbind is per-device) */
+  CUdevice dev; /* device the binding applies to (unbind is per device) */
 } Bind;
 
 static Alloc g_alloc[MAXN];
 static Mapping g_map[MAXN];
 static Bind g_bind[MAXN];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-/* All accesses are atomic or under g_gate_lock (see the suspend gate). */
-static int g_suspended;
 
-/* Sticky: some state could not be tracked (a table overflow), so arming the
+/* Sticky: some state could not be tracked or cannot be carried, so arming the
  * gate refuses. Must hold g_lock. */
 static int g_untracked;
 static const char* g_untracked_why;
+
+/* Sticky, lock-free (set from the dlsym interposer): a lookup of a tracked
+ * entry point returned an ABI the shim has no wrapper for. */
+static const char* g_bad_lookup;
 
 /* Sticky: a suspend or resume failed partway, so this process stays gated.
  * Must hold g_lock. */
@@ -310,67 +587,122 @@ static void mark_untracked(const char* why) {
   if (!g_untracked) {
     g_untracked = 1;
     g_untracked_why = why;
+    mclog("NOTE: checkpoint disabled for this process: %s", why);
   }
 }
 
-static int alloc_new(void) {
+static CUdevice cur_dev(void) {
+  CUdevice d = -1;
+  if (!r_cuCtxGetDevice || r_cuCtxGetDevice(&d) != CUDA_SUCCESS) return -1;
+  return d;
+}
+
+static int alloc_by_app(CUmemGenericAllocationHandle h) {
   for (int i = 0; i < MAXN; i++)
-    if (g_alloc[i].kind == KIND_FREE) return i;
-  if (!g_untracked)
-    mclog(
-        "FATAL: alloc table full (MAXN=%d); object untracked -- "
-        "suspend is disabled for this process",
-        MAXN);
-  mark_untracked("alloc table overflow");
+    if (g_alloc[i].kind != KIND_FREE && g_alloc[i].app == h) return i;
   return -1;
 }
 
-/* Find alloc index whose CURRENT handle matches h. */
-static int alloc_find(CUmemGenericAllocationHandle h) {
+static int alloc_by_handle(CUmemGenericAllocationHandle h) {
+  if (!h) return -1;
   for (int i = 0; i < MAXN; i++)
     if (g_alloc[i].kind != KIND_FREE && g_alloc[i].handle == h) return i;
   return -1;
 }
 
-/* Translate a possibly stale handle to its object's current one: apps and NCCL
- * keep original handles in their structs, and a rebuild rotates them. */
-static CUmemGenericAllocationHandle xlate_mc(CUmemGenericAllocationHandle h) {
-  for (int i = 0; i < MAXN; i++)
-    if (g_alloc[i].kind != KIND_FREE && g_alloc[i].orig == h)
-      return g_alloc[i].handle;
-  return h;
+/* Must hold g_lock. The driver handle for an application value. */
+static CUmemGenericAllocationHandle xlate(CUmemGenericAllocationHandle h) {
+  int i = alloc_by_app(h);
+  return i >= 0 && g_alloc[i].handle ? g_alloc[i].handle : h;
 }
 
-/* Must hold g_lock. Record h as a's current handle (a may be NULL for an
- * untracked handle). The driver reuses handle values, so an object whose
- * original handle is issued anew stops translating it (vLLM's sleep/wake churn
- * makes this routine). */
-static void set_handle(Alloc* a, CUmemGenericAllocationHandle h) {
-  for (int i = 0; i < MAXN; i++)
-    if (g_alloc[i].kind != KIND_FREE && g_alloc[i].orig == h)
-      g_alloc[i].orig = g_alloc[i].handle;
-  if (a) a->handle = h;
-}
-
-/* Must hold g_lock. Reset slot i and record the current context + handle. */
-static Alloc* alloc_init(int i, int kind, CUmemGenericAllocationHandle h) {
+/* Must hold g_lock. Track a new object with driver handle h and one app
+ * reference. The application gets h, unless a live object's application value
+ * already is h (the driver reuses values that a rebuild freed): then it gets a
+ * synthetic value. Returns the slot, -1 if untracked (*app = h), or -2 if h
+ * cannot be represented (the caller releases it and fails). */
+static int track_new(int kind, CUmemGenericAllocationHandle h, CUdevice dev,
+                     CUmemGenericAllocationHandle* app) {
+  static unsigned long long synth;
+  int i = 0;
+  while (i < MAXN && g_alloc[i].kind != KIND_FREE) i++;
+  if (i == MAXN) {
+    mark_untracked("object table overflow");
+    if (alloc_by_app(h) >= 0) return -2;
+    *app = h;
+    return -1;
+  }
+  CUmemGenericAllocationHandle v = h;
+  while (alloc_by_app(v) >= 0) v = 0xdc00000000000000ULL | ++synth;
   Alloc* a = &g_alloc[i];
-  set_handle(NULL, h);
   memset(a, 0, sizeof(*a));
   a->kind = kind;
-  a->handle = a->orig = h;
+  a->handle = h;
+  a->app = v;
+  a->app_refs = 1;
+  a->dev = dev;
   a->pub_fd = -1;
-  r_cuCtxGetCurrent(&a->ctx);
-  return a;
+  if (dev < 0 || dev >= MAX_DEV) mark_untracked("object on an unknown device");
+  *app = v;
+  return i;
 }
 
-/* Locked translation of a possibly-stale MC handle (see xlate_mc). */
-static CUmemGenericAllocationHandle xlate_locked(
-    CUmemGenericAllocationHandle h) {
-  pthread_mutex_lock(&g_lock);
-  CUmemGenericAllocationHandle r = xlate_mc(h);
-  pthread_mutex_unlock(&g_lock);
-  return r;
+static int has_maps(int i) {
+  for (int m = 0; m < MAXN; m++)
+    if (g_map[m].used && g_map[m].allocIdx == i) return 1;
+  return 0;
+}
+
+static int first_map(int i) {
+  for (int m = 0; m < MAXN; m++)
+    if (g_map[m].used && g_map[m].allocIdx == i) return m;
+  return -1;
+}
+
+static int bound_as_mem(int i) {
+  for (int b = 0; b < MAXN; b++)
+    if (g_bind[b].used && !g_bind[b].by_addr && g_bind[b].memIdx == i) return 1;
+  return 0;
+}
+
+/* Must hold g_lock. The mapping containing va, or -1. */
+static int map_at(CUdeviceptr va) {
+  for (int m = 0; m < MAXN; m++)
+    if (g_map[m].used && va >= g_map[m].va && va < g_map[m].va + g_map[m].size)
+      return m;
+  return -1;
+}
+
+static void unpublish_fd(Alloc* a);
+static void alloc_gc_all(void);
+
+/* Must hold g_lock. Forget alloc i and the binds and maps that reference it. */
+static void alloc_forget(int i) {
+  int group = g_alloc[i].kind == KIND_MC || g_alloc[i].kind == KIND_IMP;
+  for (int b = 0; b < MAXN; b++)
+    if (g_bind[b].used && (g_bind[b].groupIdx == i ||
+                           (!g_bind[b].by_addr && g_bind[b].memIdx == i)))
+      g_bind[b].used = 0;
+  for (int m = 0; m < MAXN; m++)
+    if (g_map[m].used && g_map[m].allocIdx == i) g_map[m].used = 0;
+  unpublish_fd(&g_alloc[i]);
+  free(g_alloc[i].uc_content);
+  memset(&g_alloc[i], 0, sizeof(g_alloc[i]));
+  g_alloc[i].pub_fd = -1;
+  /* Memory bound only through the group's binds is now dead too. */
+  if (group) alloc_gc_all();
+}
+
+/* Must hold g_lock. Forget alloc i if nothing keeps it alive. */
+static void alloc_gc(int i) {
+  if (i < 0 || g_alloc[i].kind == KIND_FREE) return;
+  if (g_alloc[i].app_refs > 0 || has_maps(i) || bound_as_mem(i)) return;
+  alloc_forget(i);
+}
+
+static void alloc_gc_all(void) {
+  for (int i = 0; i < MAXN; i++)
+    if (g_alloc[i].kind != KIND_FREE && g_alloc[i].app_refs <= 0) alloc_gc(i);
 }
 
 /* nvproxy reports an exported RM object's identity in /proc/self/fdinfo/<fd>:
@@ -398,7 +730,8 @@ static int fdinfo_oracle(int fd, unsigned long* client, unsigned long* object) {
 
 /* Must hold g_lock. Record the rendezvous identity from nvproxy's fdinfo line;
  * without it the object cannot be rebuilt, so checkpoints are refused. The
- * first key wins. */
+ * first key wins: re-exports after a rebuild only matter to a later restore
+ * of a restored process, which is out of scope. */
 static void record_key(int i, int fd) {
   Alloc* a = &g_alloc[i];
   if (a->has_key) return;
@@ -409,383 +742,588 @@ static void record_key(int i, int fd) {
   a->has_key = 1;
 }
 
-/* Interposed entry points. */
+/* Interposed entry points. Mutators hold g_lock across the real call, so a
+ * translation cannot go stale before it is used; binds, which block until
+ * every device has joined, are the exception. */
+
+static void ensure_control_thread(void);
+
+static CUresult (*r_cuInit)(unsigned int);
+static CUresult (*r_cuMemCreate)(CUmemGenericAllocationHandle*, size_t,
+                                 const CUmemAllocationProp*,
+                                 unsigned long long);
+static CUresult (*r_cuMemRelease)(CUmemGenericAllocationHandle);
+static CUresult (*r_cuMemMap)(CUdeviceptr, size_t, size_t,
+                              CUmemGenericAllocationHandle, unsigned long long);
+static CUresult (*r_cuMemUnmap)(CUdeviceptr, size_t);
+static CUresult (*r_cuMemSetAccess)(CUdeviceptr, size_t, const CUmemAccessDesc*,
+                                    size_t);
+static CUresult (*r_cuMemRetainAllocationHandle)(CUmemGenericAllocationHandle*,
+                                                 void*);
+static CUresult (*r_cuMemGetAllocationPropertiesFromHandle)(
+    CUmemAllocationProp*, CUmemGenericAllocationHandle);
+static CUresult (*r_cuMulticastCreate)(CUmemGenericAllocationHandle*,
+                                       const CUmulticastObjectProp*);
+static CUresult (*r_cuMulticastAddDevice)(CUmemGenericAllocationHandle,
+                                          CUdevice);
+static CUresult (*r_cuMulticastBindMem)(CUmemGenericAllocationHandle, size_t,
+                                        CUmemGenericAllocationHandle, size_t,
+                                        size_t, unsigned long long);
+static CUresult (*r_cuMulticastBindAddr)(CUmemGenericAllocationHandle, size_t,
+                                         CUdeviceptr, size_t,
+                                         unsigned long long);
+static CUresult (*r_cuMulticastBindMem_v2)(CUmemGenericAllocationHandle,
+                                           CUdevice, size_t,
+                                           CUmemGenericAllocationHandle, size_t,
+                                           size_t, unsigned long long);
+static CUresult (*r_cuMulticastBindAddr_v2)(CUmemGenericAllocationHandle,
+                                            CUdevice, size_t, CUdeviceptr,
+                                            size_t, unsigned long long);
+static CUresult (*r_cuMulticastUnbind)(CUmemGenericAllocationHandle, CUdevice,
+                                       size_t, size_t);
+static CUresult (*r_cuMemExportToShareableHandle)(void*,
+                                                  CUmemGenericAllocationHandle,
+                                                  int, unsigned long long);
+static CUresult (*r_cuMemImportFromShareableHandle)(
+    CUmemGenericAllocationHandle*, void*, int);
+static CUresult (*r_cuDeviceGetAttribute)(int*, int, CUdevice);
 
 CUresult cuInit(unsigned int flags) {
-  static CUresult (*real)(unsigned int);
-  REAL(real, "cuInit");
-  if (!real) return 3; /* CUDA_ERROR_NOT_INITIALIZED */
+  REAL(r_cuInit, "cuInit");
+  if (!r_cuInit) return CUDA_ERROR_NOT_INITIALIZED;
   /* Only processes that initialize CUDA take part in the protocol. */
   ensure_control_thread();
-  return real(flags);
+  return r_cuInit(flags);
 }
 
-#define CU_MEM_HANDLE_TYPE_FABRIC 0x8
+/* Fabric handle types create an NV_MEMORY_FABRIC (00f8) object at allocation
+ * time, which cuda-checkpoint cannot serialize. On a single node POSIX fds are
+ * equivalent. Masking the device attribute is not enough, since statically
+ * linked runtimes bypass it. */
+static unsigned long long strip_fabric(unsigned long long types,
+                                       const char* what) {
+  if (!(types & CU_MEM_HANDLE_TYPE_FABRIC) || allow_fabric()) return types;
+  unsigned long long fixed =
+      types & ~(unsigned long long)CU_MEM_HANDLE_TYPE_FABRIC;
+  if (!fixed) fixed = CU_MEM_HANDLE_TYPE_POSIX_FD;
+  static int logged;
+  if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+    mclog(
+        "stripping CU_MEM_HANDLE_TYPE_FABRIC from %s (-> 0x%llx); set "
+        "MCSHIM_ALLOW_FABRIC=1 to keep it",
+        what, fixed);
+  return fixed;
+}
 
 CUresult cuMemCreate(CUmemGenericAllocationHandle* h, size_t size,
                      const CUmemAllocationProp* prop,
                      unsigned long long flags) {
-  resolve_reals();
-  gate_wait();
-  /* Strip the FABRIC handle type: it creates an NV_MEMORY_FABRIC (00f8) object
-   * at allocation time, which cuda-checkpoint cannot serialize. On a single
-   * node POSIX fds are equivalent. Masking the device attribute is not enough,
-   * since statically linked runtimes bypass it. */
+  REAL(r_cuMemCreate, "cuMemCreate");
+  REAL(r_cuMemRelease, "cuMemRelease");
+  resolve_internal();
   CUmemAllocationProp fixed;
-  if (prop && (prop->requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC) &&
-      !getenv("MCSHIM_ALLOW_FABRIC")) {
+  if (prop) {
     fixed = *prop;
-    fixed.requestedHandleTypes &= ~CU_MEM_HANDLE_TYPE_FABRIC;
-    if (!fixed.requestedHandleTypes)
-      fixed.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FD;
+    fixed.requestedHandleTypes =
+        (int)strip_fabric((unsigned)prop->requestedHandleTypes, "cuMemCreate");
     prop = &fixed;
-    static int logged;
-    if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
-      mclog(
-          "stripping CU_MEM_HANDLE_TYPE_FABRIC from "
-          "cuMemCreate (-> handleTypes 0x%x): fabric-handle "
-          "memory is not checkpointable; set "
-          "MCSHIM_ALLOW_FABRIC=1 to keep it",
-          fixed.requestedHandleTypes);
   }
+  gate_enter();
+  pthread_mutex_lock(&g_lock);
   CUresult rc = r_cuMemCreate(h, size, prop, flags);
   if (rc == CUDA_SUCCESS) {
-    pthread_mutex_lock(&g_lock);
-    int i = alloc_new();
+    CUdevice dev = prop && prop->location.type == CU_MEM_LOCATION_TYPE_DEVICE
+                       ? prop->location.id
+                       : cur_dev();
+    CUmemGenericAllocationHandle real = *h;
+    int i = track_new(KIND_UC, real, dev, h);
     if (i >= 0) {
-      Alloc* a = alloc_init(i, KIND_UC, *h);
-      a->size = size;
-      if (prop) a->uprop = *prop;
-    } else {
-      /* Untracked, but its value must not translate to a stale object. */
-      set_handle(NULL, *h);
+      g_alloc[i].size = size;
+      if (prop) g_alloc[i].uprop = *prop;
+    } else if (i == -2) {
+      r_cuMemRelease(real);
+      rc = CUDA_ERROR_OUT_OF_MEMORY;
     }
-    pthread_mutex_unlock(&g_lock);
   }
+  pthread_mutex_unlock(&g_lock);
+  gate_exit();
   return rc;
 }
 
 CUresult cuMulticastCreate(CUmemGenericAllocationHandle* h,
                            const CUmulticastObjectProp* prop) {
-  resolve_reals();
-  gate_wait();
+  REAL(r_cuMulticastCreate, "cuMulticastCreate");
+  REAL(r_cuMemRelease, "cuMemRelease");
+  resolve_internal();
+  CUmulticastObjectProp fixed;
+  if (prop) {
+    fixed = *prop;
+    fixed.handleTypes = strip_fabric(prop->handleTypes, "cuMulticastCreate");
+    prop = &fixed;
+  }
+  gate_enter();
+  pthread_mutex_lock(&g_lock);
   CUresult rc = r_cuMulticastCreate(h, prop);
   if (rc == CUDA_SUCCESS) {
-    pthread_mutex_lock(&g_lock);
-    int i = alloc_new();
-    if (i >= 0) {
-      Alloc* a = alloc_init(i, KIND_MC, *h);
-      if (prop) {
-        a->mprop = *prop;
-        a->size = prop->size;
-      }
-    } else {
-      set_handle(NULL, *h);
+    CUmemGenericAllocationHandle real = *h;
+    int i = track_new(KIND_MC, real, cur_dev(), h);
+    if (i >= 0 && prop) {
+      g_alloc[i].mprop = *prop;
+      g_alloc[i].size = prop->size;
+    } else if (i == -2) {
+      r_cuMemRelease(real);
+      rc = CUDA_ERROR_OUT_OF_MEMORY;
     }
-    pthread_mutex_unlock(&g_lock);
   }
+  pthread_mutex_unlock(&g_lock);
+  gate_exit();
   return rc;
 }
-
-#define CUDA_ERROR_NOT_SUPPORTED 801
 
 CUresult cuMemExportToShareableHandle(void* shHandle,
                                       CUmemGenericAllocationHandle h, int type,
                                       unsigned long long flags) {
-  resolve_reals();
-  gate_wait();
+  REAL(r_cuMemExportToShareableHandle, "cuMemExportToShareableHandle");
   /* Refuse fabric exports. The driver fabric-exports memory that never asked
    * for fabric handles, so torch's export-as-FABRIC probe would succeed and
    * create one 00f8 object per pool chunk. Failing it makes torch fall back to
    * POSIX fds. */
-  if (type == CU_MEM_HANDLE_TYPE_FABRIC && !getenv("MCSHIM_ALLOW_FABRIC")) {
+  if (type == CU_MEM_HANDLE_TYPE_FABRIC && !allow_fabric()) {
     static int logged;
     if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
       mclog(
-          "refusing fabric-typed cuMemExportToShareableHandle:"
-          " fabric exports are not checkpointable; set "
-          "MCSHIM_ALLOW_FABRIC=1 to permit them");
+          "refusing fabric-typed cuMemExportToShareableHandle; set "
+          "MCSHIM_ALLOW_FABRIC=1 to permit it");
     return CUDA_ERROR_NOT_SUPPORTED;
   }
-  CUmemGenericAllocationHandle real_h = xlate_locked(h);
-  CUresult rc = r_cuMemExportToShareableHandle(shHandle, real_h, type, flags);
-  if (rc == CUDA_SUCCESS && type == CU_MEM_HANDLE_TYPE_POSIX_FD && shHandle) {
-    pthread_mutex_lock(&g_lock);
-    int i = alloc_find(real_h);
-    /* Multicast groups and unicast (P2P) exports alike must be re-exported and
-     * published on resume. */
-    if (i >= 0 && (g_alloc[i].kind == KIND_MC || g_alloc[i].kind == KIND_UC)) {
+  gate_enter();
+  pthread_mutex_lock(&g_lock);
+  int i = alloc_by_app(h);
+  CUresult rc = r_cuMemExportToShareableHandle(shHandle, xlate(h), type, flags);
+  if (rc == CUDA_SUCCESS && i >= 0) {
+    if (type == CU_MEM_HANDLE_TYPE_POSIX_FD && shHandle)
       record_key(i, *(int*)shHandle);
-    }
-    pthread_mutex_unlock(&g_lock);
+    else
+      mark_untracked("export of a non-POSIX-fd handle type");
   }
+  pthread_mutex_unlock(&g_lock);
+  gate_exit();
   return rc;
 }
 
 CUresult cuMemImportFromShareableHandle(CUmemGenericAllocationHandle* h,
                                         void* osHandle, int type) {
-  resolve_reals();
-  gate_wait();
+  REAL(r_cuMemImportFromShareableHandle, "cuMemImportFromShareableHandle");
+  REAL(r_cuMemRelease, "cuMemRelease");
+  resolve_internal();
+  gate_enter();
+  pthread_mutex_lock(&g_lock);
   CUresult rc = r_cuMemImportFromShareableHandle(h, osHandle, type);
-  if (rc == CUDA_SUCCESS && type == CU_MEM_HANDLE_TYPE_POSIX_FD && h) {
-    pthread_mutex_lock(&g_lock);
-    int i = alloc_new();
-    if (i >= 0) {
-      Alloc* a = alloc_init(i, KIND_IMP, *h);
-      a->imported = 1;
-      /* For POSIX-FD imports osHandle is the fd. */
-      record_key(i, (int)(intptr_t)osHandle);
+  if (rc == CUDA_SUCCESS && h) {
+    int j = alloc_by_handle(*h);
+    if (type != CU_MEM_HANDLE_TYPE_POSIX_FD) {
+      mark_untracked("import of a non-POSIX-fd handle type");
+    } else if (j >= 0) {
+      /* The driver returned an object this process already holds. */
+      g_alloc[j].app_refs++;
+      *h = g_alloc[j].app;
     } else {
-      set_handle(NULL, *h);
+      CUmemGenericAllocationHandle real = *h;
+      int i = track_new(KIND_IMP, real, cur_dev(), h);
+      if (i >= 0) {
+        g_alloc[i].imported = 1;
+        /* For POSIX-FD imports osHandle is the fd. */
+        record_key(i, (int)(intptr_t)osHandle);
+      } else if (i == -2) {
+        r_cuMemRelease(real);
+        rc = CUDA_ERROR_OUT_OF_MEMORY;
+      }
     }
-    pthread_mutex_unlock(&g_lock);
   }
+  pthread_mutex_unlock(&g_lock);
+  gate_exit();
   return rc;
 }
 
 /* Report no fabric-handle support unless MCSHIM_ALLOW_FABRIC=1, so that
- * frameworks choose POSIX fds. Fabric memory creates 00f8 objects that
- * cuda-checkpoint cannot serialize, and on a single node fds perform the same.
- */
+ * frameworks choose POSIX fds. */
 CUresult cuDeviceGetAttribute(int* pi, int attrib, CUdevice dev) {
-  resolve_reals();
+  REAL(r_cuDeviceGetAttribute, "cuDeviceGetAttribute");
+  if (!r_cuDeviceGetAttribute) return CUDA_ERROR_NOT_INITIALIZED;
   CUresult rc = r_cuDeviceGetAttribute(pi, attrib, dev);
   if (rc == CUDA_SUCCESS && pi &&
       attrib == CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED && *pi != 0 &&
-      !getenv("MCSHIM_ALLOW_FABRIC")) {
-    static int logged;
-    if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
-      mclog(
-          "masking HANDLE_TYPE_FABRIC_SUPPORTED=0 (dev %d): "
-          "fabric-handle exports are not checkpointable; "
-          "set MCSHIM_ALLOW_FABRIC=1 to report the truth",
-          dev);
+      !allow_fabric())
     *pi = 0;
+  return rc;
+}
+
+CUresult cuMemRetainAllocationHandle(CUmemGenericAllocationHandle* h,
+                                     void* addr) {
+  REAL(r_cuMemRetainAllocationHandle, "cuMemRetainAllocationHandle");
+  gate_enter();
+  pthread_mutex_lock(&g_lock);
+  CUresult rc = r_cuMemRetainAllocationHandle(h, addr);
+  if (rc == CUDA_SUCCESS && h) {
+    int i = alloc_by_handle(*h);
+    if (i >= 0) {
+      g_alloc[i].app_refs++;
+      *h = g_alloc[i].app;
+    }
   }
+  pthread_mutex_unlock(&g_lock);
+  gate_exit();
+  return rc;
+}
+
+CUresult cuMemGetAllocationPropertiesFromHandle(
+    CUmemAllocationProp* prop, CUmemGenericAllocationHandle h) {
+  REAL(r_cuMemGetAllocationPropertiesFromHandle,
+       "cuMemGetAllocationPropertiesFromHandle");
+  gate_enter();
+  pthread_mutex_lock(&g_lock);
+  CUresult rc = r_cuMemGetAllocationPropertiesFromHandle(prop, xlate(h));
+  pthread_mutex_unlock(&g_lock);
+  gate_exit();
+  return rc;
+}
+
+CUresult cuMemRelease(CUmemGenericAllocationHandle h) {
+  REAL(r_cuMemRelease, "cuMemRelease");
+  gate_enter();
+  pthread_mutex_lock(&g_lock);
+  int i = alloc_by_app(h);
+  CUresult rc = r_cuMemRelease(xlate(h));
+  if (rc == CUDA_SUCCESS && i >= 0) {
+    g_alloc[i].app_refs--;
+    alloc_gc(i);
+  }
+  pthread_mutex_unlock(&g_lock);
+  gate_exit();
   return rc;
 }
 
 CUresult cuMulticastAddDevice(CUmemGenericAllocationHandle h, CUdevice dev) {
-  resolve_reals();
-  gate_wait();
-  CUmemGenericAllocationHandle real_h = xlate_locked(h);
-
-  CUresult rc = r_cuMulticastAddDevice(real_h, dev);
-  if (rc == CUDA_SUCCESS) {
-    pthread_mutex_lock(&g_lock);
-    int i = alloc_find(real_h);
-    /* AddDevice proves that an imported handle is a multicast group. */
-    if (i >= 0 && g_alloc[i].kind == KIND_IMP) g_alloc[i].kind = KIND_MC;
-    if (i >= 0 && g_alloc[i].kind == KIND_MC && g_alloc[i].ndev < MAX_DEV)
-      g_alloc[i].devs[g_alloc[i].ndev++] = dev;
-    pthread_mutex_unlock(&g_lock);
+  REAL(r_cuMulticastAddDevice, "cuMulticastAddDevice");
+  gate_enter();
+  pthread_mutex_lock(&g_lock);
+  int i = alloc_by_app(h);
+  CUresult rc = r_cuMulticastAddDevice(xlate(h), dev);
+  if (rc == CUDA_SUCCESS && i >= 0) {
+    Alloc* a = &g_alloc[i];
+    if (a->kind == KIND_IMP) a->kind = KIND_MC;
+    if (a->kind == KIND_MC) {
+      if (a->ndev < MAX_DEV)
+        a->devs[a->ndev++] = dev;
+      else
+        mark_untracked("too many devices in a multicast group");
+    }
   }
+  pthread_mutex_unlock(&g_lock);
+  gate_exit();
   return rc;
 }
 
-/* Must hold g_lock. Record a successful bind. */
-static void bind_record(int gi, int by_addr, CUmemGenericAllocationHandle mem,
-                        CUdeviceptr va, size_t mcOffset, size_t memOffset,
-                        size_t size, CUdevice dev) {
-  if (gi < 0) return;
+/* Must hold g_lock. Record a successful bind into group gi. */
+static void bind_record(int gi, int v2, int by_addr, int mi, CUdeviceptr va,
+                        size_t mcOffset, size_t memOffset, size_t size,
+                        CUdevice dev) {
+  if (gi < 0) {
+    mark_untracked("bind to an untracked multicast object");
+    return;
+  }
+  if (!by_addr && mi < 0) {
+    mark_untracked("bind of untracked memory");
+    return;
+  }
+  if (dev < 0 || dev >= MAX_DEV) {
+    mark_untracked("bind on an unknown device");
+    return;
+  }
+  if (g_alloc[gi].kind == KIND_IMP) g_alloc[gi].kind = KIND_MC;
   for (int b = 0; b < MAXN; b++) {
     if (g_bind[b].used) continue;
-    g_bind[b].used = 1;
-    g_bind[b].groupIdx = gi;
-    g_bind[b].by_addr = by_addr;
-    g_bind[b].mem = mem;
-    g_bind[b].va = va;
-    g_bind[b].mcOffset = mcOffset;
-    g_bind[b].memOffset = memOffset;
-    g_bind[b].size = size;
-    g_bind[b].dev = dev;
-    r_cuCtxGetCurrent(&g_bind[b].ctx);
+    g_bind[b] = (Bind){.used = 1,
+                       .groupIdx = gi,
+                       .v2 = v2,
+                       .by_addr = by_addr,
+                       .memIdx = mi,
+                       .va = va,
+                       .mcOffset = mcOffset,
+                       .memOffset = memOffset,
+                       .size = size,
+                       .dev = dev};
     return;
   }
   mark_untracked("bind table overflow");
-  mclog(
-      "FATAL: bind table full (MAXN=%d); bind not tracked -- suspend "
-      "is disabled for this process",
-      MAXN);
+}
+
+/* The device a v1 bind applies to: the one hosting the memory. */
+static CUdevice mem_dev(int mi, CUdeviceptr va) {
+  if (mi < 0) {
+    int m = map_at(va);
+    if (m >= 0) mi = g_map[m].allocIdx;
+  }
+  if (mi >= 0 && g_alloc[mi].kind == KIND_UC &&
+      g_alloc[mi].uprop.location.type == CU_MEM_LOCATION_TYPE_DEVICE)
+    return g_alloc[mi].uprop.location.id;
+  return cur_dev();
+}
+
+/* Binds block until every device has joined the group, so the real call runs
+ * without g_lock. */
+static CUresult do_bind(int v2, int by_addr, CUmemGenericAllocationHandle mc,
+                        CUdevice dev, size_t mcOffset,
+                        CUmemGenericAllocationHandle mem, CUdeviceptr va,
+                        size_t memOffset, size_t size,
+                        unsigned long long flags) {
+  resolve_internal();
+  gate_enter();
+  pthread_mutex_lock(&g_lock);
+  int gi = alloc_by_app(mc);
+  int mi = by_addr ? -1 : alloc_by_app(mem);
+  CUmemGenericAllocationHandle rmc = xlate(mc);
+  CUmemGenericAllocationHandle rmem = by_addr ? 0 : xlate(mem);
+  pthread_mutex_unlock(&g_lock);
+  CUresult rc;
+  if (v2 && by_addr)
+    rc = r_cuMulticastBindAddr_v2(rmc, dev, mcOffset, va, size, flags);
+  else if (v2)
+    rc = r_cuMulticastBindMem_v2(rmc, dev, mcOffset, rmem, memOffset, size,
+                                 flags);
+  else if (by_addr)
+    rc = r_cuMulticastBindAddr(rmc, mcOffset, va, size, flags);
+  else
+    rc = r_cuMulticastBindMem(rmc, mcOffset, rmem, memOffset, size, flags);
+  if (rc == CUDA_SUCCESS) {
+    pthread_mutex_lock(&g_lock);
+    /* An object freed and replaced meanwhile would be an app race. */
+    if (gi >= 0 && g_alloc[gi].handle != rmc) gi = -1;
+    if (mi >= 0 && g_alloc[mi].handle != rmem) mi = -1;
+    bind_record(gi, v2, by_addr, mi, va, mcOffset, memOffset, size,
+                v2 ? dev : mem_dev(mi, va));
+    pthread_mutex_unlock(&g_lock);
+  }
+  gate_exit();
+  return rc;
 }
 
 CUresult cuMulticastBindMem(CUmemGenericAllocationHandle mc, size_t mcOffset,
                             CUmemGenericAllocationHandle mem, size_t memOffset,
                             size_t size, unsigned long long flags) {
-  resolve_reals();
-  gate_wait();
-  CUmemGenericAllocationHandle real_mc = xlate_locked(mc);
-  /* The bound memory may be a rotated import handle; record the current one. */
-  CUmemGenericAllocationHandle real_mem = xlate_locked(mem);
-
-  CUresult rc =
-      r_cuMulticastBindMem(real_mc, mcOffset, real_mem, memOffset, size, flags);
-  if (rc == CUDA_SUCCESS) {
-    pthread_mutex_lock(&g_lock);
-    /* Unbind is per device: the one hosting the memory. */
-    CUdevice dev = -1;
-    int mi = alloc_find(real_mem);
-    if (mi >= 0 && g_alloc[mi].kind == KIND_UC)
-      dev = g_alloc[mi].uprop.location.id;
-    bind_record(alloc_find(real_mc), 0, real_mem, 0, mcOffset, memOffset, size,
-                dev);
-    pthread_mutex_unlock(&g_lock);
-  }
-  return rc;
+  REAL(r_cuMulticastBindMem, "cuMulticastBindMem");
+  return do_bind(0, 0, mc, -1, mcOffset, mem, 0, memOffset, size, flags);
 }
 
 CUresult cuMulticastBindAddr(CUmemGenericAllocationHandle mc, size_t mcOffset,
                              CUdeviceptr memptr, size_t size,
                              unsigned long long flags) {
-  resolve_reals();
-  gate_wait();
-  CUmemGenericAllocationHandle real_mc = xlate_locked(mc);
-  CUresult rc = r_cuMulticastBindAddr(real_mc, mcOffset, memptr, size, flags);
-  if (rc == CUDA_SUCCESS) {
-    pthread_mutex_lock(&g_lock);
-    /* Replay is by VA; the hosting device is the caller's. */
-    CUdevice dev = -1;
-    r_cuCtxGetDevice(&dev);
-    bind_record(alloc_find(real_mc), 1, 0, memptr, mcOffset, 0, size, dev);
-    pthread_mutex_unlock(&g_lock);
-  }
-  return rc;
+  REAL(r_cuMulticastBindAddr, "cuMulticastBindAddr");
+  return do_bind(0, 1, mc, -1, mcOffset, 0, memptr, 0, size, flags);
+}
+
+CUresult cuMulticastBindMem_v2(CUmemGenericAllocationHandle mc, CUdevice dev,
+                               size_t mcOffset,
+                               CUmemGenericAllocationHandle mem,
+                               size_t memOffset, size_t size,
+                               unsigned long long flags) {
+  REAL(r_cuMulticastBindMem_v2, "cuMulticastBindMem_v2");
+  return do_bind(1, 0, mc, dev, mcOffset, mem, 0, memOffset, size, flags);
+}
+
+CUresult cuMulticastBindAddr_v2(CUmemGenericAllocationHandle mc, CUdevice dev,
+                                size_t mcOffset, CUdeviceptr memptr,
+                                size_t size, unsigned long long flags) {
+  REAL(r_cuMulticastBindAddr_v2, "cuMulticastBindAddr_v2");
+  return do_bind(1, 1, mc, dev, mcOffset, 0, memptr, 0, size, flags);
 }
 
 CUresult cuMulticastUnbind(CUmemGenericAllocationHandle mc, CUdevice dev,
                            size_t mcOffset, size_t size) {
-  resolve_reals();
-  gate_wait();
-  CUmemGenericAllocationHandle real_mc = xlate_locked(mc);
-  CUresult rc = r_cuMulticastUnbind(real_mc, dev, mcOffset, size);
-  /* App-initiated: drop the recorded bind. The shim's own teardown calls the
-   * reals. */
-  if (rc == CUDA_SUCCESS && !__atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST)) {
-    pthread_mutex_lock(&g_lock);
-    int gi = alloc_find(real_mc);
+  REAL(r_cuMulticastUnbind, "cuMulticastUnbind");
+  gate_enter();
+  pthread_mutex_lock(&g_lock);
+  int gi = alloc_by_app(mc);
+  CUresult rc = r_cuMulticastUnbind(xlate(mc), dev, mcOffset, size);
+  if (rc == CUDA_SUCCESS && gi >= 0) {
     for (int b = 0; b < MAXN; b++)
       if (g_bind[b].used && g_bind[b].groupIdx == gi && g_bind[b].dev == dev &&
-          g_bind[b].mcOffset == mcOffset && g_bind[b].size == size)
+          g_bind[b].mcOffset >= mcOffset &&
+          g_bind[b].mcOffset + g_bind[b].size <= mcOffset + size)
         g_bind[b].used = 0;
-    pthread_mutex_unlock(&g_lock);
+    alloc_gc_all();
   }
+  pthread_mutex_unlock(&g_lock);
+  gate_exit();
   return rc;
 }
 
 CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
-                  CUmemGenericAllocationHandle handle,
-                  unsigned long long flags) {
-  resolve_reals();
-  gate_wait();
-  CUmemGenericAllocationHandle real_h = xlate_locked(handle);
-  CUresult rc = r_cuMemMap(ptr, size, offset, real_h, flags);
-  if (rc == CUDA_SUCCESS && !__atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST)) {
-    pthread_mutex_lock(&g_lock);
-    int ai = alloc_find(real_h);
-    if (ai >= 0) {
-      int placed = 0;
-      for (int m = 0; m < MAXN; m++) {
-        if (g_map[m].used) continue;
-        g_map[m].used = 1;
-        g_map[m].va = ptr;
-        g_map[m].size = size;
-        g_map[m].offset = offset;
-        g_map[m].allocIdx = ai;
-        g_map[m].naccess = 0;
-        r_cuCtxGetCurrent(&g_map[m].ctx);
-        placed = 1;
-        break;
-      }
-      if (!placed) {
-        mark_untracked("mapping table overflow");
-        mclog(
-            "FATAL: mapping table full (MAXN=%d); "
-            "mapping va=0x%llx untracked -- suspend "
-            "is disabled for this process",
-            MAXN, (unsigned long long)ptr);
-      }
+                  CUmemGenericAllocationHandle h, unsigned long long flags) {
+  REAL(r_cuMemMap, "cuMemMap");
+  resolve_internal();
+  gate_enter();
+  pthread_mutex_lock(&g_lock);
+  int ai = alloc_by_app(h);
+  CUresult rc = r_cuMemMap(ptr, size, offset, xlate(h), flags);
+  if (rc == CUDA_SUCCESS && ai >= 0) {
+    int m = 0;
+    while (m < MAXN && g_map[m].used) m++;
+    if (m < MAXN) {
+      CUdevice d = cur_dev();
+      g_map[m] = (Mapping){.used = 1,
+                           .va = ptr,
+                           .size = size,
+                           .offset = offset,
+                           .allocIdx = ai,
+                           .dev = d >= 0 ? d : g_alloc[ai].dev};
+    } else {
+      mark_untracked("mapping table overflow");
     }
-    pthread_mutex_unlock(&g_lock);
   }
+  pthread_mutex_unlock(&g_lock);
+  gate_exit();
   return rc;
 }
 
 CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) {
-  resolve_reals();
-  gate_wait();
+  REAL(r_cuMemUnmap, "cuMemUnmap");
+  gate_enter();
+  pthread_mutex_lock(&g_lock);
   CUresult rc = r_cuMemUnmap(ptr, size);
-  /* App-initiated: forget the mapping. */
-  if (rc == CUDA_SUCCESS && !__atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST)) {
-    pthread_mutex_lock(&g_lock);
-    for (int m = 0; m < MAXN; m++)
-      if (g_map[m].used && g_map[m].va == ptr) g_map[m].used = 0;
-    pthread_mutex_unlock(&g_lock);
-  }
-  return rc;
-}
-
-CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size,
-                        const CUmemAccessDesc* desc, size_t count) {
-  resolve_reals();
-  gate_wait();
-  CUresult rc = r_cuMemSetAccess(ptr, size, desc, count);
-  if (rc == CUDA_SUCCESS && desc && count >= 1) {
-    size_t n = count;
-    if (n > MAX_ACCESS) {
-      /* A prefix would silently narrow the access set at resume; log, and let
-       * remap_alloc's owner-RW fallback apply. */
-      mclog(
-          "NOTE: cuMemSetAccess va=0x%llx count=%zu exceeds "
-          "MAX_ACCESS=%d; access set NOT recorded (resume "
-          "grants owner RW only)",
-          (unsigned long long)ptr, count, MAX_ACCESS);
-      n = 0;
-    }
-    /* Record on every tracked mapping in range: NCCL sets access once over a
-     * reservation holding several maps. */
-    pthread_mutex_lock(&g_lock);
+  if (rc == CUDA_SUCCESS) {
+    /* The range may span several mappings. */
     for (int m = 0; m < MAXN; m++) {
       if (!g_map[m].used || g_map[m].va < ptr ||
           g_map[m].va + g_map[m].size > ptr + size)
         continue;
-      g_map[m].naccess = (int)n;
-      if (n) memcpy(g_map[m].access, desc, n * sizeof(*desc));
+      g_map[m].used = 0;
+      alloc_gc(g_map[m].allocIdx);
     }
-    pthread_mutex_unlock(&g_lock);
   }
+  pthread_mutex_unlock(&g_lock);
+  gate_exit();
   return rc;
 }
 
-static void unpublish_fd(Alloc* a);
-
-/* Must hold g_lock. Forget alloc i and the binds and maps that reference it. */
-static void alloc_forget(int i) {
-  for (int b = 0; b < MAXN; b++)
-    if (g_bind[b].used &&
-        (g_bind[b].groupIdx == i || g_bind[b].mem == g_alloc[i].handle ||
-         g_bind[b].mem == g_alloc[i].orig))
-      g_bind[b].used = 0;
-  for (int m = 0; m < MAXN; m++)
-    if (g_map[m].used && g_map[m].allocIdx == i) g_map[m].used = 0;
-  unpublish_fd(&g_alloc[i]);
-  g_alloc[i].ctx = NULL; /* a freed slot must never look targetable */
-  g_alloc[i].kind = KIND_FREE;
+static int same_location(const CUmemLocation* a, const CUmemLocation* b) {
+  return a->type == b->type &&
+         (a->type != CU_MEM_LOCATION_TYPE_DEVICE || a->id == b->id);
 }
 
-CUresult cuMemRelease(CUmemGenericAllocationHandle handle) {
-  resolve_reals();
-  gate_wait();
-  CUmemGenericAllocationHandle real_h = xlate_locked(handle);
-  CUresult rc = r_cuMemRelease(real_h);
-  /* App-initiated: forget the alloc and its dependents. */
-  if (rc == CUDA_SUCCESS && !__atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST)) {
-    pthread_mutex_lock(&g_lock);
-    int i = alloc_find(real_h);
-    if (i >= 0) alloc_forget(i);
-    pthread_mutex_unlock(&g_lock);
+CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size,
+                        const CUmemAccessDesc* desc, size_t count) {
+  REAL(r_cuMemSetAccess, "cuMemSetAccess");
+  gate_enter();
+  pthread_mutex_lock(&g_lock);
+  CUresult rc = r_cuMemSetAccess(ptr, size, desc, count);
+  if (rc == CUDA_SUCCESS && desc) {
+    /* The call updates only the listed locations, over every mapping in the
+     * range: NCCL sets access once over a reservation holding several maps,
+     * and torch grants peers one at a time. */
+    for (int m = 0; m < MAXN; m++) {
+      Mapping* mp = &g_map[m];
+      if (!mp->used || mp->va + mp->size <= ptr || mp->va >= ptr + size)
+        continue;
+      if (mp->va < ptr || mp->va + mp->size > ptr + size) {
+        mark_untracked("cuMemSetAccess over part of a mapping");
+        continue;
+      }
+      for (size_t k = 0; k < count; k++) {
+        int j = 0;
+        while (j < mp->naccess &&
+               !same_location(&mp->access[j].location, &desc[k].location))
+          j++;
+        if (j == mp->naccess) {
+          if (j == MAX_ACCESS) {
+            mark_untracked("access table overflow");
+            break;
+          }
+          mp->naccess++;
+        }
+        mp->access[j] = desc[k];
+      }
+    }
   }
+  pthread_mutex_unlock(&g_lock);
+  gate_exit();
   return rc;
 }
+
+/* Sparse array mappings are not replayed: translate, and refuse checkpoints. */
+static CUresult map_array(CUresult (*real)(CUarrayMapInfo*, unsigned, CUstream),
+                          CUarrayMapInfo* list, unsigned count, CUstream st) {
+  if (!real) return CUDA_ERROR_NOT_FOUND;
+  CUarrayMapInfo* copy = count ? malloc(count * sizeof(*list)) : NULL;
+  if (count && !copy) return CUDA_ERROR_OUT_OF_MEMORY;
+  gate_enter();
+  pthread_mutex_lock(&g_lock);
+  for (unsigned k = 0; k < count; k++) {
+    copy[k] = list[k];
+    if (copy[k].memOperationType == CU_MEM_OPERATION_TYPE_MAP &&
+        copy[k].memHandleType == CU_MEM_HANDLE_TYPE_GENERIC)
+      copy[k].memHandle.memHandle = xlate(copy[k].memHandle.memHandle);
+  }
+  CUresult rc = real(copy, count, st);
+  if (rc == CUDA_SUCCESS) mark_untracked("sparse array mapping");
+  pthread_mutex_unlock(&g_lock);
+  gate_exit();
+  free(copy);
+  return rc;
+}
+
+static CUresult (*r_cuMemMapArrayAsync)(CUarrayMapInfo*, unsigned, CUstream);
+static CUresult (*r_cuMemMapArrayAsync_ptsz)(CUarrayMapInfo*, unsigned,
+                                             CUstream);
+
+CUresult cuMemMapArrayAsync(CUarrayMapInfo* list, unsigned count, CUstream st) {
+  REAL(r_cuMemMapArrayAsync, "cuMemMapArrayAsync");
+  return map_array(r_cuMemMapArrayAsync, list, count, st);
+}
+
+CUresult cuMemMapArrayAsync_ptsz(CUarrayMapInfo* list, unsigned count,
+                                 CUstream st) {
+  REAL(r_cuMemMapArrayAsync_ptsz, "cuMemMapArrayAsync_ptsz");
+  return map_array(r_cuMemMapArrayAsync_ptsz, list, count, st);
+}
+
+/* Shared state neither the shim nor cuda-checkpoint can carry: succeed, and
+ * refuse checkpoints. */
+#define REFUSED_LIST(X)                                                     \
+  X(cuMemPoolExportToShareableHandle,                                       \
+    (void* out, CUmemoryPool pool, int type, unsigned long long fl),        \
+    (out, pool, type, fl), "memory pool export")                            \
+  X(cuMemPoolImportFromShareableHandle,                                     \
+    (CUmemoryPool * out, void* h, int type, unsigned long long fl),         \
+    (out, h, type, fl), "memory pool import")                               \
+  X(cuMemPoolExportPointer, (void* out, CUdeviceptr ptr), (out, ptr),       \
+    "memory pool pointer export")                                           \
+  X(cuMemPoolImportPointer,                                                 \
+    (CUdeviceptr * out, CUmemoryPool pool, void* data), (out, pool, data),  \
+    "memory pool pointer import")                                           \
+  X(cuLogicalEndpointCreate, (cuuint32_t id, const void* prop), (id, prop), \
+    "logical endpoint")                                                     \
+  X(cuLogicalEndpointImport, (cuuint32_t id, const void* h, int type),      \
+    (id, h, type), "logical endpoint import")
+
+#define REFUSED_DEF(name, proto, args, why)     \
+  static CUresult(*r_##name) proto;             \
+  CUresult name proto;                          \
+  CUresult name proto {                         \
+    REAL(r_##name, #name);                      \
+    if (!r_##name) return CUDA_ERROR_NOT_FOUND; \
+    gate_enter();                               \
+    CUresult rc = r_##name args;                \
+    if (rc == CUDA_SUCCESS) {                   \
+      pthread_mutex_lock(&g_lock);              \
+      mark_untracked(why);                      \
+      pthread_mutex_unlock(&g_lock);            \
+    }                                           \
+    gate_exit();                                \
+    return rc;                                  \
+  }
+
+REFUSED_LIST(REFUSED_DEF)
 
 /* Cross-rank fd rendezvous. After a restore, each exporter re-exports its
  * object and publishes "<pid> <fd>" in /tmp/mcshim under the original export's
@@ -866,15 +1404,128 @@ static int fetch_fd(const Alloc* a, int timeout_ms) {
   return -1;
 }
 
-/* Suspend/resume helpers. */
+/* Suspend/resume helpers. Calls are issued from each device's primary
+ * context, retained for the duration of a transition; can_carry checks that
+ * the application still holds it. */
+
+static CUcontext g_pctx[MAX_DEV];
+
+/* Must hold g_lock. */
+static int use_dev(CUdevice d) {
+  if (d < 0 || d >= MAX_DEV) return -1;
+  if (!g_pctx[d] && r_cuDevicePrimaryCtxRetain(&g_pctx[d], d) != CUDA_SUCCESS) {
+    g_pctx[d] = NULL;
+    return -1;
+  }
+  return r_cuCtxSetCurrent(g_pctx[d]) == CUDA_SUCCESS ? 0 : -1;
+}
+
+static void release_devs(void) {
+  for (int d = 0; d < MAX_DEV; d++)
+    if (g_pctx[d]) {
+      r_cuDevicePrimaryCtxRelease(d);
+      g_pctx[d] = NULL;
+    }
+}
+
+/* Must hold g_lock. Bitmask of the devices the tracked state lives on. */
+static unsigned devs_in_use(void) {
+  unsigned mask = 0;
+  for (int i = 0; i < MAXN; i++) {
+    if (g_alloc[i].kind == KIND_FREE) continue;
+    if (g_alloc[i].dev >= 0 && g_alloc[i].dev < MAX_DEV)
+      mask |= 1u << g_alloc[i].dev;
+    for (int d = 0; d < g_alloc[i].ndev; d++)
+      if (g_alloc[i].devs[d] >= 0 && g_alloc[i].devs[d] < MAX_DEV)
+        mask |= 1u << g_alloc[i].devs[d];
+  }
+  for (int m = 0; m < MAXN; m++)
+    if (g_map[m].used && g_map[m].dev >= 0 && g_map[m].dev < MAX_DEV)
+      mask |= 1u << g_map[m].dev;
+  for (int b = 0; b < MAXN; b++)
+    if (g_bind[b].used) mask |= 1u << g_bind[b].dev;
+  return mask;
+}
+
+/* Must hold g_lock. Synchronize every device in use. After a restore, the
+ * first VMM call on a context can fail with CUDA_ERROR_UNKNOWN until it is. */
+static int sync_devs(const char* what) {
+  unsigned mask = devs_in_use();
+  for (int d = 0; d < MAX_DEV; d++) {
+    if (!(mask & (1u << d))) continue;
+    CUresult rc = use_dev(d) ? -1 : r_cuCtxSynchronize();
+    if (rc != CUDA_SUCCESS) {
+      mclog("%s: synchronizing device %d rc=%d", what, d, rc);
+      return -1;
+    }
+  }
+  return 0;
+}
+
+static int is_mc_bound(int gi);
+
+/* Must hold g_lock. Whether do_suspend releases alloc i. */
+static int torn_down(int i) {
+  const Alloc* a = &g_alloc[i];
+  return a->kind == KIND_MC || a->kind == KIND_IMP ||
+         (a->kind == KIND_UC && a->has_key && is_mc_bound(i));
+}
+
+/* Must hold g_lock. Why the tracked state cannot be carried through a
+ * checkpoint, or NULL. Runs at the gate, before anything is torn down. */
+static const char* can_carry(void) {
+  if (g_untracked) return g_untracked_why;
+  const char* bad = __atomic_load_n(&g_bad_lookup, __ATOMIC_ACQUIRE);
+  if (bad) return bad;
+  unsigned mask = devs_in_use();
+  for (int d = 0; d < MAX_DEV; d++) {
+    unsigned flags = 0;
+    int active = 0;
+    if ((mask & (1u << d)) &&
+        (r_cuDevicePrimaryCtxGetState(d, &flags, &active) != CUDA_SUCCESS ||
+         !active))
+      return "a device's primary context is not active";
+  }
+  for (int i = 0; i < MAXN; i++) {
+    const Alloc* a = &g_alloc[i];
+    if (a->kind == KIND_FREE) continue;
+    int maps = has_maps(i), torn = torn_down(i);
+    /* Restoring more than one reference needs a mapped VA to retain from. */
+    if (torn && a->app_refs > 1 && !maps)
+      return "several references to an unmapped object";
+    /* A freed export's contents are saved through a mapping, and memory kept
+     * alive only by a bind dies when suspend unbinds it. */
+    if (a->kind == KIND_UC && !maps && (torn || a->app_refs <= 0))
+      return "multicast-bound memory without a mapping";
+  }
+  return NULL;
+}
+
+/* Must hold g_lock. A usable handle for alloc i: its own while referenced,
+ * otherwise a reference retained from a mapping (*held = 1; release it). */
+static int hold_handle(int i, CUmemGenericAllocationHandle* h, int* held) {
+  Alloc* a = &g_alloc[i];
+  *held = 0;
+  if (a->app_refs > 0 || a->shim_ref) {
+    *h = a->handle;
+    return 0;
+  }
+  int m = first_map(i);
+  if (m < 0 || use_dev(g_map[m].dev) != 0 ||
+      r_cuMemRetainAllocationHandle(h, (void*)(uintptr_t)g_map[m].va) !=
+          CUDA_SUCCESS)
+    return -1;
+  *held = 1;
+  return 0;
+}
 
 /* Must hold g_lock. Unmap every VA that maps alloc gi, KEEPING the VA
  * reservations (cuMemUnmap only -- never cuMemAddressFree). */
 static int unmap_alloc(int gi, const char* what, int* unmapped) {
   for (int m = 0; m < MAXN; m++) {
     if (!g_map[m].used || g_map[m].allocIdx != gi) continue;
-    if (g_map[m].ctx) r_cuCtxSetCurrent(g_map[m].ctx);
-    CUresult rc = r_cuMemUnmap(g_map[m].va, g_map[m].size);
+    CUresult rc =
+        use_dev(g_map[m].dev) ? -1 : r_cuMemUnmap(g_map[m].va, g_map[m].size);
     if (rc != CUDA_SUCCESS) {
       mclog("SUSPEND: cuMemUnmap(%s 0x%llx) rc=%d", what,
             (unsigned long long)g_map[m].va, rc);
@@ -885,39 +1536,30 @@ static int unmap_alloc(int gi, const char* what, int* unmapped) {
   return 0;
 }
 
-/* Must hold g_lock. Re-map every VA of alloc gi at the identical address,
- * backed by h, in the retained reservation. */
-static int remap_alloc(int gi, CUmemGenericAllocationHandle h, const char* what,
-                       int* remapped) {
+/* Must hold g_lock. Re-map every VA of alloc gi at the identical address and
+ * replay its access set. */
+static int remap_alloc(int gi, const char* what, int* remapped) {
   for (int m = 0; m < MAXN; m++) {
-    if (!g_map[m].used || g_map[m].allocIdx != gi) continue;
-    if (g_map[m].ctx) r_cuCtxSetCurrent(g_map[m].ctx);
-    CUresult rc = r_cuMemMap(g_map[m].va, g_map[m].size, g_map[m].offset, h, 0);
+    Mapping* mp = &g_map[m];
+    if (!mp->used || mp->allocIdx != gi) continue;
+    CUresult rc = use_dev(mp->dev) ? -1
+                                   : r_cuMemMap(mp->va, mp->size, mp->offset,
+                                                g_alloc[gi].handle, 0);
     if (rc != CUDA_SUCCESS) {
       mclog("RESUME: %s re-map at 0x%llx rc=%d", what,
-            (unsigned long long)g_map[m].va, rc);
+            (unsigned long long)mp->va, rc);
       return -1;
     }
-    /* Replay the recorded access set. With none recorded, grant RW to the
-     * owning device, which NCCL's imports and NVLS VAs need: an inaccessible
-     * view faults the collective (719). */
-    CUmemAccessDesc fallback;
-    const CUmemAccessDesc* acc = g_map[m].access;
-    size_t nacc = (size_t)g_map[m].naccess;
-    if (nacc == 0) {
-      CUdevice d = -1;
-      r_cuCtxGetDevice(&d);
-      memset(&fallback, 0, sizeof(fallback));
-      fallback.location.type = 1 /* CU_MEM_LOCATION_TYPE_DEVICE */;
-      fallback.location.id = d;
-      fallback.flags = 3 /* CU_MEM_ACCESS_FLAGS_PROT_READWRITE */;
-      acc = &fallback;
-      nacc = 1;
-    }
-    CUresult ac = r_cuMemSetAccess(g_map[m].va, g_map[m].size, acc, nacc);
-    if (ac != CUDA_SUCCESS) {
+    /* With no access set recorded, grant RW to the mapping device: an
+     * inaccessible view faults the collective (719). */
+    CUmemAccessDesc fallback = {{CU_MEM_LOCATION_TYPE_DEVICE, mp->dev},
+                                CU_MEM_ACCESS_FLAGS_PROT_READWRITE};
+    rc = mp->naccess ? r_cuMemSetAccess(mp->va, mp->size, mp->access,
+                                        (size_t)mp->naccess)
+                     : r_cuMemSetAccess(mp->va, mp->size, &fallback, 1);
+    if (rc != CUDA_SUCCESS) {
       mclog("RESUME: %s cuMemSetAccess(0x%llx) rc=%d", what,
-            (unsigned long long)g_map[m].va, ac);
+            (unsigned long long)mp->va, rc);
       return -1;
     }
     (*remapped)++;
@@ -925,8 +1567,25 @@ static int remap_alloc(int gi, CUmemGenericAllocationHandle h, const char* what,
   return 0;
 }
 
-/* Must hold g_lock. Re-export alloc gi's handle h and publish it for
- * importers. */
+/* Must hold g_lock. Drop the application's references to alloc i, and forget
+ * its driver handle: the object is freed once unmapped. */
+static int release_refs(int i, const char* what, int* released) {
+  for (int k = 0; k < g_alloc[i].app_refs; k++) {
+    CUresult rc =
+        use_dev(g_alloc[i].dev) ? -1 : r_cuMemRelease(g_alloc[i].handle);
+    if (rc != CUDA_SUCCESS) {
+      mclog("SUSPEND: cuMemRelease(%s 0x%llx) rc=%d", what,
+            (unsigned long long)g_alloc[i].handle, rc);
+      return -1;
+    }
+    (*released)++;
+  }
+  g_alloc[i].handle = 0;
+  return 0;
+}
+
+/* Must hold g_lock. Export alloc gi's handle h and publish it for importers.
+ */
 static int reexport(int gi, CUmemGenericAllocationHandle h) {
   /* A freshly restored allocation can transiently fail its export with
    * INVALID_VALUE; retry briefly (unretried, peers time out and fault with
@@ -934,17 +1593,13 @@ static int reexport(int gi, CUmemGenericAllocationHandle h) {
   int fd = -1;
   CUresult rc = 0;
   for (int attempt = 0; attempt < 100; attempt++) {
-    rc = r_cuMemExportToShareableHandle(&fd, h, CU_MEM_HANDLE_TYPE_POSIX_FD, 0);
+    rc = use_dev(g_alloc[gi].dev) ? -1
+                                  : r_cuMemExportToShareableHandle(
+                                        &fd, h, CU_MEM_HANDLE_TYPE_POSIX_FD, 0);
     if (rc == CUDA_SUCCESS && fd >= 0) break;
-    if (attempt == 0) {
-      CUcontext cur = NULL;
-      r_cuCtxGetCurrent(&cur);
-      mclog(
-          "RESUME: re-export idx=%d kind=%d handle=0x%llx "
-          "ctx=%p cur=%p rc=%d fd=%d, retrying",
-          gi, g_alloc[gi].kind, (unsigned long long)h, g_alloc[gi].ctx, cur, rc,
-          fd);
-    }
+    if (attempt == 0)
+      mclog("RESUME: re-export idx=%d kind=%d dev=%d rc=%d, retrying", gi,
+            g_alloc[gi].kind, g_alloc[gi].dev, rc);
     struct timespec ts = {0, 100 * 1000 * 1000}; /* 100ms */
     nanosleep(&ts, NULL);
   }
@@ -964,35 +1619,34 @@ static int reexport(int gi, CUmemGenericAllocationHandle h) {
 
 /* Must hold g_lock. Fetch gi's re-exported fd and re-import it. Concurrent
  * imports can transiently fail with 304, so retry, bounded. */
-static int reimport(int gi, CUmemGenericAllocationHandle* out) {
-  if (!g_alloc[gi].has_key) {
+static int reimport(int gi) {
+  Alloc* a = &g_alloc[gi];
+  if (!a->has_key) {
     mclog("RESUME: imported idx=%d has no rendezvous key", gi);
     return -1;
   }
   for (int attempt = 0;; attempt++) {
-    int fd = fetch_fd(&g_alloc[gi], 60 * 1000);
+    int fd = fetch_fd(a, 60 * 1000);
     if (fd < 0) return -1;
-    CUresult rc = r_cuMemImportFromShareableHandle(out, (void*)(intptr_t)fd,
-                                                   CU_MEM_HANDLE_TYPE_POSIX_FD);
+    CUmemGenericAllocationHandle h = 0;
+    CUresult rc = use_dev(a->dev) ? -1
+                                  : r_cuMemImportFromShareableHandle(
+                                        &h, (void*)(intptr_t)fd,
+                                        CU_MEM_HANDLE_TYPE_POSIX_FD);
     close(fd);
     if (rc == CUDA_SUCCESS) {
+      a->handle = h;
+      a->shim_ref = 1;
       if (attempt > 0)
-        mclog(
-            "RESUME: re-import idx=%d key=%lx:%lx ok "
-            "after %d retries",
-            gi, g_alloc[gi].key_client, g_alloc[gi].key_object, attempt);
+        mclog("RESUME: re-import idx=%d key=%lx:%lx ok after %d retries", gi,
+              a->key_client, a->key_object, attempt);
       return 0;
     }
-    /* Report the first failure as it happens, for correlation with the sentry's
-     * logs. */
-    if (attempt == 0) {
-      CUdevice cur = -1;
-      r_cuCtxGetDevice(&cur);
+    if (attempt == 0)
       mclog(
-          "RESUME: re-import idx=%d key=%lx:%lx dev=%d "
-          "rc=%d on first attempt",
-          gi, g_alloc[gi].key_client, g_alloc[gi].key_object, cur, rc);
-    }
+          "RESUME: re-import idx=%d key=%lx:%lx dev=%d rc=%d on first "
+          "attempt",
+          gi, a->key_client, a->key_object, a->dev, rc);
     /* INVALID_DEVICE is never transient: this process cannot address the
      * exporter's device. */
     if (rc == CUDA_ERROR_INVALID_DEVICE) {
@@ -1009,38 +1663,40 @@ static int reimport(int gi, CUmemGenericAllocationHandle* out) {
   }
 }
 
-/* Suspend. */
-
 /* Must hold g_lock. Whether alloc gi's memory is bound into a tracked multicast
- * group (by handle, or for cuMulticastBindAddr by mapping VA). */
-static int uc_is_mc_bound(int gi) {
+ * group (by allocation, or for cuMulticastBindAddr by mapping VA). */
+static int is_mc_bound(int gi) {
   for (int b = 0; b < MAXN; b++) {
     if (!g_bind[b].used) continue;
     if (!g_bind[b].by_addr) {
-      if (g_bind[b].mem == g_alloc[gi].handle ||
-          g_bind[b].mem == g_alloc[gi].orig)
-        return 1;
+      if (g_bind[b].memIdx == gi) return 1;
     } else {
-      for (int m = 0; m < MAXN; m++)
-        if (g_map[m].used && g_map[m].allocIdx == gi &&
-            g_bind[b].va >= g_map[m].va &&
-            g_bind[b].va < g_map[m].va + g_map[m].size)
-          return 1;
+      int m = map_at(g_bind[b].va);
+      if (m >= 0 && g_map[m].allocIdx == gi) return 1;
     }
   }
   return 0;
 }
 
-static int do_suspend(void) {
+/* Must hold g_lock. The device to copy mapping m through: one with access. */
+static CUdevice access_dev(const Mapping* mp) {
+  for (int j = 0; j < mp->naccess; j++)
+    if (mp->access[j].location.type == CU_MEM_LOCATION_TYPE_DEVICE &&
+        mp->access[j].flags)
+      return mp->access[j].location.id;
+  return mp->dev;
+}
+
+/* Suspend: runs with the gate armed and drained, and can_carry satisfied. */
+static int suspend_locked(void) {
   int groups = 0, imports = 0, unmapped = 0, unbound = 0, released = 0;
-  CUcontext saved = NULL;
-  r_cuCtxGetCurrent(&saved);
+  int uc_freed = 0;
 
   if (g_untracked) {
-    mclog("SUSPEND: refusing: untracked state (%s) cannot be torn down",
-          g_untracked_why);
+    mclog("SUSPEND: refusing: %s", g_untracked_why);
     return -1;
   }
+  if (sync_devs("SUSPEND") != 0) return -1;
   /* Withdraw the previous resume's fds: a held export fd blocks the
    * checkpoint. */
   unpublish_all();
@@ -1051,96 +1707,65 @@ static int do_suspend(void) {
     groups++;
     if (unmap_alloc(gi, "MC", &unmapped) != 0) return -1;
     for (int b = 0; b < MAXN; b++) {
-      if (!g_bind[b].used || g_bind[b].groupIdx != gi) continue;
-      if (g_bind[b].dev < 0) {
-        mclog("SUSPEND: bind %d has unknown device", b);
-        return -1;
-      }
-      if (g_bind[b].ctx) r_cuCtxSetCurrent(g_bind[b].ctx);
-      CUresult rc = r_cuMulticastUnbind(g_alloc[gi].handle, g_bind[b].dev,
-                                        g_bind[b].mcOffset, g_bind[b].size);
+      Bind* bp = &g_bind[b];
+      if (!bp->used || bp->groupIdx != gi) continue;
+      CUresult rc = use_dev(bp->dev)
+                        ? -1
+                        : r_cuMulticastUnbind(g_alloc[gi].handle, bp->dev,
+                                              bp->mcOffset, bp->size);
       if (rc != CUDA_SUCCESS) {
         mclog(
-            "SUSPEND: cuMulticastUnbind(mc=0x%llx, "
-            "dev=%d, mcOff=0x%zx, size=0x%zx) rc=%d",
-            (unsigned long long)g_alloc[gi].handle, g_bind[b].dev,
-            g_bind[b].mcOffset, g_bind[b].size, rc);
+            "SUSPEND: cuMulticastUnbind(dev=%d, mcOff=0x%zx, size=0x%zx) "
+            "rc=%d",
+            bp->dev, bp->mcOffset, bp->size, rc);
         return -1;
       }
       unbound++;
     }
-    CUresult rc = r_cuMemRelease(g_alloc[gi].handle);
-    if (rc != CUDA_SUCCESS) {
-      mclog("SUSPEND: cuMemRelease(MC 0x%llx) rc=%d",
-            (unsigned long long)g_alloc[gi].handle, rc);
-      return -1;
-    }
-    released++;
+    if (release_refs(gi, "MC", &released) != 0) return -1;
   }
 
   /* Multicast-bound exporters: save contents, unmap (keeping reservations) and
    * release. Left resident, the next export after restore fails with
    * OBJECT_NOT_FOUND (R610, vLLM TP=4 and torch symmetric memory). Runs after
    * the group teardown, so the memory is already unbound. */
-  int uc_freed = 0;
   for (int gi = 0; gi < MAXN; gi++) {
-    if (g_alloc[gi].kind != KIND_UC || !g_alloc[gi].has_key) continue;
-    if (!uc_is_mc_bound(gi)) continue;
+    if (g_alloc[gi].kind != KIND_UC || !torn_down(gi)) continue;
     void* buf = malloc(g_alloc[gi].size);
     if (!buf) {
       mclog("SUSPEND: no memory for UC-export backup (0x%zx bytes)",
             g_alloc[gi].size);
       return -1;
     }
-    int copied = 0;
+    g_alloc[gi].uc_content = buf;
     for (int m = 0; m < MAXN; m++) {
-      if (!g_map[m].used || g_map[m].allocIdx != gi) continue;
-      if (g_map[m].ctx) r_cuCtxSetCurrent(g_map[m].ctx);
-      CUresult rc = r_cuMemcpyDtoH((char*)buf + g_map[m].offset, g_map[m].va,
-                                   g_map[m].size);
+      Mapping* mp = &g_map[m];
+      if (!mp->used || mp->allocIdx != gi) continue;
+      CUresult rc =
+          use_dev(access_dev(mp))
+              ? -1
+              : r_cuMemcpyDtoH_v2((char*)buf + mp->offset, mp->va, mp->size);
       if (rc != CUDA_SUCCESS) {
         mclog("SUSPEND: UC-export backup copy (va=0x%llx size=0x%zx) rc=%d",
-              (unsigned long long)g_map[m].va, g_map[m].size, rc);
-        free(buf);
+              (unsigned long long)mp->va, mp->size, rc);
         return -1;
       }
-      copied++;
     }
-    if (!copied) {
-      free(buf);
-      mclog("SUSPEND: UC-export idx=%d has no mapping to save", gi);
-      return -1;
-    }
-    g_alloc[gi].uc_content = buf;
     if (unmap_alloc(gi, "UC-export", &unmapped) != 0) return -1;
-    CUresult rc = r_cuMemRelease(g_alloc[gi].handle);
-    if (rc != CUDA_SUCCESS) {
-      mclog("SUSPEND: cuMemRelease(UC-export 0x%llx) rc=%d",
-            (unsigned long long)g_alloc[gi].handle, rc);
-      return -1;
-    }
-    released++;
+    if (release_refs(gi, "UC-export", &released) != 0) return -1;
     uc_freed++;
   }
 
-  /* UC imports (P2P peer buffers): unmap and release. The memory is the
-   * exporter's and cuda-checkpoint saves it; only the live import must go,
-   * since cuda-checkpoint cannot restore it. */
+  /* Imports: unmap and release. The memory is the exporter's and
+   * cuda-checkpoint saves it; only the live import must go, since
+   * cuda-checkpoint cannot restore it. */
   for (int ii = 0; ii < MAXN; ii++) {
     if (g_alloc[ii].kind != KIND_IMP) continue;
     imports++;
-    if (unmap_alloc(ii, "UC-import", &unmapped) != 0) return -1;
-    CUresult rc = r_cuMemRelease(g_alloc[ii].handle);
-    if (rc != CUDA_SUCCESS) {
-      mclog("SUSPEND: cuMemRelease(import 0x%llx) rc=%d",
-            (unsigned long long)g_alloc[ii].handle, rc);
-      return -1;
-    }
-    released++;
+    if (unmap_alloc(ii, "import", &unmapped) != 0) return -1;
+    if (release_refs(ii, "import", &released) != 0) return -1;
   }
 
-  if (saved) r_cuCtxSetCurrent(saved);
-  if (r_cuCtxSynchronize) r_cuCtxSynchronize();
   mclog(
       "SUSPEND done: groups=%d imports=%d uc_freed=%d unmapped=%d "
       "unbound=%d released=%d",
@@ -1148,148 +1773,432 @@ static int do_suspend(void) {
   return 0;
 }
 
-/* Resume: rebuild everything a completed do_suspend released. A rank both
- * exports and imports, so every exporter publishes (phase 1) before anyone
- * fetches (phase 2), which avoids deadlock; binds and mappings follow (phase
- * 3). */
-
-/* Must hold g_lock. */
-static int do_resume(void) {
+/* Resume: rebuild everything suspend released. A rank both exports and
+ * imports, so every exporter publishes (phase 1) before anyone fetches (phase
+ * 2). Binds block until every device has joined their group, so all
+ * AddDevices (3a) precede all binds (3b); remaps follow (3c). Phase 4 returns
+ * the reference counts to the application's. */
+static int resume_locked(void) {
   int groups = 0, imports = 0, remapped = 0, rebound = 0, published = 0;
-  CUcontext saved = NULL;
-  r_cuCtxGetCurrent(&saved);
 
-  /* Phase 0: the first VMM call on a freshly restored context can fail with
-   * CUDA_ERROR_UNKNOWN until the context is synchronized. */
-  for (int i = 0; i < MAXN; i++) {
-    if (g_alloc[i].kind == KIND_FREE || !g_alloc[i].ctx) continue;
-    r_cuCtxSetCurrent(g_alloc[i].ctx);
-    r_cuCtxSynchronize();
-  }
+  if (sync_devs("RESUME") != 0) return -1;
 
-  /* Phase 1: every exporter re-creates its object and publishes the re-exported
-   * fd. */
+  /* Phase 1: exporters re-create their objects and publish. */
   for (int gi = 0; gi < MAXN; gi++) {
-    /* Switch context only after the kind checks, so a free slot never installs
-     * a stale one. */
-    if (g_alloc[gi].kind == KIND_MC && !g_alloc[gi].imported) {
-      if (g_alloc[gi].ctx) r_cuCtxSetCurrent(g_alloc[gi].ctx);
-      CUmemGenericAllocationHandle newmc = 0;
-      if (r_cuMulticastCreate(&newmc, &g_alloc[gi].mprop) != CUDA_SUCCESS) {
+    Alloc* a = &g_alloc[gi];
+    if (a->kind == KIND_MC && !a->imported) {
+      CUmemGenericAllocationHandle h = 0;
+      if (use_dev(a->dev) != 0 ||
+          r_cuMulticastCreate(&h, &a->mprop) != CUDA_SUCCESS) {
         mclog("RESUME: cuMulticastCreate idx=%d failed", gi);
         return -1;
       }
-      set_handle(&g_alloc[gi], newmc);
-      if (g_alloc[gi].has_key && reexport(gi, newmc) != 0) return -1;
+      a->handle = h;
+      a->shim_ref = 1;
+      if (a->has_key && reexport(gi, h) != 0) return -1;
       groups++;
-    } else if (g_alloc[gi].kind == KIND_UC) {
-      CUmemGenericAllocationHandle h = g_alloc[gi].handle;
-      if (g_alloc[gi].uc_content) {
-        /* Freed across the checkpoint (see do_suspend): recreate, re-map at the
-         * identical VAs and restore the contents, before the re-export below
-         * and the phase 3 binds. */
-        if (g_alloc[gi].ctx) r_cuCtxSetCurrent(g_alloc[gi].ctx);
-        CUmemGenericAllocationHandle nh = 0;
-        CUresult rc =
-            r_cuMemCreate(&nh, g_alloc[gi].size, &g_alloc[gi].uprop, 0);
+    } else if (a->kind == KIND_UC && a->uc_content) {
+      /* Freed across the checkpoint: recreate, re-map at the identical VAs and
+       * restore the contents, before the re-export and the binds. */
+      CUmemGenericAllocationHandle h = 0;
+      CUresult rc =
+          use_dev(a->dev) ? -1 : r_cuMemCreate(&h, a->size, &a->uprop, 0);
+      if (rc != CUDA_SUCCESS) {
+        mclog("RESUME: recreate UC-export idx=%d (size=0x%zx) rc=%d", gi,
+              a->size, rc);
+        return -1;
+      }
+      a->handle = h;
+      a->shim_ref = 1;
+      if (remap_alloc(gi, "UC-export", &remapped) != 0) return -1;
+      for (int m = 0; m < MAXN; m++) {
+        Mapping* mp = &g_map[m];
+        if (!mp->used || mp->allocIdx != gi) continue;
+        rc = use_dev(access_dev(mp))
+                 ? -1
+                 : r_cuMemcpyHtoD_v2(mp->va, (char*)a->uc_content + mp->offset,
+                                     mp->size);
         if (rc != CUDA_SUCCESS) {
-          mclog(
-              "RESUME: recreate UC-export idx=%d "
-              "(size=0x%zx) rc=%d",
-              gi, g_alloc[gi].size, rc);
+          mclog("RESUME: UC-export content restore (va=0x%llx) rc=%d",
+                (unsigned long long)mp->va, rc);
           return -1;
         }
-        set_handle(&g_alloc[gi], nh);
-        h = nh;
-        if (remap_alloc(gi, nh, "UC-export", &remapped) != 0) return -1;
-        for (int m = 0; m < MAXN; m++) {
-          if (!g_map[m].used || g_map[m].allocIdx != gi) continue;
-          if (g_map[m].ctx) r_cuCtxSetCurrent(g_map[m].ctx);
-          rc = r_cuMemcpyHtoD(g_map[m].va,
-                              (char*)g_alloc[gi].uc_content + g_map[m].offset,
-                              g_map[m].size);
-          if (rc != CUDA_SUCCESS) {
-            mclog(
-                "RESUME: UC-export content "
-                "restore (va=0x%llx) rc=%d",
-                (unsigned long long)g_map[m].va, rc);
-            return -1;
-          }
-        }
-        free(g_alloc[gi].uc_content);
-        g_alloc[gi].uc_content = NULL;
       }
-      if (g_alloc[gi].has_key) {
-        if (g_alloc[gi].ctx) r_cuCtxSetCurrent(g_alloc[gi].ctx);
-        /* P2P exporter: publish the handle importers fetch. */
+      free(a->uc_content);
+      a->uc_content = NULL;
+      if (a->has_key) {
         if (reexport(gi, h) != 0) return -1;
         published++;
       }
-    }
-  }
-
-  /* Phase 2: importers fetch and re-import (new handles). */
-  for (int gi = 0; gi < MAXN; gi++) {
-    if (g_alloc[gi].kind == KIND_MC && g_alloc[gi].imported) {
-      if (g_alloc[gi].ctx) r_cuCtxSetCurrent(g_alloc[gi].ctx);
-      CUmemGenericAllocationHandle newmc = 0;
-      if (reimport(gi, &newmc) != 0) return -1;
-      set_handle(&g_alloc[gi], newmc);
-      groups++;
-    } else if (g_alloc[gi].kind == KIND_IMP) {
-      if (g_alloc[gi].ctx) r_cuCtxSetCurrent(g_alloc[gi].ctx);
-      CUmemGenericAllocationHandle newh = 0;
-      if (reimport(gi, &newh) != 0) return -1;
-      set_handle(&g_alloc[gi], newh);
-      imports++;
-    }
-  }
-
-  /* Phase 3: replay AddDevice and binds, and re-map every VA at its identical
-   * address. */
-  for (int gi = 0; gi < MAXN; gi++) {
-    if (g_alloc[gi].kind != KIND_MC && g_alloc[gi].kind != KIND_IMP) continue;
-    if (g_alloc[gi].ctx) r_cuCtxSetCurrent(g_alloc[gi].ctx);
-    if (g_alloc[gi].kind == KIND_MC) {
-      CUmemGenericAllocationHandle mc = g_alloc[gi].handle;
-      for (int d = 0; d < g_alloc[gi].ndev; d++)
-        if (r_cuMulticastAddDevice(mc, g_alloc[gi].devs[d]) != CUDA_SUCCESS) {
-          mclog("RESUME: AddDevice dev=%d failed", g_alloc[gi].devs[d]);
-          return -1;
-        }
-      /* cuMulticastBindMem blocks until every device joins: the binds are the
-       * cross-rank barrier. */
-      for (int b = 0; b < MAXN; b++) {
-        if (!g_bind[b].used || g_bind[b].groupIdx != gi) continue;
-        if (g_bind[b].ctx) r_cuCtxSetCurrent(g_bind[b].ctx);
-        CUresult rc =
-            g_bind[b].by_addr
-                ? r_cuMulticastBindAddr(mc, g_bind[b].mcOffset, g_bind[b].va,
-                                        g_bind[b].size, 0)
-                : r_cuMulticastBindMem(mc, g_bind[b].mcOffset,
-                                       xlate_mc(g_bind[b].mem),
-                                       g_bind[b].memOffset, g_bind[b].size, 0);
-        if (rc != CUDA_SUCCESS) {
-          mclog("RESUME: re-bind (%s) rc=%d",
-                g_bind[b].by_addr ? "addr" : "mem", rc);
-          return -1;
-        }
-        rebound++;
-      }
-      if (remap_alloc(gi, mc, "MC", &remapped) != 0) return -1;
-    } else {
-      if (remap_alloc(gi, g_alloc[gi].handle, "UC-import", &remapped) != 0)
+    } else if (a->kind == KIND_UC && a->has_key) {
+      /* Resident P2P exporter: publish the handle importers fetch. */
+      CUmemGenericAllocationHandle h;
+      int held;
+      if (hold_handle(gi, &h, &held) != 0) {
+        mclog("RESUME: no handle for resident export idx=%d", gi);
         return -1;
+      }
+      int rc = reexport(gi, h);
+      if (held) r_cuMemRelease(h);
+      if (rc != 0) return -1;
+      published++;
     }
   }
 
-  if (saved) r_cuCtxSetCurrent(saved);
-  if (r_cuCtxSynchronize) r_cuCtxSynchronize();
+  /* Phase 2: importers fetch and re-import. */
+  for (int gi = 0; gi < MAXN; gi++) {
+    Alloc* a = &g_alloc[gi];
+    if ((a->kind == KIND_MC && a->imported) || a->kind == KIND_IMP) {
+      if (reimport(gi) != 0) return -1;
+      if (a->kind == KIND_MC)
+        groups++;
+      else
+        imports++;
+    }
+  }
+
+  /* Phase 3a: re-add devices. AddDevice does not block. */
+  for (int gi = 0; gi < MAXN; gi++) {
+    Alloc* a = &g_alloc[gi];
+    if (a->kind != KIND_MC) continue;
+    for (int d = 0; d < a->ndev; d++)
+      if (use_dev(a->dev) != 0 ||
+          r_cuMulticastAddDevice(a->handle, a->devs[d]) != CUDA_SUCCESS) {
+        mclog("RESUME: AddDevice dev=%d failed", a->devs[d]);
+        return -1;
+      }
+  }
+
+  /* Phase 3b: re-bind. */
+  for (int b = 0; b < MAXN; b++) {
+    Bind* bp = &g_bind[b];
+    if (!bp->used) continue;
+    CUmemGenericAllocationHandle mc = g_alloc[bp->groupIdx].handle, mem = 0;
+    int held = 0;
+    if (!bp->by_addr && hold_handle(bp->memIdx, &mem, &held) != 0) {
+      mclog("RESUME: no handle for bound memory idx=%d", bp->memIdx);
+      return -1;
+    }
+    CUresult rc = use_dev(bp->dev);
+    if (rc == 0) {
+      if (bp->v2 && bp->by_addr)
+        rc = r_cuMulticastBindAddr_v2(mc, bp->dev, bp->mcOffset, bp->va,
+                                      bp->size, 0);
+      else if (bp->v2)
+        rc = r_cuMulticastBindMem_v2(mc, bp->dev, bp->mcOffset, mem,
+                                     bp->memOffset, bp->size, 0);
+      else if (bp->by_addr)
+        rc = r_cuMulticastBindAddr(mc, bp->mcOffset, bp->va, bp->size, 0);
+      else
+        rc = r_cuMulticastBindMem(mc, bp->mcOffset, mem, bp->memOffset,
+                                  bp->size, 0);
+    }
+    if (held) r_cuMemRelease(mem);
+    if (rc != CUDA_SUCCESS) {
+      mclog("RESUME: re-bind (%s%s, dev=%d) rc=%d",
+            bp->by_addr ? "addr" : "mem", bp->v2 ? "_v2" : "", bp->dev, rc);
+      return -1;
+    }
+    rebound++;
+  }
+
+  /* Phase 3c: re-map groups and imports at their identical addresses. */
+  for (int gi = 0; gi < MAXN; gi++) {
+    int k = g_alloc[gi].kind;
+    if ((k == KIND_MC || k == KIND_IMP) &&
+        remap_alloc(gi, k == KIND_MC ? "MC" : "import", &remapped) != 0)
+      return -1;
+  }
+
+  /* Phase 4: hand the references back. The shim's one reference stands for
+   * the first of the application's; more are retained from a mapping. */
+  for (int gi = 0; gi < MAXN; gi++) {
+    Alloc* a = &g_alloc[gi];
+    if (a->kind == KIND_FREE || !a->shim_ref) continue;
+    if (use_dev(a->dev) != 0) return -1;
+    CUresult rc = CUDA_SUCCESS;
+    if (a->app_refs == 0) rc = r_cuMemRelease(a->handle);
+    int m = first_map(gi);
+    for (int k = 1; k < a->app_refs && rc == CUDA_SUCCESS; k++) {
+      CUmemGenericAllocationHandle h = 0;
+      rc = m < 0 ? -1
+                 : r_cuMemRetainAllocationHandle(&h,
+                                                 (void*)(uintptr_t)g_map[m].va);
+      if (rc == CUDA_SUCCESS && h != a->handle) rc = -1;
+    }
+    if (rc != CUDA_SUCCESS) {
+      mclog("RESUME: restoring %d reference(s) to idx=%d rc=%d", a->app_refs,
+            gi, rc);
+      return -1;
+    }
+    a->shim_ref = 0;
+  }
+
   mclog(
       "RESUME done: groups=%d imports=%d published=%d rebound=%d "
       "remapped=%d",
       groups, imports, published, rebound, remapped);
   return 0;
+}
+
+/* Must hold g_lock. Run a transition with the caller's context restored and
+ * the primary contexts released afterwards. */
+static int run_transition(int (*fn)(void)) {
+  CUcontext saved = NULL;
+  r_cuCtxGetCurrent(&saved);
+  int rc = fn();
+  r_cuCtxSetCurrent(saved);
+  release_devs();
+  return rc;
+}
+
+/* Lookup interposition: torch, NCCL and ctypes resolve driver entry points with
+ * dlsym, cuGetProcAddress or cudart's resolvers, bypassing symbol
+ * interposition. The address a lookup returns identifies the exact exported
+ * symbol, and so its ABI version, so it is redirected to the wrapper of that
+ * symbol. */
+
+CUresult cuGetProcAddress(const char*, void**, int, unsigned long long);
+CUresult cuGetProcAddress_v2(const char*, void**, int, unsigned long long,
+                             int*);
+static CUresult (*r_cuGetProcAddress)(const char*, void**, int,
+                                      unsigned long long);
+static CUresult (*r_cuGetProcAddress_v2)(const char*, void**, int,
+                                         unsigned long long, int*);
+
+typedef struct {
+  const char* name;
+  void* wrapper;
+  void** real;
+  int tracked; /* an unknown ABI of this entry point refuses checkpoints */
+} Hook;
+
+#define HOOK(name, tracked) {#name, (void*)name, (void**)&r_##name, tracked},
+#define GATED_HOOK(name, sfx, proto, args) HOOK(name, 1) HOOK(name##sfx, 1)
+#define REFUSED_HOOK(name, proto, args, why) HOOK(name, 1)
+
+static const Hook g_hooks[] = {
+    HOOK(cuInit, 0)                                 /**/
+    HOOK(cuDeviceGetAttribute, 0)                   /**/
+    HOOK(cuGetProcAddress, 0)                       /**/
+    HOOK(cuGetProcAddress_v2, 0)                    /**/
+    HOOK(cuMemCreate, 1)                            /**/
+    HOOK(cuMemRelease, 1)                           /**/
+    HOOK(cuMemMap, 1)                               /**/
+    HOOK(cuMemUnmap, 1)                             /**/
+    HOOK(cuMemSetAccess, 1)                         /**/
+    HOOK(cuMemRetainAllocationHandle, 1)            /**/
+    HOOK(cuMemGetAllocationPropertiesFromHandle, 1) /**/
+    HOOK(cuMemExportToShareableHandle, 1)           /**/
+    HOOK(cuMemImportFromShareableHandle, 1)         /**/
+    HOOK(cuMemMapArrayAsync, 1)                     /**/
+    HOOK(cuMemMapArrayAsync_ptsz, 1)                /**/
+    HOOK(cuMulticastCreate, 1)                      /**/
+    HOOK(cuMulticastAddDevice, 1)                   /**/
+    HOOK(cuMulticastBindMem, 1)                     /**/
+    HOOK(cuMulticastBindAddr, 1)                    /**/
+    HOOK(cuMulticastBindMem_v2, 1)                  /**/
+    HOOK(cuMulticastBindAddr_v2, 1)                 /**/
+    HOOK(cuMulticastUnbind, 1)                      /**/
+    GATED_LIST(GATED_HOOK)                          /**/
+    WAIT_LIST(GATED_HOOK)                           /**/
+    REFUSED_LIST(REFUSED_HOOK)                      /**/
+};
+#define NHOOKS ((int)(sizeof(g_hooks) / sizeof(g_hooks[0])))
+
+static void resolve_hooks(void) {
+  static int done;
+  if (__atomic_load_n(&done, __ATOMIC_ACQUIRE)) return;
+  init_real_dlsym();
+  void* h = libcuda_handle();
+  if (!real_dlsym || !h) return;
+  for (int i = 0; i < NHOOKS; i++)
+    if (!*g_hooks[i].real) *g_hooks[i].real = real_dlsym(h, g_hooks[i].name);
+  resolve_internal();
+  __atomic_store_n(&done, 1, __ATOMIC_RELEASE);
+}
+
+/* Length of name without a _ptsz/_ptds suffix and then a _v<N> suffix. */
+static size_t base_len(const char* name, int* suffixed) {
+  size_t n = strlen(name);
+  *suffixed = 0;
+  if (n > 5 && (strcmp(name + n - 5, "_ptsz") == 0 ||
+                strcmp(name + n - 5, "_ptds") == 0)) {
+    n -= 5;
+    *suffixed = 1;
+  }
+  size_t k = n;
+  while (k > 0 && name[k - 1] >= '0' && name[k - 1] <= '9') k--;
+  if (k < n && k >= 2 && name[k - 1] == 'v' && name[k - 2] == '_') {
+    n = k - 2;
+    *suffixed = 1;
+  }
+  return n;
+}
+
+/* Whether symbol is a variant of a tracked entry point. Unsuffixed dlsym names
+ * are the pre-3.2 32-bit ABI where a newer one exists; nothing resolves those
+ * through the driver resolvers. */
+static int tracked_symbol(const char* symbol, int from_resolver) {
+  int suffixed, hsuffixed;
+  size_t n = base_len(symbol, &suffixed);
+  if (!suffixed && !from_resolver) return 0;
+  for (int i = 0; i < NHOOKS; i++) {
+    if (!g_hooks[i].tracked) continue;
+    size_t hn = base_len(g_hooks[i].name, &hsuffixed);
+    if (hn == n && strncmp(g_hooks[i].name, symbol, n) == 0) return 1;
+  }
+  return 0;
+}
+
+/* The wrapper for the libcuda function at p, or p. */
+static void* redirect(const char* symbol, void* p, int from_resolver) {
+  if (!p) return p;
+  for (int i = 0; i < NHOOKS; i++)
+    if (g_hooks[i].wrapper == p) return p;
+  if (!libcuda_loaded()) return p;
+  resolve_hooks();
+  for (int i = 0; i < NHOOKS; i++)
+    if (*g_hooks[i].real == p) return g_hooks[i].wrapper;
+  if (symbol && tracked_symbol(symbol, from_resolver)) {
+    const char* prev = NULL;
+    if (__atomic_compare_exchange_n(&g_bad_lookup, &prev,
+                                    "lookup of an unknown ABI version of a "
+                                    "tracked entry point",
+                                    0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+      mclog(
+          "NOTE: checkpoint disabled for this process: no wrapper for the "
+          "ABI %s resolved to",
+          symbol);
+  }
+  return p;
+}
+
+CUresult cuGetProcAddress(const char* symbol, void** pfn, int cudaVersion,
+                          unsigned long long flags) {
+  REAL(r_cuGetProcAddress, "cuGetProcAddress");
+  if (!r_cuGetProcAddress) return CUDA_ERROR_NOT_INITIALIZED;
+  CUresult rc = r_cuGetProcAddress(symbol, pfn, cudaVersion, flags);
+  if (rc == CUDA_SUCCESS && pfn) *pfn = redirect(symbol, *pfn, 1);
+  return rc;
+}
+
+CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion,
+                             unsigned long long flags, int* symbolStatus) {
+  REAL(r_cuGetProcAddress_v2, "cuGetProcAddress_v2");
+  if (!r_cuGetProcAddress_v2) return CUDA_ERROR_NOT_INITIALIZED;
+  CUresult rc =
+      r_cuGetProcAddress_v2(symbol, pfn, cudaVersion, flags, symbolStatus);
+  if (rc == CUDA_SUCCESS && pfn) *pfn = redirect(symbol, *pfn, 1);
+  return rc;
+}
+
+/* Interposed cudart resolvers. torch >= 2.11 resolves its driver API through
+ * cudaGetDriverEntryPointByVersion, and cudart reaches libcuda by a path
+ * neither hook sees, so interpose the resolver, let cudart look the symbol up,
+ * and redirect the result. The reals live in libcudart: resolve via RTLD_NEXT,
+ * then in an already-loaded libcudart (torch dlopens it RTLD_LOCAL). Never
+ * force-load it. */
+
+#define CUDA_ERROR_RT_SYMBOL_NOT_FOUND 500 /* cudaErrorSymbolNotFound */
+
+static void* libcudart_sym(const char* name) {
+  init_real_dlsym();
+  if (!real_dlsym) return NULL;
+  void* s = real_dlsym(RTLD_NEXT, name);
+  if (s) return s;
+  static void* h;
+  if (!h) {
+    static const char* const sonames[] = {"libcudart.so.13", "libcudart.so.12",
+                                          "libcudart.so.11.0", "libcudart.so",
+                                          NULL};
+    for (int i = 0; !h && sonames[i]; i++)
+      h = dlopen(sonames[i], RTLD_NOW | RTLD_NOLOAD);
+  }
+  return h ? real_dlsym(h, name) : NULL;
+}
+
+#define RTREAL(var, name)                                \
+  do {                                                   \
+    if (!(var)) *(void**)(&(var)) = libcudart_sym(name); \
+  } while (0)
+
+int cudaGetDriverEntryPoint(const char* symbol, void** pfn,
+                            unsigned long long flags, int* driverStatus) {
+  static int (*real)(const char*, void**, unsigned long long, int*);
+  RTREAL(real, "cudaGetDriverEntryPoint");
+  if (!real) return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
+  int rc = real(symbol, pfn, flags, driverStatus);
+  if (rc == 0 && pfn) *pfn = redirect(symbol, *pfn, 1);
+  return rc;
+}
+
+int cudaGetDriverEntryPoint_ptsz(const char* symbol, void** pfn,
+                                 unsigned long long flags, int* driverStatus) {
+  static int (*real)(const char*, void**, unsigned long long, int*);
+  RTREAL(real, "cudaGetDriverEntryPoint_ptsz");
+  if (!real) return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
+  int rc = real(symbol, pfn, flags, driverStatus);
+  if (rc == 0 && pfn) *pfn = redirect(symbol, *pfn, 1);
+  return rc;
+}
+
+int cudaGetDriverEntryPointByVersion(const char* symbol, void** pfn,
+                                     unsigned int cudaVersion,
+                                     unsigned long long flags,
+                                     int* driverStatus) {
+  static int (*real)(const char*, void**, unsigned int, unsigned long long,
+                     int*);
+  RTREAL(real, "cudaGetDriverEntryPointByVersion");
+  if (!real) return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
+  int rc = real(symbol, pfn, cudaVersion, flags, driverStatus);
+  if (rc == 0 && pfn) *pfn = redirect(symbol, *pfn, 1);
+  return rc;
+}
+
+int cudaGetDriverEntryPointByVersion_ptsz(const char* symbol, void** pfn,
+                                          unsigned int cudaVersion,
+                                          unsigned long long flags,
+                                          int* driverStatus) {
+  static int (*real)(const char*, void**, unsigned int, unsigned long long,
+                     int*);
+  RTREAL(real, "cudaGetDriverEntryPointByVersion_ptsz");
+  if (!real) return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
+  int rc = real(symbol, pfn, cudaVersion, flags, driverStatus);
+  if (rc == 0 && pfn) *pfn = redirect(symbol, *pfn, 1);
+  return rc;
+}
+
+/* Covers apps that dlsym the resolvers from a dlopen'd libcudart. */
+static void* cudart_wrapper(const char* name) {
+  static const struct {
+    const char* name;
+    void* fn;
+  } t[] = {
+      {"cudaGetDriverEntryPoint", (void*)cudaGetDriverEntryPoint},
+      {"cudaGetDriverEntryPoint_ptsz", (void*)cudaGetDriverEntryPoint_ptsz},
+      {"cudaGetDriverEntryPointByVersion",
+       (void*)cudaGetDriverEntryPointByVersion},
+      {"cudaGetDriverEntryPointByVersion_ptsz",
+       (void*)cudaGetDriverEntryPointByVersion_ptsz},
+  };
+  for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++)
+    if (strcmp(t[i].name, name) == 0) return t[i].fn;
+  return NULL;
+}
+
+/* Interposed dlsym. Delegating through a dlvsym-resolved dlsym re-anchors
+ * RTLD_NEXT at mcshim, which can confuse interposers stacked after it. */
+void* dlsym(void* handle, const char* symbol) {
+  init_real_dlsym();
+  if (!real_dlsym) return NULL;
+  void* r = real_dlsym(handle, symbol);
+  if (!r || symbol[0] != 'c' || symbol[1] != 'u') return r;
+  if (strncmp(symbol, "cudaGetDriverEntryPoint", 23) == 0) {
+    void* w = cudart_wrapper(symbol);
+    return w ? w : r;
+  }
+  return redirect(symbol, r, 0);
 }
 
 /* Control thread: polls /tmp/mcshim for markers. */
@@ -1321,465 +2230,117 @@ static void marker_write(const char* name, const char* body) {
   }
 }
 
-/* Lookup interposition: torch, NCCL and ctypes resolve driver entry points with
- * dlsym or cuGetProcAddress, bypassing symbol interposition, so tracked names
- * are redirected to the wrappers. */
-
-/* Suspend gate. While suspended, multicast groups and imports are released and
- * their VAs unmapped: an app thread touching the GPU then faults its context
- * (700), and through a shared group every rank. cuda-checkpoint --toggle
- * restores and unlocks the app before the rebuild, so the entry points that
- * submit GPU work block until it completes. The shim's own work calls the
- * reals. */
-
-static pthread_mutex_t g_gate_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_gate_cv = PTHREAD_COND_INITIALIZER;
-
-/* Arm before the teardown, so that no app thread slips in before the first
- * unmap. gate_wait reads g_suspended locklessly, so transitions are atomic
- * stores. */
-static void gate_arm(void) {
-  pthread_mutex_lock(&g_gate_lock);
-  __atomic_store_n(&g_suspended, 1, __ATOMIC_SEQ_CST);
-  pthread_mutex_unlock(&g_gate_lock);
-}
-
-static void gate_disarm(void) {
-  pthread_mutex_lock(&g_gate_lock);
-  __atomic_store_n(&g_suspended, 0, __ATOMIC_SEQ_CST);
-  pthread_cond_broadcast(&g_gate_cv);
-  pthread_mutex_unlock(&g_gate_lock);
-}
-
-static void gate_wait(void) {
-  /* fast path: one load on every GPU submission */
-  if (!__atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST)) return;
-  static __thread int logged;
-  pthread_mutex_lock(&g_gate_lock);
-  if (g_suspended && !logged) {
-    logged = 1;
-    mclog("GATE: app thread blocked until resume");
-  }
-  while (g_suspended) pthread_cond_wait(&g_gate_cv, &g_gate_lock);
-  pthread_mutex_unlock(&g_gate_lock);
-}
-
-/* Entry points that submit GPU work or wait on it: block while suspended, then
- * forward. Tracked mutators call gate_wait() too, so that nothing creates or
- * frees shared state after the strict blocker check. Suspend and resume use the
- * reals, so gating cannot deadlock them. */
-#define GATED(name, proto, args)                            \
-  static CUresult(*r_##name) proto;                         \
-  CUresult name proto;                                      \
-  CUresult name proto {                                     \
-    REAL(r_##name, #name);                                  \
-    if (!r_##name) return 1 /* CUDA_ERROR_INVALID_VALUE */; \
-    gate_wait();                                            \
-    return r_##name args;                                   \
-  }
-
-typedef void* CUstream_t;
-typedef void* CUfunction_t;
-typedef void* CUgraphExec_t;
-typedef void* CUhostFn_t;
-
-GATED(cuLaunchKernel,
-      (CUfunction_t f, unsigned gx, unsigned gy, unsigned gz, unsigned bx,
-       unsigned by, unsigned bz, unsigned shmem, CUstream_t st, void** kp,
-       void** extra),
-      (f, gx, gy, gz, bx, by, bz, shmem, st, kp, extra))
-GATED(cuLaunchKernelEx,
-      (const void* cfg, CUfunction_t f, void** kp, void** extra),
-      (cfg, f, kp, extra))
-GATED(cuLaunchCooperativeKernel,
-      (CUfunction_t f, unsigned gx, unsigned gy, unsigned gz, unsigned bx,
-       unsigned by, unsigned bz, unsigned shmem, CUstream_t st, void** kp),
-      (f, gx, gy, gz, bx, by, bz, shmem, st, kp))
-GATED(cuGraphLaunch, (CUgraphExec_t g, CUstream_t st), (g, st))
-GATED(cuMemsetD32_v2, (CUdeviceptr d, unsigned ui, size_t n), (d, ui, n))
-GATED(cuMemsetD32Async, (CUdeviceptr d, unsigned ui, size_t n, CUstream_t st),
-      (d, ui, n, st))
-GATED(cuMemsetD8_v2, (CUdeviceptr d, unsigned char uc, size_t n), (d, uc, n))
-GATED(cuMemsetD8Async,
-      (CUdeviceptr d, unsigned char uc, size_t n, CUstream_t st),
-      (d, uc, n, st))
-GATED(cuMemcpyAsync,
-      (CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream_t st),
-      (dst, src, n, st))
-GATED(cuMemcpyHtoD_v2, (CUdeviceptr dst, const void* src, size_t n),
-      (dst, src, n))
-GATED(cuMemcpyDtoH_v2, (void* dst, CUdeviceptr src, size_t n), (dst, src, n))
-GATED(cuMemcpyHtoDAsync_v2,
-      (CUdeviceptr dst, const void* src, size_t n, CUstream_t st),
-      (dst, src, n, st))
-GATED(cuMemcpyDtoHAsync_v2,
-      (void* dst, CUdeviceptr src, size_t n, CUstream_t st), (dst, src, n, st))
-GATED(cuMemcpyDtoD_v2, (CUdeviceptr dst, CUdeviceptr src, size_t n),
-      (dst, src, n))
-GATED(cuMemcpyDtoDAsync_v2,
-      (CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream_t st),
-      (dst, src, n, st))
-GATED(cuMemcpy2D_v2, (const void* pCopy), (pCopy))
-GATED(cuMemcpy2DAsync_v2, (const void* pCopy, CUstream_t st), (pCopy, st))
-GATED(cuMemcpy3D_v2, (const void* pCopy), (pCopy))
-GATED(cuMemcpy3DAsync_v2, (const void* pCopy, CUstream_t st), (pCopy, st))
-GATED(cuMemsetD16_v2, (CUdeviceptr d, unsigned short us, size_t n), (d, us, n))
-GATED(cuMemsetD16Async,
-      (CUdeviceptr d, unsigned short us, size_t n, CUstream_t st),
-      (d, us, n, st))
-GATED(cuLaunchHostFunc, (CUstream_t st, CUhostFn_t fn, void* userData),
-      (st, fn, userData))
-GATED(cuStreamSynchronize, (CUstream_t st), (st))
-
-CUresult cuGetProcAddress(const char*, void**, int, unsigned long long);
-CUresult cuGetProcAddress_v2(const char*, void**, int, unsigned long long,
-                             int*);
-/* CUDA runtime resolvers (cudaError_t and the query-result enum are plain
- * ints in this toolkit-free build; 0 is success for both). */
-int cudaGetDriverEntryPoint(const char*, void**, unsigned long long, int*);
-int cudaGetDriverEntryPoint_ptsz(const char*, void**, unsigned long long, int*);
-int cudaGetDriverEntryPointByVersion(const char*, void**, unsigned int,
-                                     unsigned long long, int*);
-int cudaGetDriverEntryPointByVersion_ptsz(const char*, void**, unsigned int,
-                                          unsigned long long, int*);
-
 typedef struct {
-  const char* name;
-  void* fn;
-  /* Wrappers forward to the legacy-stream real, so PTDS lookups are not
-   * redirected to them (see gpa_redirect). */
-  int stream_sem;
-} WrapEntry;
+  char suspended[64], resumed[64], error[64], gated[64];
+} Acks;
 
-static const WrapEntry* wrap_table(void) {
-  static WrapEntry t[] = {
-      {"cuMemCreate", (void*)cuMemCreate, 0},
-      {"cuMemRelease", (void*)cuMemRelease, 0},
-      {"cuMemMap", (void*)cuMemMap, 0},
-      {"cuMemUnmap", (void*)cuMemUnmap, 0},
-      {"cuMemSetAccess", (void*)cuMemSetAccess, 0},
-      {"cuMulticastCreate", (void*)cuMulticastCreate, 0},
-      {"cuMulticastAddDevice", (void*)cuMulticastAddDevice, 0},
-      {"cuMulticastBindMem", (void*)cuMulticastBindMem, 0},
-      {"cuMulticastBindAddr", (void*)cuMulticastBindAddr, 0},
-      {"cuMulticastUnbind", (void*)cuMulticastUnbind, 0},
-      {"cuInit", (void*)cuInit, 0},
-      {"cuMemExportToShareableHandle", (void*)cuMemExportToShareableHandle, 0},
-      {"cuMemImportFromShareableHandle", (void*)cuMemImportFromShareableHandle,
-       0},
-      {"cuDeviceGetAttribute", (void*)cuDeviceGetAttribute, 0},
-
-      {"cuLaunchKernel", (void*)cuLaunchKernel, 1},
-      {"cuLaunchKernelEx", (void*)cuLaunchKernelEx, 1},
-      {"cuLaunchCooperativeKernel", (void*)cuLaunchCooperativeKernel, 1},
-      {"cuGraphLaunch", (void*)cuGraphLaunch, 1},
-      {"cuLaunchHostFunc", (void*)cuLaunchHostFunc, 1},
-      {"cuMemsetD32", (void*)cuMemsetD32_v2, 1},
-      {"cuMemsetD32_v2", (void*)cuMemsetD32_v2, 1},
-      {"cuMemsetD32Async", (void*)cuMemsetD32Async, 1},
-      {"cuMemsetD16", (void*)cuMemsetD16_v2, 1},
-      {"cuMemsetD16_v2", (void*)cuMemsetD16_v2, 1},
-      {"cuMemsetD16Async", (void*)cuMemsetD16Async, 1},
-      {"cuMemsetD8", (void*)cuMemsetD8_v2, 1},
-      {"cuMemsetD8_v2", (void*)cuMemsetD8_v2, 1},
-      {"cuMemsetD8Async", (void*)cuMemsetD8Async, 1},
-      {"cuMemcpyAsync", (void*)cuMemcpyAsync, 1},
-      {"cuMemcpyHtoD", (void*)cuMemcpyHtoD_v2, 1},
-      {"cuMemcpyHtoD_v2", (void*)cuMemcpyHtoD_v2, 1},
-      {"cuMemcpyDtoH", (void*)cuMemcpyDtoH_v2, 1},
-      {"cuMemcpyDtoH_v2", (void*)cuMemcpyDtoH_v2, 1},
-      {"cuMemcpyDtoD", (void*)cuMemcpyDtoD_v2, 1},
-      {"cuMemcpyDtoD_v2", (void*)cuMemcpyDtoD_v2, 1},
-      {"cuMemcpyHtoDAsync", (void*)cuMemcpyHtoDAsync_v2, 1},
-      {"cuMemcpyHtoDAsync_v2", (void*)cuMemcpyHtoDAsync_v2, 1},
-      {"cuMemcpyDtoHAsync", (void*)cuMemcpyDtoHAsync_v2, 1},
-      {"cuMemcpyDtoHAsync_v2", (void*)cuMemcpyDtoHAsync_v2, 1},
-      {"cuMemcpyDtoDAsync", (void*)cuMemcpyDtoDAsync_v2, 1},
-      {"cuMemcpyDtoDAsync_v2", (void*)cuMemcpyDtoDAsync_v2, 1},
-      {"cuMemcpy2D", (void*)cuMemcpy2D_v2, 1},
-      {"cuMemcpy2D_v2", (void*)cuMemcpy2D_v2, 1},
-      {"cuMemcpy2DAsync", (void*)cuMemcpy2DAsync_v2, 1},
-      {"cuMemcpy2DAsync_v2", (void*)cuMemcpy2DAsync_v2, 1},
-      {"cuMemcpy3D", (void*)cuMemcpy3D_v2, 1},
-      {"cuMemcpy3D_v2", (void*)cuMemcpy3D_v2, 1},
-      {"cuMemcpy3DAsync", (void*)cuMemcpy3DAsync_v2, 1},
-      {"cuMemcpy3DAsync_v2", (void*)cuMemcpy3DAsync_v2, 1},
-      {"cuStreamSynchronize", (void*)cuStreamSynchronize, 1},
-      {"cuGetProcAddress", (void*)cuGetProcAddress, 0},
-      {"cuGetProcAddress_v2", (void*)cuGetProcAddress_v2, 0},
-      /* Covers apps that dlsym these from a dlopen'd libcudart. */
-      {"cudaGetDriverEntryPoint", (void*)cudaGetDriverEntryPoint, 0},
-      {"cudaGetDriverEntryPoint_ptsz", (void*)cudaGetDriverEntryPoint_ptsz, 0},
-      {"cudaGetDriverEntryPointByVersion",
-       (void*)cudaGetDriverEntryPointByVersion, 0},
-      {"cudaGetDriverEntryPointByVersion_ptsz",
-       (void*)cudaGetDriverEntryPointByVersion_ptsz, 0},
-      {NULL, NULL, 0},
-  };
-  return t;
-}
-
-static const WrapEntry* wrap_entry(const char* name) {
-  if (!name) return NULL;
-  for (const WrapEntry* e = wrap_table(); e->name; e++)
-    if (strcmp(e->name, name) == 0) return e;
-  return NULL;
-}
-
-static void* wrapper_for(const char* name) {
-  const WrapEntry* e = wrap_entry(name);
-  return e ? e->fn : NULL;
-}
-
-/* Interposed dlsym: hand out wrappers for tracked driver symbols. Delegating
- * through a dlvsym-resolved dlsym re-anchors RTLD_NEXT at mcshim, which can
- * confuse interposers stacked after it. */
-void* dlsym(void* handle, const char* symbol) {
-  init_real_dlsym();
-  if (!real_dlsym) return NULL;
-  void* w = wrapper_for(symbol);
-  if (w) {
-    /* Redirect only if the library has the symbol, so feature probes still
-     * work. */
-    void* r = real_dlsym(handle, symbol);
-    if (r) return w;
-    return r;
+/* The gate appeared: arm, drain, and check that the state can be carried,
+ * before any process tears anything down, so the sentry can still unwind. The
+ * sentry arms the gate before it locks the processes. */
+static void on_gate_up(const Acks* k) {
+  const char* why = NULL;
+  if (gate_arm() != 0) why = "application CUDA calls did not drain";
+  pthread_mutex_lock(&g_lock);
+  resolve_hooks();
+  int broken = g_broken;
+  if (!why && !broken) why = can_carry();
+  pthread_mutex_unlock(&g_lock);
+  if (broken) {
+    marker_write(k->error, "an earlier transition failed");
+  } else if (why) {
+    gate_disarm();
+    mclog("GATE: refusing: %s", why);
+    marker_write(k->error, why);
+  } else {
+    marker_write(k->gated, "ok");
   }
-  return real_dlsym(handle, symbol);
 }
 
-/* Interposed cuGetProcAddress. A lookup of "cuGetProcAddress" at cudaVersion >=
- * 12000 expects the 5-argument v2 ABI, so it must get the v2 wrapper: the v1
- * wrapper leaves symbolStatus unwritten, and NCCL then treats every symbol as
- * missing. */
-
-#define CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM (1ULL << 1)
-
-static void* gpa_redirect(const char* symbol, int cudaVersion,
-                          unsigned long long flags) {
-  if (strcmp(symbol, "cuGetProcAddress") == 0)
-    return cudaVersion >= 12000 ? (void*)cuGetProcAddress_v2
-                                : (void*)cuGetProcAddress;
-  const WrapEntry* e = wrap_entry(symbol);
-  if (!e) return NULL;
-  /* A PTDS lookup of a stream-sensitive entry gets the driver's own pfn, since
-   * the wrapper would change NULL-stream semantics. Such apps are not gated on
-   * these entries. */
-  if (e->stream_sem && (flags & CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM))
-    return NULL;
-  return e->fn;
-}
-
-CUresult cuGetProcAddress(const char* symbol, void** pfn, int cudaVersion,
-                          unsigned long long flags) {
-  static CUresult (*real)(const char*, void**, int, unsigned long long);
-  REAL(real, "cuGetProcAddress");
-  if (!real) return 3; /* CUDA_ERROR_NOT_INITIALIZED */
-  CUresult rc = real(symbol, pfn, cudaVersion, flags);
-  void* w;
-  if (rc == CUDA_SUCCESS && pfn && *pfn &&
-      (w = gpa_redirect(symbol, cudaVersion, flags))) {
-    *pfn = w;
+static void on_gate_down(const Acks* k) {
+  pthread_mutex_lock(&g_lock);
+  int broken = g_broken;
+  /* Every process has resumed: withdraw the published fds. */
+  if (!broken) unpublish_all();
+  pthread_mutex_unlock(&g_lock);
+  if (broken) {
+    mclog(
+        "FATAL: refusing to release the gate after a failed transition; "
+        "the application would run over unmapped GPU state");
+    return;
   }
-  return rc;
+  gate_disarm();
+  marker_rm(k->gated);
 }
 
-CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion,
-                             unsigned long long flags, int* symbolStatus) {
-  static CUresult (*real)(const char*, void**, int, unsigned long long, int*);
-  REAL(real, "cuGetProcAddress_v2");
-  if (!real) return 3;
-  CUresult rc = real(symbol, pfn, cudaVersion, flags, symbolStatus);
-  void* w;
-  if (rc == CUDA_SUCCESS && pfn && *pfn &&
-      (w = gpa_redirect(symbol, cudaVersion, flags))) {
-    *pfn = w;
+static void on_suspend_edge(const Acks* k, int want) {
+  /* Drop a stale error ack: the sentry fails fast on error.<pid>. */
+  marker_rm(k->error);
+  /* Normally already armed and drained at the gate. */
+  int rc = want ? gate_arm() : 0;
+  pthread_mutex_lock(&g_lock);
+  resolve_hooks();
+  if (rc != 0 || g_broken) {
+    mclog("refusing: %s",
+          g_broken ? "an earlier transition failed" : "calls did not drain");
+    rc = -1;
+  } else {
+    rc = run_transition(want ? suspend_locked : resume_locked);
   }
-  return rc;
-}
-
-/* Interposed cudart resolvers. torch >= 2.11 resolves its driver API through
- * cudaGetDriverEntryPointByVersion, and cudart reaches libcuda by a path
- * neither hook sees, so interpose the resolver, let cudart look the symbol up,
- * and post-process like cuGetProcAddress. cudart's cudaEnable* values equal the
- * driver's CU_GET_PROC_ADDRESS_* bits, except that cudaEnableDefault means PTDS
- * in the _ptsz variants. The reals live in libcudart: resolve via RTLD_NEXT,
- * then in an already-loaded libcudart (torch dlopens it RTLD_LOCAL). Never
- * force-load it. */
-
-#define CUDA_ERROR_RT_SYMBOL_NOT_FOUND 500 /* cudaErrorSymbolNotFound */
-
-static void* libcudart_sym(const char* name) {
-  init_real_dlsym();
-  if (!real_dlsym) return NULL;
-  void* s = real_dlsym(RTLD_NEXT, name);
-  if (s) return s;
-  static void* h;
-  if (!h) {
-    static const char* const sonames[] = {"libcudart.so.13", "libcudart.so.12",
-                                          "libcudart.so.11.0", "libcudart.so",
-                                          NULL};
-    for (int i = 0; !h && sonames[i]; i++)
-      h = dlopen(sonames[i], RTLD_NOW | RTLD_NOLOAD);
+  /* A failure leaves this process torn down partway, and its peers may have
+   * released state it needs, so it stays gated for good: better blocked than
+   * corrupt. The sentry does not unwind it. */
+  if (rc != 0) g_broken = 1;
+  pthread_mutex_unlock(&g_lock);
+  if (rc != 0) {
+    marker_write(k->error, want ? "suspend failed" : "resume failed");
+  } else if (want) {
+    marker_rm(k->resumed);
+    marker_write(k->suspended, "ok");
+  } else {
+    gate_disarm();
+    marker_rm(k->suspended);
+    marker_write(k->resumed, "ok");
   }
-  return h ? real_dlsym(h, name) : NULL;
 }
 
-#define RTREAL(var, name)                                \
-  do {                                                   \
-    if (!(var)) *(void**)(&(var)) = libcudart_sym(name); \
-  } while (0)
-
-/* cudaEnableDefault in a _ptsz resolver means PTDS. */
-static unsigned long long rt_eff_flags(unsigned long long flags, int ptsz) {
-  if (ptsz && flags == 0) return CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM;
-  return flags;
-}
-
-/* The unversioned resolver follows the runtime's own ABI generation, and cudart
- * >= 12.0 means the v2-era driver ABI. */
-static void rt_gpa_post(const char* symbol, void** pfn, int cudaVersion,
-                        unsigned long long flags) {
-  void* w;
-  if (pfn && *pfn && (w = gpa_redirect(symbol, cudaVersion, flags))) *pfn = w;
-}
-
-int cudaGetDriverEntryPoint(const char* symbol, void** pfn,
-                            unsigned long long flags, int* driverStatus) {
-  static int (*real)(const char*, void**, unsigned long long, int*);
-  RTREAL(real, "cudaGetDriverEntryPoint");
-  if (!real) return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
-  int rc = real(symbol, pfn, flags, driverStatus);
-  if (rc == 0) rt_gpa_post(symbol, pfn, 12000, rt_eff_flags(flags, 0));
-  return rc;
-}
-
-int cudaGetDriverEntryPoint_ptsz(const char* symbol, void** pfn,
-                                 unsigned long long flags, int* driverStatus) {
-  static int (*real)(const char*, void**, unsigned long long, int*);
-  RTREAL(real, "cudaGetDriverEntryPoint_ptsz");
-  if (!real) return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
-  int rc = real(symbol, pfn, flags, driverStatus);
-  if (rc == 0) rt_gpa_post(symbol, pfn, 12000, rt_eff_flags(flags, 1));
-  return rc;
-}
-
-int cudaGetDriverEntryPointByVersion(const char* symbol, void** pfn,
-                                     unsigned int cudaVersion,
-                                     unsigned long long flags,
-                                     int* driverStatus) {
-  static int (*real)(const char*, void**, unsigned int, unsigned long long,
-                     int*);
-  RTREAL(real, "cudaGetDriverEntryPointByVersion");
-  if (!real) return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
-  int rc = real(symbol, pfn, cudaVersion, flags, driverStatus);
-  if (rc == 0)
-    rt_gpa_post(symbol, pfn, (int)cudaVersion, rt_eff_flags(flags, 0));
-  return rc;
-}
-
-int cudaGetDriverEntryPointByVersion_ptsz(const char* symbol, void** pfn,
-                                          unsigned int cudaVersion,
-                                          unsigned long long flags,
-                                          int* driverStatus) {
-  static int (*real)(const char*, void**, unsigned int, unsigned long long,
-                     int*);
-  RTREAL(real, "cudaGetDriverEntryPointByVersion_ptsz");
-  if (!real) return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
-  int rc = real(symbol, pfn, cudaVersion, flags, driverStatus);
-  if (rc == 0)
-    rt_gpa_post(symbol, pfn, (int)cudaVersion, rt_eff_flags(flags, 1));
-  return rc;
-}
-
-/* Edge-triggered on marker existence: "suspend" appearing suspends and acks
- * suspended.<pid>, disappearing resumes and acks resumed.<pid>, and failures
- * ack error.<pid>. The marker is in the checkpoint image, so after a restore
- * the shim stays suspended until the sentry removes it. */
+/* Edge-triggered on marker existence: "gate" appearing gates and acks
+ * gated.<pid>; "suspend" appearing suspends and acks suspended.<pid>,
+ * disappearing resumes and acks resumed.<pid>; failures ack error.<pid>. The
+ * markers are in the checkpoint image, so after a restore the shim stays
+ * suspended until the sentry removes them. */
 static void* control_thread(void* arg) {
   (void)arg;
-  char ack_s[64], ack_r[64], ack_e[64];
-  snprintf(ack_s, sizeof(ack_s), "suspended.%d", (int)getpid());
-  snprintf(ack_r, sizeof(ack_r), "resumed.%d", (int)getpid());
-  snprintf(ack_e, sizeof(ack_e), "error.%d", (int)getpid());
-  char ack_g[64];
-  snprintf(ack_g, sizeof(ack_g), "gated.%d", (int)getpid());
+  Acks k;
+  int pid = (int)getpid();
+  snprintf(k.suspended, sizeof(k.suspended), "suspended.%d", pid);
+  snprintf(k.resumed, sizeof(k.resumed), "resumed.%d", pid);
+  snprintf(k.error, sizeof(k.error), "error.%d", pid);
+  snprintf(k.gated, sizeof(k.gated), "gated.%d", pid);
   /* present.<pid> tells the sentry that this process will ack. The sentry
    * selects CUDA processes by their open NVIDIA fds, a broader set. */
   char present[64];
-  snprintf(present, sizeof(present), "present.%d", (int)getpid());
+  snprintf(present, sizeof(present), "present.%d", pid);
   /* Clear acks left by a dead process with the same pid. */
-  marker_rm(ack_s);
-  marker_rm(ack_r);
-  marker_rm(ack_e);
-  marker_rm(ack_g);
+  marker_rm(k.suspended);
+  marker_rm(k.resumed);
+  marker_rm(k.error);
+  marker_rm(k.gated);
   marker_write(present, "ok");
   mclog("control thread started (dir=%s)", g_dir);
-  int prev = 0;      /* treat startup as not-suspended */
-  int prev_gate = 0; /* and not-gated */
+  int prev = 0, prev_gate = 0;
   for (;;) {
-    /* "gate" issues no CUDA calls, so the sentry can arm it while
-     * cuda-checkpoint holds this process locked. */
     int wgate = marker_exists("gate");
     if (wgate != prev_gate) {
       prev_gate = wgate;
-      pthread_mutex_lock(&g_lock);
-      const char* untracked = g_untracked ? g_untracked_why : NULL;
-      int broken = g_broken;
-      pthread_mutex_unlock(&g_lock);
-      if (wgate && untracked) {
-        /* Refuse before any process tears anything down, so the sentry can
-         * still unwind: untracked state cannot be rebuilt. */
-        mclog("GATE: refusing: untracked state (%s)", untracked);
-        marker_write(ack_e, "untracked state");
-      } else if (wgate) {
-        gate_arm();
-        marker_write(ack_g, "ok");
-      } else if (broken) {
-        mclog(
-            "FATAL: refusing to release the gate after a failed transition; "
-            "the application would run over unmapped GPU state");
-      } else {
-        gate_disarm();
-        marker_rm(ack_g);
-        /* Every process has resumed: withdraw the published fds. */
-        pthread_mutex_lock(&g_lock);
-        unpublish_all();
-        pthread_mutex_unlock(&g_lock);
-      }
+      if (wgate)
+        on_gate_up(&k);
+      else
+        on_gate_down(&k);
     }
     int want = marker_exists("suspend");
     if (want != prev) {
       prev = want;
-      /* Drop a stale error ack: the sentry fails fast on error.<pid>. */
-      marker_rm(ack_e);
-      pthread_mutex_lock(&g_lock);
-      resolve_reals();
-      int rc = -1;
-      if (g_broken) {
-        mclog("refusing: an earlier transition failed");
-      } else if (want) {
-        /* Arm first: no app thread may reach the GPU before the last unmap. */
-        gate_arm();
-        rc = do_suspend();
-      } else {
-        rc = do_resume();
-        if (rc == 0) gate_disarm();
-      }
-      /* A failure leaves this process torn down partway, and its peers may
-       * have released state it needs, so it stays gated for good: better
-       * blocked than corrupt. The sentry does not unwind it. */
-      if (rc != 0) g_broken = 1;
-      pthread_mutex_unlock(&g_lock);
-      if (rc != 0) {
-        marker_write(ack_e, want ? "suspend failed" : "resume failed");
-      } else if (want) {
-        marker_rm(ack_r);
-        marker_write(ack_s, "ok");
-      } else {
-        marker_rm(ack_s);
-        marker_write(ack_r, "ok");
-      }
+      on_suspend_edge(&k, want);
     }
     /* Poll every 5 ms: the spread in when ranks see the gate bounds how often a
      * collective straddles it, which fails the sentry's lock. */
@@ -1791,9 +2352,9 @@ static void* control_thread(void* arg) {
 
 static int g_disabled;
 
-/* Start the control thread only in processes that resolve a tracked entry
- * point, so that helpers inheriting LD_PRELOAD (shells, runsc exec,
- * cuda-checkpoint) never consume or ack markers. */
+/* Start the control thread only in processes that initialize CUDA, so that
+ * helpers inheriting LD_PRELOAD (shells, runsc exec, cuda-checkpoint) never
+ * consume or ack markers. */
 static void control_thread_start(void) {
   if (g_disabled) return;
   pthread_t t;
@@ -1803,8 +2364,8 @@ static void control_thread_start(void) {
   else
     /* Otherwise this surfaces as an unexplained sentry ack timeout. */
     mclog(
-        "FATAL: control thread creation failed: %s -- this "
-        "process will never acknowledge suspend/resume markers",
+        "FATAL: control thread creation failed: %s -- this process will "
+        "never acknowledge suspend/resume markers",
         strerror(err));
 }
 
@@ -1829,7 +2390,10 @@ static void mcshim_atfork_child(void) {
   g_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
   g_gate_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
   g_gate_cv = (pthread_cond_t)PTHREAD_COND_INITIALIZER;
+  g_drain_cv = (pthread_cond_t)PTHREAD_COND_INITIALIZER;
   __atomic_store_n(&g_suspended, 0, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_inflight, 0, __ATOMIC_SEQ_CST);
+  memset(g_pctx, 0, sizeof(g_pctx));
   if (g_control_started) g_disabled = 1;
   for (int i = 0; i < MAXN; i++) {
     if (g_alloc[i].kind != KIND_FREE && g_alloc[i].pub_fd >= 0)
