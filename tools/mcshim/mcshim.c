@@ -1705,14 +1705,21 @@ static int suspend_locked(void) {
   for (int gi = 0; gi < MAXN; gi++) {
     if (g_alloc[gi].kind != KIND_MC) continue;
     groups++;
+    /* With no application reference, the unmap would free the group before
+     * the unbinds. */
+    CUmemGenericAllocationHandle h;
+    int held;
+    if (hold_handle(gi, &h, &held) != 0) {
+      mclog("SUSPEND: no handle for group idx=%d", gi);
+      return -1;
+    }
     if (unmap_alloc(gi, "MC", &unmapped) != 0) return -1;
     for (int b = 0; b < MAXN; b++) {
       Bind* bp = &g_bind[b];
       if (!bp->used || bp->groupIdx != gi) continue;
-      CUresult rc = use_dev(bp->dev)
-                        ? -1
-                        : r_cuMulticastUnbind(g_alloc[gi].handle, bp->dev,
-                                              bp->mcOffset, bp->size);
+      CUresult rc = use_dev(bp->dev) ? -1
+                                     : r_cuMulticastUnbind(
+                                           h, bp->dev, bp->mcOffset, bp->size);
       if (rc != CUDA_SUCCESS) {
         mclog(
             "SUSPEND: cuMulticastUnbind(dev=%d, mcOff=0x%zx, size=0x%zx) "
@@ -1722,6 +1729,7 @@ static int suspend_locked(void) {
       }
       unbound++;
     }
+    if (held && r_cuMemRelease(h) != CUDA_SUCCESS) return -1;
     if (release_refs(gi, "MC", &released) != 0) return -1;
   }
 
