@@ -946,10 +946,11 @@ static int ipc_rank(int d, int peer, int ctl) {
     vp = map(pbuf, size, 1, 1);
     CK(cuMemRelease(pbuf));
   }
+  /* Binds wait for every device, so add ours to both groups first. */
   int order[2] = {d, 1 - d};
+  for (int i = 0; i < 2; i++) CK(cuMulticastAddDevice(grp[order[i]], d));
   for (int i = 0; i < 2; i++) {
     int k = order[i];
-    CK(cuMulticastAddDevice(grp[k], d));
     AllocProp up = uc_prop(d, POSIX_FD);
     CK(cuMemCreate(&uc[k], size, &up, 0));
     CK(cuMulticastBindMem(grp[k], 0, uc[k], 0, size, 0));

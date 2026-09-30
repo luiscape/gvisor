@@ -14,8 +14,8 @@
 # limitations under the License.
 
 # Runs the interposer tests on a host with two or more NVLS-capable GPUs.
-# "ipc" needs nvproxy's exported-object identity, so it runs under runsc, in a
-# sandbox over the host's /usr and /etc; the others run natively.
+# "ipc" needs nvproxy's exported-object identity, so it runs under runsc over
+# the host's libraries; the others run natively.
 #
 # Usage: run.sh [-r /path/to/runsc] [test...]   (default: all)
 set -euo pipefail
@@ -33,7 +33,7 @@ if [ $# -eq 0 ]; then set -- abi gate mc refcount refuse ipc; fi
 W=$(mktemp -d)
 chmod 777 "$W"
 cleanup() {
-  if [ -n "$RUNSC" ]; then
+  if [ -n "$RUNSC" ] && [ -d "$W/root" ]; then
     for id in $(sudo "$RUNSC" --root "$W/root" list -q 2>/dev/null); do
       sudo "$RUNSC" --root "$W/root" delete -force "$id" || true
     done
@@ -49,55 +49,57 @@ native() {
   MCSHIM_LOG="$W/$1.log" LD_PRELOAD="$W/mcshim.so" "$W/mcshim_test" "$1"
 }
 
+# The sandbox sees only the host's libraries and /etc: with the host's
+# nvidia-modprobe on its path, libcuda tries to load the module and finds no
+# device.
 sandboxed() {
   if [ -z "$RUNSC" ]; then
     echo "SKIP $1: needs -r RUNSC"
     return 0
   fi
-  mkdir -p "$W"/rootfs/{usr,lib,lib64,bin,etc,mnt,proc,dev,sys,tmp}
+  mkdir -p "$W"/rootfs/{usr/lib,usr/lib64,lib,lib64,etc,proc,dev,sys,tmp,mnt}
   python3 - "$1" "$W" > "$W/config.json" <<'EOF'
 import json, os, sys
+test, w = sys.argv[1], sys.argv[2]
 def dev(path):
     st = os.stat(path)
     return {"path": path, "type": "c", "major": os.major(st.st_rdev),
-            "minor": os.minor(st.st_rdev), "fileMode": 0o666}
-paths = ["/dev/nvidia0", "/dev/nvidia1", "/dev/nvidiactl", "/dev/nvidia-uvm",
-         "/dev/nvidia-uvm-tools"]
+            "minor": os.minor(st.st_rdev), "fileMode": 0o666, "uid": 0,
+            "gid": 0}
+libs = ["/usr/lib", "/usr/lib64", "/lib", "/lib64", "/etc"]
 print(json.dumps({
     "ociVersion": "1.0.0",
     "process": {
         "user": {"uid": 0, "gid": 0},
-        "args": ["/mnt/mcshim_test", sys.argv[1]],
-        "env": ["PATH=/usr/bin:/bin", "LD_PRELOAD=/mnt/mcshim.so",
-                "NVIDIA_VISIBLE_DEVICES=0,1",
-                "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
-                "MCSHIM_LOG=/mnt/%s.log" % sys.argv[1]],
+        "args": ["/mnt/mcshim_test", test],
+        "env": ["LD_PRELOAD=/mnt/mcshim.so", "MCSHIM_LOG=/mnt/%s.log" % test,
+                "NVIDIA_VISIBLE_DEVICES=0,1"],
         "cwd": "/",
     },
-    "root": {"path": sys.argv[2] + "/rootfs", "readonly": True},
-    "mounts": [
-        {"destination": d, "type": "bind", "source": d,
-         "options": ["rbind", "ro"]} for d in ("/usr", "/lib", "/lib64",
-                                               "/bin", "/etc")
-    ] + [
+    "root": {"path": w + "/rootfs", "readonly": True},
+    "mounts": [{"destination": d, "type": "bind", "source": d,
+                "options": ["rbind", "ro"]} for d in libs] + [
         {"destination": "/proc", "type": "proc", "source": "proc"},
-        {"destination": "/dev", "type": "tmpfs", "source": "tmpfs"},
+        {"destination": "/dev", "type": "tmpfs", "source": "tmpfs",
+         "options": ["nosuid", "mode=755"]},
         {"destination": "/sys", "type": "sysfs", "source": "sysfs",
          "options": ["ro"]},
         {"destination": "/tmp", "type": "tmpfs", "source": "tmpfs"},
-        {"destination": "/mnt", "type": "bind", "source": sys.argv[2],
+        {"destination": "/mnt", "type": "bind", "source": w,
          "options": ["rbind", "rw"]},
     ],
     "linux": {
         "namespaces": [{"type": t} for t in
                        ("pid", "mount", "ipc", "uts", "network")],
-        "devices": [dev(p) for p in paths],
+        "devices": [dev(p) for p in ["/dev/nvidia0", "/dev/nvidia1",
+                                     "/dev/nvidiactl", "/dev/nvidia-uvm",
+                                     "/dev/nvidia-uvm-tools"]],
     },
 }))
 EOF
   (cd "$W" && sudo "$RUNSC" --root "$W/root" --nvproxy \
-    --nvproxy-allowed-driver-capabilities=all --network=none --ignore-cgroups ${RUNSC_FLAGS:-} \
-    run --bundle "$W" "mcshim-test-$$-$1")
+    --nvproxy-allowed-driver-capabilities=all --network=none --ignore-cgroups \
+    ${RUNSC_FLAGS:-} run --bundle "$W" "mcshim-test-$$-$1")
 }
 
 failed=0
