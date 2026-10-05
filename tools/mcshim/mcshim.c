@@ -39,12 +39,10 @@
  * gets the wrapper with its own signature. */
 
 #define _GNU_SOURCE
-#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -541,7 +539,6 @@ typedef struct {
   /* Rendezvous identity of the export (see record_key). */
   int has_key;
   unsigned long key_client, key_object;
-  int exp_marked; /* exp-<key>.<pid> exists (see mark_export) */
   /* After a resume: the re-exported fd, published until the gate is removed
    * (see publish_fd). */
   int pub_fd;
@@ -691,7 +688,6 @@ static int map_at(CUdeviceptr va) {
 
 static void unpublish_fd(Alloc* a);
 static void alloc_gc_all(void);
-static void unmark_export(Alloc* a);
 
 /* Must hold g_lock. Forget alloc i and the binds and maps that reference it. */
 static void alloc_forget(int i) {
@@ -703,7 +699,6 @@ static void alloc_forget(int i) {
   for (int m = 0; m < MAXN; m++)
     if (g_map[m].used && g_map[m].allocIdx == i) g_map[m].used = 0;
   unpublish_fd(&g_alloc[i]);
-  unmark_export(&g_alloc[i]);
   free(g_alloc[i].uc_content);
   memset(&g_alloc[i], 0, sizeof(g_alloc[i]));
   g_alloc[i].pub_fd = -1;
@@ -746,8 +741,6 @@ static int fdinfo_oracle(int fd, unsigned long* client, unsigned long* object) {
   return found;
 }
 
-static void mark_export(Alloc* a);
-
 /* Must hold g_lock. Record the rendezvous identity from nvproxy's fdinfo line;
  * without it the object cannot be rebuilt, so checkpoints are refused. The
  * identity is the exported object's, so every export of an object has the
@@ -761,7 +754,6 @@ static void record_key(int i, int fd) {
     return;
   }
   a->has_key = 1;
-  if (!a->imported) mark_export(a);
 }
 
 /* Interposed entry points. No call that can wait on the GPU or on a peer runs
@@ -1501,67 +1493,6 @@ static void unpublish_all(void) {
   }
 }
 
-/* Exporters announce each exported identity as exp-<client>-<object>.<pid>, so
- * that an importer can check at the gate, before anything is torn down, that
- * its exporter will republish (see can_carry). */
-static void exp_path(const Alloc* a, int pid, char* out, size_t n) {
-  snprintf(out, n, "%s/exp-%lx-%lx.%d", g_dir, a->key_client, a->key_object,
-           pid);
-}
-
-/* Must hold g_lock. */
-static void mark_export(Alloc* a) {
-  char p[600];
-  exp_path(a, (int)getpid(), p, sizeof(p));
-  int fd = open(p, O_CREAT | O_WRONLY | O_CLOEXEC, 0666);
-  if (fd >= 0) close(fd);
-  a->exp_marked = fd >= 0;
-}
-
-/* Must hold g_lock. */
-static void unmark_export(Alloc* a) {
-  if (!a->exp_marked) return;
-  char p[600];
-  exp_path(a, (int)getpid(), p, sizeof(p));
-  unlink(p);
-  a->exp_marked = 0;
-}
-
-/* Whether a live process announces a's identity. */
-static int export_announced(const Alloc* a) {
-  char prefix[96];
-  int n = snprintf(prefix, sizeof(prefix), "exp-%lx-%lx.", a->key_client,
-                   a->key_object);
-  DIR* d = opendir(g_dir);
-  if (!d) return 0;
-  int found = 0;
-  for (struct dirent* e; !found && (e = readdir(d));) {
-    if (strncmp(e->d_name, prefix, n) != 0) continue;
-    int pid = atoi(e->d_name + n);
-    found = pid > 0 && (kill(pid, 0) == 0 || errno == EPERM);
-  }
-  closedir(d);
-  return found;
-}
-
-/* Remove announcements a dead process with this pid left behind. */
-static void unmark_stale_exports(void) {
-  char suffix[32];
-  int n = snprintf(suffix, sizeof(suffix), ".%d", (int)getpid());
-  DIR* d = opendir(g_dir);
-  if (!d) return;
-  for (struct dirent* e; (e = readdir(d));) {
-    size_t len = strlen(e->d_name);
-    if (strncmp(e->d_name, "exp-", 4) != 0 || len <= (size_t)n ||
-        strcmp(e->d_name + len - n, suffix) != 0)
-      continue;
-    char p[600];
-    snprintf(p, sizeof(p), "%s/%s", g_dir, e->d_name);
-    unlink(p);
-  }
-  closedir(d);
-}
-
 /* Copy the fd published for a, waiting up to timeout_ms for it to appear. */
 static int fetch_fd(const Alloc* a, int timeout_ms) {
   char path[600];
@@ -1711,9 +1642,6 @@ static const char* can_carry(void) {
         if (g_map[m].used && g_map[m].allocIdx == i &&
             rw_dev(&g_map[m], mask) < 0)
           return "multicast-bound export without read-write access";
-    /* An import is rebuilt from its exporter's republished fd. */
-    if (a->imported && a->has_key && !export_announced(a))
-      return "an import whose exporter will not republish it";
   }
   return NULL;
 }
@@ -2636,7 +2564,6 @@ __attribute__((constructor)) static void mcshim_init(void) {
   /* Create the control dir, which may also hold MCSHIM_LOG, before the first
    * mclog. */
   mkdir(g_dir, 0777);
-  unmark_stale_exports();
   /* Markers belong to the sentry; the control thread starts from cuInit. */
   mclog("loaded; control dir=%s", g_dir);
 }

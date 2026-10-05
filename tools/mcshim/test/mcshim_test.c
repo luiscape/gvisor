@@ -1169,13 +1169,6 @@ static int ipc_rank(int d, int peer, int ctl) {
     EXPECT(read32(d, vp) == 0xbeef, "rank %d round %d: peer buffer 0x%x", d,
            round, read32(d, vp));
   }
-  /* The exporter frees the peer buffer that rank 1 still maps: nobody would
-   * republish it, so rank 1 must now refuse the gate. */
-  if (d == 0) {
-    CK(cuMemUnmap(vp, size));
-    CK(cuMemRelease(pbuf));
-  }
-  sync_byte(ctl, 'f');
   sync_byte(ctl, 'd');
   return g_failed;
 }
@@ -1199,15 +1192,6 @@ static int t_ipc(void) {
     for (int d = 0; d < 2; d++)
       if (write(ctl[d], "g", 1) != 1) return 1;
   }
-  for (int d = 0; d < 2; d++)
-    if (read(ctl[d], &c, 1) != 1) return 1;
-  char e1[64];
-  snprintf(e1, sizeof(e1), "error.%d", (int)pids[1]);
-  EXPECT(gate_up(pids, 2) != 0 && exists(e1),
-         "rank 1 accepted the gate with an import nobody will republish");
-  gate_down();
-  for (int d = 0; d < 2; d++)
-    if (write(ctl[d], "g", 1) != 1) return 1;
   for (int d = 0; d < 2; d++) {
     if (read(ctl[d], &c, 1) != 1 || write(ctl[d], "g", 1) != 1) return 1;
   }

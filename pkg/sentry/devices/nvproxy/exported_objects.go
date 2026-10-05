@@ -66,11 +66,11 @@ func procFDInfoExportedObjectLine(exp exportedObjInfo) string {
 }
 
 // ctrlExportToFDInvoke performs the frontend-FD-translating control sequence
-// shared by the export-to-fd handlers, mirroring ctrlHasFrontendFD: CopyIn,
+// shared by the export and import handlers, mirroring ctrlHasFrontendFD: CopyIn,
 // translate the params' FD to the corresponding host FD, invoke, restore the
 // application FD value, CopyOut. If the invoke succeeded, it calls post with
-// the populated params and the destination frontendFD (with a reference
-// held); post is responsible for checking ioctlParams.Status.
+// the populated params and the params' frontendFD (with a reference held);
+// post is responsible for checking ioctlParams.Status.
 func ctrlExportToFDInvoke[Params any, PtrParams hasFrontendFDPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS, post func(params PtrParams, ctlFile *frontendFD)) (uintptr, error) {
 	var ctrlParamsValue Params
 	ctrlParams := PtrParams(&ctrlParamsValue)
@@ -155,5 +155,78 @@ func ctrlClientExportObjectToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS5
 		}
 		objectH := nvgpu.Handle{Val: binary.LittleEndian.Uint32(ctrlParams.Object.Data[8:12])}
 		setExportedObj(fi, ctlFile, ioctlParams.HClient, objectH)
+	})
+}
+
+// importedObject tracks an object that a client imported from an exported fd,
+// duped under one of its own objects. cuda-checkpoint cannot carry imports (a
+// restore fails, and for multicast objects the checkpoint hangs), so they are
+// checkpoint blockers, and like other dups they are not restorable.
+type importedObject struct {
+	object
+
+	// src is the exported object, as the fd recorded it; zero if unknown.
+	src exportedObjInfo
+
+	// multicast is true for an imported multicast object.
+	multicast bool
+}
+
+// Release implements objectImpl.Release.
+func (o *importedObject) Release(ctx context.Context) func() {
+	return nil
+}
+
+// addImportedObj records objectH, duped under parentH in clientH, as
+// imported from fd slot index.
+func addImportedObj(fi *frontendIoctlState, fd *frontendFD, clientH, parentH, objectH nvgpu.Handle, index int, multicast bool) {
+	nvp := fi.fd.dev.nvp
+	var src exportedObjInfo
+	if index == 0 {
+		nvp.fdsMu.Lock()
+		src = fd.exportedObj
+		nvp.fdsMu.Unlock()
+	}
+	client, unlock := nvp.getClientWithLock(fi.ctx, clientH)
+	if client == nil {
+		return
+	}
+	nvp.objAdd(fi.ctx, client, objectH, src.class, &importedObject{src: src, multicast: multicast}, parentH)
+	unlock()
+}
+
+// ctrlClientImportObjectFromFD proxies
+// NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD like ctrlHasFrontendFD, and
+// records the imported object.
+func ctrlClientImportObjectFromFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
+	return ctrlExportToFDInvoke(fi, ioctlParams, func(ctrlParams *nvgpu.NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS, ctlFile *frontendFD) {
+		// For type RM, the union is struct {hDevice, hParent, hObject}.
+		if ioctlParams.Status != nvgpu.NV_OK || ctrlParams.Object.Type != nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM {
+			return
+		}
+		parentH := nvgpu.Handle{Val: binary.LittleEndian.Uint32(ctrlParams.Object.Data[4:8])}
+		objectH := nvgpu.Handle{Val: binary.LittleEndian.Uint32(ctrlParams.Object.Data[8:12])}
+		addImportedObj(fi, ctlFile, ioctlParams.HClient, parentH, objectH, 0, false)
+	})
+}
+
+// ctrlClientImportObjectsFromFD proxies
+// NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECTS_FROM_FD (used by current libcuda, e.g.
+// for cuMemImportFromShareableHandle) like ctrlHasFrontendFD, and records the
+// imported objects.
+func ctrlClientImportObjectsFromFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
+	return ctrlExportToFDInvoke(fi, ioctlParams, func(ctrlParams *nvgpu.NV0000_CTRL_OS_UNIX_IMPORT_OBJECTS_FROM_FD_PARAMS, ctlFile *frontendFD) {
+		if ioctlParams.Status != nvgpu.NV_OK {
+			return
+		}
+		n := min(int(ctrlParams.NumObjects), len(ctrlParams.Objects))
+		for i := 0; i < n; i++ {
+			t := ctrlParams.ObjectTypes[i]
+			if ctrlParams.Objects[i].Val == 0 || t == nvgpu.NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_TYPE_NONE {
+				continue
+			}
+			addImportedObj(fi, ctlFile, ioctlParams.HClient, ctrlParams.HParent, ctrlParams.Objects[i],
+				int(ctrlParams.Index)+i, t == nvgpu.NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_TYPE_FABRIC_MC)
+		}
 	})
 }

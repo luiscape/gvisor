@@ -69,4 +69,73 @@ func TestCheckpointBlockers(t *testing.T) {
 	if got := nvp.checkpointBlockers(map[kernel.ThreadID]bool{41: true}); got != want {
 		t.Fatalf("except 41: got %q, want %q", got, want)
 	}
+
+	// Objects imported from an exported fd are blockers, whatever their class.
+	addImport := func(c *rootClient, h uint32, src exportedObjInfo, multicast bool) {
+		c.objsMu.Lock()
+		nvp.objAdd(ctx, c, nvgpu.Handle{Val: h}, src.class, &importedObject{src: src, multicast: multicast}, c.handle)
+		c.objsMu.Unlock()
+	}
+	addImport(rank1, 0x5c000006, exportedObjInfo{client: rank0.handle, object: nvgpu.Handle{Val: 0x5c000001}, class: nvgpu.NV01_MEMORY_LOCAL_USER}, false)
+	addImport(rank1, 0x5c000007, exportedObjInfo{client: rank0.handle, object: nvgpu.Handle{Val: 0x5c000004}, class: nvgpu.NV_MEMORY_MULTICAST_FABRIC}, true)
+	want = "PID 42 (client 0xc1d00002): 1 fabric-import, 1 import, 1 multicast-import"
+	if got := nvp.checkpointBlockers(map[kernel.ThreadID]bool{41: true}); got != want {
+		t.Fatalf("imports: got %q, want %q", got, want)
+	}
+}
+
+func TestUnresolvableImports(t *testing.T) {
+	ctx := context.Background()
+	nvp := &nvproxy{clients: make(map[nvgpu.Handle]*rootClient)}
+	addClient := func(h uint32, tgid kernel.ThreadID) *rootClient {
+		c := &rootClient{resources: make(map[nvgpu.Handle]*object), tgid: tgid}
+		nvp.clients[nvgpu.Handle{Val: h}] = c
+		c.objsMu.Lock()
+		nvp.objAdd(ctx, c, nvgpu.Handle{Val: h}, nvgpu.NV01_ROOT_CLIENT, c, nvgpu.Handle{Val: nvgpu.NV01_NULL_OBJECT})
+		c.objsMu.Unlock()
+		return c
+	}
+	add := func(c *rootClient, h uint32, oi objectImpl, class nvgpu.ClassID) {
+		c.objsMu.Lock()
+		nvp.objAdd(ctx, c, nvgpu.Handle{Val: h}, class, oi, c.handle)
+		c.objsMu.Unlock()
+	}
+	exporter := addClient(0xc1d00001, 41)
+	importer := addClient(0xc1d00002, 42)
+	add(exporter, 0x5c000001, &miscObject{}, nvgpu.NV01_MEMORY_LOCAL_USER)
+	src := exportedObjInfo{client: exporter.handle, object: nvgpu.Handle{Val: 0x5c000001}, class: nvgpu.NV01_MEMORY_LOCAL_USER}
+	add(importer, 0x5c000002, &importedObject{src: src}, src.class)
+	both := map[kernel.ThreadID]bool{41: true, 42: true}
+	if got := nvp.unresolvableImports(both); got != "" {
+		t.Fatalf("live exporter: got %q, want none", got)
+	}
+
+	// The exporter is not among the processes that will rebuild.
+	want := "PID 42: object 0xc1d00002:0x5c000002 imported from 0xc1d00001:0x5c000001, which no longer exists"
+	if got := nvp.unresolvableImports(map[kernel.ThreadID]bool{42: true}); got != want {
+		t.Fatalf("exporter not managed: got %q, want %q", got, want)
+	}
+
+	// The exporter freed the object.
+	exporter.objsMu.Lock()
+	nvp.objFree(ctx, exporter, nvgpu.Handle{Val: 0x5c000001})
+	exporter.objsMu.Unlock()
+	if got := nvp.unresolvableImports(both); got != want {
+		t.Fatalf("exporter freed: got %q, want %q", got, want)
+	}
+
+	// Freeing the import itself, or its parent, drops it.
+	importer.objsMu.Lock()
+	nvp.objFree(ctx, importer, nvgpu.Handle{Val: 0x5c000002})
+	importer.objsMu.Unlock()
+	if got := nvp.unresolvableImports(both); got != "" {
+		t.Fatalf("import freed: got %q, want none", got)
+	}
+
+	// An import whose export is unknown cannot be rebuilt.
+	add(importer, 0x5c000003, &importedObject{}, 0)
+	want = "PID 42: object 0xc1d00002:0x5c000003 imported from an unknown export"
+	if got := nvp.unresolvableImports(both); got != want {
+		t.Fatalf("unknown export: got %q, want %q", got, want)
+	}
 }

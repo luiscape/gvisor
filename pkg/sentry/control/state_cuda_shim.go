@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -352,7 +353,20 @@ func armCudaMulticastShimGate(sctx context.Context, k *kernel.Kernel, cudaProcs 
 		return err
 	}
 	managed := cudaShimManagedProcs(sctx, k, cudaProcs)
-	if err := cudaShimWaitAcks(sctx, k, managed, "gated"); err != nil {
+	err := cudaShimWaitAcks(sctx, k, managed, "gated")
+	if err == nil {
+		// After a restore the interposer rebuilds each import from its
+		// exporter's re-export. Every process is gated, so none can free an
+		// exported object while this checks.
+		procs := make(map[kernel.ThreadID]bool, len(managed))
+		for _, tg := range managed {
+			procs[tg.ID()] = true
+		}
+		if imports := nvproxy.UnresolvableImports(k.VFS(), procs); imports != "" {
+			err = fmt.Errorf("multicast interposer: imports that could not be rebuilt after a restore: %s", imports)
+		}
+	}
+	if err != nil {
 		if rerr := cudaShimSetMarker(sctx, k, cudaProcs, cudaShimGateMarker, false /* set */); rerr != nil {
 			log.Warningf("Failed to clear multicast interposer gate after arm failure: %v", rerr)
 		}
