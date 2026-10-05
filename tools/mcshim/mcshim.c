@@ -584,7 +584,8 @@ static const char* g_untracked_why;
 static const char* g_bad_lookup;
 
 /* Sticky: a suspend or resume failed partway, so this process stays gated.
- * Must hold g_lock. */
+ * Written by the control thread under g_lock; the control thread reads it
+ * without. */
 static int g_broken;
 
 static void mark_untracked(const char* why) {
@@ -2397,88 +2398,78 @@ typedef struct {
   char suspended[64], resumed[64], error[64], gated[64];
 } Acks;
 
-/* Arm the gate, drain it, and check that the state can be carried. Returns
- * why not, or NULL; a refusal disarms, so the application keeps running. */
-static const char* preflight(void) {
-  const char* why = NULL;
-  if (gate_arm() != 0) why = "application CUDA calls did not drain";
-  pthread_mutex_lock(&g_lock);
-  resolve_hooks();
-  if (g_broken)
-    why = "an earlier transition failed";
-  else if (!why)
-    why = can_carry();
-  int broken = g_broken;
-  pthread_mutex_unlock(&g_lock);
-  if (why) {
-    mclog("GATE: refusing: %s", why);
-    if (!broken) gate_disarm();
-  }
-  return why;
-}
-
 /* Whether this process's state is torn down: from a successful suspend until
  * a successful resume. Control thread only; part of the checkpoint image. */
 static int g_torn;
 
+/* Arm the gate, drain it, and check that the state can be carried. Returns
+ * why not, or NULL. A refusal disarms the gate, unless the process is torn
+ * down or broken: then it must stay gated. */
+static const char* preflight(void) {
+  const char* why = NULL;
+  if (g_broken) {
+    why = "an earlier transition failed";
+  } else if (gate_arm() != 0) {
+    /* Without g_lock: the call that did not drain may hold it. */
+    why = "application CUDA calls did not drain";
+  } else {
+    pthread_mutex_lock(&g_lock);
+    resolve_hooks();
+    why = can_carry();
+    pthread_mutex_unlock(&g_lock);
+  }
+  if (why) {
+    mclog("GATE: refusing: %s", why);
+    if (!g_torn && !g_broken) gate_disarm();
+  }
+  return why;
+}
+
 /* The gate appeared. The refusal comes before any process tears anything
  * down, so the sentry can still unwind. The sentry arms the gate before it
  * locks the processes, and locks every one of them, which drains their GPU
- * work, before it requests the suspend. Returns whether the gate is armed. */
-static int on_gate_up(const Acks* k) {
+ * work, before it requests the suspend. */
+static void on_gate_up(const Acks* k) {
+  /* A refusal from an earlier attempt must not fail this one. */
+  marker_rm(k->error);
   const char* why = preflight();
   marker_write(why ? k->error : k->gated, why ? why : "ok");
-  return !why;
 }
 
-/* Release the application: the gate is gone and every process has resumed.
- * Withdraw the published fds. Returns whether it released. */
-static int on_gate_down(const Acks* k) {
-  static int logged;
+/* Release the application: the gate is gone and nothing is torn down, so
+ * every process has resumed. Withdraw the published fds. */
+static void release(const Acks* k) {
   pthread_mutex_lock(&g_lock);
-  int broken = g_broken;
-  if (!broken) unpublish_all();
+  unpublish_all();
   pthread_mutex_unlock(&g_lock);
-  if (broken) {
-    if (!logged++)
-      mclog(
-          "FATAL: refusing to release the gate after a failed transition; "
-          "the application would run over unmapped GPU state");
-    return 0;
-  }
   gate_disarm();
   marker_rm(k->gated);
-  return 1;
 }
 
-static void on_suspend_edge(const Acks* k, int want, int* armed) {
+static void on_suspend_edge(const Acks* k, int want) {
   /* Drop a stale error ack: the sentry fails fast on error.<pid>. */
   marker_rm(k->error);
-  /* Normally the gate already ran the preflight. */
-  if (want && !*armed) {
-    const char* why = preflight();
-    if (why) {
-      marker_write(k->error, why);
-      return;
-    }
-    *armed = 1;
-  }
+  const char* why = NULL;
   pthread_mutex_lock(&g_lock);
   resolve_hooks();
-  int rc = -1;
-  if (g_broken)
-    mclog("refusing: an earlier transition failed");
-  else if (!want && !g_torn)
-    rc = 0; /* nothing was torn down, so there is nothing to rebuild */
-  else
-    rc = run_transition(want ? suspend_locked : resume_locked);
-  /* A failure leaves this process torn down partway, and its peers may have
-   * released state it needs, so it stays gated for good: better blocked than
-   * corrupt. The sentry does not unwind it. */
-  if (rc != 0) g_broken = 1;
+  if (g_broken) {
+    why = "an earlier transition failed";
+  } else if (want && !__atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST)) {
+    /* The sentry always gates first. */
+    why = "suspend without the gate";
+  } else if (want || g_torn) {
+    /* A failure leaves this process torn down partway, and its peers may have
+     * released state it needs, so it stays gated for good: better blocked
+     * than corrupt. The sentry does not unwind it. */
+    if (run_transition(want ? suspend_locked : resume_locked) != 0) {
+      g_broken = 1;
+      why = want ? "suspend failed" : "resume failed";
+    }
+  }
   pthread_mutex_unlock(&g_lock);
-  if (rc != 0) {
-    marker_write(k->error, want ? "suspend failed" : "resume failed");
+  if (why) {
+    mclog("%s: %s", want ? "SUSPEND" : "RESUME", why);
+    marker_write(k->error, why);
     return;
   }
   g_torn = want;
@@ -2492,11 +2483,11 @@ static void on_suspend_edge(const Acks* k, int want, int* armed) {
  * markers are in the checkpoint image, so after a restore the shim stays
  * suspended until the sentry removes them.
  *
- * The application is released only once the gate is gone and this process is
- * not torn down. The sentry removes the gate after every process has resumed:
- * a bind waits for every device to be added, not for every rank's memory to be
- * bound, so a rank released at its own resume could reach a group that a peer
- * is still binding. */
+ * The release is level-triggered on state: the application runs again once
+ * the gate is gone and nothing is torn down. The sentry removes the gate after
+ * every process has resumed: a bind waits for every device to be added, not
+ * for every rank's memory to be bound, so a rank released at its own resume
+ * could reach a group that a peer is still binding. */
 static void* control_thread(void* arg) {
   (void)arg;
   Acks k;
@@ -2516,18 +2507,26 @@ static void* control_thread(void* arg) {
   marker_rm(k.gated);
   marker_write(present, "ok");
   mclog("control thread started (dir=%s)", g_dir);
-  /* Last seen markers, and whether the gate is armed for a checkpoint. */
-  int prev = 0, prev_gate = 0, armed = 0;
+  int prev_suspend = 0, prev_gate = 0, logged = 0;
   for (;;) {
+    /* Gate first, so that a process that starts while both markers exist is
+     * gated before it suspends. */
+    int gate = marker_exists("gate");
+    if (gate && !prev_gate) on_gate_up(&k);
+    prev_gate = gate;
     int want = marker_exists("suspend");
-    if (want != prev) {
-      prev = want;
-      on_suspend_edge(&k, want, &armed);
+    if (want != prev_suspend) {
+      prev_suspend = want;
+      on_suspend_edge(&k, want);
     }
-    int wgate = marker_exists("gate");
-    if (wgate && !prev_gate) armed = on_gate_up(&k);
-    prev_gate = wgate;
-    if (armed && !wgate && !g_torn && on_gate_down(&k)) armed = 0;
+    if (!gate && !g_torn && __atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST)) {
+      if (!g_broken)
+        release(&k);
+      else if (!logged++)
+        mclog(
+            "FATAL: refusing to release the gate after a failed transition; "
+            "the application would run over unmapped GPU state");
+    }
     /* Poll every 5 ms: the spread in when ranks see the gate bounds how often a
      * collective straddles it, which fails the sentry's lock. */
     struct timespec ts = {0, 5 * 1000 * 1000}; /* 5ms */

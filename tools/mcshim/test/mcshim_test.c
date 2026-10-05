@@ -238,6 +238,17 @@ static void clear_markers(void) {
   rm("suspend");
 }
 
+/* The sentry's preamble to each request: stale acks must not satisfy it. */
+static void clear_acks(const pid_t* pids, int n) {
+  static const char* const kinds[] = {"gated", "suspended", "resumed", "error"};
+  for (int i = 0; i < n; i++)
+    for (int k = 0; k < 4; k++) {
+      char a[64];
+      snprintf(a, sizeof(a), "%s.%d", kinds[k], (int)pids[i]);
+      rm(a);
+    }
+}
+
 static int gate_up(const pid_t* pids, int n) {
   mk("gate");
   return wait_ack("gated", pids, n);
@@ -630,6 +641,46 @@ static int t_gate(void) {
   pthread_join(t, NULL);
   EXPECT(late.done && late.rc == 0, "rc=%d after the gate was removed",
          late.rc);
+
+  /* A suspend without the gate refuses, and leaves the application running. */
+  clear_acks(&me, 1);
+  mk("suspend");
+  EXPECT(wait_ack("suspended", &me, 1) != 0, "suspended without the gate");
+  CK(cuMemsetD32_v2(g_buf, 3, 16));
+  rm("suspend");
+  msleep(50);
+
+  /* While torn down, the gate can go and come back (a sentry retry or
+   * abort). Re-arming must neither release the application over the torn
+   * state nor, if the preflight refuses, strand it after the resume. */
+  clear_acks(&me, 1);
+  EXPECT(gate_up(&me, 1) == 0, "gate refused");
+  mk("suspend");
+  EXPECT(wait_ack("suspended", &me, 1) == 0, "suspend failed");
+  GatedCall torn = {"cuMemsetD32_v2", c_memset, 0, 0};
+  pthread_create(&t, NULL, run_call, &torn);
+  rm("gate");
+  msleep(100);
+  EXPECT(!torn.done, "released over torn-down state");
+  clear_acks(&me, 1);
+  EXPECT(gate_up(&me, 1) == 0, "re-armed gate refused");
+  /* Now make the preflight refuse: a lookup of an ABI without a wrapper. */
+  gpa("cuMemsetD8", 2000, 1);
+  rm("gate");
+  msleep(50);
+  clear_acks(&me, 1);
+  EXPECT(gate_up(&me, 1) != 0, "gate accepted after an unknown ABI lookup");
+  msleep(100);
+  EXPECT(!torn.done, "released over torn-down state after a refusal");
+  clear_acks(&me, 1);
+  rm("suspend");
+  EXPECT(wait_ack("resumed", &me, 1) == 0, "resume failed");
+  msleep(100);
+  EXPECT(!torn.done, "released before the gate was removed");
+  gate_down();
+  pthread_join(t, NULL);
+  EXPECT(torn.done && torn.rc == 0, "stranded after the resume: rc=%d",
+         torn.rc);
 
   use(0);
   CK(cuCtxSynchronize());
