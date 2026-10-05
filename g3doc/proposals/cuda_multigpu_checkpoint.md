@@ -286,7 +286,9 @@ with it, the inventory verifies the teardown.
 ## Validation
 
 Two hosts, both with driver and fabric manager 610.57.04: 8x H100 80GB with
-NVSwitch, and 8x B300 (NVLink 5). vLLM 0.29.0 and SGLang 0.5.20 serve
+NVSwitch, and 8x B300 (NVLink 5). The H100 results are from the current
+revision; the B300 results are from the revision before the interposer
+reviews. vLLM 0.29.0 and SGLang 0.5.20 serve
 Qwen2.5-1.5B-Instruct in their default configurations plus the listed flags.
 Each run boots the engine, records a completion at temperature 0, puts the
 engine to sleep, checkpoints, restores (onto other GPUs where listed), wakes
@@ -301,21 +303,21 @@ H100:
 
 Workload                                  | GPUs       | Checkpoint (image) | Restore | First inference after restore | vs. cold boot
 ----------------------------------------- | ---------- | ------------------ | ------- | ----------------------------- | -------------
-vLLM TP=2                                 | 0,1        | 8.6 s (12G)        | 2.0 s   | 6.2 s                         | 36x
-vLLM TP=4                                 | 0-3        | 14.2 s (18G)       | 2.8 s   | 11.0 s                        | 23x
-vLLM TP=8                                 | 0-7        | 36.2 s (35G)       | 5.4 s   | 27.0 s                        | 12x
-vLLM TP=2                                 | 0,1 -> 4,5 | 8.6 s (12G)        | 2.0 s   | 7.2 s                         | 31x
-vLLM TP=4                                 | 0-3 -> 4-7 | 14.3 s (18G)       | 2.9 s   | 12.0 s                        | 21x
-vLLM TP=2                                 | 0,1 -> 1,2 | 8.6 s (12G)        | 2.0 s   | 6.5 s                         | 35x
-SGLang TP=4                               | 0-3        | 14.9 s (17G)       | 2.8 s   | 11.5 s                        | 16x
-SGLang TP=4                               | 0-3 -> 4-7 | 15.0 s (17G)       | 2.8 s   | 12.4 s                        | 14x
-SGLang TP=4 `--enable-nccl-nvls`          | 0-3        | 15.0 s (17G)       | 2.8 s   | 11.5 s                        | 16x
-SGLang TP=4 `--enable-torch-symm-mem`     | 0-3        | 15.2 s (17G)       | 2.8 s   | 11.6 s                        | 16x
-SGLang TP=4 FlashInfer all-reduce fusion  | 0-3        | 16.5 s (18G)       | 2.8 s   | 12.4 s                        | 14x
-SGLang TP=4 FlashInfer all-reduce fusion  | 0-3 -> 4-7 | 16.6 s (18G)       | 2.9 s   | 13.6 s                        | 13x
-SGLang TP=4 `--enable-nccl-nvls`          | 0-3 -> 4-7 | 15.1 s (17G)       | 3.0 s   | 12.8 s                        | 14x
-SGLang TP=4 `--enable-torch-symm-mem`     | 0-3 -> 4-7 | 15.3 s (17G)       | 2.8 s   | 12.7 s                        | 14x
-SGLang TP=8                               | 0-7        | 42.1 s (33G)       | 5.2 s   | 27.5 s                        | 8x
+vLLM TP=2                                 | 0,1        | 8.6 s (12G)        | 1.4 s   | 5.3 s                         | 42x
+vLLM TP=4                                 | 0-3        | 14.4 s (18G)       | 2.3 s   | 9.7 s                         | 26x
+vLLM TP=8                                 | 0-7        | 36.6 s (35G)       | 4.5 s   | 22.6 s                        | 14x
+vLLM TP=2                                 | 0,1 -> 4,5 | 8.4 s (12G)        | 1.5 s   | 5.6 s                         | 40x
+vLLM TP=4                                 | 0-3 -> 4-7 | 14.4 s (18G)       | 2.3 s   | 10.6 s                        | 24x
+vLLM TP=2                                 | 0,1 -> 1,2 | 8.6 s (12G)        | 1.4 s   | 5.5 s                         | 41x
+SGLang TP=4                               | 0-3        | 15.2 s (17G)       | 2.2 s   | 9.7 s                         | 18x
+SGLang TP=4                               | 0-3 -> 4-7 | 15.1 s (17G)       | 2.3 s   | 10.8 s                        | 17x
+SGLang TP=4 `--enable-nccl-nvls`          | 0-3        | 15.3 s (17G)       | 2.2 s   | 9.9 s                         | 18x
+SGLang TP=4 `--enable-torch-symm-mem`     | 0-3        | 15.5 s (17G)       | 2.2 s   | 9.9 s                         | 18x
+SGLang TP=4 FlashInfer all-reduce fusion  | 0-3        | 16.8 s (18G)       | 2.3 s   | 10.5 s                        | 17x
+SGLang TP=4 FlashInfer all-reduce fusion  | 0-3 -> 4-7 | 16.7 s (18G)       | 2.3 s   | 11.5 s                        | 15x
+SGLang TP=4 `--enable-nccl-nvls`          | 0-3 -> 4-7 | 15.3 s (17G)       | 2.3 s   | 11.0 s                        | 16x
+SGLang TP=4 `--enable-torch-symm-mem`     | 0-3 -> 4-7 | 15.4 s (17G)       | 2.3 s   | 11.1 s                        | 16x
+SGLang TP=8                               | 0-7        | 42.3 s (33G)       | 4.4 s   | 23.1 s                        | 9x
 
 B300:
 
@@ -339,8 +341,8 @@ SGLang TP=8                               | 0-7        | 43.9 s (37G)       | 3.
 
 Timings are from a single run per host; repeat runs varied by up to about
 30%. The interposer's share is small: on H100, arming the gate takes about
-0.1 s, the teardown 0.1 to 0.7 s, and the rebuild 0.9 to 1.7 s at TP=2 and
-TP=4 and about 4 s at TP=8. vLLM TP=4, SGLang TP=4 with symmetric memory, and
+0.1 s, the teardown 0.1 to 0.4 s (0.7 s at TP=8), and the rebuild 0.4 to
+0.8 s (1.0 s at TP=8). vLLM TP=4, SGLang TP=4 with symmetric memory, and
 the vLLM TP=2 cross-GPU restore also pass on H100 in containers without
 `CAP_SYS_PTRACE`, where `pidfd_getfd` relies on the exporters'
 `PR_SET_PTRACER_ANY`.
