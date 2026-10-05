@@ -124,9 +124,14 @@ print(json.dumps({
     },
 }))
 EOF
+  # runsc takes over the stdio it inherits, so give it a file of its own.
+  local rc=0
   (cd "$W" && sudo "$RUNSC" --root "$W/root" --nvproxy \
     --nvproxy-allowed-driver-capabilities=all --network=none --ignore-cgroups \
-    ${RUNSC_FLAGS:-} run --bundle "$W" "mcshim-test-$$-$name")
+    ${RUNSC_FLAGS:-} run --bundle "$W" "mcshim-test-$$-$name") \
+    > "$W/$name.out" 2>&1 || rc=$?
+  sudo cat "$W/$name.out"
+  return $rc
 }
 
 # The image's glibc may be older than the host's: build a portable copy.
