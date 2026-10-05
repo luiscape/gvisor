@@ -16,8 +16,9 @@
 
 /* Interposer tests (see run.sh). mcshim must be LD_PRELOADed. Each test plays
  * the sentry's side of the marker protocol, with a suspend and resume in place
- * of a checkpoint and restore. Multicast tests need two GPUs with switch
- * multicast (NVLS); "ipc" needs nvproxy's fdinfo identity, so runsc.
+ * of a checkpoint and restore, except "orphan", which run.sh drives with
+ * `runsc checkpoint`. Multicast tests need two GPUs with switch multicast
+ * (NVLS); "ipc" and "orphan" need nvproxy, so runsc.
  *
  *   abi       every lookup gets the wrapper of the exact ABI it returned
  *   gate      the gate stops submissions and drains calls in flight
@@ -27,6 +28,8 @@
  *   refuse    state that cannot be carried refuses at the gate
  *   ipc       two processes: exported groups imported in opposite order, and
  *             a peer buffer
+ *   orphan    two processes: one maps memory the other exported and freed;
+ *             each counts its kernel launches in /mnt/orphan.<rank>
  */
 
 #define _GNU_SOURCE
@@ -1307,13 +1310,67 @@ static int t_mapwait(void) {
   return g_failed;
 }
 
+/* orphan */
+
+/* Rank 1 maps memory that rank 0 exports and then frees, so no process can
+ * re-export it after a restore. Both ranks then launch kernels until killed. */
+static int orphan_rank(int d, int sock) {
+  setup(1);
+  size_t size = 2 << 20;
+  AllocProp up = uc_prop(0, POSIX_FD);
+  H h;
+  int fd;
+  if (d == 0) {
+    CK(cuMemCreate(&h, size, &up, 0));
+    CK(cuMemExportToShareableHandle(&fd, h, POSIX_FD, 0));
+    if (send_fds(sock, &fd, 1) != 0) exit(3);
+    close(fd);
+    sync_byte(sock, 'i');
+    CK(cuMemRelease(h));
+  } else {
+    if (recv_fds(sock, &fd, 1) != 0) exit(3);
+    CK(cuMemImportFromShareableHandle(&h, (void*)(intptr_t)fd, POSIX_FD));
+    close(fd);
+    map(h, size, 0, 1);
+    sync_byte(sock, 'i');
+  }
+  CUdeviceptr p;
+  CK(cuMemAlloc_v2(&p, 4));
+  void* args[] = {&p};
+  char path[64], tmp[64];
+  snprintf(path, sizeof(path), "/mnt/orphan.%d", d);
+  snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+  for (unsigned long n = 1;; n++) {
+    CK(launch1(g_bump, args, NULL));
+    CK(cuCtxSynchronize());
+    FILE* f = fopen(tmp, "w");
+    if (!f) exit(3);
+    fprintf(f, "%lu\n", n);
+    fclose(f);
+    rename(tmp, path);
+    msleep(20);
+  }
+}
+
+static int t_orphan(void) {
+  int sv[2];
+  socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+  for (int d = 0; d < 2; d++)
+    if (fork() == 0) exit(orphan_rank(d, sv[d]));
+  int st;
+  while (wait(&st) > 0)
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return 1;
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc == 3 && !strcmp(argv[1], "refuse1")) {
     clear_markers();
     return refuse_case(argv[2]) ? 1 : 0;
   }
   if (argc != 2) {
-    fprintf(stderr, "usage: %s abi|gate|mc|refcount|refuse|ipc|mapwait\n",
+    fprintf(stderr,
+            "usage: %s abi|gate|mc|refcount|refuse|ipc|mapwait|orphan\n",
             argv[0]);
     return 2;
   }
@@ -1323,7 +1380,7 @@ int main(int argc, char** argv) {
     int (*fn)(void);
   } tests[] = {{"abi", t_abi},           {"gate", t_gate},     {"mc", t_mc},
                {"refcount", t_refcount}, {"refuse", t_refuse}, {"ipc", t_ipc},
-               {"mapwait", t_mapwait}};
+               {"mapwait", t_mapwait},   {"orphan", t_orphan}};
   for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
     if (strcmp(argv[1], tests[i].name) == 0) {
       int rc = tests[i].fn();

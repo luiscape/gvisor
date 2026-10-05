@@ -18,6 +18,9 @@
 #   abi gate mc refcount refuse mapwait  native (mcshim_test.c)
 #   ipc                          under runsc (-r), over the host's libraries:
 #                                needs nvproxy's exported-object identity
+#   orphan                       under runsc (-r): `runsc checkpoint` refuses an
+#                                import whose exporter freed the object, and
+#                                the application keeps running
 #   torch-kernel torch-symm      under runsc (-r) in a rootfs with PyTorch and
 #                                the host driver's userspace (-i, -e: its env)
 #
@@ -36,7 +39,7 @@ while getopts r:i:e: o; do
 done
 shift $((OPTIND - 1))
 if [ $# -eq 0 ]; then
-  set -- abi gate mc refcount refuse mapwait ipc torch-kernel torch-symm
+  set -- abi gate mc refcount refuse mapwait ipc orphan torch-kernel torch-symm
 fi
 GPUS=${MCSHIM_TEST_GPUS:-0,1}
 
@@ -61,7 +64,8 @@ native() {
     "$W/mcshim_test" "$1"
 }
 
-# sandboxed NAME ROOT SHIM ARGS...: runs ARGS under runsc with SHIM preloaded.
+# sandboxed NAME ROOT SHIM ARGS...: runs ARGS under runsc with SHIM preloaded,
+# in container mcshim-test-$$-NAME (detached if DETACH=1).
 # ROOT "" means the host's libraries and /etc only: with the host's
 # nvidia-modprobe on its path, libcuda tries to load the module and finds no
 # device.
@@ -126,12 +130,51 @@ print(json.dumps({
 EOF
   # runsc takes over the stdio it inherits, so give it a file of its own.
   local rc=0
-  (cd "$W" && sudo "$RUNSC" --root "$W/root" --nvproxy \
-    --nvproxy-allowed-driver-capabilities=all --network=none --ignore-cgroups \
-    ${RUNSC_FLAGS:-} run --bundle "$W" "mcshim-test-$$-$name") \
+  (cd "$W" && runsc run ${DETACH:+-detach} --bundle "$W" "mcshim-test-$$-$name") \
     > "$W/$name.out" 2>&1 || rc=$?
   sudo cat "$W/$name.out"
   return $rc
+}
+
+runsc() {
+  sudo "$RUNSC" --root "$W/root" --nvproxy \
+    --nvproxy-allowed-driver-capabilities=all --network=none --ignore-cgroups \
+    ${RUNSC_FLAGS:-} "$@"
+}
+
+# count FILE: the number in FILE, or 0.
+count() {
+  local n
+  n=$(cat "$1" 2>/dev/null) || true
+  echo "${n:-0}"
+}
+
+orphan() {
+  local id=mcshim-test-$$-orphan
+  cp "$(command -v cuda-checkpoint)" "$W/" || return 77
+  export RUNSC_FLAGS="${RUNSC_FLAGS:-} --cuda-checkpoint-path=/mnt/cuda-checkpoint"
+  DETACH=1 sandboxed orphan "" mcshim.so /mnt/mcshim_test orphan || return 1
+  for _ in $(seq 600); do
+    [ "$(count "$W/orphan.0")" -gt 0 ] && [ "$(count "$W/orphan.1")" -gt 0 ] &&
+      break
+    sleep 0.1
+  done
+  local rc=0
+  runsc checkpoint --image-path "$W/ckpt" "$id" > "$W/orphan.ckpt" 2>&1 || rc=$?
+  sudo cat "$W/orphan.ckpt"
+  if [ $rc -eq 0 ] || ! grep -q "could not be rebuilt" "$W/orphan.ckpt"; then
+    echo "checkpoint not refused for the orphaned import"
+    return 1
+  fi
+  local n0 n1
+  n0=$(count "$W/orphan.0") n1=$(count "$W/orphan.1")
+  sleep 2
+  if [ "$(count "$W/orphan.0")" -le "$n0" ] ||
+    [ "$(count "$W/orphan.1")" -le "$n1" ]; then
+    echo "the application stopped after the refused checkpoint"
+    return 1
+  fi
+  runsc kill "$id" KILL || true
 }
 
 # The image's glibc may be older than the host's: build a portable copy.
@@ -146,6 +189,13 @@ for t in "$@"; do
   rc=0
   case $t in
     ipc) sandboxed "$t" "" mcshim.so /mnt/mcshim_test ipc || rc=$? ;;
+    orphan)
+      if [ -z "$RUNSC" ]; then
+        echo "SKIP $t: needs -r RUNSC"
+        continue
+      fi
+      (orphan) || rc=$?
+      ;;
     torch-*)
       if [ -z "$ROOTFS" ]; then
         echo "SKIP $t: needs -i ROOTFS"
