@@ -15,7 +15,7 @@
 
 # Runs the interposer tests on a host with two or more NVLS-capable GPUs.
 #
-#   abi gate mc refcount refuse  native (mcshim_test.c)
+#   abi gate mc refcount refuse mapwait  native (mcshim_test.c)
 #   ipc                          under runsc (-r), over the host's libraries:
 #                                needs nvproxy's exported-object identity
 #   torch-kernel torch-symm      under runsc (-r) in a rootfs with PyTorch and
@@ -36,7 +36,7 @@ while getopts r:i:e: o; do
 done
 shift $((OPTIND - 1))
 if [ $# -eq 0 ]; then
-  set -- abi gate mc refcount refuse ipc torch-kernel torch-symm
+  set -- abi gate mc refcount refuse mapwait ipc torch-kernel torch-symm
 fi
 GPUS=${MCSHIM_TEST_GPUS:-0,1}
 

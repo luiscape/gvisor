@@ -519,6 +519,12 @@ enum { KIND_FREE = 0, KIND_UC = 1, KIND_MC = 2, KIND_IMP = 3 };
 
 typedef struct {
   int kind;
+  /* Unique to this object, so that an unlocked call can tell, when it
+   * commits, whether the slot still holds the object it looked up. */
+  unsigned gen;
+  /* An unlocked cuMemUnmap in flight is freeing the object: lookups skip it,
+   * since the driver may already be reissuing its handle. */
+  int dying;
   CUmemGenericAllocationHandle handle; /* driver handle; 0 while torn down */
   CUmemGenericAllocationHandle app;    /* the value the application holds */
   /* Application references: 1 for the create or import, +1 per retain, -1
@@ -602,16 +608,20 @@ static CUdevice cur_dev(void) {
   return d;
 }
 
+static int live(int i) {
+  return g_alloc[i].kind != KIND_FREE && !g_alloc[i].dying;
+}
+
 static int alloc_by_app(CUmemGenericAllocationHandle h) {
   for (int i = 0; i < MAXN; i++)
-    if (g_alloc[i].kind != KIND_FREE && g_alloc[i].app == h) return i;
+    if (live(i) && g_alloc[i].app == h) return i;
   return -1;
 }
 
 static int alloc_by_handle(CUmemGenericAllocationHandle h) {
   if (!h) return -1;
   for (int i = 0; i < MAXN; i++)
-    if (g_alloc[i].kind != KIND_FREE && g_alloc[i].handle == h) return i;
+    if (live(i) && g_alloc[i].handle == h) return i;
   return -1;
 }
 
@@ -629,6 +639,7 @@ static CUmemGenericAllocationHandle xlate(CUmemGenericAllocationHandle h) {
 static int track_new(int kind, CUmemGenericAllocationHandle h, CUdevice dev,
                      CUmemGenericAllocationHandle* app) {
   static unsigned long long synth;
+  static unsigned gen;
   int i = 0;
   while (i < MAXN && g_alloc[i].kind != KIND_FREE) i++;
   if (i == MAXN) {
@@ -642,6 +653,7 @@ static int track_new(int kind, CUmemGenericAllocationHandle h, CUdevice dev,
   Alloc* a = &g_alloc[i];
   memset(a, 0, sizeof(*a));
   a->kind = kind;
+  a->gen = ++gen;
   a->handle = h;
   a->app = v;
   a->app_refs = 1;
@@ -752,9 +764,13 @@ static void record_key(int i, int fd) {
   if (!a->imported) mark_export(a);
 }
 
-/* Interposed entry points. Mutators hold g_lock across the real call, so a
- * translation cannot go stale before it is used; binds, which block until
- * every device has joined, are the exception. */
+/* Interposed entry points. No call that can wait on the GPU or on a peer runs
+ * under g_lock, or two processes can deadlock on each other's locks: binds and
+ * cuMemMap (on a multicast object, they wait until every device has joined
+ * it), and cuMemUnmap and cuMemSetAccess (they can wait for GPU work). Those
+ * translate under the lock, call the driver without it, and commit if the
+ * object they looked up still holds its slot. The other mutators hold the lock
+ * across the call. */
 
 static void ensure_control_thread(void);
 
@@ -1108,9 +1124,10 @@ static CUresult do_bind(int v2, int by_addr, CUmemGenericAllocationHandle mc,
     }
   }
   int tracked_mem = mi >= 0;
+  unsigned ggen = gi >= 0 ? g_alloc[gi].gen : 0;
+  unsigned mgen = tracked_mem ? g_alloc[mi].gen : 0;
   CUmemGenericAllocationHandle rmc = xlate(mc);
   CUmemGenericAllocationHandle rmem = by_addr ? 0 : xlate(mem);
-  CUmemGenericAllocationHandle hmem = tracked_mem ? g_alloc[mi].handle : 0;
   pthread_mutex_unlock(&g_lock);
   CUresult rc;
   if (v2 && by_addr)
@@ -1124,9 +1141,9 @@ static CUresult do_bind(int v2, int by_addr, CUmemGenericAllocationHandle mc,
     rc = r_cuMulticastBindMem(rmc, mcOffset, rmem, memOffset, size, flags);
   if (rc == CUDA_SUCCESS) {
     pthread_mutex_lock(&g_lock);
-    /* An object freed and replaced meanwhile would be an app race. */
-    if (gi >= 0 && g_alloc[gi].handle != rmc) gi = -1;
-    if (tracked_mem && g_alloc[mi].handle != hmem) mi = -1;
+    /* An object freed meanwhile would be an app race. */
+    if (gi >= 0 && g_alloc[gi].gen != ggen) gi = -1;
+    if (tracked_mem && g_alloc[mi].gen != mgen) mi = -1;
     if (spans)
       mark_untracked("multicast bind across mappings");
     else if (tracked_mem && mi < 0)
@@ -1197,8 +1214,14 @@ CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
   gate_enter();
   pthread_mutex_lock(&g_lock);
   int ai = alloc_by_app(h);
-  CUresult rc = r_cuMemMap(ptr, size, offset, xlate(h), flags);
-  if (rc == CUDA_SUCCESS && ai >= 0) {
+  unsigned gen = ai >= 0 ? g_alloc[ai].gen : 0;
+  CUmemGenericAllocationHandle rh = xlate(h);
+  pthread_mutex_unlock(&g_lock);
+  CUresult rc = r_cuMemMap(ptr, size, offset, rh, flags);
+  pthread_mutex_lock(&g_lock);
+  if (rc == CUDA_SUCCESS && ai >= 0 && g_alloc[ai].gen != gen) {
+    mark_untracked("mapping of an object freed concurrently");
+  } else if (rc == CUDA_SUCCESS && ai >= 0) {
     int m = 0;
     while (m < MAXN && g_map[m].used) m++;
     if (m < MAXN) {
@@ -1247,18 +1270,33 @@ CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) {
   gate_enter();
   pthread_mutex_lock(&g_lock);
   maps_in(ptr, size, sel);
+  /* Objects that lose their last mapping and have no other reference die
+   * with this call. */
+  for (int m = 0; m < MAXN; m++) {
+    if (!sel[m]) continue;
+    int ai = g_map[m].allocIdx, others = 0;
+    for (int o = 0; o < MAXN && !others; o++)
+      others = !sel[o] && g_map[o].used && g_map[o].allocIdx == ai;
+    if (!others && g_alloc[ai].app_refs <= 0 && !g_alloc[ai].shim_ref &&
+        !bound_as_mem(ai))
+      g_alloc[ai].dying = 1;
+  }
   pthread_mutex_unlock(&g_lock);
   CUresult rc = r_cuMemUnmap(ptr, size);
-  if (rc == CUDA_SUCCESS) {
-    pthread_mutex_lock(&g_lock);
-    /* The range may span several mappings. */
-    for (int m = 0; m < MAXN; m++) {
-      if (!sel[m] || !map_within(&g_map[m], ptr, size)) continue;
+  pthread_mutex_lock(&g_lock);
+  /* The range may span several mappings. */
+  for (int m = 0; m < MAXN; m++) {
+    if (!sel[m] || !map_within(&g_map[m], ptr, size)) continue;
+    int ai = g_map[m].allocIdx;
+    if (rc == CUDA_SUCCESS) {
       g_map[m].used = 0;
-      alloc_gc(g_map[m].allocIdx);
+      g_alloc[ai].dying = 0;
+      alloc_gc(ai);
+    } else {
+      g_alloc[ai].dying = 0;
     }
-    pthread_mutex_unlock(&g_lock);
   }
+  pthread_mutex_unlock(&g_lock);
   gate_exit();
   return rc;
 }

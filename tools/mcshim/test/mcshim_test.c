@@ -33,6 +33,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1219,13 +1220,117 @@ static int t_ipc(void) {
   return g_failed;
 }
 
+/* mapwait */
+
+/* Mapping a multicast object waits until every device has joined it. Each of
+ * two ranks maps its own group on one thread, and adds its device to the
+ * peer's group on another, a little later. If the shim held its lock across
+ * the map, each rank's second thread would wait for its first, which waits
+ * for the other rank's second thread. */
+typedef struct {
+  H mc;
+  int dev;
+  size_t size;
+  int delay_ms;
+  CUresult rc;
+} MapArg;
+
+static void* map_own(void* p) {
+  MapArg* a = p;
+  use(a->dev);
+  CUdeviceptr va;
+  CUresult rc = cuMulticastAddDevice(a->mc, a->dev);
+  if (rc == 0) rc = cuMemAddressReserve(&va, a->size, 0, 0, 0);
+  if (rc == 0) rc = cuMemMap(va, a->size, 0, a->mc, 0);
+  a->rc = rc;
+  return NULL;
+}
+
+static void* add_dev(void* p) {
+  MapArg* a = p;
+  use(a->dev);
+  msleep(a->delay_ms);
+  a->rc = cuMulticastAddDevice(a->mc, a->dev);
+  return NULL;
+}
+
+static int mapwait_rank(int d, int sock) {
+  setup(2);
+  size_t size = mc_size();
+  McProp p = {2, size, POSIX_FD, 0};
+  H own, peer;
+  use(d);
+  CK(cuMulticastCreate(&own, &p));
+  int fd, pfd;
+  CK(cuMemExportToShareableHandle(&fd, own, POSIX_FD, 0));
+  if (send_fds(sock, &fd, 1) != 0 || recv_fds(sock, &pfd, 1) != 0) exit(3);
+  CK(cuMemImportFromShareableHandle(&peer, (void*)(intptr_t)pfd, POSIX_FD));
+  MapArg a1 = {own, d, size, 0, -1}, a2 = {peer, d, size, 300, -1};
+  pthread_t t1, t2;
+  pthread_create(&t1, NULL, map_own, &a1);
+  pthread_create(&t2, NULL, add_dev, &a2);
+  pthread_join(t1, NULL);
+  pthread_join(t2, NULL);
+  EXPECT(a1.rc == 0 && a2.rc == 0, "rank %d: map rc=%d, add rc=%d", d, a1.rc,
+         a2.rc);
+  return g_failed;
+}
+
+static int t_mapwait(void) {
+  int sv[2];
+  socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+  pid_t pids[2];
+  for (int d = 0; d < 2; d++) {
+    pids[d] = fork();
+    if (pids[d] == 0) exit(mapwait_rank(d, sv[d]));
+  }
+  for (int d = 0; d < 2; d++) {
+    int st = 0, done = 0;
+    for (int i = 0; i < 600 && !done; i++) {
+      done = waitpid(pids[d], &st, WNOHANG) == pids[d];
+      if (!done) msleep(100);
+    }
+    if (!done) {
+      kill(pids[0], SIGKILL);
+      kill(pids[1], SIGKILL);
+      EXPECT(0, "rank %d still mapping after 60 s: deadlock", d);
+      return g_failed;
+    }
+    EXPECT(WIFEXITED(st) && WEXITSTATUS(st) == 0, "rank %d exited 0x%x", d, st);
+  }
+
+  /* A map that waits for a device nobody adds holds up the gate's drain: the
+   * gate must refuse when the drain times out, not hang. */
+  setup(2);
+  pid_t me = getpid();
+  size_t size = mc_size();
+  McProp p = {2, size, 0, 0};
+  H mc;
+  use(0);
+  CK(cuMulticastCreate(&mc, &p));
+  MapArg a = {mc, 0, size, 0, -1};
+  pthread_t t;
+  pthread_create(&t, NULL, map_own, &a);
+  msleep(300);
+  double t0 = now();
+  EXPECT(gate_up(&me, 1) != 0, "gate accepted with a map in flight");
+  printf("mapwait: gate refused after %.0f s\n", now() - t0);
+  gate_down();
+  CK(cuMulticastAddDevice(mc, 1));
+  pthread_join(t, NULL);
+  EXPECT(a.rc == 0, "map rc=%d", a.rc);
+  printf("mapwait: %s\n", g_failed ? "FAILED" : "ok");
+  return g_failed;
+}
+
 int main(int argc, char** argv) {
   if (argc == 3 && !strcmp(argv[1], "refuse1")) {
     clear_markers();
     return refuse_case(argv[2]) ? 1 : 0;
   }
   if (argc != 2) {
-    fprintf(stderr, "usage: %s abi|gate|mc|refcount|refuse|ipc\n", argv[0]);
+    fprintf(stderr, "usage: %s abi|gate|mc|refcount|refuse|ipc|mapwait\n",
+            argv[0]);
     return 2;
   }
   clear_markers();
@@ -1233,7 +1338,8 @@ int main(int argc, char** argv) {
     const char* name;
     int (*fn)(void);
   } tests[] = {{"abi", t_abi},           {"gate", t_gate},     {"mc", t_mc},
-               {"refcount", t_refcount}, {"refuse", t_refuse}, {"ipc", t_ipc}};
+               {"refcount", t_refcount}, {"refuse", t_refuse}, {"ipc", t_ipc},
+               {"mapwait", t_mapwait}};
   for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
     if (strcmp(argv[1], tests[i].name) == 0) {
       int rc = tests[i].fn();
