@@ -34,13 +34,10 @@ With `runsc --cuda-checkpoint-path=... --cuda-multicast-shim-path=/path/to/mcshi
 `--cuda-multicast-shim-source=EMBEDDED`, in which case runsc first writes its
 embedded copy of `mcshim.so` into the container filesystem at that path
 (default `/usr/local/lib/mcshim.so`) -- `Loader.setupCudaMulticastShim`
-(`runsc/boot/loader.go`):
-
-*   prepends the shim to the container's `LD_PRELOAD` **and** appends it to
-    `/etc/ld.so.preload` through the container's VFS (launchers like SGLang's
-    `torch_memory_saver` rewrite `LD_PRELOAD` for exactly the worker processes
-    that matter; `ld.so.preload` is immune),
-*   sets `NCCL_CUMEM_ENABLE=1` unless the container sets it.
+(`runsc/boot/loader.go`) prepends the shim to the container's `LD_PRELOAD`
+**and** appends it to `/etc/ld.so.preload` through the container's VFS
+(launchers like SGLang's `torch_memory_saver` rewrite `LD_PRELOAD` for exactly
+the worker processes that matter; `ld.so.preload` is immune).
 
 The shim and the sentry (`pkg/sentry/control/state_cuda_shim.go`)
 rendezvous in `/tmp/mcshim`, which must be part of the checkpoint image (not
@@ -60,12 +57,13 @@ processes sharing one directory.
 
 | File                  | Written by | Meaning                                                        |
 | :-------------------- | :--------- | :------------------------------------------------------------- |
-| `gate`                | sentry     | created: arm the gate, wait for tracked calls in flight, check the state can be carried (else `error.<pid>` and disarm); removed: unblock (refused after a failed transition) |
+| `gate`                | sentry     | created: arm the gate, wait for tracked calls in flight, check the state can be carried (else `error.<pid>` and disarm); removed: release the application, once this process is not torn down (refused after a failed transition) |
 | `suspend`             | sentry     | created: tear down tracked state; removed: rebuild it          |
 | `present.<pid>`       | shim       | this pid runs a control thread and will ack transitions        |
 | `gated.<pid>`         | shim       | gate armed and drained                                         |
 | `suspended.<pid>` / `resumed.<pid>` | shim | teardown / rebuild finished                      |
 | `error.<pid>`         | shim       | the transition in flight failed (sentry fails fast on this)    |
+| `exp-<client>-<object>.<pid>` | shim | this process exports that object and will republish it after a restore |
 
 The sentry waits up to 5 minutes for acks. On startup the control thread
 removes any stale acks a dead predecessor with the same (reused) pid left
@@ -73,13 +71,14 @@ behind, then writes `present.<pid>`.
 
 The markers live in the container filesystem, so they are **part of the
 checkpoint image**: after a restore they still exist, and the shim stays
-suspended (and the gate armed) until the sentry removes `suspend` to trigger
-the rebuild.
+suspended until the sentry removes `suspend` to trigger the rebuild, and gated
+until the sentry removes `gate`.
 
 ## The sentry's sequence
 
 From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 
+0.  refuse if a process that does not run the shim holds multicast objects,
 1.  create `gate`, wait for `gated.<pid>`. Arming waits (up to 30 s) for
     application threads to leave tracked calls, so it must precede the lock;
     a refusal here fails the checkpoint before anything is torn down,
@@ -92,10 +91,13 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 5.  verify the checkpoint-blocker set is empty (trust but verify),
 6.  re-lock, `--action checkpoint` (one process at a time in job mode), save
     the sandbox;
-7.  on restore: `--action restore --device-map`, then `--action unlock`,
+7.  on restore: `--toggle`, or `--action restore --device-map` then
+    `--action unlock` when the GPUs changed,
 8.  remove `suspend`, wait for `resumed.<pid>`,
-9.  remove `gate` (the shim also releases the gate itself on a successful
-    resume).
+9.  remove `gate`, which releases the application. Not earlier: a bind waits
+    for every device to be added, not for every rank's memory to be bound, so
+    a rank released at its own resume could reach a group a peer is still
+    binding.
 
 ## Environment variables
 
@@ -144,8 +146,20 @@ interposer's rebuild runs against the same ordinals it recorded.
     application's (releasing it if the application held none, or retaining
     more from a mapping).
 *   **Contexts.** Calls are issued from each recorded device's primary
-    context, retained for the duration of a transition. The gate refuses if
-    the application no longer holds a device's primary context.
+    context, retained for the duration of a transition. The shim never
+    retains a primary context the application does not hold (that would
+    create one, which fails in exclusive-process mode), so the gate refuses
+    if one is inactive. Freed exports are copied through a device that has
+    read-write access to the mapping.
+*   **Binds.** A bind by address over tracked memory is recorded as a bind of
+    that allocation at the matching offset, so its replay depends neither on
+    the VA nor on the order of remaps; only memory the shim does not track,
+    which stays resident, is rebound by address.
+*   **Locking.** Mutators hold the shim's lock across the real call, so a
+    translation cannot go stale before it is used. Binds, `cuMemUnmap` and
+    `cuMemSetAccess` are the exceptions: binds block until every device has
+    joined, and the other two can wait for GPU work, which may wait for a
+    host thread that needs the lock.
 *   **Identical-VA guarantee.** Suspend unmaps with `cuMemUnmap` only, never
     `cuMemAddressFree`, so the VA reservations survive the checkpoint; resume
     maps back into them and replays each mapping's access set, merged by
@@ -160,7 +174,10 @@ interposer's rebuild runs against the same ordinals it recorded.
 *   **Cross-rank resume.** (1) every exporter re-creates its object,
     re-exports it and publishes `<pid> <fd>` in `/tmp/mcshim` under the
     original export's identity (nvproxy's fdinfo line); (2) importers copy
-    the fd with `pidfd_getfd(2)` and re-import; (3a) every group gets its
+    the fd with `pidfd_getfd(2)` and re-import (the identity is per object,
+    so every export of an object shares it; exporters announce it as
+    `exp-<client>-<object>.<pid>` so that the gate can refuse an import that
+    nobody will republish); (3a) every group gets its
     devices back, (3b) then every bind, which blocks until all devices have
     joined, (3c) then every mapping; (4) references are restored. Publishing
     before fetching, and adding devices before binding, keep ranks that hold
@@ -175,9 +192,9 @@ interposer's rebuild runs against the same ordinals it recorded.
     thread is inside a tracked call and none can complete one over the
     teardown. Stream synchronization blocks but is not counted: it may wait
     on a peer that is already gated. The shim's own teardown/rebuild calls the
-    real entry points and is never gated. After a failed teardown or rebuild,
-    the shim refuses to release the gate even if the `gate` marker is
-    removed.
+    real entry points and is never gated. The application is released when
+    the `gate` marker is removed, not at the process's own resume. After a
+    failed teardown or rebuild, the shim refuses to release it.
 *   **Fabric handles.** Fabric handle types create `NV_MEMORY_FABRIC` (0x00f8)
     objects that `cuda-checkpoint` cannot serialize. Unless
     `MCSHIM_ALLOW_FABRIC=1`, the shim strips them from `cuMemCreate` and
@@ -191,26 +208,45 @@ The gate refuses, before anything is torn down, when a process has:
 
 *   overflowed a tracking table, or resolved an unknown ABI of a tracked
     entry point;
-*   exported or imported a memory pool (`cuMemPool{Export,Import}*`), created
-    or imported a logical endpoint, exported or imported a handle type other
-    than POSIX fds, or mapped a sparse array (`cuMemMapArrayAsync`);
+*   exported or imported a memory pool (`cuMemPool{Export,Import}*`), created,
+    imported or bound a logical endpoint, exported or imported a handle type
+    other than POSIX fds, mapped a sparse array (`cuMemMapArrayAsync`), or
+    allocated managed memory (which `cuda-checkpoint` cannot carry; frees are
+    not tracked, so this refuses for the process's lifetime);
 *   an export without nvproxy's identity (not running under nvproxy);
+*   an import whose exporter no longer announces it: it exited, freed the
+    object, or runs in another container;
+*   bound memory the shim does not track by handle, or bound one range by
+    address across several mappings;
 *   set access on part of a mapping, or on more than 16 locations;
-*   several references to an object it must tear down but has not mapped, or
-    multicast-bound memory that is not mapped;
+*   several references to an object it must tear down but has not mapped,
+    multicast-bound memory that is not mapped or has no read-write mapping, or
+    such an object on an unknown device;
 *   released a device's primary context while holding tracked state;
 *   tracked calls still in flight after 30 s.
 
+The sentry also refuses up front when a process that does not run the shim
+holds multicast objects.
+
 ## Testing
 
-`test/run.sh [-r /path/to/runsc] [test...]` runs `test/mcshim_test.c` on a
-host with two NVLS-capable GPUs. Each test plays the sentry's side of the
-protocol, with a suspend and resume in place of a checkpoint and restore:
-`abi` (every lookup returns the wrapper of the symbol the driver returned),
-`gate` (submissions block; arming waits for a synchronous call in flight),
-`mc` (v1 and v2 binds, merged access, retained and colliding handles),
-`refcount` (objects held only by mappings), `refuse`, and `ipc` (two
-processes importing exported groups in opposite order; needs runsc).
+`test/run.sh [-r RUNSC] [-i ROOTFS -e ENVFILE] [test...]` runs the tests on a
+host with two NVLS-capable GPUs (`MCSHIM_TEST_GPUS`, default `0,1`). Each test
+plays the sentry's side of the protocol, with a suspend and resume in place of
+a checkpoint and restore:
+
+*   `abi`: every lookup returns the wrapper of the symbol the driver returned;
+*   `gate`: submissions block; arming waits for a synchronous call in flight;
+    the application stays gated after its own resume until the gate goes;
+*   `mc`: v1 and v2 binds by handle and by address, merged access, retained
+    and colliding handles;
+*   `refcount`: objects held only by mappings;
+*   `refuse`: each refusal above that can be provoked, in a fresh process;
+*   `ipc`: two processes importing exported groups in opposite order (under
+    runsc, `-r`);
+*   `torch-kernel`, `torch-symm`: the gate stops kernels that PyTorch submits,
+    including a multimem all-reduce on symmetric memory across two ranks
+    (under runsc, in a rootfs with PyTorch: `-i`, with its env file `-e`).
 
 ## Threat model
 
@@ -246,8 +282,12 @@ inside the container's trust domain, not gVisor's:
     Deliberately: better blocked than corrupt. Peers may already have
     released state the failed process needs, so nothing is rolled back; the
     sentry fails the checkpoint and the workload must be restarted.
-*   **Not refused, not carried:** managed memory, IPC events and dma-buf
-    exports (`cuMemGetHandleForAddressRange`) are left to `cuda-checkpoint`.
+*   **Left to `cuda-checkpoint`:** in job mode it carries legacy IPC memory,
+    IPC events and dma-buf exports (`cuMemGetHandleForAddressRange`); measured
+    on R610. It cannot carry managed memory, which the gate refuses.
+*   **Binds by address across mappings** are refused. On H100 the multicast
+    and allocation granularities are both 2 MiB, so such a bind could be split
+    per mapping; none of the tested engines makes one.
 *   **Multicast slot contention on restore** manifests as a re-bind timeout
     (binds are the cross-rank barrier, so one rank failing to join blocks
     the rest until the deadline).

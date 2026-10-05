@@ -1,6 +1,6 @@
 # Multi-GPU CUDA Checkpoint/Restore
 
-Status as of 2026-09-29: Draft, seeking feedback on the
+Status as of 2026-10-05: Draft, seeking feedback on the
 [open questions](#open-questions).
 
 ## Synopsis
@@ -45,7 +45,8 @@ VMM IPC import (`cuMemImportFromShareableHandle`)          | NCCL peer-to-peer w
 Legacy CUDA IPC import (`cuIpcOpenMemHandle`)              | NCCL with cuMem disabled, the engines' custom all-reduce           | `cuda-checkpoint` hangs (killed after 300 s)
 
 R610's job mode (`cuda-checkpoint --launch-job`) fixes the last row, and only
-that one.
+that one. In job mode `cuda-checkpoint` also carries IPC events and dma-buf
+exports; it cannot carry managed memory ("operation not supported").
 
 Both engines hit this in their default configurations. vLLM 0.29.0 at TP=2
 dispatches all-reduce to FlashInfer, custom and symmetric-memory backends
@@ -101,10 +102,10 @@ flowchart TD
 
 ### The interposer (`tools/mcshim`)
 
-A single C file (~2,400 lines, no CUDA toolkit dependency) that interposes 146
+A single C file (~2,600 lines, no CUDA toolkit dependency) that interposes 148
 exported CUDA driver symbols: 118 that submit GPU work or wait on it
 (launches, copies, memsets, stream memory operations and batches, with their
-per-thread-stream variants), which the gate blocks, and 28 that track state,
+per-thread-stream variants), which the gate blocks, and 30 that track state,
 refuse checkpoints, initialize, or resolve entry points. It is inert until a
 process calls `cuInit`.
 
@@ -151,7 +152,10 @@ process calls `cuInit`.
     to drain, so no application thread can finish a call over the teardown
     or create shared state after the sentry verified there is none. A
     teardown or rebuild that fails partway leaves the application gated
-    rather than running on inconsistent state.
+    rather than running on inconsistent state. The application is released
+    only when the sentry removes the gate, after every process has resumed: a
+    bind waits for every device to be added, not for every rank's memory to
+    be bound.
 
 Settings: `MCSHIM_LOG`, `MCSHIM_DISABLE`, `MCSHIM_ALLOW_FABRIC`
 (fabric-handle support is reported as absent by default, so frameworks choose
@@ -178,7 +182,6 @@ POSIX fds).
     `LD_PRELOAD` for exactly the worker processes that hold GPU state (SGLang's
     `torch_memory_saver`), and the failure is silent: the checkpoint succeeds
     and the restore fails.
--   It sets `NCCL_CUMEM_ENABLE=1` unless the container sets it.
 
 ### Control protocol
 
@@ -189,15 +192,17 @@ the interposer in the processes that announced themselves (`present.<pid>`).
 
 File                                | Writer      | Meaning
 ----------------------------------- | ----------- | -------
-`gate`                              | sentry      | created: block GPU submission, drain calls in flight, check the state can be carried; removed: unblock
+`gate`                              | sentry      | created: block GPU submission, drain calls in flight, check the state can be carried; removed: release the application
 `suspend`                           | sentry      | created: tear down; removed: rebuild
 `present.<pid>`                     | interposer  | this process participates
 `gated.<pid>`                       | interposer  | gate armed and drained
 `suspended.<pid>`, `resumed.<pid>`  | interposer  | teardown / rebuild finished
 `error.<pid>`                       | interposer  | the transition failed; the sentry fails fast
+`exp-<client>-<object>.<pid>`       | interposer  | this process exports that object and will republish it after restore
 
-`suspend` lives in the container filesystem, so it is part of the checkpoint:
-after restore the interposer stays suspended until the sentry removes it.
+The markers live in the container filesystem, so they are part of the
+checkpoint: after restore the interposer stays suspended, and the application
+gated, until the sentry removes them.
 
 ### Checkpoint and restore sequence
 
@@ -224,6 +229,7 @@ sequenceDiagram
     M->>M: publish, re-import, re-bind, re-map at original VAs
     M-->>S: resumed.pid
     S->>M: remove gate
+    M->>M: release the application
 ```
 
 The gate and the lock handle different halves of quiescing: the gate stops
@@ -237,8 +243,11 @@ A failure before the teardown, or after it completed on every process,
 unwinds: unlock, rebuild, release the gate, and the application keeps running.
 A process whose state cannot be carried refuses the gate, before anything is
 torn down: a table overflow, an unknown entry-point ABI, memory-pool IPC,
-logical endpoints, non-POSIX-fd handles, sparse array mappings, or references
-it could not restore (see `tools/mcshim/README.md`). If the teardown itself fails partway, peers may already
+logical endpoints, non-POSIX-fd handles, sparse array mappings, managed
+memory, an import nobody will republish, or references it could not restore
+(see `tools/mcshim/README.md`). The sentry likewise refuses up front when a
+process that does not run the interposer holds multicast objects. If the
+teardown itself fails partway, peers may already
 have released state the failed process needs, so nothing is rolled back: the
 application stays blocked, the checkpoint fails, and the workload must be
 restarted.
