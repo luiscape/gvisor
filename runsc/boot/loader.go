@@ -1661,12 +1661,6 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	if !preloaded {
 		env = append(env, preloadKey+shimPath)
 	}
-	// NCCL shares P2P buffers either through the VMM API (cuMemCreate +
-	// cuMemExportToShareableHandle; NCCL_CUMEM_ENABLE=1), which the interposer
-	// restores, or through legacy CUDA IPC, which is left to cuda-checkpoint's
-	// job support. Pin NCCL to the VMM path, the tested one, unless the user
-	// chose otherwise.
-	env = appendEnvIfAbsent(env, "NCCL_CUMEM_ENABLE", "1")
 	info.procArgs.Envv = env
 
 	// The env append above only covers processes that inherit the initial
@@ -1756,16 +1750,6 @@ func (l *Loader) writeContainerFile(info *containerInfo, dstPath string, data []
 		}
 	}
 	return nil
-}
-
-// appendEnvIfAbsent appends "key=value" to env unless key is already set.
-func appendEnvIfAbsent(env []string, key, value string) []string {
-	for _, e := range env {
-		if strings.HasPrefix(e, key+"=") {
-			return env
-		}
-	}
-	return append(env, key+"="+value)
 }
 
 // writeLdSoPreload appends the interposer path (shimPath) to the container's
