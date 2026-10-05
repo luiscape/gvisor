@@ -1131,8 +1131,8 @@ static CUresult do_bind(int v2, int by_addr, CUmemGenericAllocationHandle mc,
     else if (tracked_mem && mi < 0)
       mark_untracked("bind of memory freed concurrently");
     else
-      bind_record(gi, v2, !tracked_mem, mi, va, mcOffset, memOffset, size,
-                  v2 ? dev : mem_dev(mi));
+      bind_record(gi, v2, by_addr && !tracked_mem, mi, va, mcOffset, memOffset,
+                  size, v2 ? dev : mem_dev(mi));
     pthread_mutex_unlock(&g_lock);
   }
   gate_exit();
@@ -1221,16 +1221,17 @@ CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
 
 /* Must hold g_lock. Mark (in sel) the mappings inside [ptr, ptr+size);
  * returns 1 if a mapping straddles the range. */
+static int map_within(const Mapping* mp, CUdeviceptr ptr, size_t size) {
+  return mp->used && mp->va >= ptr && mp->va + mp->size <= ptr + size;
+}
+
 static int maps_in(CUdeviceptr ptr, size_t size, unsigned char* sel) {
   int partial = 0;
   for (int m = 0; m < MAXN; m++) {
     const Mapping* mp = &g_map[m];
-    sel[m] = 0;
-    if (!mp->used || mp->va + mp->size <= ptr || mp->va >= ptr + size) continue;
-    if (mp->va < ptr || mp->va + mp->size > ptr + size)
+    sel[m] = map_within(mp, ptr, size);
+    if (mp->used && !sel[m] && mp->va < ptr + size && mp->va + mp->size > ptr)
       partial = 1;
-    else
-      sel[m] = 1;
   }
   return partial;
 }
@@ -1251,7 +1252,7 @@ CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) {
     pthread_mutex_lock(&g_lock);
     /* The range may span several mappings. */
     for (int m = 0; m < MAXN; m++) {
-      if (!sel[m] || !g_map[m].used) continue;
+      if (!sel[m] || !map_within(&g_map[m], ptr, size)) continue;
       g_map[m].used = 0;
       alloc_gc(g_map[m].allocIdx);
     }
@@ -1283,7 +1284,7 @@ CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size,
      * and torch grants peers one at a time. */
     for (int m = 0; m < MAXN; m++) {
       Mapping* mp = &g_map[m];
-      if (!sel[m] || !mp->used) continue;
+      if (!sel[m] || !map_within(mp, ptr, size)) continue;
       for (size_t k = 0; k < count; k++) {
         int j = 0;
         while (j < mp->naccess &&
@@ -1344,22 +1345,24 @@ CUresult cuMemMapArrayAsync_ptsz(CUarrayMapInfo* list, unsigned count,
 
 /* Shared state neither the shim nor cuda-checkpoint can carry: succeed, and
  * refuse checkpoints. */
-#define REFUSED_LIST(X)                                                     \
-  X(cuMemPoolExportToShareableHandle,                                       \
-    (void* out, CUmemoryPool pool, int type, unsigned long long fl),        \
-    (out, pool, type, fl), "memory pool export")                            \
-  X(cuMemPoolImportFromShareableHandle,                                     \
-    (CUmemoryPool * out, void* h, int type, unsigned long long fl),         \
-    (out, h, type, fl), "memory pool import")                               \
-  X(cuMemPoolExportPointer, (void* out, CUdeviceptr ptr), (out, ptr),       \
-    "memory pool pointer export")                                           \
-  X(cuMemPoolImportPointer,                                                 \
-    (CUdeviceptr * out, CUmemoryPool pool, void* data), (out, pool, data),  \
-    "memory pool pointer import")                                           \
-  X(cuLogicalEndpointCreate, (cuuint32_t id, const void* prop), (id, prop), \
-    "logical endpoint")                                                     \
-  X(cuLogicalEndpointImport, (cuuint32_t id, const void* h, int type),      \
-    (id, h, type), "logical endpoint import")
+#define REFUSED_LIST(X)                                                      \
+  X(cuMemPoolExportToShareableHandle,                                        \
+    (void* out, CUmemoryPool pool, int type, unsigned long long fl),         \
+    (out, pool, type, fl), "memory pool export")                             \
+  X(cuMemPoolImportFromShareableHandle,                                      \
+    (CUmemoryPool * out, void* h, int type, unsigned long long fl),          \
+    (out, h, type, fl), "memory pool import")                                \
+  X(cuMemPoolExportPointer, (void* out, CUdeviceptr ptr), (out, ptr),        \
+    "memory pool pointer export")                                            \
+  X(cuMemPoolImportPointer,                                                  \
+    (CUdeviceptr * out, CUmemoryPool pool, void* data), (out, pool, data),   \
+    "memory pool pointer import")                                            \
+  X(cuLogicalEndpointCreate, (cuuint32_t id, const void* prop), (id, prop),  \
+    "logical endpoint")                                                      \
+  X(cuLogicalEndpointImport, (cuuint32_t id, const void* h, int type),       \
+    (id, h, type), "logical endpoint import")                                \
+  X(cuMemAllocManaged, (CUdeviceptr * p, size_t n, unsigned fl), (p, n, fl), \
+    "managed memory")
 
 #define REFUSED_DEF(name, proto, args, why)     \
   static CUresult(*r_##name) proto;             \
@@ -1379,6 +1382,33 @@ CUresult cuMemMapArrayAsync_ptsz(CUarrayMapInfo* list, unsigned count,
   }
 
 REFUSED_LIST(REFUSED_DEF)
+
+/* Logical endpoints are refused above, but a bind takes an allocation handle,
+ * which must still be translated. */
+static CUresult (*r_cuLogicalEndpointBindMem)(cuuint32_t, CUdevice, cuuint64_t,
+                                              CUmemGenericAllocationHandle,
+                                              cuuint64_t, cuuint64_t,
+                                              unsigned long long);
+
+CUresult cuLogicalEndpointBindMem(cuuint32_t id, CUdevice dev, cuuint64_t off,
+                                  CUmemGenericAllocationHandle h,
+                                  cuuint64_t memOff, cuuint64_t size,
+                                  unsigned long long fl) {
+  REAL(r_cuLogicalEndpointBindMem, "cuLogicalEndpointBindMem");
+  if (!r_cuLogicalEndpointBindMem) return CUDA_ERROR_NOT_FOUND;
+  gate_enter();
+  pthread_mutex_lock(&g_lock);
+  CUmemGenericAllocationHandle rh = xlate(h);
+  pthread_mutex_unlock(&g_lock);
+  CUresult rc = r_cuLogicalEndpointBindMem(id, dev, off, rh, memOff, size, fl);
+  if (rc == CUDA_SUCCESS) {
+    pthread_mutex_lock(&g_lock);
+    mark_untracked("logical endpoint bind");
+    pthread_mutex_unlock(&g_lock);
+  }
+  gate_exit();
+  return rc;
+}
 
 /* Cross-rank fd rendezvous. After a restore, each exporter re-exports its
  * object and publishes "<pid> <fd>" in /tmp/mcshim under the original export's
@@ -1538,8 +1568,9 @@ static int dev_active(CUdevice d) {
 /* Must hold g_lock. Never creates a context: retaining an inactive primary
  * context would, and can fail (exclusive-process compute mode). */
 static int use_dev(CUdevice d) {
-  if (!g_pctx[d < 0 || d >= MAX_DEV ? 0 : d] && !dev_active(d)) return -1;
-  if (!g_pctx[d] && r_cuDevicePrimaryCtxRetain(&g_pctx[d], d) != CUDA_SUCCESS) {
+  if (d < 0 || d >= MAX_DEV) return -1;
+  if (!g_pctx[d] && (!dev_active(d) || r_cuDevicePrimaryCtxRetain(
+                                           &g_pctx[d], d) != CUDA_SUCCESS)) {
     g_pctx[d] = NULL;
     return -1;
   }
@@ -2131,6 +2162,7 @@ static const Hook g_hooks[] = {
     HOOK(cuMulticastBindMem_v2, 1)                  /**/
     HOOK(cuMulticastBindAddr_v2, 1)                 /**/
     HOOK(cuMulticastUnbind, 1)                      /**/
+    HOOK(cuLogicalEndpointBindMem, 1)               /**/
     GATED_LIST(GATED_HOOK)                          /**/
     WAIT_LIST(GATED_HOOK)                           /**/
     REFUSED_LIST(REFUSED_HOOK)                      /**/

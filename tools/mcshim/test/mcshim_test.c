@@ -94,46 +94,48 @@ typedef struct {
 static void* lib;
 static void* (*rdlsym)(void*, const char*);
 
-#define FNS(X)                                                                \
-  X(cuInit, (unsigned))                                                       \
-  X(cuDeviceGetCount, (int*))                                                 \
-  X(cuDeviceGetAttribute, (int*, int, CUdevice))                              \
-  X(cuDevicePrimaryCtxRetain, (CUcontext*, CUdevice))                         \
-  X(cuCtxSetCurrent, (CUcontext))                                             \
-  X(cuCtxSynchronize, (void))                                                 \
-  X(cuModuleLoadData, (CUmodule*, const void*))                               \
-  X(cuModuleGetFunction, (CUfunction*, CUmodule, const char*))                \
-  X(cuLaunchKernel, (CUfunction, unsigned, unsigned, unsigned, unsigned,      \
-                     unsigned, unsigned, unsigned, CUstream, void**, void**)) \
-  X(cuStreamCreate, (CUstream*, unsigned))                                    \
-  X(cuStreamSynchronize, (CUstream))                                          \
-  X(cuMemAlloc_v2, (CUdeviceptr*, size_t))                                    \
-  X(cuMemGetInfo_v2, (size_t*, size_t*))                                      \
-  X(cuMemcpyDtoH_v2, (void*, CUdeviceptr, size_t))                            \
-  X(cuMemcpyHtoD_v2, (CUdeviceptr, const void*, size_t))                      \
-  X(cuMemcpyDtoD_v2, (CUdeviceptr, CUdeviceptr, size_t))                      \
-  X(cuMemsetD32_v2, (CUdeviceptr, unsigned, size_t))                          \
-  X(cuMemsetD8Async, (CUdeviceptr, unsigned char, size_t, CUstream))          \
-  X(cuMemCreate, (H*, size_t, const AllocProp*, unsigned long long))          \
-  X(cuMemRelease, (H))                                                        \
-  X(cuMemMap, (CUdeviceptr, size_t, size_t, H, unsigned long long))           \
-  X(cuMemUnmap, (CUdeviceptr, size_t))                                        \
-  X(cuMemSetAccess, (CUdeviceptr, size_t, const Access*, size_t))             \
-  X(cuMemAddressReserve,                                                      \
-    (CUdeviceptr*, size_t, size_t, CUdeviceptr, unsigned long long))          \
-  X(cuMemGetAllocationGranularity, (size_t*, const AllocProp*, int))          \
-  X(cuMemRetainAllocationHandle, (H*, void*))                                 \
-  X(cuMemGetAllocationPropertiesFromHandle, (AllocProp*, H))                  \
-  X(cuMemExportToShareableHandle, (void*, H, int, unsigned long long))        \
-  X(cuMemImportFromShareableHandle, (H*, void*, int))                         \
-  X(cuMulticastCreate, (H*, const McProp*))                                   \
-  X(cuMulticastAddDevice, (H, CUdevice))                                      \
-  X(cuMulticastBindMem, (H, size_t, H, size_t, size_t, unsigned long long))   \
-  X(cuMulticastUnbind, (H, CUdevice, size_t, size_t))                         \
-  X(cuMulticastGetGranularity, (size_t*, const McProp*, int))                 \
-  X(cuMemPoolCreate, (CUmemoryPool*, const PoolProp*))                        \
-  X(cuMemPoolExportToShareableHandle,                                         \
-    (void*, CUmemoryPool, int, unsigned long long))                           \
+#define FNS(X)                                                                 \
+  X(cuInit, (unsigned))                                                        \
+  X(cuDeviceGetCount, (int*))                                                  \
+  X(cuDeviceGetAttribute, (int*, int, CUdevice))                               \
+  X(cuDevicePrimaryCtxRetain, (CUcontext*, CUdevice))                          \
+  X(cuCtxSetCurrent, (CUcontext))                                              \
+  X(cuCtxSynchronize, (void))                                                  \
+  X(cuModuleLoadData, (CUmodule*, const void*))                                \
+  X(cuModuleGetFunction, (CUfunction*, CUmodule, const char*))                 \
+  X(cuLaunchKernel, (CUfunction, unsigned, unsigned, unsigned, unsigned,       \
+                     unsigned, unsigned, unsigned, CUstream, void**, void**))  \
+  X(cuStreamCreate, (CUstream*, unsigned))                                     \
+  X(cuStreamSynchronize, (CUstream))                                           \
+  X(cuMemAlloc_v2, (CUdeviceptr*, size_t))                                     \
+  X(cuMemGetInfo_v2, (size_t*, size_t*))                                       \
+  X(cuMemcpyDtoH_v2, (void*, CUdeviceptr, size_t))                             \
+  X(cuMemcpyHtoD_v2, (CUdeviceptr, const void*, size_t))                       \
+  X(cuMemcpyDtoD_v2, (CUdeviceptr, CUdeviceptr, size_t))                       \
+  X(cuMemsetD32_v2, (CUdeviceptr, unsigned, size_t))                           \
+  X(cuMemsetD8Async, (CUdeviceptr, unsigned char, size_t, CUstream))           \
+  X(cuMemCreate, (H*, size_t, const AllocProp*, unsigned long long))           \
+  X(cuMemRelease, (H))                                                         \
+  X(cuMemMap, (CUdeviceptr, size_t, size_t, H, unsigned long long))            \
+  X(cuMemUnmap, (CUdeviceptr, size_t))                                         \
+  X(cuMemSetAccess, (CUdeviceptr, size_t, const Access*, size_t))              \
+  X(cuMemAddressReserve,                                                       \
+    (CUdeviceptr*, size_t, size_t, CUdeviceptr, unsigned long long))           \
+  X(cuMemGetAllocationGranularity, (size_t*, const AllocProp*, int))           \
+  X(cuMemRetainAllocationHandle, (H*, void*))                                  \
+  X(cuMemGetAllocationPropertiesFromHandle, (AllocProp*, H))                   \
+  X(cuMemExportToShareableHandle, (void*, H, int, unsigned long long))         \
+  X(cuMemImportFromShareableHandle, (H*, void*, int))                          \
+  X(cuMulticastCreate, (H*, const McProp*))                                    \
+  X(cuMulticastAddDevice, (H, CUdevice))                                       \
+  X(cuMulticastBindMem, (H, size_t, H, size_t, size_t, unsigned long long))    \
+  X(cuMulticastBindAddr, (H, size_t, CUdeviceptr, size_t, unsigned long long)) \
+  X(cuMemAllocManaged, (CUdeviceptr*, size_t, unsigned))                       \
+  X(cuMulticastUnbind, (H, CUdevice, size_t, size_t))                          \
+  X(cuMulticastGetGranularity, (size_t*, const McProp*, int))                  \
+  X(cuMemPoolCreate, (CUmemoryPool*, const PoolProp*))                         \
+  X(cuMemPoolExportToShareableHandle,                                          \
+    (void*, CUmemoryPool, int, unsigned long long))                            \
   X(cuGetProcAddress_v2, (const char*, void**, int, unsigned long long, int*))
 
 #define DECL(name, proto) static CUresult(*name) proto;
@@ -401,6 +403,8 @@ static const char* const kBases[] = {"cuInit",
                                      "cuMemPoolImportPointer",
                                      "cuLogicalEndpointCreate",
                                      "cuLogicalEndpointImport",
+                                     "cuLogicalEndpointBindMem",
+                                     "cuMemAllocManaged",
                                      NULL};
 
 static int t_abi(void) {
@@ -611,6 +615,22 @@ static int t_gate(void) {
     EXPECT(calls[i].done && calls[i].rc == 0, "%s rc=%d", calls[i].name,
            calls[i].rc);
   }
+  /* After its resume, the application stays gated until the gate is removed,
+   * since peers may still be binding. */
+  EXPECT(gate_up(&me, 1) == 0, "gate refused");
+  mk("suspend");
+  EXPECT(wait_ack("suspended", &me, 1) == 0, "suspend failed");
+  rm("suspend");
+  EXPECT(wait_ack("resumed", &me, 1) == 0, "resume failed");
+  GatedCall late = {"cuMemsetD32_v2", c_memset, 0, 0};
+  pthread_create(&t, NULL, run_call, &late);
+  msleep(150);
+  EXPECT(!late.done, "released at its own resume, before the gate was removed");
+  gate_down();
+  pthread_join(t, NULL);
+  EXPECT(late.done && late.rc == 0, "rc=%d after the gate was removed",
+         late.rc);
+
   use(0);
   CK(cuCtxSynchronize());
   printf("gate: ok\n");
@@ -707,15 +727,56 @@ static void destroy_group(Group* g) {
   CK(cuMemRelease(g->mc));
 }
 
+/* Like make_group, but bound by address: device 0's buffer is the second half
+ * of a larger mapping (cuMulticastBindAddr), device 1's a whole mapping
+ * (cuMulticastBindAddr_v2). */
+static void make_group_addr(Group* g) {
+  g->size = mc_size();
+  McProp p = {2, g->size, 0, 0};
+  use(0);
+  CK(cuMulticastCreate(&g->mc, &p));
+  CK(cuMulticastAddDevice(g->mc, 0));
+  CK(cuMulticastAddDevice(g->mc, 1));
+  CUresult (*bind_addr_v2)(H, CUdevice, size_t, CUdeviceptr, size_t,
+                           unsigned long long) =
+      gpa("cuMulticastBindAddr", 13010, 1);
+  for (int d = 0; d < 2; d++) {
+    use(d);
+    size_t sz = d == 0 ? 2 * g->size : g->size;
+    AllocProp up = uc_prop(d, 0);
+    CK(cuMemCreate(&g->uc[d], sz, &up, 0));
+    CUdeviceptr va = map(g->uc[d], sz, d, d == 0 ? 2 : 1);
+    g->vuc[d] = d == 0 ? va + g->size : va;
+    if (d == 0)
+      CK(cuMulticastBindAddr(g->mc, 0, g->vuc[0], g->size, 0));
+    else
+      CK(bind_addr_v2(g->mc, 1, 0, g->vuc[1], g->size, 0));
+  }
+  use(0);
+  g->vmc = map(g->mc, g->size, 0, 1);
+}
+
+static void destroy_group_addr(Group* g) {
+  use(0);
+  CK(cuMemUnmap(g->vmc, g->size));
+  for (int d = 0; d < 2; d++) CK(cuMulticastUnbind(g->mc, d, 0, g->size));
+  CK(cuMemUnmap(g->vuc[0] - g->size, 2 * g->size));
+  CK(cuMemUnmap(g->vuc[1], g->size));
+  for (int d = 0; d < 2; d++) CK(cuMemRelease(g->uc[d]));
+  CK(cuMemRelease(g->mc));
+}
+
 static int t_mc(void) {
   setup(2);
   pid_t me = getpid();
   /* Two groups, so that the rebuild can hand each the other's old handle. */
-  Group a, b;
+  Group a, b, c;
   make_group(&a, 0);
   make_group(&b, 0);
+  make_group_addr(&c);
   check_group(&a, 0x1111, "before");
   check_group(&b, 0x2222, "before");
+  check_group(&c, 0x6666, "before (by address)");
 
   /* A retained handle is the application's value; releasing it keeps the
    * object. */
@@ -744,6 +805,8 @@ static int t_mc(void) {
   CK(real_release(rb));
   check_group(&a, 0x3333, "after");
   check_group(&b, 0x4444, "after");
+  check_group(&c, 0x7777, "after (by address)");
+  destroy_group_addr(&c);
 
   /* After the rebuild the application still uses its original values. */
   CK(cuMemRetainAllocationHandle(&r, (void*)(uintptr_t)a.vmc));
@@ -844,27 +907,104 @@ static int t_refcount(void) {
 
 /* refuse */
 
-static int t_refuse(void) {
-  setup(1);
+/* Memory the shim never saw: created through the driver's own cuMemCreate. */
+static H untracked_alloc(int d, size_t size) {
+  CUresult (*real)(H*, size_t, const AllocProp*, unsigned long long);
+  *(void**)&real = rdlsym(lib, "cuMemCreate");
+  AllocProp up = uc_prop(d, 0);
+  H h;
+  CK(real(&h, size, &up, 0));
+  return h;
+}
+
+static H plain_group(size_t size) {
+  McProp p = {2, size, 0, 0};
+  H mc;
+  use(0);
+  CK(cuMulticastCreate(&mc, &p));
+  CK(cuMulticastAddDevice(mc, 0));
+  CK(cuMulticastAddDevice(mc, 1));
+  return mc;
+}
+
+/* One refusal case, in a fresh process. Returns 0 if the gate accepted
+ * ("clean") or refused (the rest) as expected, and the application kept
+ * running. */
+static int refuse_case(const char* name) {
+  int multicast =
+      strcmp(name, "clean") && strcmp(name, "pool") && strcmp(name, "managed");
+  setup(multicast ? 2 : 1);
   pid_t me = getpid();
-  EXPECT(gate_up(&me, 1) == 0, "gate refused a clean process");
+  if (!strcmp(name, "pool")) {
+    PoolProp pp;
+    memset(&pp, 0, sizeof(pp));
+    pp.allocType = 1;
+    pp.handleTypes = POSIX_FD;
+    pp.loc.type = DEVICE;
+    CUmemoryPool pool;
+    CK(cuMemPoolCreate(&pool, &pp));
+    int fd = -1;
+    CK(cuMemPoolExportToShareableHandle(&fd, pool, POSIX_FD, 0));
+  } else if (!strcmp(name, "managed")) {
+    CUdeviceptr m;
+    CK(cuMemAllocManaged(&m, 1 << 20, 1 /* GLOBAL */));
+  } else if (!strcmp(name, "untracked-bind")) {
+    size_t size = mc_size();
+    H mc = plain_group(size);
+    CK(cuMulticastBindMem(mc, 0, untracked_alloc(0, size), 0, size, 0));
+  } else if (!strcmp(name, "span")) {
+    /* Two allocations mapped back to back, bound by address as one range. */
+    size_t size = mc_size();
+    H mc = plain_group(2 * size);
+    AllocProp up = uc_prop(0, 0);
+    H u[2];
+    CUdeviceptr va;
+    CK(cuMemAddressReserve(&va, 2 * size, 0, 0, 0));
+    for (int k = 0; k < 2; k++) {
+      CK(cuMemCreate(&u[k], size, &up, 0));
+      CK(cuMemMap(va + k * size, size, 0, u[k], 0));
+    }
+    Access acc = {{DEVICE, 0}, RW};
+    CK(cuMemSetAccess(va, 2 * size, &acc, 1));
+    CK(cuMulticastBindAddr(mc, 0, va, 2 * size, 0));
+  } else if (strcmp(name, "clean")) {
+    fprintf(stderr, "unknown refusal case %s\n", name);
+    return 2;
+  }
+  int refused = gate_up(&me, 1) != 0;
   gate_down();
-  PoolProp pp;
-  memset(&pp, 0, sizeof(pp));
-  pp.allocType = 1;
-  pp.handleTypes = POSIX_FD;
-  pp.loc.type = DEVICE;
-  CUmemoryPool pool;
-  CK(cuMemPoolCreate(&pool, &pp));
-  int fd = -1;
-  CK(cuMemPoolExportToShareableHandle(&fd, pool, POSIX_FD, 0));
-  EXPECT(gate_up(&me, 1) != 0, "gate accepted a memory pool export");
-  gate_down();
+  if (!strcmp(name, "clean"))
+    EXPECT(!refused && cycle(&me, 1) == 0, "clean process refused");
+  else
+    EXPECT(refused, "gate accepted %s", name);
   /* A refusal leaves the application running. */
   CUdeviceptr p;
+  use(0);
   CK(cuMemAlloc_v2(&p, 4096));
   CK(cuMemsetD32_v2(p, 1, 1024));
-  printf("refuse: ok\n");
+  CK(cuCtxSynchronize());
+  return g_failed;
+}
+
+static int t_refuse(void) {
+  static const char* const cases[] = {"clean", "pool", "managed",
+                                      "untracked-bind", "span"};
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    pid_t pid = fork();
+    if (pid == 0) {
+      execl("/proc/self/exe", "mcshim_test", "refuse1", cases[i], (char*)NULL);
+      _exit(127);
+    }
+    int st;
+    waitpid(pid, &st, 0);
+    int rc = WIFEXITED(st) ? WEXITSTATUS(st) : 128;
+    if (rc == 77) {
+      printf("refuse %s: skipped\n", cases[i]);
+      continue;
+    }
+    EXPECT(rc == 0, "case %s exited 0x%x", cases[i], st);
+  }
+  printf("refuse: %s\n", g_failed ? "FAILED" : "ok");
   return g_failed;
 }
 
@@ -1013,6 +1153,10 @@ static int t_ipc(void) {
 }
 
 int main(int argc, char** argv) {
+  if (argc == 3 && !strcmp(argv[1], "refuse1")) {
+    clear_markers();
+    return refuse_case(argv[2]) ? 1 : 0;
+  }
   if (argc != 2) {
     fprintf(stderr, "usage: %s abi|gate|mc|refcount|refuse|ipc\n", argv[0]);
     return 2;
