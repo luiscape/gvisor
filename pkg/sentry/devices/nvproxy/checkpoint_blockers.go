@@ -36,15 +36,15 @@ var checkpointBlockerClasses = map[nvgpu.ClassID]string{
 
 // CheckpointBlockers returns a description of live RM objects that would
 // make cuda-checkpoint hang or fail, one line per owning process, or "" if
-// there are none.
-func CheckpointBlockers(vfsObj *vfs.VirtualFilesystem) string {
+// there are none. Processes in except are skipped.
+func CheckpointBlockers(vfsObj *vfs.VirtualFilesystem, except map[kernel.ThreadID]bool) string {
 	if nvp := nvproxyFromVFS(vfsObj); nvp != nil {
-		return nvp.checkpointBlockers()
+		return nvp.checkpointBlockers(except)
 	}
 	return ""
 }
 
-func (nvp *nvproxy) checkpointBlockers() string {
+func (nvp *nvproxy) checkpointBlockers(except map[kernel.ThreadID]bool) string {
 	type owner struct {
 		tgid   kernel.ThreadID
 		client nvgpu.Handle
@@ -58,6 +58,9 @@ func (nvp *nvproxy) checkpointBlockers() string {
 	nvp.clientsMu.RUnlock()
 	counts := make(map[owner]map[string]int)
 	for _, client := range clients {
+		if except[client.tgid] {
+			continue
+		}
 		client.objsMu.Lock()
 		if !client.released {
 			for _, o := range client.resources {

@@ -17,7 +17,6 @@ package control
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -60,12 +59,16 @@ import (
 // The protocol is existence-based, which keeps it race-free for any number of
 // ranks sharing one directory:
 //
+//	create <dir>/gate         -> each process blocks GPU work, acks <dir>/gated.<pid>
 //	create <dir>/suspend      -> each process suspends, acks <dir>/suspended.<pid>
 //	unlink <dir>/suspend      -> each process resumes,  acks <dir>/resumed.<pid>
+//	unlink <dir>/gate         -> each process releases the application
 //
-// The directory lives in the container filesystem, so the marker is part of
-// the checkpoint image: after a restore it still exists and the interposer
-// stays suspended until gVisor removes it.
+// The directory lives in the container filesystem, so the markers are part of
+// the checkpoint image: after a restore they still exist and the interposer
+// stays suspended until gVisor removes them. The gate is removed only once
+// every process has resumed, since a rank released earlier could reach a
+// multicast group that a peer is still binding.
 
 const (
 	// cudaShimDir is the rendezvous directory; the interposer uses the same
@@ -93,12 +96,6 @@ const (
 
 	// cudaShimPollInterval is how often to re-check for acknowledgements.
 	cudaShimPollInterval = 100 * time.Millisecond
-
-	// cudaShimRunningPollInterval is how often waitCudaProcsRunning re-polls
-	// `cuda-checkpoint --get-state`. Deliberately coarser than
-	// cudaShimPollInterval: every poll execs one cuda-checkpoint process per
-	// pending CUDA process.
-	cudaShimRunningPollInterval = 500 * time.Millisecond
 
 	// cudaShimSuspendedKey records, in the checkpoint, that the interposer was
 	// suspended, which tells postRestoreCuda that a rebuild is owed.
@@ -255,77 +252,6 @@ func cudaShimWaitAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kerne
 	}
 }
 
-// waitCudaProcsRunning polls `cuda-checkpoint --get-state` until every process
-// in cudaProcs reports the state "running" (processes that exit are dropped
-// from the wait, matching cudaShimWaitAcks).
-//
-// `--action restore`/`--toggle` returning success means the driver accepted the
-// restore, not that the process has finished coming back. Issuing CUDA work
-// before then is what faults the context, so this is the readiness condition
-// for the interposer's rebuild.
-func waitCudaProcsRunning(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup) error {
-	deadline := time.Now().Add(cudaShimAckTimeout)
-	nullFD, cleanup := openCudaCheckpointNullFD(sctx, k)
-	defer cleanup()
-	proc := &Proc{Kernel: k}
-	pending := make(map[*kernel.ThreadGroup]bool, len(cudaProcs))
-	for _, tg := range cudaProcs {
-		pending[tg] = true
-	}
-	for {
-		for tg := range pending {
-			ckptProc, cleanup, err := invokeCudaCheckpoint(sctx, k, proc, cudaCheckpointPath, tg, []string{"--get-state"}, nullFD)
-			if err != nil {
-				log.Warningf("Failed to get CUDA state for PID %d: %v", tg.ID(), err)
-				continue
-			}
-			if ckptProc.tg == nil {
-				// The process exited; nothing to wait for.
-				delete(pending, tg)
-				continue
-			}
-			ckptProc.tg.WaitExited()
-			status := ckptProc.tg.ExitStatus()
-			output := ""
-			if ckptProc.out != nil {
-				output = ckptProc.out.String()
-			}
-			cleanup()
-			// Only the literal state "running" is readiness; a locked or
-			// checkpointed process also exits 0 but is NOT safe to rebuild
-			// on. Match by line: stdout and stderr share the collection
-			// pipe, so other preloaded libraries' stderr chatter must not
-			// mask the state.
-			if status == 0 && outputHasLine(output, "running") {
-				delete(pending, tg)
-			}
-		}
-		if len(pending) == 0 {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			var waiting []kernel.ThreadID
-			for tg := range pending {
-				waiting = append(waiting, tg.ID())
-			}
-			return fmt.Errorf("multicast interposer: %d of %d process(es) did not report running within %s (pids %v)",
-				len(pending), len(cudaProcs), cudaShimAckTimeout, waiting)
-		}
-		time.Sleep(cudaShimRunningPollInterval)
-	}
-}
-
-// outputHasLine reports whether any whitespace-trimmed line of out equals
-// want.
-func outputHasLine(out, want string) bool {
-	for _, line := range strings.Split(out, "\n") {
-		if strings.TrimSpace(line) == want {
-			return true
-		}
-	}
-	return false
-}
-
 // cudaShimClearErrorAcks removes any stale error.<pid> ack files for
 // cudaProcs. Called before requesting a suspend or resume: cudaShimWaitAcks
 // fast-fails on error acks, and the interposer only clears its own error file
@@ -407,7 +333,7 @@ func unwindCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaProcs [
 		}
 	}
 	if err := cudaShimSetMarker(sctx, k, cudaProcs, cudaShimGateMarker, false /* set */); err != nil {
-		log.Warningf("Multicast interposer unwind: %v", err)
+		log.Warningf("Multicast interposer unwind: the application stays blocked: %v", err)
 	}
 	log.Infof("Multicast interposer unwound (%d process(es) had been torn down)", len(tornDown))
 }
@@ -461,20 +387,15 @@ func suspendCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaProcs 
 // resumeCudaMulticastShim asks the interposer to rebuild multicast objects and
 // CUDA IPC imports, and waits for every process to finish.
 //
-// Precondition: the post-restore cuda-checkpoint toggle has completed on EVERY
-// process. Resuming earlier rebuilds on a context whose device state is not
+// Precondition: restoreCudaProcs has returned, so every process is running
+// again. Resuming earlier rebuilds on a context whose device state is not
 // restored yet and permanently faults it; see the file comment.
-func resumeCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup) error {
+func resumeCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup) error {
 	if k.PopCheckpointState(cudaShimSuspendedKey) == nil {
 		log.Infof("Multicast interposer: no suspend recorded in the checkpoint; nothing to rebuild")
 		return nil
 	}
 	start := time.Now()
-	// The restore toggle returning is necessary but not sufficient: wait until
-	// every process actually reports "running" before rebuilding on top of it.
-	if err := waitCudaProcsRunning(sctx, k, cudaCheckpointPath, cudaProcs); err != nil {
-		return err
-	}
 	cudaShimClearErrorAcks(sctx, k, cudaProcs)
 	if err := cudaShimSetMarker(sctx, k, cudaProcs, cudaShimSuspendMarker, false /* set */); err != nil {
 		return err
@@ -483,10 +404,9 @@ func resumeCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaCheckpo
 	if err := cudaShimWaitAcks(sctx, k, managed, "resumed"); err != nil {
 		return err
 	}
-	// The interposer releases the application itself once the rebuild
-	// succeeds; clear the marker too so a later checkpoint starts clean.
+	// Every process has resumed: release the application.
 	if err := cudaShimSetMarker(sctx, k, cudaProcs, cudaShimGateMarker, false /* set */); err != nil {
-		log.Warningf("Failed to clear multicast interposer gate marker: %v", err)
+		return fmt.Errorf("multicast interposer: releasing the application: %w", err)
 	}
 	log.Infof("Multicast interposer resumed on %d of %d CUDA process(es) in %s", len(managed), len(cudaProcs), time.Since(start))
 	return nil

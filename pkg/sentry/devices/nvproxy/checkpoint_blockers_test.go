@@ -43,7 +43,7 @@ func TestCheckpointBlockers(t *testing.T) {
 	rank0 := addClient(0xc1d00001, 41)
 	addObj(rank0, 0x5c000001, nvgpu.NV01_DEVICE_0)    // not a blocker
 	addObj(rank0, 0x5c000002, nvgpu.NV_MEMORY_FABRIC) // not a blocker
-	if got := nvp.checkpointBlockers(); got != "" {
+	if got := nvp.checkpointBlockers(nil); got != "" {
 		t.Fatalf("no blockers expected, got %q", got)
 	}
 
@@ -51,7 +51,7 @@ func TestCheckpointBlockers(t *testing.T) {
 	addObj(rank0, 0x5c000004, nvgpu.NV_MEMORY_MULTICAST_FABRIC)
 	addObj(rank1, 0x5c000005, nvgpu.NV_MEMORY_FABRIC_IMPORTED_REF)
 	want := "PID 41 (client 0xc1d00001): 2 multicast; PID 42 (client 0xc1d00002): 1 fabric-import"
-	if got := nvp.checkpointBlockers(); got != want {
+	if got := nvp.checkpointBlockers(nil); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 
@@ -60,7 +60,13 @@ func TestCheckpointBlockers(t *testing.T) {
 	nvp.objFree(ctx, rank0, nvgpu.Handle{Val: 0x5c000003})
 	rank0.objsMu.Unlock()
 	want = "PID 41 (client 0xc1d00001): 1 multicast; PID 42 (client 0xc1d00002): 1 fabric-import"
-	if got := nvp.checkpointBlockers(); got != want {
+	if got := nvp.checkpointBlockers(nil); got != want {
 		t.Fatalf("after free: got %q, want %q", got, want)
+	}
+
+	// Processes running the interposer can be exempted.
+	want = "PID 42 (client 0xc1d00002): 1 fabric-import"
+	if got := nvp.checkpointBlockers(map[kernel.ThreadID]bool{41: true}); got != want {
+		t.Fatalf("except 41: got %q, want %q", got, want)
 	}
 }

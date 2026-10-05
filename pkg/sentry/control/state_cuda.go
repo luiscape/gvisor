@@ -84,14 +84,17 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	}
 
 	// cuda-checkpoint hangs indefinitely on processes holding NVLink
-	// multicast memory (e.g. NCCL with NVLS), so refuse up front -- unless
-	// they run the multicast interposer, which releases it before
-	// cuda-checkpoint runs (checkpointCudaProcs re-checks afterwards).
-	shim := len(cudaShimManagedProcs(sctx, k, cudaProcs)) != 0
-	if !shim {
-		if blockers := nvproxy.CheckpointBlockers(k.VFS()); blockers != "" {
-			return fail(fmt.Errorf("cannot checkpoint CUDA processes holding multicast memory (e.g. NCCL_NVLS_ENABLE=0 to disable NVLS): %s", blockers))
-		}
+	// multicast memory (e.g. NCCL with NVLS), so refuse up front, unless they
+	// run the multicast interposer, which releases it before cuda-checkpoint
+	// runs (checkpointCudaProcs re-checks afterwards).
+	managed := cudaShimManagedProcs(sctx, k, cudaProcs)
+	shim := len(managed) != 0
+	except := make(map[kernel.ThreadID]bool, len(managed))
+	for _, tg := range managed {
+		except[tg.ID()] = true
+	}
+	if blockers := nvproxy.CheckpointBlockers(k.VFS(), except); blockers != "" {
+		return fail(fmt.Errorf("cannot checkpoint CUDA processes holding multicast memory without the multicast interposer (e.g. NCCL_NVLS_ENABLE=0 to disable NVLS): %s", blockers))
 	}
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {
@@ -207,7 +210,7 @@ func postRestoreCuda(k *kernel.Kernel, timeline *timing.Timeline, nvproxyRemappi
 	// cannot be serviced, which faults every rank's context with
 	// CUDA_ERROR_ILLEGAL_ADDRESS (700). Both were observed.
 	if err == nil {
-		if rerr := resumeCudaMulticastShim(k.SupervisorContext(), k, cudaCheckpointPath, cudaProcs); rerr != nil {
+		if rerr := resumeCudaMulticastShim(k.SupervisorContext(), k, cudaProcs); rerr != nil {
 			err = fmt.Errorf("failed to resume multicast interposer: %w", rerr)
 		} else {
 			timeline.Reached("multicast interposer resumed")
@@ -500,7 +503,7 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 			return err
 		}
 		// cuda-checkpoint would hang on anything the interposer left behind.
-		if blockers := nvproxy.CheckpointBlockers(k.VFS()); blockers != "" {
+		if blockers := nvproxy.CheckpointBlockers(k.VFS(), nil); blockers != "" {
 			return fmt.Errorf("multicast interposer suspended but resources remain: %s", blockers)
 		}
 		if locked, err = runCudaAction(sctx, k, cudaCheckpointPath, cudaProcs, lockArgs, true /* parallel */, nullFD); err != nil {
