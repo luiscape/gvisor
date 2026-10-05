@@ -81,6 +81,7 @@ var _ stack.MulticastForwardingNetworkEndpoint = (*endpoint)(nil)
 var _ stack.GroupAddressableEndpoint = (*endpoint)(nil)
 var _ stack.AddressableEndpoint = (*endpoint)(nil)
 var _ stack.NetworkEndpoint = (*endpoint)(nil)
+var _ stack.RestorableNetworkEndpoint = (*endpoint)(nil)
 var _ IGMPEndpoint = (*endpoint)(nil)
 
 // +checklocksalias:igmp.ep.mu=mu
@@ -111,6 +112,13 @@ type endpoint struct {
 
 	// +checklocks:mu
 	igmp igmpState
+}
+
+// Restore implements stack.RestorableNetworkEndpoint.
+func (e *endpoint) Restore() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.igmp.restore()
 }
 
 // SetIGMPVersion implements IGMPEndpoint.
@@ -1987,7 +1995,8 @@ func (p *protocol) allowICMPReply(icmpType header.ICMPv4Type, code header.ICMPv4
 }
 
 // SendRejectionError implements stack.RejectIPv4WithHandler.
-func (p *protocol) SendRejectionError(pkt *stack.PacketBuffer, rejectWith stack.RejectIPv4WithICMPType, inputHook bool) tcpip.Error {
+func (p *protocol) SendRejectionError(pkt *stack.PacketBuffer, rejectWith stack.RejectIPv4WithICMPType, hook stack.Hook) tcpip.Error {
+	inputHook := hook == stack.Input
 	switch rejectWith {
 	case stack.RejectIPv4WithICMPNetUnreachable:
 		return p.returnError(&icmpReasonNetworkUnreachable{}, pkt, inputHook)
@@ -2002,7 +2011,7 @@ func (p *protocol) SendRejectionError(pkt *stack.PacketBuffer, rejectWith stack.
 	case stack.RejectIPv4WithICMPAdminProhibited:
 		return p.returnError(&icmpReasonAdministrativelyProhibited{}, pkt, inputHook)
 	case stack.RejectIPv4WithTCPReset:
-		return ip.RejectWithTCPReset(pkt, ProtocolNumber, p.stack, inputHook)
+		return ip.RejectWithTCPReset(pkt, ProtocolNumber, p.stack, hook)
 	default:
 		panic(fmt.Sprintf("unhandled %[1]T = %[1]d", rejectWith))
 	}

@@ -223,11 +223,14 @@ endif
 DOCKER_RUN_OPTIONS += $(DOCKER_PRIVILEGED)
 DOCKER_RUN_OPTIONS += --cap-add SYS_MODULE
 DOCKER_EXEC_OPTIONS += $(DOCKER_PRIVILEGED)
+# Direct builds do not require a local Docker socket.
+ifneq (,$(wildcard $(DOCKER_SOCKET)))
 DOCKER_GROUP := $(shell $(STAT_G) $(DOCKER_SOCKET))
 ifneq ($(GID),$(DOCKER_GROUP))
 USERADD_OPTIONS += --groups $(DOCKER_GROUP)
 GROUPADD_DOCKER += groupadd --gid $(DOCKER_GROUP) --non-unique docker-$(HASH) &&
 DOCKER_RUN_OPTIONS += --group-add $(DOCKER_GROUP)
+endif
 endif
 endif
 
@@ -351,16 +354,19 @@ ensure-bazel-server:
 endif
 .PHONY: ensure-bazel-server
 
-# build_paths extracts the built binary from the bazel stderr output.
-#
-# The last line is used to prevent terminal shenanigans.
+# build_paths materializes selected outputs and passes cquery's path/destination
+# pairs to $(2). cquery also includes manual targets that build may exclude, so
+# filter missing paths before translating them from the build environment.
+# https://github.com/bazelbuild/bazel/blob/61aa5a57c/src/main/java/com/google/devtools/build/lib/runtime/commands/CqueryCommand.java#L90-L94
+# Host filtering also permits builds whose Docker cache volume is not mounted
+# on the host; callers that consume printed paths still require local outputs.
 build_paths = \
   (set -euo pipefail; \
-  $(call wrapper,$(BAZEL) build $(BASE_OPTIONS) $(BAZEL_OPTIONS) $(1)) && \
+  $(call wrapper,$(BAZEL) build $(BASE_OPTIONS) $(BAZEL_OPTIONS) --remote_download_outputs=toplevel $(1)) && \
   $(call wrapper,$(BAZEL) cquery $(BASE_OPTIONS) $(BAZEL_OPTIONS) --output=starlark --starlark:file=tools/show_paths.bzl $(1)) \
-  | $(call wrapper,xargs -r -n 2 bash -c 'test -e "$$0" || exit 0; echo "$$($(REALPATH_M) "$$0") $$1"') \
+  | $(call wrapper,xargs -r -n 2 bash -c 'set -euo pipefail; test -e "$$0" || exit 0; output_path="$$($(REALPATH_M) "$$0")"; printf "%s %s\n" "$$output_path" "$$1"') \
   | sed 's~^$(HOME)/\.cache/bazel/~$(patsubst %/,%,$(BAZEL_CACHE))/~' \
-  | xargs -r -n 2 bash -c 'test -e "$$0" || exit 0; echo "$$($(REALPATH_M) "$$0") $$1"' \
+  | xargs -r -n 2 bash -c 'set -euo pipefail; test -e "$$0" || exit 0; output_path="$$($(REALPATH_M) "$$0")"; printf "%s %s\n" "$$output_path" "$$1"' \
   | xargs -r -n 2 bash -c 'set -euo pipefail; $(2)')
 
 clean = $(call header,CLEAN) && $(call wrapper,$(BAZEL) clean)

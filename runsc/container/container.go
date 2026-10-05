@@ -188,7 +188,7 @@ type Args struct {
 	Attached bool
 
 	// PassFiles are user-supplied files from the host to be exposed to the
-	// sandboxed app.
+	// sandboxed app. They are supported only for the sandbox's root container.
 	PassFiles map[int]*os.File
 
 	// ExecFile is the host file used for program execution.
@@ -221,6 +221,10 @@ func New(conf *config.Config, args Args) (*Container, error) {
 
 	if err := validateID(args.ID); err != nil {
 		return nil, err
+	}
+
+	if len(args.PassFiles) != 0 && !specutils.IsRootContainer(args.Spec) {
+		return nil, fmt.Errorf("passed files are supported only when creating a new sandbox")
 	}
 
 	if err := os.MkdirAll(conf.RootDir, 0711); err != nil {
@@ -259,9 +263,21 @@ func New(conf *config.Config, args Args) (*Container, error) {
 			},
 		},
 	}
-	// The Cleanup object cleans up partially created containers when an error
-	// occurs. Any errors occurring during cleanup itself are ignored.
-	cu := cleanup.Make(func() { _ = c.Destroy() })
+	// Clean up partially created containers on error. Log cleanup failures while
+	// preserving the original creation error so callers see why New failed.
+	var rootCgroup cgroup.Cgroup
+	cu := cleanup.Make(func() {
+		if err := c.Destroy(); err != nil {
+			log.Warningf("destroying container after failed creation: %v", err)
+		}
+		// Failed sandbox creation has no Sandbox to retain the root cgroup.
+		// Stop the gofer above before removing the group it was running in.
+		if rootCgroup != nil {
+			if err := rootCgroup.Uninstall(); err != nil {
+				log.Warningf("removing cgroup after failed container creation: %v", err)
+			}
+		}
+	})
 	defer cu.Clean()
 
 	// Lock the container metadata file to prevent concurrent creations of
@@ -286,7 +302,9 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	//      already started sandbox. In this case, container ID is different than
 	//      the sandbox ID.
 	if specutils.IsRootContainer(args.Spec) {
-		if err := c.createRoot(conf, args, sandboxID); err != nil {
+		var err error
+		rootCgroup, err = c.createRoot(conf, args, sandboxID)
+		if err != nil {
 			return nil, err
 		}
 
@@ -345,7 +363,9 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	return c, nil
 }
 
-func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string) error {
+// createRoot returns a cgroup that still needs rollback if creation fails.
+// The caller must stop partially created processes before uninstalling it.
+func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string) (cgroup.Cgroup, error) {
 	log.Debugf("Creating new sandbox for container, cid: %s", args.ID)
 
 	if args.Spec.Linux == nil {
@@ -363,7 +383,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		// part of the cgroup from the start (and all their children processes).
 		parentCgroup, subCgroup, err = c.setupCgroupForRoot(conf, args.Spec)
 		if err != nil {
-			return fmt.Errorf("cannot set up cgroup for root: %w", err)
+			return nil, fmt.Errorf("cannot set up cgroup for root: %w", err)
 		}
 		// Join the child cgroup when using cgroupfs. Joining non leaf-node
 		// cgroups is illegal in cgroupsv2 and will return EBUSY.
@@ -376,10 +396,10 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 	c.CompatCgroup = cgroup.CgroupJSON{Cgroup: subCgroup}
 	mountHints, err := boot.NewPodMountHints(args.Spec)
 	if err != nil {
-		return fmt.Errorf("error creating pod mount hints: %w", err)
+		return parentCgroup, fmt.Errorf("error creating pod mount hints: %w", err)
 	}
 	if err := nvProxyPreGoferHostSetup(args.Spec, conf); err != nil {
-		return err
+		return parentCgroup, err
 	}
 	if err := cgroup.RunInCgroup(containerCgroup, func(cloneIntoCgroupFD *os.File) error {
 		ioFiles, goferFilestores, devIOFile, specFile, err := c.createGoferProcess(conf, mountHints, args.Attached, cloneIntoCgroupFD)
@@ -417,9 +437,9 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		return nil
 
 	}); err != nil {
-		return err
+		return parentCgroup, err
 	}
-	return nil
+	return nil, nil
 }
 
 func (c *Container) createSubcontainer(conf *config.Config, spec *specs.Spec) error {
@@ -2158,8 +2178,29 @@ func (c *Container) setupCgroupForSubcontainer(conf *config.Config, spec *specs.
 	if cg == nil || err != nil {
 		return nil, err
 	}
-	// Use empty resources, just want the directory structure created.
-	return cgroupInstall(conf, cg, &specs.LinuxResources{})
+	// Create the directory (and populate the spec-limit files from the OCI
+	// resources) so cAdvisor and other inotify-based tools can discover the
+	// subcontainer and report its container_spec_* series. The compat cgroup
+	// is process-less, so these limits have no kernel-side effect.
+	// InstallSubcontainerCompatDir handles the systemd v2 case (where Install
+	// does not create the directory) while keeping the existing cgroupfs
+	// behavior for v1 / non-systemd v2.
+	if err := cgroup.InstallSubcontainerCompatDir(cg, spec.Linux.Resources); err != nil {
+		return nil, handleCgroupInstallErr(conf, "subcontainer cgroup", err)
+	}
+	return cg, nil
+}
+
+// handleCgroupInstallErr maps an error from a cgroup install operation. In
+// rootless mode, EACCES/EROFS mean we lack permission to configure cgroups,
+// which is non-fatal: it logs and returns nil so the caller proceeds without a
+// cgroup. All other errors are wrapped with what.
+func handleCgroupInstallErr(conf *config.Config, what string, err error) error {
+	if (errors.Is(err, unix.EACCES) || errors.Is(err, unix.EROFS)) && conf.Rootless {
+		log.Warningf("Skipping %s configuration in rootless mode: %v", what, err)
+		return nil
+	}
+	return fmt.Errorf("configuring %s: %v", what, err)
 }
 
 // cgroupInstall creates cgroups dir structure and sets their respective
@@ -2169,13 +2210,7 @@ func (c *Container) setupCgroupForSubcontainer(conf *config.Config, spec *specs.
 // no cgroups was configured.
 func cgroupInstall(conf *config.Config, cg cgroup.Cgroup, res *specs.LinuxResources) (cgroup.Cgroup, error) {
 	if err := cg.Install(res); err != nil {
-		switch {
-		case (errors.Is(err, unix.EACCES) || errors.Is(err, unix.EROFS)) && conf.Rootless:
-			log.Warningf("Skipping cgroup configuration in rootless mode: %v", err)
-			return nil, nil
-		default:
-			return nil, fmt.Errorf("configuring cgroup: %v", err)
-		}
+		return nil, handleCgroupInstallErr(conf, "cgroup", err)
 	}
 	return cg, nil
 }

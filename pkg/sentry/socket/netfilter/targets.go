@@ -80,6 +80,14 @@ func init() {
 		NetworkProtocol: header.IPv6ProtocolNumber,
 	})
 
+	// MASQUERADE targets (source NAT to the outgoing interface's address).
+	registerTargetMaker(&masqueradeTargetMaker{
+		NetworkProtocol: header.IPv4ProtocolNumber,
+	})
+	registerTargetMaker(&masqueradeTargetMaker{
+		NetworkProtocol: header.IPv6ProtocolNumber,
+	})
+
 	// CT targets (used in the raw table for conntrack zone assignment).
 	registerTargetMaker(&ctTargetMaker{
 		NetworkProtocol: header.IPv4ProtocolNumber,
@@ -509,6 +517,15 @@ func parseTarget(filter stack.IPHeaderFilter, optVal []byte, ipv6 bool, tableNam
 	}
 
 	return unmarshalTarget(target, filter, optVal)
+}
+
+func targetName(optVal []byte) string {
+	if len(optVal) < linux.SizeOfXTEntryTarget {
+		return ""
+	}
+	var target linux.XTEntryTarget
+	target.UnmarshalUnsafe(optVal)
+	return target.Name.String()
 }
 
 // JumpTarget implements stack.Target.

@@ -146,7 +146,11 @@ func skipUnlessCheckpointSupported(b *testing.B) {
 	if !testutil.IsCheckpointSupported() {
 		b.Skip("Checkpoint is not supported on this runtime.")
 	}
-	if os.Getenv("RUNTIME") == "runc" {
+	runtime := dockerutil.Runtime()
+	if runtime == "" {
+		runtime = os.Getenv("RUNTIME")
+	}
+	if runtime == "" || runtime == "runc" {
 		b.Skip("Skipping runc for Checkpoint latency benchmark.")
 	}
 }
@@ -169,12 +173,8 @@ func BenchmarkCheckpointEmpty(b *testing.B) {
 			container := client.GetContainer(ctx, b)
 			defer container.CleanUp(ctx)
 
-			// Using host network mode to avoid Docker v28+ restore bug where
-			// Moby attempts to bind-mount /proc/0/ns/net on bridge namespaces
-			// (see https://github.com/moby/moby/issues/50750).
 			if err := container.Spawn(ctx, dockerutil.RunOpts{
-				Image:       "benchmarks/alpine",
-				NetworkMode: "host",
+				Image: "benchmarks/alpine",
 			}, "sleep", "1000"); err != nil {
 				b.Fatalf("failed to spawn container: %v", err)
 			}
@@ -215,12 +215,8 @@ func BenchmarkRestoreEmpty(b *testing.B) {
 			container := client.GetContainer(ctx, b)
 			defer container.CleanUp(ctx)
 
-			// Using host network mode to avoid Docker v28+ restore bug where
-			// Moby attempts to bind-mount /proc/0/ns/net on bridge namespaces
-			// (see https://github.com/moby/moby/issues/50750).
 			if err := container.Spawn(ctx, dockerutil.RunOpts{
-				Image:       "benchmarks/alpine",
-				NetworkMode: "host",
+				Image: "benchmarks/alpine",
 			}, "sleep", "1000"); err != nil {
 				b.Fatalf("failed to spawn container: %v", err)
 			}
@@ -241,34 +237,22 @@ func BenchmarkRestoreEmpty(b *testing.B) {
 }
 
 func waitUntilHostServing(ctx context.Context, server *dockerutil.Container, port int) error {
-	serverUpChan := make(chan struct{})
-	var upErr error
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	hexPort := fmt.Sprintf(":%04X", port)
 	cmd := "while ! grep -s -E '" + hexPort + "' /proc/net/tcp /proc/net/tcp6; do sleep 0.001; done"
-	go func() {
-		_, upErr = server.Exec(ctx, dockerutil.ExecOpts{}, "sh", "-c", cmd)
-		if upErr == nil {
-			close(serverUpChan)
-		}
-	}()
-
-	select {
-	case <-serverUpChan:
-		return nil
-	case <-time.After(5 * time.Second):
-		return fmt.Errorf("timeout waiting for server on port %d (%s): last err: %v", port, hexPort, upErr)
+	if output, err := server.Exec(ctx, dockerutil.ExecOpts{}, "sh", "-c", cmd); err != nil {
+		return fmt.Errorf("waiting for server on port %d (%s): %w\n%s", port, hexPort, err, output)
 	}
+	return nil
 }
 
 func spawnServerWorkloadAndWait(ctx context.Context, b *testing.B, client harness.Machine, name string, port int) *dockerutil.Container {
 	server := client.GetContainer(ctx, b)
 
-	// Using host network mode to avoid Docker v28+ restore bug where
-	// Moby attempts to bind-mount /proc/0/ns/net on bridge namespaces
-	// (see https://github.com/moby/moby/issues/50750).
 	opts := dockerutil.RunOpts{
-		Image:       fmt.Sprintf("benchmarks/%s", name),
-		NetworkMode: "host",
+		Image: fmt.Sprintf("benchmarks/%s", name),
 	}
 
 	var cmd []string

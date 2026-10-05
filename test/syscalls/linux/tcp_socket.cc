@@ -14,10 +14,6 @@
 
 #include <fcntl.h>
 
-#include <cstdint>
-#include <iterator>
-#include <memory>
-
 #ifdef __linux__
 #include <linux/capability.h>
 #include <linux/filter.h>
@@ -37,9 +33,12 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <iterator>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <thread>  // NOLINT
 #include <utility>
@@ -2831,6 +2830,27 @@ TEST_P(SimpleTcpSocketTest, SetTCPCorkOff) {
   ASSERT_THAT(
       setsockopt(fd, IPPROTO_TCP, TCP_CORK, &kSockOptOff, sizeof(kSockOptOff)),
       SyscallSucceeds());
+}
+
+#ifndef SOL_TLS
+#define SOL_TLS 282
+#endif
+
+#ifndef TCP_ULP
+#define TCP_ULP 31
+#endif
+
+TEST_P(TcpSocketTest, SetKTLSFails) {
+  int opt = 1;
+  EXPECT_THAT(
+      setsockopt(connected_.get(), SOL_TLS, 1 /* TLS_TX */, &opt, sizeof(opt)),
+      SyscallFailsWithErrno(ENOPROTOOPT));
+
+  if (IsRunningOnGvisor()) {
+    EXPECT_THAT(
+        setsockopt(connected_.get(), SOL_TCP, TCP_ULP, "tls", sizeof("tls")),
+        SyscallFailsWithErrno(ENOPROTOOPT));
+  }
 }
 #endif  // __linux__
 

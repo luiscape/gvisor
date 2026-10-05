@@ -3,12 +3,14 @@
 load("@bazel_skylib//:bzl_library.bzl", _bzl_library = "bzl_library")
 load("@bazel_skylib//rules:build_test.bzl", _build_test = "build_test")
 load("@bazel_skylib//rules:common_settings.bzl", _BuildSettingInfo = "BuildSettingInfo", _bool_flag = "bool_flag")
+load("@bazel_skylib//rules:expand_template.bzl", _expand_template = "expand_template")
 load("@com_google_protobuf//bazel:proto_library.bzl", _proto_library = "proto_library")
 
 build_test = _build_test
 bzl_library = _bzl_library
 bool_flag = _bool_flag
 BuildSettingInfo = _BuildSettingInfo
+expand_template = _expand_template
 more_shards = 4
 most_shards = 8
 version = "//tools/bazeldefs:version"
@@ -60,12 +62,14 @@ arch_config = [
 
 def arm64_config(_settings, _attr):
     return {
-        # Race builds are always disabled for cross-architecture generation. We
-        # can't run it locally anyways, what value can this provide?
+        # Disable the inherited race setting for cross-architecture generation.
+        # Targets with an explicit race attribute still use instrumentation.
         "@io_bazel_rules_go//go/config:race": False,
         "//command_line_option:cpu": "aarch64",
         "//command_line_option:crosstool_top": "@crosstool//:toolchains",
-        "//command_line_option:platforms": "@io_bazel_rules_go//go/toolchain:linux_arm64",
+        # Permit targets that explicitly enable race instrumentation to use cgo.
+        # Ordinary targets still inherit the pure build setting from .bazelrc.
+        "//command_line_option:platforms": "//tools/bazeldefs:linux_arm64",
     }
 
 def amd64_config(_settings, _attr):
@@ -74,7 +78,8 @@ def amd64_config(_settings, _attr):
         "@io_bazel_rules_go//go/config:race": False,
         "//command_line_option:cpu": "k8",
         "//command_line_option:crosstool_top": "@crosstool//:toolchains",
-        "//command_line_option:platforms": "@io_bazel_rules_go//go/toolchain:linux_amd64",
+        # See above.
+        "//command_line_option:platforms": "//tools/bazeldefs:linux_amd64",
     }
 
 transition_allowlist = "@bazel_tools//tools/allowlists/function_transition_allowlist"

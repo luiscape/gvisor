@@ -32,6 +32,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -166,7 +167,7 @@ func FindRunsc() (string, error) {
 
 // ConfigureExePath configures the executable for runsc in the test environment.
 func ConfigureExePath() error {
-	if *runscPath == "" {
+	if _, err := os.Stat(*runscPath); err != nil {
 		path, err := FindRunsc()
 		if err != nil {
 			return err
@@ -288,9 +289,17 @@ func TestConfig(t *testing.T) *config.Config {
 	return conf
 }
 
+func isCgroupV2() bool {
+	var st unix.Statfs_t
+	if err := unix.Statfs("/sys/fs/cgroup", &st); err != nil {
+		return false
+	}
+	return st.Type == unix.CGROUP2_SUPER_MAGIC
+}
+
 // ConfigForBenchmark returns the default configuration to use in benchmarks.
-// Debugging, tracing, and logging are disabled to ensure accurate performance
-// measurements.
+// Debugging, tracing, and logging are disabled, and GKE production flags are
+// enabled to ensure accurate performance measurements.
 func ConfigForBenchmark(b *testing.B) *config.Config {
 	testFlags := flag.NewFlagSet("bench", flag.ContinueOnError)
 	config.RegisterFlags(testFlags)
@@ -298,10 +307,17 @@ func ConfigForBenchmark(b *testing.B) *config.Config {
 	if err != nil {
 		b.Fatalf("error loading configuration from flags: %v", err)
 	}
+	conf.AllowPacketEndpointWrite = true
+	conf.AllowSUID = true
 	conf.Debug = false
-	conf.Strace = false
+	conf.EnableRaw = true
+	conf.HostSettings = config.HostSettingsEnforce
 	conf.LogPackets = false
 	conf.Network = config.NetworkNone
+	conf.OCISeccomp = true
+	conf.Strace = false
+	conf.SystemdCgroup = isCgroupV2()
+	// TODO: b/567596480 - Investigate running benchmarks with TestOnlyAllowRunAsCurrentUserWithoutChroot = false
 	conf.TestOnlyAllowRunAsCurrentUserWithoutChroot = true
 	conf.WatchdogAction = "panic"
 	return conf
@@ -316,6 +332,18 @@ func Measure(b *testing.B, fn func()) time.Duration {
 	defer b.StopTimer()
 	fn()
 	return time.Since(start)
+}
+
+// ReportPercentiles sorts the recorded iteration durations and reports p50 and p90 metrics.
+func ReportPercentiles(b *testing.B, samples []time.Duration) {
+	if len(samples) == 0 {
+		return
+	}
+	slices.Sort(samples)
+	for _, p := range []int{50, 90} {
+		idx := (len(samples) - 1) * p / 100
+		b.ReportMetric(float64(samples[idx].Nanoseconds()), fmt.Sprintf("p%d.ns", p))
+	}
 }
 
 // NewSpecWithArgs creates a simple spec with the given args suitable for use
@@ -579,38 +607,45 @@ func StartReaper() func() {
 }
 
 // WaitUntilRead reads from the given reader until the wanted string is found
-// or until timeout.
+// or until timeout. The caller owns r; after a timeout, it must release any
+// blocked Read (for example by closing the reader) to let the scanner exit.
 func WaitUntilRead(r io.Reader, want string, timeout time.Duration) error {
-	sc := bufio.NewScanner(r)
-	// done must be accessed atomically. A value greater than 0 indicates
-	// that the read loop can exit.
-	doneCh := make(chan bool)
-	defer close(doneCh)
-	go func() {
-		for sc.Scan() {
-			t := sc.Text()
-			if strings.Contains(t, want) {
-				doneCh <- true
-				return
-			}
-			select {
-			case <-doneCh:
-				return
-			default:
-			}
-		}
-		doneCh <- false
-	}()
-
+	cancel := make(chan struct{})
+	defer close(cancel)
+	result := readUntil(r, want, cancel)
 	select {
 	case <-time.After(timeout):
 		return fmt.Errorf("timeout waiting to read %q", want)
-	case res := <-doneCh:
-		if !res {
+	case found := <-result:
+		if !found {
 			return fmt.Errorf("reader closed while waiting to read %q", want)
 		}
 		return nil
 	}
+}
+
+// readUntil owns the scanner and result channel. Its single result can be
+// published even after the waiter has canceled and stopped receiving.
+func readUntil(r io.Reader, want string, cancel <-chan struct{}) <-chan bool {
+	sc := bufio.NewScanner(r)
+	result := make(chan bool, 1)
+	go func() {
+		defer close(result)
+		for sc.Scan() {
+			t := sc.Text()
+			if strings.Contains(t, want) {
+				result <- true
+				return
+			}
+			select {
+			case <-cancel:
+				return
+			default:
+			}
+		}
+		result <- false
+	}()
+	return result
 }
 
 // KillCommand kills the process running cmd unless it hasn't been started. It

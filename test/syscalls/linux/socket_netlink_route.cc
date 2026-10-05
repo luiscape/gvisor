@@ -341,7 +341,7 @@ TEST_P(NetlinkSetLinkTest, ChangeLinkName) {
   SKIP_IF(IsRunningWithHostinet());
   // Hosts that run with old kernel allow renaming only when
   // the interface is down. The restriction has been removed.
-  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
   Link loopback_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
 
   FileDescriptor fd =
@@ -459,7 +459,7 @@ TEST_P(NetlinkSetLinkTest, ChangeMTU) {
 
 TEST_P(NetlinkSetLinkTest, ChangeMACAddress) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
-  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
   SKIP_IF(IsRunningWithHostinet());
   Link loopback_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
 
@@ -1268,6 +1268,235 @@ TEST(NetlinkRouteTest, GetRouteRequest) {
   EXPECT_TRUE(rtDstFound);
 }
 
+// GetRouteOversizedDestination tests that RTM_GETROUTE with an RTA_DST longer
+// than an address reads the address and leaves the socket usable.
+TEST(NetlinkRouteTest, GetRouteOversizedDestination) {
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  uint32_t port = ASSERT_NO_ERRNO_AND_VALUE(NetlinkPortID(fd.get()));
+
+  struct request {
+    struct nlmsghdr hdr;
+    struct rtmsg rtm;
+    struct nlattr nla;
+    struct in6_addr sin6_addr;
+    uint8_t extraDstByte;
+    uint8_t pad[3];
+  };
+
+  constexpr uint32_t kSeq = 12345;
+
+  struct request req = {};
+  req.hdr.nlmsg_len = sizeof(req);
+  req.hdr.nlmsg_type = RTM_GETROUTE;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST;
+  req.hdr.nlmsg_seq = kSeq;
+
+  req.rtm.rtm_family = AF_INET6;
+  req.rtm.rtm_dst_len = 128;
+  req.rtm.rtm_src_len = 0;
+  req.rtm.rtm_tos = 0;
+  req.rtm.rtm_table = RT_TABLE_UNSPEC;
+  req.rtm.rtm_protocol = RTPROT_UNSPEC;
+  req.rtm.rtm_scope = RT_SCOPE_UNIVERSE;
+  req.rtm.rtm_type = RTN_UNSPEC;
+
+  req.nla.nla_len =
+      sizeof(req.nla) + sizeof(req.sin6_addr) + sizeof(req.extraDstByte);
+  req.nla.nla_type = RTA_DST;
+  req.sin6_addr = in6addr_loopback;
+
+  bool rtDstFound = false;
+  ASSERT_NO_ERRNO(NetlinkRequestResponseSingle(
+      fd, &req, sizeof(req), [&](const struct nlmsghdr* hdr) {
+        EXPECT_EQ(hdr->nlmsg_seq, kSeq);
+        EXPECT_EQ(hdr->nlmsg_pid, port);
+        ASSERT_EQ(hdr->nlmsg_type, RTM_NEWROUTE);
+
+        const struct rtmsg* msg =
+            reinterpret_cast<const struct rtmsg*>(NLMSG_DATA(hdr));
+        EXPECT_EQ(msg->rtm_family, AF_INET6);
+
+        int len = RTM_PAYLOAD(hdr);
+        for (struct rtattr* attr = RTM_RTA(msg); RTA_OK(attr, len);
+             attr = RTA_NEXT(attr, len)) {
+          if (attr->rta_type == RTA_DST) {
+            EXPECT_EQ(RTA_PAYLOAD(attr), sizeof(req.sin6_addr));
+            EXPECT_EQ(memcmp(RTA_DATA(attr), &in6addr_loopback,
+                             sizeof(in6addr_loopback)),
+                      0);
+            rtDstFound = true;
+          }
+        }
+      }));
+  EXPECT_TRUE(rtDstFound);
+
+  const size_t exactLen =
+      sizeof(req) - sizeof(req.extraDstByte) - sizeof(req.pad);
+  req.hdr.nlmsg_len = exactLen;
+  req.hdr.nlmsg_seq = kSeq + 1;
+  req.nla.nla_len = sizeof(req.nla) + sizeof(req.sin6_addr);
+
+  bool responseFound = false;
+  ASSERT_NO_ERRNO(NetlinkRequestResponseSingle(
+      fd, &req, exactLen, [&](const struct nlmsghdr* hdr) {
+        EXPECT_EQ(hdr->nlmsg_seq, kSeq + 1);
+        EXPECT_EQ(hdr->nlmsg_pid, port);
+        responseFound = true;
+      }));
+  EXPECT_TRUE(responseFound);
+}
+
+TEST(NetlinkRouteTest, GetRouteFamilyMismatch) {
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  uint32_t port = ASSERT_NO_ERRNO_AND_VALUE(NetlinkPortID(fd.get()));
+
+  struct v4request {
+    struct nlmsghdr hdr;
+    struct rtmsg rtm;
+    struct nlattr nla;
+    struct in_addr sin_addr;
+  };
+
+  struct v6request {
+    struct nlmsghdr hdr;
+    struct rtmsg rtm;
+    struct nlattr nla;
+    struct in6_addr sin6_addr;
+  };
+
+  constexpr uint32_t kSeq = 12345;
+
+  struct v4request shortReq = {};
+  shortReq.hdr.nlmsg_len = sizeof(shortReq);
+  shortReq.hdr.nlmsg_type = RTM_GETROUTE;
+  shortReq.hdr.nlmsg_flags = NLM_F_REQUEST;
+  shortReq.hdr.nlmsg_seq = kSeq;
+
+  shortReq.rtm.rtm_family = AF_INET6;
+  shortReq.rtm.rtm_dst_len = 128;
+  shortReq.rtm.rtm_src_len = 0;
+  shortReq.rtm.rtm_tos = 0;
+  shortReq.rtm.rtm_table = RT_TABLE_UNSPEC;
+  shortReq.rtm.rtm_protocol = RTPROT_UNSPEC;
+  shortReq.rtm.rtm_scope = RT_SCOPE_UNIVERSE;
+  shortReq.rtm.rtm_type = RTN_UNSPEC;
+
+  shortReq.nla.nla_len = sizeof(shortReq.nla) + sizeof(shortReq.sin_addr);
+  shortReq.nla.nla_type = RTA_DST;
+  ASSERT_EQ(inet_aton("127.0.0.2", &shortReq.sin_addr), 1);
+
+  bool refusalFound = false;
+  ASSERT_NO_ERRNO(NetlinkRequestResponseSingle(
+      fd, &shortReq, sizeof(shortReq), [&](const struct nlmsghdr* hdr) {
+        EXPECT_EQ(hdr->nlmsg_seq, kSeq);
+        EXPECT_EQ(hdr->nlmsg_pid, port);
+        ASSERT_EQ(hdr->nlmsg_type, NLMSG_ERROR);
+
+        ASSERT_GE(hdr->nlmsg_len, sizeof(*hdr) + sizeof(struct nlmsgerr));
+        const struct nlmsgerr* msg =
+            reinterpret_cast<const struct nlmsgerr*>(NLMSG_DATA(hdr));
+        EXPECT_EQ(msg->error, -EINVAL);
+        refusalFound = true;
+      }));
+  EXPECT_TRUE(refusalFound);
+
+  struct v6request longReq = {};
+  longReq.hdr.nlmsg_len = sizeof(longReq);
+  longReq.hdr.nlmsg_type = RTM_GETROUTE;
+  longReq.hdr.nlmsg_flags = NLM_F_REQUEST;
+  longReq.hdr.nlmsg_seq = kSeq + 1;
+
+  longReq.rtm.rtm_family = AF_INET;
+  longReq.rtm.rtm_dst_len = 32;
+  longReq.rtm.rtm_src_len = 0;
+  longReq.rtm.rtm_tos = 0;
+  longReq.rtm.rtm_table = RT_TABLE_UNSPEC;
+  longReq.rtm.rtm_protocol = RTPROT_UNSPEC;
+  longReq.rtm.rtm_scope = RT_SCOPE_UNIVERSE;
+  longReq.rtm.rtm_type = RTN_UNSPEC;
+
+  longReq.nla.nla_len = sizeof(longReq.nla) + sizeof(longReq.sin6_addr);
+  longReq.nla.nla_type = RTA_DST;
+  memcpy(&longReq.sin6_addr, &shortReq.sin_addr, sizeof(shortReq.sin_addr));
+
+  bool rtDstFound = false;
+  ASSERT_NO_ERRNO(NetlinkRequestResponseSingle(
+      fd, &longReq, sizeof(longReq), [&](const struct nlmsghdr* hdr) {
+        EXPECT_EQ(hdr->nlmsg_seq, kSeq + 1);
+        EXPECT_EQ(hdr->nlmsg_pid, port);
+        ASSERT_EQ(hdr->nlmsg_type, RTM_NEWROUTE);
+
+        const struct rtmsg* msg =
+            reinterpret_cast<const struct rtmsg*>(NLMSG_DATA(hdr));
+        EXPECT_EQ(msg->rtm_family, AF_INET);
+        EXPECT_EQ(msg->rtm_dst_len, 32);
+
+        int len = RTM_PAYLOAD(hdr);
+        for (struct rtattr* attr = RTM_RTA(msg); RTA_OK(attr, len);
+             attr = RTA_NEXT(attr, len)) {
+          if (attr->rta_type == RTA_DST) {
+            EXPECT_EQ(RTA_PAYLOAD(attr), sizeof(shortReq.sin_addr));
+            EXPECT_EQ(memcmp(RTA_DATA(attr), &shortReq.sin_addr,
+                             sizeof(shortReq.sin_addr)),
+                      0);
+            rtDstFound = true;
+          }
+        }
+      }));
+  EXPECT_TRUE(rtDstFound);
+}
+
+TEST(NetlinkRouteTest, GetRouteUnsupportedFamily) {
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  uint32_t port = ASSERT_NO_ERRNO_AND_VALUE(NetlinkPortID(fd.get()));
+
+  struct request {
+    struct nlmsghdr hdr;
+    struct rtmsg rtm;
+    struct nlattr nla;
+    struct in_addr sin_addr;
+  };
+
+  constexpr uint32_t kSeq = 12345;
+
+  struct request req = {};
+  req.hdr.nlmsg_len = sizeof(req);
+  req.hdr.nlmsg_type = RTM_GETROUTE;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST;
+  req.hdr.nlmsg_seq = kSeq;
+
+  req.rtm.rtm_family = AF_UNSPEC;
+  req.rtm.rtm_dst_len = 32;
+  req.rtm.rtm_src_len = 0;
+  req.rtm.rtm_tos = 0;
+  req.rtm.rtm_table = RT_TABLE_UNSPEC;
+  req.rtm.rtm_protocol = RTPROT_UNSPEC;
+  req.rtm.rtm_scope = RT_SCOPE_UNIVERSE;
+  req.rtm.rtm_type = RTN_UNSPEC;
+
+  req.nla.nla_len = sizeof(req.nla) + sizeof(req.sin_addr);
+  req.nla.nla_type = RTA_DST;
+  ASSERT_EQ(inet_aton("127.0.0.2", &req.sin_addr), 1);
+
+  bool refusalFound = false;
+  ASSERT_NO_ERRNO(NetlinkRequestResponseSingle(
+      fd, &req, sizeof(req), [&](const struct nlmsghdr* hdr) {
+        EXPECT_EQ(hdr->nlmsg_seq, kSeq);
+        EXPECT_EQ(hdr->nlmsg_pid, port);
+        ASSERT_EQ(hdr->nlmsg_type, NLMSG_ERROR);
+
+        ASSERT_GE(hdr->nlmsg_len, sizeof(*hdr) + sizeof(struct nlmsgerr));
+        const struct nlmsgerr* msg =
+            reinterpret_cast<const struct nlmsgerr*>(NLMSG_DATA(hdr));
+        EXPECT_EQ(msg->error, -EOPNOTSUPP);
+        refusalFound = true;
+      }));
+  EXPECT_TRUE(refusalFound);
+}
+
 // GetRouteRoot tests a RTM_GETROUTE + NLM_F_ROOT request.
 TEST(NetlinkRouteTest, GetRouteRoot) {
   FileDescriptor fd =
@@ -1642,7 +1871,7 @@ TEST_P(NetlinkRouteIpInvariantTest, DeleteRoute) {
 
 TEST_P(NetlinkRouteIpInvariantTest, AddAndRemoveRoute) {
   // Gvisor does not support `RTM_NEWROUTE` or `RTM_DELROUTE`.
-  SKIP_IF(IsRunningOnGvisor() && GvisorPlatform() != Platform::kStarnix);
+  SKIP_IF(IsRunningOnGvisor());
   // CAP_NET_ADMIN is required to modify the routing table.
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
 
@@ -1694,7 +1923,7 @@ TEST_P(NetlinkRouteIpInvariantTest, AddAndRemoveRoute) {
 // GetRuleDump tests a RTM_GETRULE + NLM_F_DUMP request.
 TEST(NetlinkRouteTest, GetRuleDump) {
   // Gvisor does not support `RTM_GETRULE`
-  SKIP_IF(IsRunningOnGvisor() && GvisorPlatform() != Platform::kStarnix);
+  SKIP_IF(IsRunningOnGvisor());
 
   FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
@@ -1749,7 +1978,7 @@ TEST(NetlinkRouteTest, GetRuleDump) {
 
 TEST_P(NetlinkRouteIpInvariantTest, AddAndRemoveRule) {
   // Gvisor does not support `RTM_NEWRULE` or `RTM_DELRULE`.
-  SKIP_IF(IsRunningOnGvisor() && GvisorPlatform() != Platform::kStarnix);
+  SKIP_IF(IsRunningOnGvisor());
   // CAP_NET_ADMIN is required to modify the rule table.
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
 
@@ -2667,6 +2896,14 @@ TEST(NetlinkRouteTest, LinkMulticastGroupBasic) {
   // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
   const DisableSave ds;
 
+  // Renaming an up interface fails on older kernels. Change its state before
+  // joining the multicast group so the setup event cannot enter the test.
+  const Link link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+  ASSERT_NO_ERRNO(LinkChangeFlags(link.index, 0, IFF_UP));
+  auto restore_flags = Cleanup([&]() {
+    EXPECT_NO_ERRNO(LinkChangeFlags(link.index, link.flags & IFF_UP, IFF_UP));
+  });
+
   // nlsk_bound_group joins RTMGRP_LINK via bind().
   struct sockaddr_nl addr = {};
   addr.nl_family = AF_NETLINK;
@@ -2696,7 +2933,6 @@ TEST(NetlinkRouteTest, LinkMulticastGroupBasic) {
       ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
 
   // Change the name of the loopback interface.
-  const Link link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
   std::string old_loopback_name = link.name;
   NameRequest name_request = GetNameRequest(link, "lo_test", kSeq);
   ASSERT_NO_ERRNO(NetlinkRequestAckOrError(control_fd, kSeq, &name_request,
@@ -2883,6 +3119,14 @@ TEST(NetlinkRouteTest, LinkMulticastGroupNoop) {
   // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
   const DisableSave ds;
 
+  // Renaming an up interface fails on older kernels. Change its state before
+  // joining the multicast group so the setup event cannot enter the test.
+  const Link link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+  ASSERT_NO_ERRNO(LinkChangeFlags(link.index, 0, IFF_UP));
+  auto restore_flags = Cleanup([&]() {
+    EXPECT_NO_ERRNO(LinkChangeFlags(link.index, link.flags & IFF_UP, IFF_UP));
+  });
+
   struct sockaddr_nl mcast_addr = {};
   mcast_addr.nl_family = AF_NETLINK;
   mcast_addr.nl_groups = RTMGRP_LINK;
@@ -2890,7 +3134,6 @@ TEST(NetlinkRouteTest, LinkMulticastGroupNoop) {
       ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE, &mcast_addr));
 
   // Issue a request to set the name of the loopback interface to the same name.
-  const Link link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
   NameRequest name_request = GetNameRequest(link, link.name.c_str(), kSeq);
   FileDescriptor control_nlsk =
       ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
@@ -2929,6 +3172,15 @@ TEST(NetlinkRouteTest, LinkMulticastGroupEnobufs) {
     GTEST_SKIP() << "gVisor never returns ENOBUFS.";
   }
 
+  // Renaming an up interface fails on older kernels. Change its state before
+  // joining the multicast group so the setup event cannot enter the test.
+  const Link original_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+  ASSERT_NO_ERRNO(LinkChangeFlags(original_link.index, 0, IFF_UP));
+  auto restore_flags = Cleanup([&]() {
+    EXPECT_NO_ERRNO(LinkChangeFlags(original_link.index,
+                                    original_link.flags & IFF_UP, IFF_UP));
+  });
+
   struct sockaddr_nl mcast_addr = {};
   mcast_addr.nl_family = AF_NETLINK;
   mcast_addr.nl_groups = RTMGRP_LINK;
@@ -2949,7 +3201,13 @@ TEST(NetlinkRouteTest, LinkMulticastGroupEnobufs) {
   // Generate enough link events to overflow poor nlsk's receive buffer.
   FileDescriptor control_nlsk =
       ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
-  Link link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+  auto restore_name = Cleanup([&]() {
+    NameRequest request =
+        GetNameRequest(original_link, original_link.name.c_str(), kSeq);
+    EXPECT_NO_ERRNO(NetlinkRequestAckOrError(control_nlsk, kSeq, &request,
+                                             request.hdr.nlmsg_len));
+  });
+  Link link = original_link;
   constexpr int kMinimumNewlinkMsgSize = 32;
   const int num_msgs = recv_buf_size / kMinimumNewlinkMsgSize;
   for (int i = 0; i < num_msgs || link.name != "lo"; ++i) {

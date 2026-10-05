@@ -12,4 +12,5 @@ go_library(
     marshal = False,
     stateify = False,
     visibility = ["//tools/checklocks/test:__pkg__"],
+    deps = ["//tools/checklocks/test/atomic"],
 )

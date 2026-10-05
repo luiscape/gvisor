@@ -177,6 +177,7 @@ var _ stack.MulticastForwardingNetworkEndpoint = (*endpoint)(nil)
 var _ stack.GroupAddressableEndpoint = (*endpoint)(nil)
 var _ stack.AddressableEndpoint = (*endpoint)(nil)
 var _ stack.NetworkEndpoint = (*endpoint)(nil)
+var _ stack.RestorableNetworkEndpoint = (*endpoint)(nil)
 var _ stack.NDPEndpoint = (*endpoint)(nil)
 var _ MLDEndpoint = (*endpoint)(nil)
 var _ NDPEndpoint = (*endpoint)(nil)
@@ -244,6 +245,26 @@ type endpoint struct {
 	//
 	// LOCK ORDERING: mu > dad.mu.
 	dad endpointDAD
+}
+
+// Restore implements stack.RestorableNetworkEndpoint.
+func (e *endpoint) Restore() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.dad.mu.Lock()
+	e.dad.mu.dad.Restore(&e.dad.mu, e.protocol.stack.SecureRNG().Reader)
+	e.dad.mu.Unlock()
+	e.mu.mld.restore()
+	e.mu.ndp.restore()
+	if e.Enabled() {
+		e.mu.addressableEndpointState.ForEachEndpoint(func(addressEndpoint stack.AddressEndpoint) bool {
+			addr := addressEndpoint.AddressWithPrefix().Address
+			if header.IsV6UnicastAddress(addr) && addressEndpoint.GetKind() == stack.PermanentTentative {
+				_ = e.mu.ndp.startDuplicateAddressDetection(addr, addressEndpoint) // +checklocksforce: ForEachEndpoint calls back synchronously with e.mu held.
+			}
+			return true
+		})
+	}
 }
 
 // NICNameFromID is a function that returns a stable name for the specified NIC,
@@ -2843,7 +2864,8 @@ func (p *protocol) allowICMPReply(icmpType header.ICMPv6Type) bool {
 }
 
 // SendRejectionError implements stack.RejectIPv6WithHandler.
-func (p *protocol) SendRejectionError(pkt *stack.PacketBuffer, rejectWith stack.RejectIPv6WithICMPType, inputHook bool) tcpip.Error {
+func (p *protocol) SendRejectionError(pkt *stack.PacketBuffer, rejectWith stack.RejectIPv6WithICMPType, hook stack.Hook) tcpip.Error {
+	inputHook := hook == stack.Input
 	switch rejectWith {
 	case stack.RejectIPv6WithICMPNoRoute:
 		return p.returnError(&icmpReasonNetUnreachable{}, pkt, inputHook)
@@ -2854,7 +2876,7 @@ func (p *protocol) SendRejectionError(pkt *stack.PacketBuffer, rejectWith stack.
 	case stack.RejectIPv6WithICMPAdminProhibited:
 		return p.returnError(&icmpReasonAdministrativelyProhibited{}, pkt, inputHook)
 	case stack.RejectIPv6WithTCPReset:
-		return ip.RejectWithTCPReset(pkt, ProtocolNumber, p.stack, inputHook)
+		return ip.RejectWithTCPReset(pkt, ProtocolNumber, p.stack, hook)
 	default:
 		panic(fmt.Sprintf("unhandled %[1]T = %[1]d", rejectWith))
 	}

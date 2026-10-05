@@ -22,8 +22,10 @@ import (
 	"path/filepath"
 
 	"golang.org/x/sys/unix"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fsutil"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -256,6 +258,29 @@ func (i *directfsInode) openHandle(ctx context.Context, flags uint32, d *dentry)
 	if err != nil {
 		return noHandle, err
 	}
+	cu := cleanup.Make(func() {
+		_ = unix.Close(openFD)
+	})
+	defer cu.Clean()
+
+	// Verify that the opened file matches the expected file type and device.
+	var stat unix.Stat_t
+	if err := unix.Fstat(openFD, &stat); err != nil {
+		return noHandle, err
+	}
+	if err := checkSupportedFileType(stat.Mode); err != nil {
+		return noHandle, err
+	}
+	if got, want := stat.Mode&unix.S_IFMT, i.inode.fileType(); got != want {
+		return noHandle, unix.ESTALE
+	}
+	if i.inode.fileType() == unix.S_IFCHR {
+		if unix.Major(stat.Rdev) != i.inode.rdevMajor || unix.Minor(stat.Rdev) != i.inode.rdevMinor {
+			return noHandle, unix.ESTALE
+		}
+	}
+
+	cu.Release()
 	return handle{fd: int32(openFD)}, nil
 }
 
@@ -940,23 +965,15 @@ func doRevalidationDirectfs(ctx context.Context, vfsObj *vfs.VirtualFilesystem, 
 
 	parent := start
 	for _, d := range state.dentries {
-		childFD, err := unix.Openat(parent.controlFD, d.name, unix.O_PATH|hostOpenFlags, 0)
-		if err != nil && err != unix.ENOENT {
-			return err
-		}
-
 		var stat unix.Statx_t
 		// Lock metadata *before* getting attributes for d.
 		d.inode.metadataMu.Lock()
-		found := err == nil
-		if found {
-			err = unix.Statx(childFD, "", unix.AT_EMPTY_PATH, unix.STATX_BASIC_STATS|unix.STATX_BTIME, &stat)
-			_ = unix.Close(childFD)
-			if err != nil {
-				d.inode.metadataMu.Unlock()
-				return err
-			}
+		err := unix.Statx(parent.controlFD, d.name, unix.AT_SYMLINK_NOFOLLOW|unix.AT_NO_AUTOMOUNT, unix.STATX_BASIC_STATS|unix.STATX_BTIME, &stat)
+		if err != nil && err != unix.ENOENT {
+			d.inode.metadataMu.Unlock()
+			return err
 		}
+		found := err == nil
 
 		// Note that synthetic dentries will always fail this comparison check.
 		if !found ||
