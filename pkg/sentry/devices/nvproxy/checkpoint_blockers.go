@@ -135,13 +135,14 @@ func (nvp *nvproxy) unresolvableImports(procs map[kernel.ThreadID]bool) string {
 		clients = append(clients, client)
 	}
 	nvp.clientsMu.RUnlock()
-	type objID struct{ client, object nvgpu.Handle }
 	type imp struct {
-		tgid kernel.ThreadID
-		id   objID
-		src  exportedObjInfo
+		tgid   kernel.ThreadID
+		client nvgpu.Handle
+		object nvgpu.Handle
+		src    exportedObjInfo
 	}
-	live := make(map[objID]bool)
+	// Objects, not handles: libcuda reuses a freed handle at once.
+	live := make(map[*object]bool)
 	var imps []imp
 	for _, client := range clients {
 		if !procs[client.tgid] {
@@ -150,9 +151,9 @@ func (nvp *nvproxy) unresolvableImports(procs map[kernel.ThreadID]bool) string {
 		client.objsMu.Lock()
 		if !client.released {
 			for h, o := range client.resources {
-				live[objID{client.handle, h}] = true
+				live[o] = true
 				if i, ok := o.impl.(*importedObject); ok {
-					imps = append(imps, imp{client.tgid, objID{client.handle, h}, i.src})
+					imps = append(imps, imp{client.tgid, client.handle, h, i.src})
 				}
 			}
 		}
@@ -160,10 +161,10 @@ func (nvp *nvproxy) unresolvableImports(procs map[kernel.ThreadID]bool) string {
 	}
 	var lines []string
 	for _, i := range imps {
-		if i.src.object.Val == 0 {
-			lines = append(lines, fmt.Sprintf("PID %d: object %v:%v imported from an unknown export", i.tgid, i.id.client, i.id.object))
-		} else if !live[objID{i.src.client, i.src.object}] {
-			lines = append(lines, fmt.Sprintf("PID %d: object %v:%v imported from %v:%v, which no longer exists", i.tgid, i.id.client, i.id.object, i.src.client, i.src.object))
+		if i.src.obj == nil {
+			lines = append(lines, fmt.Sprintf("PID %d: object %v:%v imported from an unknown export", i.tgid, i.client, i.object))
+		} else if !live[i.src.obj] {
+			lines = append(lines, fmt.Sprintf("PID %d: object %v:%v imported from %v:%v, which no longer exists", i.tgid, i.client, i.object, i.src.client, i.src.object))
 		}
 	}
 	sort.Strings(lines)

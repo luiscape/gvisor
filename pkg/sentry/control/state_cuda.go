@@ -83,10 +83,11 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		return err
 	}
 
-	// cuda-checkpoint hangs indefinitely on processes holding NVLink
-	// multicast memory (e.g. NCCL with NVLS), so refuse up front, unless they
-	// run the multicast interposer, which releases it before cuda-checkpoint
-	// runs (checkpointCudaProcs re-checks afterwards).
+	// cuda-checkpoint hangs on processes holding NVLink multicast memory (e.g.
+	// NCCL with NVLS) and cannot restore memory imported from an exported fd,
+	// so refuse up front, unless they run the multicast interposer, which
+	// releases both before cuda-checkpoint runs (checkpointCudaProcs re-checks
+	// afterwards).
 	managed := cudaShimManagedProcs(sctx, k, cudaProcs)
 	shim := len(managed) != 0
 	except := make(map[kernel.ThreadID]bool, len(managed))
@@ -94,7 +95,7 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		except[tg.ID()] = true
 	}
 	if blockers := nvproxy.CheckpointBlockers(k.VFS(), except); blockers != "" {
-		return fail(fmt.Errorf("cannot checkpoint CUDA processes holding multicast memory without the multicast interposer (e.g. NCCL_NVLS_ENABLE=0 to disable NVLS): %s", blockers))
+		return fail(fmt.Errorf("cannot checkpoint CUDA processes holding multicast or imported memory without the multicast interposer (e.g. NCCL_NVLS_ENABLE=0 to disable NVLS): %s", blockers))
 	}
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {

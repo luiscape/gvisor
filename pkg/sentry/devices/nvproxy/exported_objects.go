@@ -31,6 +31,10 @@ type exportedObjInfo struct {
 	client nvgpu.Handle
 	object nvgpu.Handle
 	class  nvgpu.ClassID
+
+	// obj is the exported object, if it was tracked. Unlike the handle, it
+	// tells the object apart from a later one that reuses the handle.
+	obj *object `state:"nosave"`
 }
 
 // ProcFDInfoExtra implements proc's procFDInfoExtra (duck-typed): expose the
@@ -132,6 +136,7 @@ func setExportedObj(fi *frontendIoctlState, fd *frontendFD, clientH, objectH nvg
 		if client, unlock := nvp.getClientWithLock(fi.ctx, clientH); client != nil {
 			if obj, ok := client.resources[objectH]; ok {
 				exp.class = obj.class
+				exp.obj = obj
 			}
 			unlock()
 		}
@@ -165,7 +170,8 @@ func ctrlClientExportObjectToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS5
 type importedObject struct {
 	object
 
-	// src is the exported object, as the fd recorded it; zero if unknown.
+	// src is the exported object, as the fd recorded it; src.obj is nil if
+	// unknown.
 	src exportedObjInfo
 
 	// multicast is true for an imported multicast object.

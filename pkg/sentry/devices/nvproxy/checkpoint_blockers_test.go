@@ -102,8 +102,9 @@ func TestUnresolvableImports(t *testing.T) {
 	}
 	exporter := addClient(0xc1d00001, 41)
 	importer := addClient(0xc1d00002, 42)
-	add(exporter, 0x5c000001, &miscObject{}, nvgpu.NV01_MEMORY_LOCAL_USER)
-	src := exportedObjInfo{client: exporter.handle, object: nvgpu.Handle{Val: 0x5c000001}, class: nvgpu.NV01_MEMORY_LOCAL_USER}
+	exported := &miscObject{}
+	add(exporter, 0x5c000001, exported, nvgpu.NV01_MEMORY_LOCAL_USER)
+	src := exportedObjInfo{client: exporter.handle, object: nvgpu.Handle{Val: 0x5c000001}, class: nvgpu.NV01_MEMORY_LOCAL_USER, obj: exported.Object()}
 	add(importer, 0x5c000002, &importedObject{src: src}, src.class)
 	both := map[kernel.ThreadID]bool{41: true, 42: true}
 	if got := nvp.unresolvableImports(both); got != "" {
@@ -116,12 +117,16 @@ func TestUnresolvableImports(t *testing.T) {
 		t.Fatalf("exporter not managed: got %q, want %q", got, want)
 	}
 
-	// The exporter freed the object.
+	// The exporter freed the object, and libcuda reused its handle.
 	exporter.objsMu.Lock()
 	nvp.objFree(ctx, exporter, nvgpu.Handle{Val: 0x5c000001})
 	exporter.objsMu.Unlock()
 	if got := nvp.unresolvableImports(both); got != want {
 		t.Fatalf("exporter freed: got %q, want %q", got, want)
+	}
+	add(exporter, 0x5c000001, &miscObject{}, nvgpu.NV01_MEMORY_LOCAL_USER)
+	if got := nvp.unresolvableImports(both); got != want {
+		t.Fatalf("handle reused: got %q, want %q", got, want)
 	}
 
 	// Freeing the import itself, or its parent, drops it.
