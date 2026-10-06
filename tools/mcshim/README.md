@@ -137,7 +137,8 @@ interposer's rebuild runs against the same ordinals it recorded.
 *   **Tracking tables.** Fixed-size (`MAXN` = 4096 each): objects (`g_alloc`),
     mappings (`g_map`), multicast binds (`g_bind`). This is live state: an
     object is forgotten once it has no application reference, mapping or
-    bind. Any overflow is loud and sticky (`g_untracked`): arming the gate
+    bind. Slots fill first-free, and scans stop at each table's high-water
+    mark. Any overflow is loud and sticky (`g_untracked`): arming the gate
     refuses thereafter, failing the checkpoint before anything is torn down.
 *   **Handles.** The application only ever sees the handle values it was
     given. A rebuild gives objects new driver handles, and every
