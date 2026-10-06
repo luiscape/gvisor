@@ -367,8 +367,8 @@ restore 10.9 to 12.0 s instead of 8.6 to 9.2 s.
 
 The same engines without the interposer are refused at checkpoint (see
 [Background](#what-cuda-checkpoint-cannot-do)). The new nvproxy code (the
-blocker inventory and exported-object tracking) has unit tests, including one
-that pins the fdinfo line format.
+blocker inventory and exported- and imported-object tracking) has unit tests,
+including one that pins the fdinfo line format.
 
 ## Alternatives considered
 
@@ -410,7 +410,9 @@ that pins the fdinfo line format.
     flag?
 5.  **Testing.** `tools/mcshim/test` drives the interposer through the marker
     protocol on two NVLS GPUs (lookup ABIs, gate draining, multicast rebuild,
-    references, refusals, two-process imports). End-to-end coverage needs
+    references, refusals, two-process imports), and checks that
+    `runsc checkpoint` refuses an import nobody would re-export. End-to-end
+    coverage needs
     multiple GPUs on an NVSwitch host. Is a hardware-gated `test/gpu` target
     acceptable, with unit tests for the rest?
 
@@ -419,7 +421,8 @@ that pins the fdinfo line format.
 Once the open questions are settled, as independent PRs, each inert unless
 the interposer flag is set:
 
-1.  Exported-object tracking and the fdinfo line (nvproxy, `fsimpl/proc`).
+1.  Exported- and imported-object tracking and the fdinfo line (nvproxy,
+    `fsimpl/proc`).
 2.  Two-phase lock/checkpoint (useful without the interposer), then the
     sentry control protocol and interposer sequencing (`pkg/sentry/control`).
 3.  The `cuda-checkpoint` job wrap (#13987), then delivery and injection
