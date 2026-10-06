@@ -112,7 +112,7 @@ func TestUnresolvableImports(t *testing.T) {
 	}
 
 	// The exporter is not among the processes that will rebuild.
-	want := "PID 42: object 0xc1d00002:0x5c000002 imported from 0xc1d00001:0x5c000001, which no longer exists"
+	want := "PID 42: object 0xc1d00002:0x5c000002 imported from 0xc1d00001:0x5c000001, which will not be re-exported"
 	if got := nvp.unresolvableImports(map[kernel.ThreadID]bool{42: true}); got != want {
 		t.Fatalf("exporter not managed: got %q, want %q", got, want)
 	}

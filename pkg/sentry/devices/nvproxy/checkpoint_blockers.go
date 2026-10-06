@@ -164,7 +164,7 @@ func (nvp *nvproxy) unresolvableImports(procs map[kernel.ThreadID]bool) string {
 		if i.src.obj == nil {
 			lines = append(lines, fmt.Sprintf("PID %d: object %v:%v imported from an unknown export", i.tgid, i.client, i.object))
 		} else if !live[i.src.obj] {
-			lines = append(lines, fmt.Sprintf("PID %d: object %v:%v imported from %v:%v, which no longer exists", i.tgid, i.client, i.object, i.src.client, i.src.object))
+			lines = append(lines, fmt.Sprintf("PID %d: object %v:%v imported from %v:%v, which will not be re-exported", i.tgid, i.client, i.object, i.src.client, i.src.object))
 		}
 	}
 	sort.Strings(lines)
