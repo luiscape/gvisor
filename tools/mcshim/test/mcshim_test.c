@@ -821,17 +821,62 @@ static void destroy_group_addr(Group* g) {
   CK(cuMemRelease(g->mc));
 }
 
+static H untracked_alloc(int d, size_t size);
+
+/* Like make_group_addr, over memory the shim never saw, bound through
+ * cuMulticastBindAddr with device 0 current: each bind applies to the device
+ * holding the memory. */
+static void make_group_untracked(Group* g) {
+  g->size = mc_size();
+  McProp p = {2, g->size, 0, 0};
+  use(0);
+  CK(cuMulticastCreate(&g->mc, &p));
+  CK(cuMulticastAddDevice(g->mc, 0));
+  CK(cuMulticastAddDevice(g->mc, 1));
+  CUresult (*real_map)(CUdeviceptr, size_t, size_t, H, unsigned long long);
+  CUresult (*real_access)(CUdeviceptr, size_t, const Access*, size_t);
+  *(void**)&real_map = rdlsym(lib, "cuMemMap");
+  *(void**)&real_access = rdlsym(lib, "cuMemSetAccess");
+  Access acc[2] = {{{DEVICE, 0}, RW}, {{DEVICE, 1}, RW}};
+  for (int d = 0; d < 2; d++) {
+    g->uc[d] = untracked_alloc(d, g->size);
+    CK(cuMemAddressReserve(&g->vuc[d], g->size, 0, 0, 0));
+    CK(real_map(g->vuc[d], g->size, 0, g->uc[d], 0));
+    CK(real_access(g->vuc[d], g->size, acc, 2));
+    use(0);
+    CK(cuMulticastBindAddr(g->mc, 0, g->vuc[d], g->size, 0));
+  }
+  g->vmc = map(g->mc, g->size, 0, 1);
+}
+
+static void destroy_group_untracked(Group* g) {
+  CUresult (*real_unmap)(CUdeviceptr, size_t);
+  CUresult (*real_release)(H);
+  *(void**)&real_unmap = rdlsym(lib, "cuMemUnmap");
+  *(void**)&real_release = rdlsym(lib, "cuMemRelease");
+  use(0);
+  CK(cuMemUnmap(g->vmc, g->size));
+  for (int d = 0; d < 2; d++) {
+    CK(cuMulticastUnbind(g->mc, d, 0, g->size));
+    CK(real_unmap(g->vuc[d], g->size));
+    CK(real_release(g->uc[d]));
+  }
+  CK(cuMemRelease(g->mc));
+}
+
 static int t_mc(void) {
   setup(2);
   pid_t me = getpid();
   /* Two groups, so that the rebuild can hand each the other's old handle. */
-  Group a, b, c;
+  Group a, b, c, u;
   make_group(&a, 0);
   make_group(&b, 0);
   make_group_addr(&c);
+  make_group_untracked(&u);
   check_group(&a, 0x1111, "before");
   check_group(&b, 0x2222, "before");
   check_group(&c, 0x6666, "before (by address)");
+  check_group(&u, 0x8888, "before (untracked)");
 
   /* A retained handle is the application's value; releasing it keeps the
    * object. */
@@ -861,7 +906,9 @@ static int t_mc(void) {
   check_group(&a, 0x3333, "after");
   check_group(&b, 0x4444, "after");
   check_group(&c, 0x7777, "after (by address)");
+  check_group(&u, 0x9999, "after (untracked)");
   destroy_group_addr(&c);
+  destroy_group_untracked(&u);
 
   /* After the rebuild the application still uses its original values. */
   CK(cuMemRetainAllocationHandle(&r, (void*)(uintptr_t)a.vmc));

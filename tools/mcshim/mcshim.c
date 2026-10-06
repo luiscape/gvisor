@@ -93,6 +93,7 @@ typedef unsigned long long CUmemGenericAllocationHandle;
 #define CU_MEM_OPERATION_TYPE_MAP 1
 #define CU_MEM_HANDLE_TYPE_GENERIC 0
 #define CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED 128
+#define CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL 9
 
 typedef struct {
   int type;
@@ -239,6 +240,7 @@ static CUresult (*r_cuCtxSynchronize)(void);
 static CUresult (*r_cuDevicePrimaryCtxRetain)(CUcontext*, CUdevice);
 static CUresult (*r_cuDevicePrimaryCtxRelease)(CUdevice);
 static CUresult (*r_cuDevicePrimaryCtxGetState)(CUdevice, unsigned int*, int*);
+static CUresult (*r_cuPointerGetAttribute)(void*, int, CUdeviceptr);
 
 static void resolve_internal(void) {
   REAL(r_cuCtxGetDevice, "cuCtxGetDevice");
@@ -248,6 +250,7 @@ static void resolve_internal(void) {
   REAL(r_cuDevicePrimaryCtxRetain, "cuDevicePrimaryCtxRetain");
   REAL(r_cuDevicePrimaryCtxRelease, "cuDevicePrimaryCtxRelease_v2");
   REAL(r_cuDevicePrimaryCtxGetState, "cuDevicePrimaryCtxGetState");
+  REAL(r_cuPointerGetAttribute, "cuPointerGetAttribute");
 }
 
 /* Suspend gate. While suspended, multicast groups and imports are released and
@@ -569,6 +572,7 @@ typedef struct {
   size_t mcOffset;
   size_t memOffset;
   size_t size;
+  unsigned long long flags;
   CUdevice dev; /* device the binding applies to (unbind is per device) */
 } Bind;
 
@@ -1051,7 +1055,7 @@ CUresult cuMulticastAddDevice(CUmemGenericAllocationHandle h, CUdevice dev) {
 /* Must hold g_lock. Record a successful bind into group gi. */
 static void bind_record(int gi, int v2, int by_addr, int mi, CUdeviceptr va,
                         size_t mcOffset, size_t memOffset, size_t size,
-                        CUdevice dev) {
+                        unsigned long long flags, CUdevice dev) {
   if (gi < 0) {
     mark_untracked("bind to an untracked multicast object");
     return;
@@ -1076,18 +1080,32 @@ static void bind_record(int gi, int v2, int by_addr, int mi, CUdeviceptr va,
                        .mcOffset = mcOffset,
                        .memOffset = memOffset,
                        .size = size,
+                       .flags = flags,
                        .dev = dev};
     return;
   }
   mark_untracked("bind table overflow");
 }
 
-/* The device a v1 bind applies to: the one hosting the memory. */
+/* Must hold g_lock. The device a v1 bind of alloc mi applies to: the one
+ * holding the memory, whatever the current device. (The driver refuses to
+ * bind imported memory.) */
 static CUdevice mem_dev(int mi) {
-  if (mi >= 0 && g_alloc[mi].kind == KIND_UC &&
-      g_alloc[mi].uprop.location.type == CU_MEM_LOCATION_TYPE_DEVICE)
-    return g_alloc[mi].uprop.location.id;
-  return cur_dev();
+  const Alloc* a = &g_alloc[mi];
+  return a->kind == KIND_UC &&
+                 a->uprop.location.type == CU_MEM_LOCATION_TYPE_DEVICE
+             ? a->uprop.location.id
+             : -1;
+}
+
+/* The device holding the memory at va, or -1. */
+static CUdevice ptr_dev(CUdeviceptr va) {
+  int d = -1;
+  if (!r_cuPointerGetAttribute ||
+      r_cuPointerGetAttribute(&d, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, va) !=
+          CUDA_SUCCESS)
+    return -1;
+  return d;
 }
 
 /* Binds block until every device has joined the group, so the real call runs
@@ -1120,7 +1138,9 @@ static CUresult do_bind(int v2, int by_addr, CUmemGenericAllocationHandle mc,
   unsigned mgen = tracked_mem ? g_alloc[mi].gen : 0;
   CUmemGenericAllocationHandle rmc = xlate(mc);
   CUmemGenericAllocationHandle rmem = by_addr ? 0 : xlate(mem);
+  if (!v2 && tracked_mem) dev = mem_dev(mi);
   pthread_mutex_unlock(&g_lock);
+  if (!v2 && !tracked_mem) dev = by_addr ? ptr_dev(va) : -1;
   CUresult rc;
   if (v2 && by_addr)
     rc = r_cuMulticastBindAddr_v2(rmc, dev, mcOffset, va, size, flags);
@@ -1142,7 +1162,7 @@ static CUresult do_bind(int v2, int by_addr, CUmemGenericAllocationHandle mc,
       mark_untracked("bind of memory freed concurrently");
     else
       bind_record(gi, v2, by_addr && !tracked_mem, mi, va, mcOffset, memOffset,
-                  size, v2 ? dev : mem_dev(mi));
+                  size, flags, dev);
     pthread_mutex_unlock(&g_lock);
   }
   gate_exit();
@@ -2012,15 +2032,16 @@ static int resume_locked(void) {
     if (rc == 0) {
       if (bp->v2 && bp->by_addr)
         rc = r_cuMulticastBindAddr_v2(mc, bp->dev, bp->mcOffset, bp->va,
-                                      bp->size, 0);
+                                      bp->size, bp->flags);
       else if (bp->v2)
         rc = r_cuMulticastBindMem_v2(mc, bp->dev, bp->mcOffset, mem,
-                                     bp->memOffset, bp->size, 0);
+                                     bp->memOffset, bp->size, bp->flags);
       else if (bp->by_addr)
-        rc = r_cuMulticastBindAddr(mc, bp->mcOffset, bp->va, bp->size, 0);
+        rc = r_cuMulticastBindAddr(mc, bp->mcOffset, bp->va, bp->size,
+                                   bp->flags);
       else
         rc = r_cuMulticastBindMem(mc, bp->mcOffset, mem, bp->memOffset,
-                                  bp->size, 0);
+                                  bp->size, bp->flags);
     }
     if (held) r_cuMemRelease(mem);
     if (rc != CUDA_SUCCESS) {
