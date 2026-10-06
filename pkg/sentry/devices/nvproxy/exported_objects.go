@@ -119,7 +119,8 @@ func ctrlExportToFDInvoke[Params any, PtrParams hasFrontendFDPtr[Params]](fi *fr
 func ctrlClientExportObjectsToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
 	return ctrlExportToFDInvoke(fi, ioctlParams, func(ctrlParams *nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECTS_TO_FD_PARAMS, ctlFile *frontendFD) {
 		// Each call writes NumObjects slots starting at Index, and a zero
-		// handle clears its slot. libcuda exports one object per fd, in slot 0.
+		// handle clears its slot. libcuda exports an allocation into slot 0,
+		// and sometimes companion objects into later slots.
 		if ioctlParams.Status == nvgpu.NV_OK && ctrlParams.Index == 0 && ctrlParams.NumObjects > 0 {
 			setExportedObj(fi, ctlFile, ioctlParams.HClient, ctrlParams.Objects[0])
 		}
@@ -170,7 +171,7 @@ func ctrlClientExportObjectToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS5
 type importedObject struct {
 	object
 
-	// src is the exported object, as the fd recorded it; src.obj is nil if
+	// src is the fd's exported object (see addImportedObj); src.obj is nil if
 	// unknown.
 	src exportedObjInfo
 
@@ -184,20 +185,22 @@ func (o *importedObject) Release(ctx context.Context) func() {
 }
 
 // addImportedObj records objectH, duped under parentH in clientH, as
-// imported from fd slot index.
+// imported from fd slot index. Objects from any slot are attributed to the
+// allocation exported into slot 0 (see ctrlClientExportObjectsToFD).
 func addImportedObj(fi *frontendIoctlState, fd *frontendFD, clientH, parentH, objectH nvgpu.Handle, index int, multicast bool) {
 	nvp := fi.fd.dev.nvp
-	var src exportedObjInfo
+	nvp.fdsMu.Lock()
+	src := fd.exportedObj
+	nvp.fdsMu.Unlock()
+	var class nvgpu.ClassID
 	if index == 0 {
-		nvp.fdsMu.Lock()
-		src = fd.exportedObj
-		nvp.fdsMu.Unlock()
+		class = src.class
 	}
 	client, unlock := nvp.getClientWithLock(fi.ctx, clientH)
 	if client == nil {
 		return
 	}
-	nvp.objAdd(fi.ctx, client, objectH, src.class, &importedObject{src: src, multicast: multicast}, parentH)
+	nvp.objAdd(fi.ctx, client, objectH, class, &importedObject{src: src, multicast: multicast}, parentH)
 	unlock()
 }
 
