@@ -221,11 +221,9 @@ func cudaShimWaitAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kerne
 			}
 			// A failed transition acks with error.<pid> instead. Fail
 			// fast: without this, a shim-side failure surfaces as this
-			// loop's full timeout. (The sentry removes stale error files
-			// before requesting each transition -- see
-			// cudaShimClearErrorAcks -- and the interposer does the same
-			// when it observes the edge, so an error here is from the
-			// transition being waited on.)
+			// loop's full timeout. (The sentry removes stale acks before
+			// requesting each transition -- see cudaShimClearAcks -- so an
+			// error here is from the transition being waited on.)
 			errPath := fmt.Sprintf("%s/error.%d", cudaShimDir, tg.ID())
 			ctx, pop, cleanup, ok = cudaShimPathOp(sctx, tg, errPath)
 			if !ok {
@@ -253,24 +251,41 @@ func cudaShimWaitAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kerne
 	}
 }
 
-// cudaShimClearErrorAcks removes any stale error.<pid> ack files for
-// cudaProcs. Called before requesting a suspend or resume: cudaShimWaitAcks
-// fast-fails on error acks, and the interposer only clears its own error file
-// when it observes the next marker edge, so an error left over from an
-// earlier, timed-out transition could otherwise fail the new one instantly.
-func cudaShimClearErrorAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup) {
+// cudaShimClearAcks removes the error.<pid> and <prefix>.<pid> acks of
+// cudaProcs before a transition is requested, so that an ack left over from an
+// earlier attempt can neither fail nor satisfy cudaShimWaitAcks.
+func cudaShimClearAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, prefix string) {
 	creds := cudaShimCreds(k)
 	for _, tg := range cudaProcs {
-		path := fmt.Sprintf("%s/error.%d", cudaShimDir, tg.ID())
-		ctx, pop, cleanup, ok := cudaShimPathOp(sctx, tg, path)
+		for _, p := range []string{"error", prefix} {
+			path := fmt.Sprintf("%s/%s.%d", cudaShimDir, p, tg.ID())
+			ctx, pop, cleanup, ok := cudaShimPathOp(sctx, tg, path)
+			if !ok {
+				continue
+			}
+			if err := k.VFS().UnlinkAt(ctx, creds, pop); err != nil && !linuxerr.Equals(linuxerr.ENOENT, err) {
+				log.Warningf("Failed to clear stale interposer ack %q: %v", path, err)
+			}
+			cleanup()
+		}
+	}
+}
+
+// cudaShimMarkerExists returns whether marker exists for any of cudaProcs.
+func cudaShimMarkerExists(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, marker string) bool {
+	creds := cudaShimCreds(k)
+	for _, tg := range cudaProcs {
+		ctx, pop, cleanup, ok := cudaShimPathOp(sctx, tg, cudaShimDir+"/"+marker)
 		if !ok {
 			continue
 		}
-		if err := k.VFS().UnlinkAt(ctx, creds, pop); err != nil && !linuxerr.Equals(linuxerr.ENOENT, err) {
-			log.Warningf("Failed to clear stale interposer error ack %q: %v", path, err)
-		}
+		_, err := k.VFS().StatAt(ctx, creds, pop, &vfs.StatOptions{})
 		cleanup()
+		if err == nil {
+			return true
+		}
 	}
+	return false
 }
 
 // cudaShimProcsWith returns the subset of cudaProcs that have written the file
@@ -325,6 +340,7 @@ func unwindCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaProcs [
 	// Drop any recorded rebuild state: this instance is handling it.
 	k.PopCheckpointState(cudaShimSuspendedKey)
 	tornDown := cudaShimProcsWith(sctx, k, cudaProcs, "suspended")
+	cudaShimClearAcks(sctx, k, tornDown, "resumed")
 	if err := cudaShimSetMarker(sctx, k, cudaProcs, cudaShimSuspendMarker, false /* set */); err != nil {
 		log.Warningf("Multicast interposer unwind: %v", err)
 	}
@@ -346,9 +362,12 @@ func unwindCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaProcs [
 // anything is torn down.
 func armCudaMulticastShimGate(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup) error {
 	start := time.Now()
-	// Clear stale error acks: the gate wait fails fast on them, and the
-	// interposer clears its own only on suspend/resume edges.
-	cudaShimClearErrorAcks(sctx, k, cudaProcs)
+	// A failed teardown leaves its markers in place and the application
+	// blocked; a new attempt would wait for acks that never come.
+	if cudaShimMarkerExists(sctx, k, cudaProcs, cudaShimGateMarker) || cudaShimMarkerExists(sctx, k, cudaProcs, cudaShimSuspendMarker) {
+		return fmt.Errorf("%w (an earlier attempt's markers remain)", errCudaShimTornDown)
+	}
+	cudaShimClearAcks(sctx, k, cudaProcs, "gated")
 	if err := cudaShimSetMarker(sctx, k, cudaProcs, cudaShimGateMarker, true /* set */); err != nil {
 		return err
 	}
@@ -385,7 +404,7 @@ func armCudaMulticastShimGate(sctx context.Context, k *kernel.Kernel, cudaProcs 
 // is what keeps the application off the GPU meanwhile).
 func suspendCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup) error {
 	start := time.Now()
-	cudaShimClearErrorAcks(sctx, k, cudaProcs)
+	cudaShimClearAcks(sctx, k, cudaProcs, "suspended")
 	if err := cudaShimSetMarker(sctx, k, cudaProcs, cudaShimSuspendMarker, true /* set */); err != nil {
 		return err
 	}
@@ -410,7 +429,7 @@ func resumeCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaProcs [
 		return nil
 	}
 	start := time.Now()
-	cudaShimClearErrorAcks(sctx, k, cudaProcs)
+	cudaShimClearAcks(sctx, k, cudaProcs, "resumed")
 	if err := cudaShimSetMarker(sctx, k, cudaProcs, cudaShimSuspendMarker, false /* set */); err != nil {
 		return err
 	}
