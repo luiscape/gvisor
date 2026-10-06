@@ -314,21 +314,21 @@ H100:
 
 Workload                                  | GPUs       | Checkpoint (image) | Restore | First inference after restore | vs. cold boot
 ----------------------------------------- | ---------- | ------------------ | ------- | ----------------------------- | -------------
-vLLM TP=2                                 | 0,1        | 8.6 s (12G)        | 1.4 s   | 5.2 s                         | 43x
-vLLM TP=4                                 | 0-3        | 14.4 s (18G)       | 2.3 s   | 9.7 s                         | 26x
-vLLM TP=8                                 | 0-7        | 36.4 s (35G)       | 4.4 s   | 22.9 s                        | 14x
-vLLM TP=2                                 | 0,1 -> 4,5 | 8.5 s (12G)        | 1.4 s   | 5.6 s                         | 40x
-vLLM TP=4                                 | 0-3 -> 4-7 | 14.4 s (18G)       | 2.3 s   | 10.3 s                        | 24x
-vLLM TP=2                                 | 0,1 -> 1,2 | 8.7 s (12G)        | 1.4 s   | 5.6 s                         | 40x
-SGLang TP=4                               | 0-3        | 15.0 s (17G)       | 2.3 s   | 10.0 s                        | 18x
-SGLang TP=4                               | 0-3 -> 4-7 | 15.1 s (17G)       | 2.3 s   | 10.8 s                        | 17x
-SGLang TP=4 `--enable-nccl-nvls`          | 0-3        | 15.3 s (17G)       | 2.2 s   | 10.0 s                        | 18x
-SGLang TP=4 `--enable-torch-symm-mem`     | 0-3        | 15.4 s (17G)       | 2.3 s   | 10.0 s                        | 18x
-SGLang TP=4 FlashInfer all-reduce fusion  | 0-3        | 16.7 s (18G)       | 2.3 s   | 10.6 s                        | 17x
-SGLang TP=4 FlashInfer all-reduce fusion  | 0-3 -> 4-7 | 16.7 s (18G)       | 2.3 s   | 11.5 s                        | 16x
-SGLang TP=4 `--enable-nccl-nvls`          | 0-3 -> 4-7 | 15.3 s (17G)       | 2.3 s   | 10.9 s                        | 16x
-SGLang TP=4 `--enable-torch-symm-mem`     | 0-3 -> 4-7 | 15.4 s (17G)       | 2.3 s   | 11.0 s                        | 16x
-SGLang TP=8                               | 0-7        | 42.5 s (33G)       | 4.4 s   | 23.3 s                        | 9x
+vLLM TP=2                                 | 0,1        | 8.7 s (12G)        | 1.4 s   | 5.3 s                         | 42x
+vLLM TP=4                                 | 0-3        | 14.4 s (18G)       | 2.3 s   | 9.6 s                         | 26x
+vLLM TP=8                                 | 0-7        | 36.6 s (35G)       | 4.5 s   | 22.9 s                        | 14x
+vLLM TP=2                                 | 0,1 -> 4,5 | 8.7 s (12G)        | 1.5 s   | 5.6 s                         | 41x
+vLLM TP=4                                 | 0-3 -> 4-7 | 14.2 s (18G)       | 2.4 s   | 10.5 s                        | 24x
+vLLM TP=2                                 | 0,1 -> 1,2 | 8.5 s (12G)        | 1.4 s   | 5.6 s                         | 40x
+SGLang TP=4                               | 0-3        | 15.1 s (17G)       | 2.2 s   | 9.6 s                         | 19x
+SGLang TP=4                               | 0-3 -> 4-7 | 15.0 s (17G)       | 2.2 s   | 10.8 s                        | 17x
+SGLang TP=4 `--enable-nccl-nvls`          | 0-3        | 15.3 s (17G)       | 2.2 s   | 10.1 s                        | 18x
+SGLang TP=4 `--enable-torch-symm-mem`     | 0-3        | 15.4 s (17G)       | 2.2 s   | 10.0 s                        | 18x
+SGLang TP=4 FlashInfer all-reduce fusion  | 0-3        | 16.7 s (18G)       | 2.3 s   | 10.5 s                        | 17x
+SGLang TP=4 FlashInfer all-reduce fusion  | 0-3 -> 4-7 | 16.9 s (18G)       | 2.3 s   | 11.7 s                        | 15x
+SGLang TP=4 `--enable-nccl-nvls`          | 0-3 -> 4-7 | 15.2 s (17G)       | 2.3 s   | 11.1 s                        | 16x
+SGLang TP=4 `--enable-torch-symm-mem`     | 0-3 -> 4-7 | 15.3 s (17G)       | 2.3 s   | 11.1 s                        | 16x
+SGLang TP=8                               | 0-7        | 42.5 s (33G)       | 4.3 s   | 23.2 s                        | 9x
 
 B300:
 
