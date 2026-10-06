@@ -1575,17 +1575,15 @@ static void release_devs(void) {
     }
 }
 
-/* Must hold g_lock. Bitmask of the devices the tracked state lives on. */
+/* Must hold g_lock. Bitmask of the devices whose contexts transitions use.
+ * A device only added to a group is not one: the group's own device re-adds
+ * it. */
 static unsigned devs_in_use(void) {
   unsigned mask = 0;
-  for (int i = 0; i < MAXN; i++) {
-    if (g_alloc[i].kind == KIND_FREE) continue;
-    if (g_alloc[i].dev >= 0 && g_alloc[i].dev < MAX_DEV)
+  for (int i = 0; i < MAXN; i++)
+    if (g_alloc[i].kind != KIND_FREE && g_alloc[i].dev >= 0 &&
+        g_alloc[i].dev < MAX_DEV)
       mask |= 1u << g_alloc[i].dev;
-    for (int d = 0; d < g_alloc[i].ndev; d++)
-      if (g_alloc[i].devs[d] >= 0 && g_alloc[i].devs[d] < MAX_DEV)
-        mask |= 1u << g_alloc[i].devs[d];
-  }
   for (int m = 0; m < MAXN; m++)
     if (g_map[m].used && g_map[m].dev >= 0 && g_map[m].dev < MAX_DEV)
       mask |= 1u << g_map[m].dev;

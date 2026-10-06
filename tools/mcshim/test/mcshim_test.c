@@ -1030,14 +1030,26 @@ static H plain_group(size_t size) {
 }
 
 /* One refusal case, in a fresh process. Returns 0 if the gate accepted
- * ("clean") or refused (the rest) as expected, and the application kept
- * running. */
+ * ("clean", "add-only") or refused (the rest) as expected, and the
+ * application kept running. */
 static int refuse_case(const char* name) {
-  int multicast =
-      strcmp(name, "clean") && strcmp(name, "pool") && strcmp(name, "managed");
+  int accept = !strcmp(name, "clean") || !strcmp(name, "add-only");
+  int multicast = !accept && strcmp(name, "pool") && strcmp(name, "managed");
   setup(multicast ? 2 : 1);
   pid_t me = getpid();
-  if (!strcmp(name, "pool")) {
+  if (!strcmp(name, "add-only")) {
+    /* A device added to a group needs no context of its own. */
+    int n, mc = 0;
+    CK(cuDeviceGetCount(&n));
+    CK(cuDeviceGetAttribute(&mc, ATTR_MULTICAST, 0));
+    if (n < 2 || !mc) exit(77);
+    size_t size = mc_size();
+    McProp p = {2, size, 0, 0};
+    H g;
+    CK(cuMulticastCreate(&g, &p));
+    CK(cuMulticastAddDevice(g, 0));
+    CK(cuMulticastAddDevice(g, 1));
+  } else if (!strcmp(name, "pool")) {
     PoolProp pp;
     memset(&pp, 0, sizeof(pp));
     pp.allocType = 1;
@@ -1075,8 +1087,8 @@ static int refuse_case(const char* name) {
   }
   int refused = gate_up(&me, 1) != 0;
   gate_down();
-  if (!strcmp(name, "clean"))
-    EXPECT(!refused && cycle(&me, 1) == 0, "clean process refused");
+  if (accept)
+    EXPECT(!refused && cycle(&me, 1) == 0, "gate refused %s", name);
   else
     EXPECT(refused, "gate accepted %s", name);
   /* A refusal leaves the application running. */
@@ -1089,8 +1101,8 @@ static int refuse_case(const char* name) {
 }
 
 static int t_refuse(void) {
-  static const char* const cases[] = {"clean", "pool", "managed",
-                                      "untracked-bind", "span"};
+  static const char* const cases[] = {"clean",   "add-only",       "pool",
+                                      "managed", "untracked-bind", "span"};
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     pid_t pid = fork();
     if (pid == 0) {
