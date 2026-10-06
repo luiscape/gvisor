@@ -259,7 +259,8 @@ Without an interposer there is no gate or teardown, and two things still
 differ from today: the checkpoint uses `cuda-checkpoint`'s two-phase
 lock/checkpoint instead of a per-process `--toggle`, because a rank spinning
 in a collective can only be quiesced while its peers are locking too; and the
-blocker inventory refuses a checkpoint `cuda-checkpoint` would hang on.
+blocker inventory refuses a checkpoint `cuda-checkpoint` would hang on or
+could not restore.
 
 ### nvproxy additions
 
