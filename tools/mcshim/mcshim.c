@@ -579,6 +579,9 @@ typedef struct {
 static Alloc g_alloc[MAXN];
 static Mapping g_map[MAXN];
 static Bind g_bind[MAXN];
+/* One past the highest slot ever used in each table, so that scans skip the
+ * rest. Only grows. */
+static int g_nalloc, g_nmap, g_nbind;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Sticky: some state could not be tracked or cannot be carried, so arming the
@@ -614,14 +617,14 @@ static int live(int i) {
 }
 
 static int alloc_by_app(CUmemGenericAllocationHandle h) {
-  for (int i = 0; i < MAXN; i++)
+  for (int i = 0; i < g_nalloc; i++)
     if (live(i) && g_alloc[i].app == h) return i;
   return -1;
 }
 
 static int alloc_by_handle(CUmemGenericAllocationHandle h) {
   if (!h) return -1;
-  for (int i = 0; i < MAXN; i++)
+  for (int i = 0; i < g_nalloc; i++)
     if (live(i) && g_alloc[i].handle == h) return i;
   return -1;
 }
@@ -651,6 +654,7 @@ static int track_new(int kind, CUmemGenericAllocationHandle h, CUdevice dev,
   }
   CUmemGenericAllocationHandle v = h;
   while (alloc_by_app(v) >= 0) v = 0xdc00000000000000ULL | ++synth;
+  if (i >= g_nalloc) g_nalloc = i + 1;
   Alloc* a = &g_alloc[i];
   memset(a, 0, sizeof(*a));
   a->kind = kind;
@@ -665,26 +669,26 @@ static int track_new(int kind, CUmemGenericAllocationHandle h, CUdevice dev,
 }
 
 static int has_maps(int i) {
-  for (int m = 0; m < MAXN; m++)
+  for (int m = 0; m < g_nmap; m++)
     if (g_map[m].used && g_map[m].allocIdx == i) return 1;
   return 0;
 }
 
 static int first_map(int i) {
-  for (int m = 0; m < MAXN; m++)
+  for (int m = 0; m < g_nmap; m++)
     if (g_map[m].used && g_map[m].allocIdx == i) return m;
   return -1;
 }
 
 static int bound_as_mem(int i) {
-  for (int b = 0; b < MAXN; b++)
+  for (int b = 0; b < g_nbind; b++)
     if (g_bind[b].used && !g_bind[b].by_addr && g_bind[b].memIdx == i) return 1;
   return 0;
 }
 
 /* Must hold g_lock. The mapping containing va, or -1. */
 static int map_at(CUdeviceptr va) {
-  for (int m = 0; m < MAXN; m++)
+  for (int m = 0; m < g_nmap; m++)
     if (g_map[m].used && va >= g_map[m].va && va < g_map[m].va + g_map[m].size)
       return m;
   return -1;
@@ -696,11 +700,11 @@ static void alloc_gc_all(void);
 /* Must hold g_lock. Forget alloc i and the binds and maps that reference it. */
 static void alloc_forget(int i) {
   int group = g_alloc[i].kind == KIND_MC || g_alloc[i].kind == KIND_IMP;
-  for (int b = 0; b < MAXN; b++)
+  for (int b = 0; b < g_nbind; b++)
     if (g_bind[b].used && (g_bind[b].groupIdx == i ||
                            (!g_bind[b].by_addr && g_bind[b].memIdx == i)))
       g_bind[b].used = 0;
-  for (int m = 0; m < MAXN; m++)
+  for (int m = 0; m < g_nmap; m++)
     if (g_map[m].used && g_map[m].allocIdx == i) g_map[m].used = 0;
   unpublish_fd(&g_alloc[i]);
   free(g_alloc[i].uc_content);
@@ -718,7 +722,7 @@ static void alloc_gc(int i) {
 }
 
 static void alloc_gc_all(void) {
-  for (int i = 0; i < MAXN; i++)
+  for (int i = 0; i < g_nalloc; i++)
     if (g_alloc[i].kind != KIND_FREE && g_alloc[i].app_refs <= 0) alloc_gc(i);
 }
 
@@ -1071,6 +1075,7 @@ static void bind_record(int gi, int v2, int by_addr, int mi, CUdeviceptr va,
   if (g_alloc[gi].kind == KIND_IMP) g_alloc[gi].kind = KIND_MC;
   for (int b = 0; b < MAXN; b++) {
     if (g_bind[b].used) continue;
+    if (b >= g_nbind) g_nbind = b + 1;
     g_bind[b] = (Bind){.used = 1,
                        .groupIdx = gi,
                        .v2 = v2,
@@ -1207,7 +1212,7 @@ CUresult cuMulticastUnbind(CUmemGenericAllocationHandle mc, CUdevice dev,
   int gi = alloc_by_app(mc);
   CUresult rc = r_cuMulticastUnbind(xlate(mc), dev, mcOffset, size);
   if (rc == CUDA_SUCCESS && gi >= 0) {
-    for (int b = 0; b < MAXN; b++)
+    for (int b = 0; b < g_nbind; b++)
       if (g_bind[b].used && g_bind[b].groupIdx == gi && g_bind[b].dev == dev &&
           g_bind[b].mcOffset >= mcOffset &&
           g_bind[b].mcOffset + g_bind[b].size <= mcOffset + size)
@@ -1240,6 +1245,7 @@ CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
       CUdevice d = cur_dev();
       /* Created without a current context: adopt the mapping's device. */
       if (g_alloc[ai].dev < 0) g_alloc[ai].dev = d;
+      if (m >= g_nmap) g_nmap = m + 1;
       g_map[m] = (Mapping){.used = 1,
                            .va = ptr,
                            .size = size,
@@ -1255,15 +1261,17 @@ CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
   return rc;
 }
 
-/* Must hold g_lock. Mark (in sel) the mappings inside [ptr, ptr+size);
- * returns 1 if a mapping straddles the range. */
 static int map_within(const Mapping* mp, CUdeviceptr ptr, size_t size) {
   return mp->used && mp->va >= ptr && mp->va + mp->size <= ptr + size;
 }
 
+/* Must hold g_lock. Mark (in sel, sized MAXN) the mappings inside
+ * [ptr, ptr+size), clearing the rest; returns 1 if a mapping straddles the
+ * range. */
 static int maps_in(CUdeviceptr ptr, size_t size, unsigned char* sel) {
   int partial = 0;
-  for (int m = 0; m < MAXN; m++) {
+  memset(sel, 0, MAXN);
+  for (int m = 0; m < g_nmap; m++) {
     const Mapping* mp = &g_map[m];
     sel[m] = map_within(mp, ptr, size);
     if (mp->used && !sel[m] && mp->va < ptr + size && mp->va + mp->size > ptr)
@@ -1284,10 +1292,10 @@ CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) {
   maps_in(ptr, size, sel);
   /* Objects that lose their last mapping and have no other reference die
    * with this call. */
-  for (int m = 0; m < MAXN; m++) {
+  for (int m = 0; m < g_nmap; m++) {
     if (!sel[m]) continue;
     int ai = g_map[m].allocIdx, others = 0;
-    for (int o = 0; o < MAXN && !others; o++)
+    for (int o = 0; o < g_nmap && !others; o++)
       others = !sel[o] && g_map[o].used && g_map[o].allocIdx == ai;
     if (!others && g_alloc[ai].app_refs <= 0 && !g_alloc[ai].shim_ref &&
         !bound_as_mem(ai))
@@ -1297,7 +1305,7 @@ CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) {
   CUresult rc = r_cuMemUnmap(ptr, size);
   pthread_mutex_lock(&g_lock);
   /* The range may span several mappings. */
-  for (int m = 0; m < MAXN; m++) {
+  for (int m = 0; m < g_nmap; m++) {
     if (!sel[m] || !map_within(&g_map[m], ptr, size)) continue;
     int ai = g_map[m].allocIdx;
     if (rc == CUDA_SUCCESS) {
@@ -1333,7 +1341,7 @@ CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size,
     /* The call updates only the listed locations, over every mapping in the
      * range: NCCL sets access once over a reservation holding several maps,
      * and torch grants peers one at a time. */
-    for (int m = 0; m < MAXN; m++) {
+    for (int m = 0; m < g_nmap; m++) {
       Mapping* mp = &g_map[m];
       if (!sel[m] || !map_within(mp, ptr, size)) continue;
       for (size_t k = 0; k < count; k++) {
@@ -1505,7 +1513,7 @@ static void unpublish_fd(Alloc* a) {
 
 /* Must hold g_lock. */
 static void unpublish_all(void) {
-  for (int i = 0; i < MAXN; i++)
+  for (int i = 0; i < g_nalloc; i++)
     if (g_alloc[i].kind != KIND_FREE) unpublish_fd(&g_alloc[i]);
   if (g_ptracer_any) {
     prctl(PR_SET_PTRACER, 0, 0, 0, 0);
@@ -1580,14 +1588,14 @@ static void release_devs(void) {
  * it. */
 static unsigned devs_in_use(void) {
   unsigned mask = 0;
-  for (int i = 0; i < MAXN; i++)
+  for (int i = 0; i < g_nalloc; i++)
     if (g_alloc[i].kind != KIND_FREE && g_alloc[i].dev >= 0 &&
         g_alloc[i].dev < MAX_DEV)
       mask |= 1u << g_alloc[i].dev;
-  for (int m = 0; m < MAXN; m++)
+  for (int m = 0; m < g_nmap; m++)
     if (g_map[m].used && g_map[m].dev >= 0 && g_map[m].dev < MAX_DEV)
       mask |= 1u << g_map[m].dev;
-  for (int b = 0; b < MAXN; b++)
+  for (int b = 0; b < g_nbind; b++)
     if (g_bind[b].used) mask |= 1u << g_bind[b].dev;
   return mask;
 }
@@ -1641,7 +1649,7 @@ static const char* can_carry(void) {
   for (int d = 0; d < MAX_DEV; d++)
     if ((mask & (1u << d)) && !dev_active(d))
       return "a device's primary context is not active";
-  for (int i = 0; i < MAXN; i++) {
+  for (int i = 0; i < g_nalloc; i++) {
     const Alloc* a = &g_alloc[i];
     if (a->kind == KIND_FREE) continue;
     int maps = has_maps(i), torn = torn_down(i);
@@ -1656,7 +1664,7 @@ static const char* can_carry(void) {
     if (a->kind == KIND_UC && !maps && (torn || a->app_refs <= 0))
       return "multicast-bound memory without a mapping";
     if (a->kind == KIND_UC && torn)
-      for (int m = 0; m < MAXN; m++)
+      for (int m = 0; m < g_nmap; m++)
         if (g_map[m].used && g_map[m].allocIdx == i &&
             rw_dev(&g_map[m], mask) < 0)
           return "multicast-bound export without read-write access";
@@ -1685,7 +1693,7 @@ static int hold_handle(int i, CUmemGenericAllocationHandle* h, int* held) {
 /* Must hold g_lock. Unmap every VA that maps alloc gi, KEEPING the VA
  * reservations (cuMemUnmap only -- never cuMemAddressFree). */
 static int unmap_alloc(int gi, const char* what, int* unmapped) {
-  for (int m = 0; m < MAXN; m++) {
+  for (int m = 0; m < g_nmap; m++) {
     if (!g_map[m].used || g_map[m].allocIdx != gi) continue;
     CUresult rc =
         use_dev(g_map[m].dev) ? -1 : r_cuMemUnmap(g_map[m].va, g_map[m].size);
@@ -1702,7 +1710,7 @@ static int unmap_alloc(int gi, const char* what, int* unmapped) {
 /* Must hold g_lock. Re-map every VA of alloc gi at the identical address and
  * replay its access set. */
 static int remap_alloc(int gi, const char* what, int* remapped) {
-  for (int m = 0; m < MAXN; m++) {
+  for (int m = 0; m < g_nmap; m++) {
     Mapping* mp = &g_map[m];
     if (!mp->used || mp->allocIdx != gi) continue;
     CUresult rc = use_dev(mp->dev) ? -1
@@ -1841,7 +1849,7 @@ static int suspend_locked(void) {
   unpublish_all();
 
   /* Multicast groups: unmap, unbind each device, release. */
-  for (int gi = 0; gi < MAXN; gi++) {
+  for (int gi = 0; gi < g_nalloc; gi++) {
     if (g_alloc[gi].kind != KIND_MC) continue;
     groups++;
     /* With no application reference, the unmap would free the group before
@@ -1853,7 +1861,7 @@ static int suspend_locked(void) {
       return -1;
     }
     if (unmap_alloc(gi, "MC", &unmapped) != 0) return -1;
-    for (int b = 0; b < MAXN; b++) {
+    for (int b = 0; b < g_nbind; b++) {
       Bind* bp = &g_bind[b];
       if (!bp->used || bp->groupIdx != gi) continue;
       CUresult rc = use_dev(bp->dev) ? -1
@@ -1876,7 +1884,7 @@ static int suspend_locked(void) {
    * release. Left resident, the next export after restore fails with
    * OBJECT_NOT_FOUND (R610, vLLM TP=4 and torch symmetric memory). Runs after
    * the group teardown, so the memory is already unbound. */
-  for (int gi = 0; gi < MAXN; gi++) {
+  for (int gi = 0; gi < g_nalloc; gi++) {
     if (g_alloc[gi].kind != KIND_UC || !torn_down(gi)) continue;
     void* buf = malloc(g_alloc[gi].size);
     if (!buf) {
@@ -1885,7 +1893,7 @@ static int suspend_locked(void) {
       return -1;
     }
     g_alloc[gi].uc_content = buf;
-    for (int m = 0; m < MAXN; m++) {
+    for (int m = 0; m < g_nmap; m++) {
       Mapping* mp = &g_map[m];
       if (!mp->used || mp->allocIdx != gi) continue;
       CUresult rc =
@@ -1906,7 +1914,7 @@ static int suspend_locked(void) {
   /* Imports: unmap and release. The memory is the exporter's and
    * cuda-checkpoint saves it; only the live import must go, since
    * cuda-checkpoint cannot restore it. */
-  for (int ii = 0; ii < MAXN; ii++) {
+  for (int ii = 0; ii < g_nalloc; ii++) {
     if (g_alloc[ii].kind != KIND_IMP) continue;
     imports++;
     if (unmap_alloc(ii, "import", &unmapped) != 0) return -1;
@@ -1931,7 +1939,7 @@ static int resume_locked(void) {
   if (sync_devs("RESUME") != 0) return -1;
 
   /* Phase 1: exporters re-create their objects and publish. */
-  for (int gi = 0; gi < MAXN; gi++) {
+  for (int gi = 0; gi < g_nalloc; gi++) {
     Alloc* a = &g_alloc[gi];
     if (a->kind == KIND_MC && !a->imported) {
       CUmemGenericAllocationHandle h = 0;
@@ -1958,7 +1966,7 @@ static int resume_locked(void) {
       a->handle = h;
       a->shim_ref = 1;
       if (remap_alloc(gi, "UC-export", &remapped) != 0) return -1;
-      for (int m = 0; m < MAXN; m++) {
+      for (int m = 0; m < g_nmap; m++) {
         Mapping* mp = &g_map[m];
         if (!mp->used || mp->allocIdx != gi) continue;
         rc = use_dev(rw_dev(mp, devs_in_use()))
@@ -1993,7 +2001,7 @@ static int resume_locked(void) {
   }
 
   /* Phase 2: importers fetch and re-import. */
-  for (int gi = 0; gi < MAXN; gi++) {
+  for (int gi = 0; gi < g_nalloc; gi++) {
     Alloc* a = &g_alloc[gi];
     if ((a->kind == KIND_MC && a->imported) || a->kind == KIND_IMP) {
       if (reimport(gi) != 0) return -1;
@@ -2005,7 +2013,7 @@ static int resume_locked(void) {
   }
 
   /* Phase 3a: re-add devices. AddDevice does not block. */
-  for (int gi = 0; gi < MAXN; gi++) {
+  for (int gi = 0; gi < g_nalloc; gi++) {
     Alloc* a = &g_alloc[gi];
     if (a->kind != KIND_MC) continue;
     for (int d = 0; d < a->ndev; d++)
@@ -2017,7 +2025,7 @@ static int resume_locked(void) {
   }
 
   /* Phase 3b: re-bind. */
-  for (int b = 0; b < MAXN; b++) {
+  for (int b = 0; b < g_nbind; b++) {
     Bind* bp = &g_bind[b];
     if (!bp->used) continue;
     CUmemGenericAllocationHandle mc = g_alloc[bp->groupIdx].handle, mem = 0;
@@ -2051,7 +2059,7 @@ static int resume_locked(void) {
   }
 
   /* Phase 3c: re-map groups and imports at their identical addresses. */
-  for (int gi = 0; gi < MAXN; gi++) {
+  for (int gi = 0; gi < g_nalloc; gi++) {
     int k = g_alloc[gi].kind;
     if ((k == KIND_MC || k == KIND_IMP) &&
         remap_alloc(gi, k == KIND_MC ? "MC" : "import", &remapped) != 0)
@@ -2060,7 +2068,7 @@ static int resume_locked(void) {
 
   /* Phase 4: hand the references back. The shim's one reference stands for
    * the first of the application's; more are retained from a mapping. */
-  for (int gi = 0; gi < MAXN; gi++) {
+  for (int gi = 0; gi < g_nalloc; gi++) {
     Alloc* a = &g_alloc[gi];
     if (a->kind == KIND_FREE || !a->shim_ref) continue;
     if (use_dev(a->dev) != 0) return -1;
@@ -2565,7 +2573,7 @@ static void mcshim_atfork_child(void) {
   __atomic_store_n(&g_inflight, 0, __ATOMIC_SEQ_CST);
   memset(g_pctx, 0, sizeof(g_pctx));
   if (g_control_started) g_disabled = 1;
-  for (int i = 0; i < MAXN; i++) {
+  for (int i = 0; i < g_nalloc; i++) {
     if (g_alloc[i].kind != KIND_FREE && g_alloc[i].pub_fd >= 0)
       close(g_alloc[i].pub_fd);
     g_alloc[i].pub_fd = -1;
