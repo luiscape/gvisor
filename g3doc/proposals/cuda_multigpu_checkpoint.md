@@ -198,7 +198,6 @@ File                                | Writer      | Meaning
 `gated.<pid>`                       | interposer  | gate armed and drained
 `suspended.<pid>`, `resumed.<pid>`  | interposer  | teardown / rebuild finished
 `error.<pid>`                       | interposer  | the transition failed; the sentry fails fast
-`exp-<client>-<object>.<pid>`       | interposer  | this process exports that object and will republish it after restore
 
 The markers live in the container filesystem, so they are part of the
 checkpoint: after restore the interposer stays suspended, and the application
@@ -215,6 +214,7 @@ sequenceDiagram
     S->>S: collect CUDA processes
     S->>M: create gate
     M-->>S: gated.pid
+    S->>S: every import's exported object must still exist
     S->>C: lock all ranks in parallel
     S->>C: unlock
     S->>M: create suspend
@@ -244,13 +244,16 @@ unwinds: unlock, rebuild, release the gate, and the application keeps running.
 A process whose state cannot be carried refuses the gate, before anything is
 torn down: a table overflow, an unknown entry-point ABI, memory-pool IPC,
 logical endpoints, non-POSIX-fd handles, sparse array mappings, managed
-memory, an import nobody will republish, or references it could not restore
-(see `tools/mcshim/README.md`). The sentry likewise refuses up front when a
-process that does not run the interposer holds multicast objects. If the
-teardown itself fails partway, peers may already
-have released state the failed process needs, so nothing is rolled back: the
-application stays blocked, the checkpoint fails, and the workload must be
-restarted.
+memory, or references it could not restore (see `tools/mcshim/README.md`).
+Once every process is gated, the sentry refuses an import whose exported
+object no longer exists in a process that runs the interposer, since nobody
+would re-export it after restore; with every process gated, none can free an
+object during the check. The sentry likewise refuses up front when a process
+that does not run the interposer holds multicast objects or imported memory.
+If the teardown itself fails partway, peers may already have released state
+the failed process needs, so nothing is rolled back: the application stays
+blocked, the checkpoint fails, later attempts are refused at once, and the
+workload must be restarted.
 
 Without an interposer there is no gate or teardown, and two things still
 differ from today: the checkpoint uses `cuda-checkpoint`'s two-phase
@@ -275,13 +278,20 @@ blocker inventory refuses a checkpoint `cuda-checkpoint` would hang on.
     restore. Linux precedent: dmabuf and DRM `show_fdinfo`. Without it the
     interposer refuses the checkpoint.
 
+-   **Imported objects.** nvproxy records objects imported through
+    `IMPORT_OBJECT(S)_FROM_FD` with the exported object they came from (by
+    object, not handle: libcuda reuses a freed handle at once). Imports are
+    checkpoint blockers, since `cuda-checkpoint` cannot restore them, and the
+    sentry checks that each import's source still exists before a teardown.
+
 This builds on #14525 (merged) and #14817 (approved) for restore onto other
 GPUs, and #14850 (merged), a control libcuda issues on NVSwitch systems when
 allocating and exporting VMM memory. It also uses a checkpoint blocker
 inventory, to be proposed separately: nvproxy reports, per process, the live
 multicast groups and fabric-memory imports that would make `cuda-checkpoint`
-hang. Without the interposer the sentry refuses such a checkpoint up front;
-with it, the inventory verifies the teardown.
+hang or fail, including the imports above. Without the interposer the sentry
+refuses such a checkpoint up front; with it, the inventory verifies the
+teardown.
 
 ## Validation
 
