@@ -1590,12 +1590,36 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	return nil
 }
 
+// cudaMulticastShimValidatedDriverMajor is the only driver release the
+// multicast interposer, and the cuda-checkpoint job it runs with, have been
+// validated on. cuda-checkpoint's job and lock/checkpoint actions need R610+;
+// --cuda-multicast-shim-unvalidated-driver=ALLOW enables the interposer on
+// newer releases.
+const cudaMulticastShimValidatedDriverMajor = 610
+
+// cudaMulticastShimDriverError returns why the multicast interposer cannot be
+// used on driver release driverMajor, or nil if it can.
+func cudaMulticastShimDriverError(conf *config.Config, driverMajor int) error {
+	switch {
+	case driverMajor < cudaMulticastShimValidatedDriverMajor:
+		return fmt.Errorf("driver R%d is older than R%d", driverMajor, cudaMulticastShimValidatedDriverMajor)
+	case driverMajor == cudaMulticastShimValidatedDriverMajor:
+		return nil
+	case conf.CUDAMulticastShimUnvalidatedDriver == config.CUDAMulticastShimUnvalidatedDriverAllow:
+		log.Warningf("Using the multicast interposer on driver R%d, on which it has not been validated (only on R%d), because --cuda-multicast-shim-unvalidated-driver=ALLOW is set", driverMajor, cudaMulticastShimValidatedDriverMajor)
+		return nil
+	default:
+		return fmt.Errorf("the multicast interposer has not been validated on driver R%d, only on R%d; --cuda-multicast-shim-unvalidated-driver=ALLOW enables it anyway", driverMajor, cudaMulticastShimValidatedDriverMajor)
+	}
+}
+
 // cudaMulticastShimEnabled reports whether conf opts into the multicast
-// interposer, which needs --cuda-checkpoint-path and driver R610+. Only then
-// do containers run in a cuda-checkpoint job and checkpoint with the
-// interposer's protocol; otherwise CUDA checkpoints are unchanged.
+// interposer, which needs --cuda-checkpoint-path and a driver release it may
+// be used on (see cudaMulticastShimDriverError). Only then do containers run
+// in a cuda-checkpoint job and checkpoint with the interposer's protocol;
+// otherwise CUDA checkpoints are unchanged.
 func cudaMulticastShimEnabled(conf *config.Config, driverMajor int) bool {
-	return conf.CUDAMulticastShimContainerPath() != "" && conf.CUDACheckpointPath != "" && driverMajor >= 610
+	return conf.CUDAMulticastShimContainerPath() != "" && conf.CUDACheckpointPath != "" && cudaMulticastShimDriverError(conf, driverMajor) == nil
 }
 
 // setupCudaCheckpointJob groups a GPU container's CUDA processes into a
@@ -1625,7 +1649,7 @@ func (l *Loader) setupCudaCheckpointJob(info *containerInfo) error {
 // setupCudaMulticastShim LD_PRELOADs the multicast suspend/resume interposer
 // into a GPU container (when --cuda-multicast-shim-path and/or
 // --cuda-multicast-shim-source=EMBEDDED is set, nvproxy is enabled, and the driver
-// is R610+). With
+// is one the interposer may be used on, see cudaMulticastShimDriverError). With
 // --cuda-multicast-shim-source=EMBEDDED, the interposer bundled inside the runsc
 // binary is first written into the container's filesystem; otherwise the
 // container image must carry it at --cuda-multicast-shim-path.
@@ -1640,8 +1664,8 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	if shimPath == "" || !specutils.NVProxyEnabled(info.spec, info.conf) {
 		return nil
 	}
-	if major := l.k.NvidiaDriverVersion.Major(); major < 610 {
-		log.Warningf("the multicast interposer is enabled but driver R%d is older than R610; not preloading it into container %q", major, info.containerName)
+	if err := cudaMulticastShimDriverError(info.conf, l.k.NvidiaDriverVersion.Major()); err != nil {
+		log.Warningf("The multicast interposer is enabled but %v; not preloading it into container %q", err, info.containerName)
 		return nil
 	}
 
