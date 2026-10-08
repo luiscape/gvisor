@@ -20,6 +20,9 @@
 #   preload                      native, no GPU: an interposer preloaded after
 #                                the shim still finds the next definition with
 #                                dlsym(RTLD_NEXT)
+#   glibc                        no GPU: the shim needs no symbol version above
+#                                its glibc floor, and loads in old images
+#                                (glibc_smoke.sh; needs docker)
 #   rtres                        native: cudart's resolvers reach each caller's
 #                                own runtime; needs MCSHIM_TEST_CUDART, two
 #                                libcudart.so files of different majors
@@ -52,8 +55,8 @@ while getopts r:i:e: o; do
 done
 shift $((OPTIND - 1))
 if [ $# -eq 0 ]; then
-  set -- abi gate mc refcount refuse mapwait silent preload rtres ipc orphan \
-    deadline reason optout torch-kernel torch-symm
+  set -- abi gate mc refcount refuse mapwait silent preload glibc rtres ipc \
+    orphan deadline reason optout torch-kernel torch-symm
 fi
 GPUS=${MCSHIM_TEST_GPUS:-0,1}
 
@@ -69,7 +72,11 @@ cleanup() {
   sudo rm -rf "$W"
 }
 trap cleanup EXIT
-gcc -O2 -g -Wall -Wextra -fPIC -shared -o "$W/mcshim.so" ../mcshim.c -ldl -lpthread
+# Linked as in ../BUILD, against stubs that pin the glibc floor.
+../glibc_stubs.sh "$W/stubs"
+gcc -O2 -g -Wall -Wextra -fPIC -shared -o "$W/mcshim.so" ../mcshim.c \
+  -Wl,--no-as-needed "$W/stubs/libdl.so.2" "$W/stubs/libpthread.so.0" \
+  -Wl,--as-needed
 gcc -O2 -g -Wall -Wextra -rdynamic -o "$W/mcshim_test" mcshim_test.c -ldl \
   -lpthread
 gcc -O2 -g -Wall -Wextra -o "$W/ckpt_stub" ckpt_stub.c
@@ -228,6 +235,25 @@ preload() {
       return 1
     fi
   done
+}
+
+# glibc: no symbol version above the floor (README.md), and the shim loads in
+# images with old glibc.
+glibc() {
+  local floor=GLIBC_2.17 newest
+  newest=$(objdump -T "$W/mcshim.so" | grep -oE 'GLIBC_[0-9.]+' |
+    sort -t_ -k2,2V | tail -1)
+  if [ "$(printf '%s\n%s\n' "$newest" "$floor" | sort -t_ -k2,2V | tail -1)" != "$floor" ]; then
+    echo "needs $newest, above the $floor floor:"
+    objdump -T "$W/mcshim.so" | grep "$newest"
+    return 1
+  fi
+  echo "newest glibc symbol version: $newest"
+  if ! docker info >/dev/null 2>&1 && ! sudo docker info >/dev/null 2>&1; then
+    echo "needs docker for the old-image smoke test"
+    return 77
+  fi
+  ./glibc_smoke.sh "$W/mcshim.so"
 }
 
 # count FILE: the number in FILE, or 0.
@@ -391,6 +417,7 @@ for t in "$@"; do
   case $t in
     silent) silent || rc=$? ;;
     preload) preload || rc=$? ;;
+    glibc) glibc || rc=$? ;;
     rtres) rtres || rc=$? ;;
     deadline | reason | optout)
       if [ -z "$RUNSC" ]; then

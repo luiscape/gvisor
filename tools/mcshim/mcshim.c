@@ -62,6 +62,23 @@
 #define SYS_pidfd_getfd 438
 #endif
 
+/* glibc floor: GLIBC_2.17 (see README.md). The shim is preloaded into every
+ * process of the container, and a library that needs a symbol version the
+ * image's glibc lacks makes the dynamic linker exit the process with status 1,
+ * so nothing in the image can start. glibc 2.34 moved libdl and libpthread
+ * into libc and re-versioned their entry points, so the shim is linked against
+ * stubs of libdl.so.2 and libpthread.so.0 that define the ones it uses at the
+ * base version (glibc_stubs.sh), and the text parsing below avoids scanf and
+ * strtoul, which glibc 2.38 re-versioned. GLIBC_BASE is the architecture's
+ * first symbol version. */
+#if defined(__x86_64__)
+#define GLIBC_BASE "GLIBC_2.2.5"
+#elif defined(__aarch64__)
+#define GLIBC_BASE "GLIBC_2.17"
+#else
+#error "unsupported architecture: add its glibc base version"
+#endif
+
 /* Minimal CUDA driver ABI (x86_64), mirrored from cuda.h. */
 
 typedef int CUresult;
@@ -212,10 +229,10 @@ static void* (*real_dlsym)(void*, const char*);
 
 static void init_real_dlsym(void) {
   if (real_dlsym) return;
-  /* glibc >= 2.34 exports dlsym as GLIBC_2.34, older glibc as GLIBC_2.2.5. */
+  /* glibc >= 2.34 exports dlsym as GLIBC_2.34, older glibc at its base. */
   *(void**)(&real_dlsym) = dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
   if (!real_dlsym)
-    *(void**)(&real_dlsym) = dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+    *(void**)(&real_dlsym) = dlvsym(RTLD_NEXT, "dlsym", GLIBC_BASE);
   if (!real_dlsym) mclog("FATAL: could not resolve real dlsym via dlvsym");
 }
 
@@ -745,6 +762,41 @@ static void alloc_gc_all(void) {
     if (g_alloc[i].kind != KIND_FREE && g_alloc[i].app_refs <= 0) alloc_gc(i);
 }
 
+/* Text parsing without scanf or strtoul: with _GNU_SOURCE, glibc >= 2.38
+ * binds those to __isoc23_* symbols at GLIBC_2.38, above the shim's floor. */
+
+/* Skips blanks at *p, then tok; advances past it. 1 if tok was there. */
+static int skip_tok(const char** p, const char* tok) {
+  const char* s = *p;
+  while (*s == ' ' || *s == '\t') s++;
+  size_t n = strlen(tok);
+  if (strncmp(s, tok, n) != 0) return 0;
+  *p = s + n;
+  return 1;
+}
+
+/* Skips blanks at *p, then parses an unsigned number in base 10 or 16 (an
+ * optional 0x prefix in base 16); advances past it. 1 if there were digits. */
+static int parse_num(const char** p, int base, unsigned long* out) {
+  const char* s = *p;
+  while (*s == ' ' || *s == '\t') s++;
+  if (base == 16 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+  unsigned long v = 0;
+  int n = 0;
+  for (;; s++, n++) {
+    int d;
+    if (*s >= '0' && *s <= '9') d = *s - '0';
+    else if (base == 16 && *s >= 'a' && *s <= 'f') d = *s - 'a' + 10;
+    else if (base == 16 && *s >= 'A' && *s <= 'F') d = *s - 'A' + 10;
+    else break;
+    v = v * (unsigned long)base + (unsigned long)d;
+  }
+  if (!n) return 0;
+  *p = s;
+  *out = v;
+  return 1;
+}
+
 /* nvproxy reports an exported RM object's identity in /proc/self/fdinfo/<fd>:
  *
  *   nvproxy_exported_object:\tclient=0x... object=0x... class=0x...
@@ -758,8 +810,10 @@ static int fdinfo_oracle(int fd, unsigned long* client, unsigned long* object) {
   if (!f) return -1;
   int found = -1;
   while (fgets(line, sizeof(line), f)) {
-    if (sscanf(line, "nvproxy_exported_object: client=%lx object=%lx", client,
-               object) == 2) {
+    const char* p = line;
+    if (skip_tok(&p, "nvproxy_exported_object:") && skip_tok(&p, "client=") &&
+        parse_num(&p, 16, client) && skip_tok(&p, "object=") &&
+        parse_num(&p, 16, object)) {
       found = 0;
       break;
     }
@@ -1545,16 +1599,19 @@ static int fetch_fd(const Alloc* a, int timeout_ms) {
   char path[600];
   pub_path(a, path, sizeof(path));
   for (int waited = 0; waited < timeout_ms; waited += 10) {
-    int pid, fd;
+    unsigned long pid, fd;
+    char line[64];
     FILE* f = fopen(path, "r");
     if (f) {
-      int n = fscanf(f, "%d %d", &pid, &fd);
+      const char* p = fgets(line, sizeof(line), f) ? line : "";
+      int n = parse_num(&p, 10, &pid) && parse_num(&p, 10, &fd);
       fclose(f);
-      if (n == 2) {
-        int pfd = (int)syscall(SYS_pidfd_open, pid, 0);
-        int got = pfd < 0 ? -1 : (int)syscall(SYS_pidfd_getfd, pfd, fd, 0);
+      if (n) {
+        int pfd = (int)syscall(SYS_pidfd_open, (int)pid, 0);
+        int got =
+            pfd < 0 ? -1 : (int)syscall(SYS_pidfd_getfd, pfd, (int)fd, 0);
         if (got < 0)
-          mclog("RESUME: copying fd %d from pid %d: %s", fd, pid,
+          mclog("RESUME: copying fd %d from pid %d: %s", (int)fd, (int)pid,
                 strerror(errno));
         if (pfd >= 0) close(pfd);
         return got;
@@ -2366,8 +2423,10 @@ static int rt_scan(struct dl_phdr_info* info, size_t size, void* arg) {
   const char* v = info->dlpi_name ? cudart_suffix(info->dlpi_name) : NULL;
   if (!v) return 0;
   unsigned long ver[4] = {0};
-  for (int i = 0; i < 4 && *v == '.'; i++)
-    ver[i] = strtoul(v + 1, (char**)&v, 10);
+  for (int i = 0; i < 4 && *v == '.'; i++) {
+    v++;
+    if (!parse_num(&v, 10, &ver[i])) break;
+  }
   int cmp = 0;
   for (int i = 0; i < 4 && !cmp; i++)
     cmp = (ver[i] > s->ver[i]) - (ver[i] < s->ver[i]);
