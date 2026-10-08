@@ -115,15 +115,17 @@ process calls `cuInit`.
     the exact exported symbol and so its ABI: `cuMulticastBindMem` resolves
     to the 7-argument `cuMulticastBindMem_v2` from CUDA 13.1, for example.
     A lookup of a tracked entry point that returns a symbol without a
-    wrapper refuses checkpoints.
+    wrapper refuses checkpoints. A cudart resolver answers with its own
+    runtime's ABI, so each call goes to the runtime of the caller's own
+    dependencies, since libraries can load different runtimes `RTLD_LOCAL`.
 -   **Tracking.** VMM allocations, mappings and access (`cuMemCreate`,
     `cuMemMap`, `cuMemSetAccess`, `cuMemUnmap`, `cuMemRetainAllocationHandle`,
     `cuMemRelease`), multicast groups (`cuMulticastCreate`, `AddDevice`,
     `BindMem`, `BindAddr` and their `_v2` forms, `Unbind`), and VMM
     export/import. Legacy IPC is not interposed. Tracking is live state: an
     object is forgotten once it has no application reference, mapping or
-    bind. Tables are fixed-size (4096 entries); overflow makes every later
-    checkpoint fail up front.
+    bind. Tables are fixed-size (4096 entries; Qwen2.5-72B at TP=8 fits);
+    overflow makes every later checkpoint fail up front.
 -   **Suspend.** Unbind and release multicast groups, unmap (keeping the VA
     reservations), and release imports.
     Multicast-bound exporter allocations are copied to host memory (which the
@@ -157,9 +159,10 @@ process calls `cuInit`.
     bind waits for every device to be added, not for every rank's memory to
     be bound.
 
-Settings: `MCSHIM_LOG`, `MCSHIM_DISABLE`, `MCSHIM_ALLOW_FABRIC`
-(fabric-handle support is reported as absent by default, so frameworks choose
-POSIX fds).
+Settings: `MCSHIM_LOG` (by default `/tmp/mcshim/mcshim.log`; the interposer is
+loaded into every process in the container, so it never prints),
+`MCSHIM_DISABLE`, `MCSHIM_ALLOW_FABRIC` (fabric-handle support is reported as
+absent by default, so frameworks choose POSIX fds).
 
 ### Delivery and injection (runsc)
 
