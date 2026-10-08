@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -677,6 +678,29 @@ func TestCudaMulticastShimEnabled(t *testing.T) {
 			}
 			if got := cudaMulticastShimEnabled(conf, tc.major); got != tc.want {
 				t.Errorf("cudaMulticastShimEnabled() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCudaMulticastShimPreloadOrder covers where setupCudaMulticastShim puts
+// the interposer in a container's LD_PRELOAD: after the container's own
+// entries, as /etc/ld.so.preload orders them too.
+func TestCudaMulticastShimPreloadOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want []string
+	}{
+		{name: "no LD_PRELOAD", env: []string{"A=1"}, want: []string{"A=1", "LD_PRELOAD=/s.so"}},
+		{name: "empty LD_PRELOAD", env: []string{"LD_PRELOAD=", "A=1"}, want: []string{"LD_PRELOAD=/s.so", "A=1"}},
+		{name: "one entry", env: []string{"LD_PRELOAD=/u.so"}, want: []string{"LD_PRELOAD=/u.so:/s.so"}},
+		{name: "two entries", env: []string{"A=1", "LD_PRELOAD=/u.so:/v.so"}, want: []string{"A=1", "LD_PRELOAD=/u.so:/v.so:/s.so"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := appendLdPreload(append([]string(nil), tc.env...), "/s.so")
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("appendLdPreload(%q) = %q, want %q", tc.env, got, tc.want)
 			}
 		})
 	}

@@ -1682,26 +1682,7 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 		log.Warningf("Multicast interposer %q is not a file in container %q (%v); not preloading it", shimPath, info.containerName, err)
 		return nil
 	}
-	// Append to any LD_PRELOAD the container already sets rather than
-	// clobbering it.
-	env := info.procArgs.Envv
-	const preloadKey = "LD_PRELOAD="
-	preloaded := false
-	for i, e := range env {
-		if strings.HasPrefix(e, preloadKey) {
-			if existing := e[len(preloadKey):]; existing != "" {
-				env[i] = preloadKey + shimPath + ":" + existing
-			} else {
-				env[i] = preloadKey + shimPath
-			}
-			preloaded = true
-			break
-		}
-	}
-	if !preloaded {
-		env = append(env, preloadKey+shimPath)
-	}
-	info.procArgs.Envv = env
+	info.procArgs.Envv = appendLdPreload(info.procArgs.Envv, shimPath)
 
 	// The env append above only covers processes that inherit the initial
 	// environment. Launchers that REWRITE LD_PRELOAD when spawning workers --
@@ -1724,6 +1705,29 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	}
 	log.Infof("Preloaded multicast interposer %q into container %q", shimPath, info.containerName)
 	return nil
+}
+
+// appendLdPreload returns env with lib added to its LD_PRELOAD, after any
+// entries the container already sets rather than clobbering or preceding
+// them: that is the order /etc/ld.so.preload gives them anyway, since the
+// dynamic linker loads LD_PRELOAD first, and it lets the container's own
+// interposers wrap lib's. (The multicast interposer forwards the dlsym
+// lookups it does not rewrite with a tail call, so an entry after it
+// resolves RTLD_NEXT correctly too; the order is not for correctness.)
+func appendLdPreload(env []string, lib string) []string {
+	const preloadKey = "LD_PRELOAD="
+	for i, e := range env {
+		if !strings.HasPrefix(e, preloadKey) {
+			continue
+		}
+		if existing := e[len(preloadKey):]; existing != "" {
+			env[i] = preloadKey + existing + ":" + lib
+		} else {
+			env[i] = preloadKey + lib
+		}
+		return env
+	}
+	return append(env, preloadKey+lib)
 }
 
 // materializeCudaMulticastShim writes the multicast interposer bundled
