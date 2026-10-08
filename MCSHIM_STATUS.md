@@ -11,9 +11,9 @@ opening upstream PRs.
     brief work started, the branch passed every test on H100 ×8 with driver
     610.57.04: the shim suite, all 15 engine cells and the 3 cells without
     `CAP_SYS_PTRACE`.
--   **Engineering brief, P0 tier:** all seven tasks are done and pushed. The
-    full engine gate and a large-model check (Qwen2.5-72B on all 8 GPUs) are
-    running on the final binary.
+-   **Engineering brief, P0 tier:** all seven tasks are done and pushed. On
+    the final binary (`ea443eb56`), the shim suite, all 15 engine cells, the
+    3 cells without `CAP_SYS_PTRACE`, and Qwen2.5-72B on all 8 GPUs pass.
 -   **Scope for the first merge:** R610 only. R615 comes after the first
     version is merged.
 
@@ -114,10 +114,13 @@ There is no `_v2_ptsz`, so no new wrapper is needed.
     `reason` and `optout` use a stub `cuda-checkpoint`
     (`tools/mcshim/test/ckpt_stub.c`) that logs its calls and hangs or fails
     on request.
--   **Engine cells:** a quick check on the P0.5 binary passed: `vllm_tp2`
-    (44x faster to first inference than a cold boot) and `sglang_tp4_symm`
-    (19x). The full gate (15 + 3 cells) is running on the final binary
-    (`ea443eb56`).
+-   **Engine cells on the final binary (`ea443eb56`):** all 15 pass, and so
+    do the 3 without `CAP_SYS_PTRACE`, with timings as before (for example
+    `vllm_tp2` 45x faster to first inference than a cold boot,
+    `sglang_tp4_symm` 19x, `sglang_tp8` 9x).
+-   **Silent preload in a real container (P0.3):** in a running vLLM cell,
+    `/etc/ld.so.preload` lists the shim, and `runsc exec ... sh -c true`
+    prints nothing.
 -   **Shim suite on the final binary:** all 15 tests pass (abi, gate, mc,
     refcount, refuse, mapwait, silent, rtres, ipc, orphan, deadline, reason,
     optout, torch-kernel, torch-symm).
