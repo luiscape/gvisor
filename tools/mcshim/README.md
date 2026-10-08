@@ -16,9 +16,10 @@ can checkpoint and restore workloads it otherwise refuses:
 
 Legacy CUDA IPC (`cuIpcGetMemHandle` / `cuIpcOpenMemHandle`, used by the
 engines' custom all-reduce) is not the shim's concern: `cuda-checkpoint`
-carries it when the processes share a job, which runsc arranges with
-`--cuda-checkpoint-path`. runsc therefore rejects the interposer flags without
-it.
+carries it when the processes share a job, which runsc arranges whenever the
+interposer is enabled. runsc therefore rejects the interposer flags without
+`--cuda-checkpoint-path`. Without the interposer, CUDA checkpoints are
+unchanged: one `cuda-checkpoint --toggle` per process, no job.
 
 Build with `./build.sh` (toolkit-free; runs in a pinned ubuntu:22.04 container
 by default so the result loads under older glibc). The Bazel target
@@ -39,7 +40,8 @@ embedded copy of `mcshim.so` into the container filesystem at that path
 (launchers like SGLang's `torch_memory_saver` rewrite `LD_PRELOAD` for exactly
 the worker processes that matter; `ld.so.preload` is immune). In IMAGE mode,
 a path that is not a file in the container is not preloaded at all, since the
-dynamic loader would print an error on every exec.
+dynamic loader would print an error on every exec. `Loader.setupCudaCheckpointJob`
+wraps the container's command in `cuda-checkpoint --launch-job`.
 
 The shim and the sentry (`pkg/sentry/control/state_cuda_shim.go`)
 rendezvous in `/tmp/mcshim`, which must be part of the checkpoint image (not
@@ -105,6 +107,10 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
     for every device to be added, not for every rank's memory to be bound, so
     a rank released at its own resume could reach a group a peer is still
     binding.
+
+Every `cuda-checkpoint` invocation is bounded by `--cuda-checkpoint-timeout`
+(10 minutes by default): one still running is killed, and the checkpoint or
+restore fails.
 
 ## Environment variables
 

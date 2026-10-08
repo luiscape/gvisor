@@ -16,21 +16,27 @@
 
 /* A stand-in for cuda-checkpoint (see run.sh). It appends each invocation to
  * /mnt/ckpt_stub.log, answers --get-state with "running", hangs on any
- * invocation containing the text in /mnt/ckpt_stub.hang, and otherwise
- * succeeds without touching the process. --launch-job execs the rest of argv.
- */
+ * invocation containing the text in /mnt/ckpt_stub.hang, fails any containing
+ * the text in /mnt/ckpt_stub.fail, and otherwise succeeds without touching
+ * the process. --launch-job execs the rest of argv. */
 
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
+/* Whether line contains the first line of file. */
+static int matches(const char* file, const char* line) {
+  char want[128] = "";
+  FILE* f = fopen(file, "r");
+  if (!f) return 0;
+  if (!fgets(want, sizeof(want), f)) want[0] = 0;
+  fclose(f);
+  want[strcspn(want, "\n")] = 0;
+  return want[0] && strstr(line, want);
+}
+
 int main(int argc, char** argv) {
-  if (argc > 2 && strcmp(argv[1], "--launch-job") == 0) {
-    execv(argv[2], argv + 2);
-    perror("execv");
-    return 127;
-  }
   char line[512] = "";
   for (int i = 1; i < argc; i++) {
     strncat(line, argv[i], sizeof(line) - strlen(line) - 2);
@@ -42,18 +48,16 @@ int main(int argc, char** argv) {
     }
     close(fd);
   }
+  if (argc > 2 && strcmp(argv[1], "--launch-job") == 0) {
+    execv(argv[2], argv + 2);
+    perror("execv");
+    return 127;
+  }
   if (argc > 1 && strcmp(argv[1], "--get-state") == 0) {
     puts("running");
     return 0;
   }
-  char hang[128] = "";
-  FILE* f = fopen("/mnt/ckpt_stub.hang", "r");
-  if (f) {
-    if (!fgets(hang, sizeof(hang), f)) hang[0] = 0;
-    fclose(f);
-    hang[strcspn(hang, "\n")] = 0;
-  }
-  if (hang[0] && strstr(line, hang))
+  if (matches("/mnt/ckpt_stub.hang", line))
     for (;;) pause();
-  return 0;
+  return matches("/mnt/ckpt_stub.fail", line) ? 1 : 0;
 }

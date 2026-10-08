@@ -81,8 +81,12 @@ type SaveOpts struct {
 	// sequentially (rather than in parallel).
 	CudaCheckpointSequential bool
 
-	// CudaCheckpointTimeout bounds each cuda-checkpoint invocation; zero means
-	// the default.
+	// CudaMulticastShim selects the multicast interposer's checkpoint protocol
+	// (see control.SaveOpts).
+	CudaMulticastShim bool
+
+	// CudaCheckpointTimeout bounds each cuda-checkpoint invocation when
+	// CudaMulticastShim is set; zero means the default.
 	CudaCheckpointTimeout time.Duration
 
 	// FSSaveOpts contains options for filesystem checkpoint. If non-nil, we

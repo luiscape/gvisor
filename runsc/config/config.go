@@ -395,17 +395,19 @@ type Config struct {
 	NVProxyAllowUnsupportedDriver bool `flag:"nvproxy-allow-unsupported-driver"`
 
 	// CUDACheckpointPath is the path to the cuda-checkpoint binary inside the
-	// container filesystem. On driver R610+, a GPU container's command is
-	// wrapped in `cuda-checkpoint --launch-job` so that its CUDA processes share
-	// a job, which lets cuda-checkpoint carry their CUDA IPC
-	// (cuIpcGetMemHandle) state. Checkpoints then default to this binary and run
-	// it sequentially, as jobs require. See
+	// container filesystem, which checkpoints use unless given their own. With
+	// the multicast interposer enabled (see CUDAMulticastShimPath) on driver
+	// R610+, a GPU container's command is also wrapped in `cuda-checkpoint
+	// --launch-job` so that its CUDA processes share a job, which lets
+	// cuda-checkpoint carry their CUDA IPC (cuIpcGetMemHandle) state, and
+	// checkpoints run it sequentially, as jobs require. See
 	// https://github.com/NVIDIA/cuda-checkpoint#610-features.
 	CUDACheckpointPath string `flag:"cuda-checkpoint-path"`
 
 	// CUDACheckpointTimeout bounds each cuda-checkpoint invocation during a
-	// checkpoint or restore; one still running is killed and the operation
-	// fails. cuda-checkpoint can hang on state it does not support.
+	// checkpoint or restore with the multicast interposer; one still running is
+	// killed and the operation fails. cuda-checkpoint can hang on state it does
+	// not support.
 	CUDACheckpointTimeout time.Duration `flag:"cuda-checkpoint-timeout"`
 
 	// CUDAMulticastShimPath is the path, inside the container filesystem, to

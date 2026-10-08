@@ -723,17 +723,21 @@ func (r *restorer) calculateWallTimeSavings(s *Savings) error {
 }
 
 func (l *Loader) save(o *control.SaveOpts) error {
-	// Containers run in a cuda-checkpoint job (see setupCudaCheckpointJob) are
-	// checkpointed with the same binary, and jobs must be checkpointed and
-	// restored sequentially.
-	if p := l.root.conf.CUDACheckpointPath; p != "" {
-		if o.CudaCheckpointPath == "" {
-			o.CudaCheckpointPath = p
-		}
-		o.CudaCheckpointSequential = true
+	// The runtime --cuda-checkpoint-path is the default binary. With the
+	// multicast interposer, the containers run in a cuda-checkpoint job (see
+	// setupCudaCheckpointJob): checkpoint them one process at a time, as jobs
+	// require, and with the interposer's protocol. Otherwise CUDA checkpoints
+	// are unchanged.
+	conf := l.root.conf
+	if o.CudaCheckpointPath == "" {
+		o.CudaCheckpointPath = conf.CUDACheckpointPath
 	}
-	if o.CudaCheckpointTimeout == 0 {
-		o.CudaCheckpointTimeout = l.root.conf.CUDACheckpointTimeout
+	if cudaMulticastShimEnabled(conf, l.k.NvidiaDriverVersion.Major()) {
+		o.CudaCheckpointSequential = true
+		o.CudaMulticastShim = true
+		if o.CudaCheckpointTimeout == 0 {
+			o.CudaCheckpointTimeout = conf.CUDACheckpointTimeout
+		}
 	}
 	saveOpts, err := control.ConvertToStateSaveOpts(o)
 	if err != nil {

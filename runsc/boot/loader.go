@@ -1590,19 +1590,23 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	return nil
 }
 
+// cudaMulticastShimEnabled reports whether conf opts into the multicast
+// interposer, which needs --cuda-checkpoint-path and driver R610+. Only then
+// do containers run in a cuda-checkpoint job and checkpoint with the
+// interposer's protocol; otherwise CUDA checkpoints are unchanged.
+func cudaMulticastShimEnabled(conf *config.Config, driverMajor int) bool {
+	return conf.CUDAMulticastShimContainerPath() != "" && conf.CUDACheckpointPath != "" && driverMajor >= 610
+}
+
 // setupCudaCheckpointJob groups a GPU container's CUDA processes into a
-// cuda-checkpoint job (when --cuda-checkpoint-path is set, nvproxy is enabled,
-// and the driver is R610+) so that CUDA IPC state (cuIpcGetMemHandle) can be
-// checkpointed/restored coherently.
+// cuda-checkpoint job (when the multicast interposer is enabled, see
+// cudaMulticastShimEnabled, and nvproxy is enabled) so that CUDA IPC state
+// (cuIpcGetMemHandle) can be checkpointed/restored coherently.
 //
 // It works by prepending `cuda-checkpoint --launch-job` to the container's
 // command. See https://github.com/NVIDIA/cuda-checkpoint#610-features.
 func (l *Loader) setupCudaCheckpointJob(info *containerInfo) error {
-	if info.conf.CUDACheckpointPath == "" || !specutils.NVProxyEnabled(info.spec, info.conf) {
-		return nil
-	}
-	if major := l.k.NvidiaDriverVersion.Major(); major < 610 {
-		log.Warningf("--cuda-checkpoint-path is set but driver R%d is older than R610; not wrapping container %q in a cuda-checkpoint job", major, info.containerName)
+	if !specutils.NVProxyEnabled(info.spec, info.conf) || !cudaMulticastShimEnabled(info.conf, l.k.NvidiaDriverVersion.Major()) {
 		return nil
 	}
 	if len(info.procArgs.Argv) == 0 {

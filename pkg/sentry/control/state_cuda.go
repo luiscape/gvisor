@@ -89,9 +89,14 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		}
 	}
 	sctx := k.SupervisorContext()
-	timeout := o.CudaCheckpointTimeout
-	if timeout <= 0 {
-		timeout = cudaCheckpointTimeoutDefault
+	// Without the multicast interposer, checkpoints are as they were before
+	// it: one unbounded cuda-checkpoint --toggle per process.
+	var timeout time.Duration
+	if o.CudaMulticastShim {
+		timeout = o.CudaCheckpointTimeout
+		if timeout <= 0 {
+			timeout = cudaCheckpointTimeoutDefault
+		}
 	}
 	cudaProcs := cudaProcs(sctx, k, o.CudaCheckpointPath, k.NvidiaDriverVersion.Major(), timeout)
 	fail := func(err error) error {
@@ -101,25 +106,33 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		return err
 	}
 
-	// cuda-checkpoint hangs on processes holding NVLink multicast memory (e.g.
-	// NCCL with NVLS) and cannot restore memory imported from an exported fd,
-	// so refuse up front, unless they run the multicast interposer, which
-	// releases both before cuda-checkpoint runs (checkpointCudaProcs re-checks
-	// afterwards).
-	managed := cudaShimManagedProcs(sctx, k, cudaProcs)
-	shim := len(managed) != 0
-	except := make(map[kernel.ThreadID]bool, len(managed))
-	for _, tg := range managed {
-		except[tg.ID()] = true
-	}
-	if blockers := nvproxy.CheckpointBlockers(k.VFS(), except); blockers != "" {
-		return fail(fmt.Errorf("cannot checkpoint CUDA processes holding multicast or imported memory without the multicast interposer (e.g. NCCL_NVLS_ENABLE=0 to disable NVLS): %s", blockers))
+	shim := false
+	if o.CudaMulticastShim {
+		// cuda-checkpoint hangs on processes holding NVLink multicast memory
+		// (e.g. NCCL with NVLS) and cannot restore memory imported from an
+		// exported fd, so refuse up front, unless they run the multicast
+		// interposer, which releases both before cuda-checkpoint runs
+		// (checkpointCudaProcs re-checks afterwards).
+		managed := cudaShimManagedProcs(sctx, k, cudaProcs)
+		shim = len(managed) != 0
+		except := make(map[kernel.ThreadID]bool, len(managed))
+		for _, tg := range managed {
+			except[tg.ID()] = true
+		}
+		if blockers := nvproxy.CheckpointBlockers(k.VFS(), except); blockers != "" {
+			return fail(fmt.Errorf("cannot checkpoint CUDA processes holding multicast or imported memory that do not run the multicast interposer: %s", blockers))
+		}
 	}
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {
 		tg.SigsegvLock()
 	}
-	err := checkpointCudaProcs(sctx, k, o.CudaCheckpointPath, cudaProcs, o.CudaCheckpointSequential, shim, timeout)
+	var err error
+	if o.CudaMulticastShim {
+		err = checkpointCudaProcs(sctx, k, o.CudaCheckpointPath, cudaProcs, o.CudaCheckpointSequential, shim, timeout)
+	} else {
+		err = toggleCudaProcs(sctx, k, o.CudaCheckpointPath, cudaProcs, o.CudaCheckpointSequential)
+	}
 	if err != nil {
 		// Unwind BEFORE re-pausing (the docker flow): the interposer rebuild
 		// needs the application's shim control threads to run and
@@ -212,8 +225,9 @@ func postRestoreCuda(k *kernel.Kernel, timeline *timing.Timeline, nvproxyRemappi
 	}
 	cudaCheckpointPath := cudaCheckpointPathVal.(string)
 	cudaCheckpointSequential := k.PopCheckpointState(cudaCheckpointSequentialKey).(bool)
-	timeout := cudaCheckpointTimeoutDefault
-	if v, ok := k.PopCheckpointState(cudaCheckpointTimeoutKey).(int64); ok && v > 0 {
+	// Zero (no bound) unless the checkpoint used the multicast interposer.
+	var timeout time.Duration
+	if v, ok := k.PopCheckpointState(cudaCheckpointTimeoutKey).(int64); ok {
 		timeout = time.Duration(v)
 	}
 	cudaProcs := k.PopCheckpointState(cudaProcsKey).([]*kernel.ThreadGroup)
@@ -249,9 +263,13 @@ type checkpointProc struct {
 	out  *fdcollector.Agent
 }
 
-// wait waits for p to exit until deadline, then kills it. It returns an error
-// if p had to be killed, or would not exit.
+// wait waits for p to exit until deadline (forever if zero), then kills it.
+// It returns an error if p had to be killed, or would not exit.
 func (p checkpointProc) wait(deadline time.Time) error {
+	if deadline.IsZero() {
+		p.tg.WaitExited()
+		return nil
+	}
 	done := make(chan struct{})
 	go func() {
 		p.tg.WaitExited()
@@ -399,7 +417,7 @@ func filterCudaProcsUsingGetState(sctx context.Context, k *kernel.Kernel, cudaCh
 	// Call cuda-checkpoint for each CUDA PID parallelly.
 	proc := &Proc{Kernel: k}
 	ckptProcs := make(map[*kernel.ThreadGroup]checkpointProc)
-	deadline := time.Now().Add(timeout)
+	deadline := cudaCheckpointDeadline(timeout)
 	for _, cudaProc := range cudaProcs {
 		ckptProc, cleanup, err := invokeCudaCheckpoint(sctx, k, proc, cudaCheckpointPath, cudaProc, []string{"--get-state"}, nullFD)
 		if err != nil {
@@ -455,11 +473,40 @@ func openCudaCheckpointNullFD(sctx context.Context, k *kernel.Kernel) (*vfs.File
 	}
 }
 
+// cudaCheckpointDeadline returns the deadline for an invocation started now:
+// zero (none) if timeout is zero.
+func cudaCheckpointDeadline(timeout time.Duration) time.Time {
+	if timeout <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(timeout)
+}
+
+// toggleCudaProcs checkpoints each of cudaProcs with one cuda-checkpoint
+// --toggle, in parallel unless sequential, with no bound on their duration. If
+// any fails, it toggles the others back, best effort. This is how processes
+// are checkpointed without the multicast interposer.
+func toggleCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, sequential bool) error {
+	start := time.Now()
+	nullFD, cleanup := openCudaCheckpointNullFD(sctx, k)
+	defer cleanup()
+	toggled, err := runCudaAction(sctx, k, cudaCheckpointPath, cudaProcs, []string{"--toggle"}, !sequential, nullFD, 0 /* timeout */)
+	if err != nil {
+		if _, uerr := runCudaAction(sctx, k, cudaCheckpointPath, toggled, []string{"--toggle"}, !sequential, nullFD, 0 /* timeout */); uerr != nil {
+			log.Warningf("Undoing cuda-checkpoint --toggle also failed: %v", uerr)
+		}
+		return err
+	}
+	log.Infof("cuda-checkpoint on %d processes took [%s]", len(toggled), time.Since(start))
+	return nil
+}
+
 // runCudaAction invokes `cuda-checkpoint <opArgs...> --pid <pid>` on every
 // process in cudaProcs. When parallel is true all invocations run concurrently;
 // otherwise they run one at a time. Each invocation still running after timeout
-// is killed and counts as failed. It returns the processes for which the
-// action succeeded (exit status 0) and a combined error describing any failures.
+// (if non-zero) is killed and counts as failed. It returns the processes for
+// which the action succeeded (exit status 0) and a combined error describing
+// any failures.
 func runCudaAction(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, opArgs []string, parallel bool, nullFD *vfs.FileDescription, timeout time.Duration) ([]*kernel.ThreadGroup, error) {
 	proc := &Proc{Kernel: k}
 	ckptProcs := make(map[*kernel.ThreadGroup]checkpointProc)
@@ -476,7 +523,7 @@ func runCudaAction(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath st
 			continue
 		}
 		ckptProcs[cudaProc] = ckptProc
-		deadlines[cudaProc] = time.Now().Add(timeout)
+		deadlines[cudaProc] = cudaCheckpointDeadline(timeout)
 		defer cleanup()
 		// In sequential mode, wait for each invocation to finish before starting
 		// the next. In parallel mode, all invocations are launched first and

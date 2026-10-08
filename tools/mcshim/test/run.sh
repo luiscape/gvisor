@@ -22,10 +22,12 @@
 #   orphan                       under runsc (-r): `runsc checkpoint` refuses an
 #                                import whose exporter freed the object, and
 #                                the application keeps running
-#   deadline reason              under runsc (-r), with a stub cuda-checkpoint:
+#   deadline reason optout       under runsc (-r), with a stub cuda-checkpoint:
 #                                a hung invocation is killed and the checkpoint
 #                                fails, with the application still running; a
-#                                refusal's reason reaches the sentry's error
+#                                refusal's reason reaches the sentry's error;
+#                                without the interposer, no job and one
+#                                --toggle per process, as before it
 #   torch-kernel torch-symm      under runsc (-r) in a rootfs with PyTorch and
 #                                the host driver's userspace (-i, -e: its env)
 #
@@ -45,7 +47,7 @@ done
 shift $((OPTIND - 1))
 if [ $# -eq 0 ]; then
   set -- abi gate mc refcount refuse mapwait silent ipc orphan deadline reason \
-    torch-kernel torch-symm
+    optout torch-kernel torch-symm
 fi
 GPUS=${MCSHIM_TEST_GPUS:-0,1}
 
@@ -193,7 +195,7 @@ count() {
 stub_start() {
   local name=$1
   shift
-  rm -f "$W/beat" "$W/ckpt_stub.log" "$W/ckpt_stub.hang"
+  rm -f "$W/beat" "$W/ckpt_stub.log" "$W/ckpt_stub.hang" "$W/ckpt_stub.fail"
   DETACH=1 sandboxed "$name" "" "" /mnt/mcshim_test "$@" || return 1
   for _ in $(seq 600); do
     [ "$(count "$W/beat")" -gt 0 ] && return 0
@@ -247,13 +249,39 @@ hung() {
   runsc kill "mcshim-test-$$-$name" KILL || true
 }
 
+# deadline: with the interposer, a lock and a checkpoint that hang are killed.
 deadline() {
-  local flags="${RUNSC_FLAGS:-} --cuda-checkpoint-path=/mnt/ckpt_stub --cuda-checkpoint-timeout=5s"
-  # Without the interposer: the first action after --get-state hangs.
-  RUNSC_FLAGS="$flags" hung deadline-plain "--pid" || return 1
-  # With it: lock and unlock succeed, the checkpoint phase hangs.
-  RUNSC_FLAGS="$flags --cuda-multicast-shim-path=/mnt/mcshim.so" \
-    hung deadline-shim "--action checkpoint"
+  local flags="${RUNSC_FLAGS:-} --cuda-checkpoint-path=/mnt/ckpt_stub --cuda-checkpoint-timeout=5s --cuda-multicast-shim-path=/mnt/mcshim.so"
+  RUNSC_FLAGS="$flags" hung deadline-lock "--action lock" || return 1
+  RUNSC_FLAGS="$flags" hung deadline-ckpt "--action checkpoint" || return 1
+  if ! grep -q -- "--launch-job /mnt/mcshim_test beat" "$W/ckpt_stub.log"; then
+    echo "deadline: the container did not run in a cuda-checkpoint job"
+    return 1
+  fi
+}
+
+# optout: with the runtime --cuda-checkpoint-path but no interposer, the
+# container is not wrapped in a job and is checkpointed with one --toggle per
+# process, exactly as before the interposer. A failed toggle fails the
+# checkpoint and leaves the application running.
+optout() {
+  local rc=0 want
+  export RUNSC_FLAGS="${RUNSC_FLAGS:-} --cuda-checkpoint-path=/mnt/ckpt_stub"
+  stub_start optout beat || return 1
+  echo "--toggle" > "$W/ckpt_stub.fail"
+  stub_ckpt optout || rc=$?
+  want=$(printf -- '--get-state --pid 1\n--toggle --pid 1')
+  echo "optout: checkpoint rc=$rc; cuda-checkpoint calls:"
+  sed 's/^/  /' "$W/ckpt_stub.log"
+  if [ $rc -eq 0 ] || [ "$(cat "$W/ckpt_stub.log")" != "$want" ]; then
+    echo "optout: want only: $want"
+    return 1
+  fi
+  if ! beating; then
+    echo "optout: the application stopped"
+    return 1
+  fi
+  runsc kill "mcshim-test-$$-optout" KILL || true
 }
 
 # reason: a shim refusal names its cause in the sentry's error, including the
@@ -277,7 +305,7 @@ reason() {
 orphan() {
   local id=mcshim-test-$$-orphan
   cp "$(command -v cuda-checkpoint)" "$W/" || return 77
-  export RUNSC_FLAGS="${RUNSC_FLAGS:-} --cuda-checkpoint-path=/mnt/cuda-checkpoint"
+  export RUNSC_FLAGS="${RUNSC_FLAGS:-} --cuda-checkpoint-path=/mnt/cuda-checkpoint --cuda-multicast-shim-path=/mnt/mcshim.so"
   DETACH=1 sandboxed orphan "" mcshim.so /mnt/mcshim_test orphan || return 1
   for _ in $(seq 600); do
     [ "$(count "$W/orphan.0")" -gt 0 ] && [ "$(count "$W/orphan.1")" -gt 0 ] &&
@@ -314,7 +342,7 @@ for t in "$@"; do
   rc=0
   case $t in
     silent) silent || rc=$? ;;
-    deadline | reason)
+    deadline | reason | optout)
       if [ -z "$RUNSC" ]; then
         echo "SKIP $t: needs -r RUNSC"
         continue

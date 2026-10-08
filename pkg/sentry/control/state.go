@@ -110,8 +110,14 @@ type SaveOpts struct {
 	// sequentially (rather than in parallel).
 	CudaCheckpointSequential bool `json:"cuda_checkpoint_sequential"`
 
-	// CudaCheckpointTimeout bounds each cuda-checkpoint invocation; zero means
-	// the default.
+	// CudaMulticastShim is set when the CUDA processes run in a cuda-checkpoint
+	// job with the multicast interposer: they are checkpointed with the
+	// interposer's protocol (see state_cuda.go). Otherwise each is checkpointed
+	// with one cuda-checkpoint --toggle.
+	CudaMulticastShim bool `json:"cuda_multicast_shim"`
+
+	// CudaCheckpointTimeout bounds each cuda-checkpoint invocation when
+	// CudaMulticastShim is set; zero means the default.
 	CudaCheckpointTimeout time.Duration `json:"cuda_checkpoint_timeout"`
 
 	// SplitFSCheckpointPaths is the list of paths to include in the filesystem
@@ -148,6 +154,7 @@ func ConvertToStateSaveOpts(o *SaveOpts) (*state.SaveOpts, error) {
 		Resume:                         o.Resume,
 		CudaCheckpointPath:             o.CudaCheckpointPath,
 		CudaCheckpointSequential:       o.CudaCheckpointSequential,
+		CudaMulticastShim:              o.CudaMulticastShim,
 		CudaCheckpointTimeout:          o.CudaCheckpointTimeout,
 	}
 	if err := setSaveOpts(o, saveOpts); err != nil {

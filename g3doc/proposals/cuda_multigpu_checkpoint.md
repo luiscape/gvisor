@@ -255,12 +255,16 @@ the failed process needs, so nothing is rolled back: the application stays
 blocked, the checkpoint fails, later attempts are refused at once, and the
 workload must be restarted.
 
-Without an interposer there is no gate or teardown, and two things still
-differ from today: the checkpoint uses `cuda-checkpoint`'s two-phase
+Everything above is opt-in: it applies only when the interposer is enabled,
+which also turns on job mode. Without it, CUDA checkpoints are exactly as
+today: one unbounded `cuda-checkpoint --toggle` per process, no job, and no
+blocker inventory. With it, the checkpoint uses `cuda-checkpoint`'s two-phase
 lock/checkpoint instead of a per-process `--toggle`, because a rank spinning
-in a collective can only be quiesced while its peers are locking too; and the
-blocker inventory refuses a checkpoint `cuda-checkpoint` would hang on or
-could not restore.
+in a collective can only be quiesced while its peers are locking too, and
+every `cuda-checkpoint` invocation is bounded (`--cuda-checkpoint-timeout`).
+Refusing up front what `cuda-checkpoint` would hang on, and bounding its
+invocations, would help without the interposer too; both are left for later,
+since they change the behavior of existing configurations.
 
 ### nvproxy additions
 
@@ -424,7 +428,7 @@ the interposer flag is set:
 
 1.  Exported- and imported-object tracking and the fdinfo line (nvproxy,
     `fsimpl/proc`).
-2.  Two-phase lock/checkpoint (useful without the interposer), then the
+2.  Two-phase lock/checkpoint, then the
     sentry control protocol and interposer sequencing (`pkg/sentry/control`).
 3.  The `cuda-checkpoint` job wrap (#13987), then delivery and injection
     flags with `IMAGE` mode (`runsc/boot`, `runsc/config`).

@@ -211,35 +211,31 @@ restore` does not require any special flags. If the snapshot was created with
 `runsc checkpoint --cuda-checkpoint-path`, then the same configuration will
 automatically be used on restore.
 
-### CUDA IPC (multi-process) support
+### Multi-process, multi-GPU support
 
-Processes that share GPU memory via CUDA IPC (`cuIpcGetMemHandle`) can only be
-checkpointed and restored when they belong to the same `cuda-checkpoint` *job*.
-This requires driver R610+ (see
-[cuda-checkpoint 610 features](https://github.com/NVIDIA/cuda-checkpoint#610-features)).
+Processes that share GPU memory cannot be checkpointed by `cuda-checkpoint`
+alone:
 
-To enable this, set the runtime `--cuda-checkpoint-path` flag to the path of the
-`cuda-checkpoint` binary inside the container filesystem. gVisor then wraps each
-GPU container's command in `cuda-checkpoint --launch-job`, so that all of its
-CUDA processes share a job. Jobs must be checkpointed sequentially, which
-`runsc checkpoint` then does automatically; it also uses the same binary unless
-given its own `--cuda-checkpoint-path`. CUDA processes started with `runsc exec`
-are not part of the job.
+*   CUDA IPC (`cuIpcGetMemHandle`, used for example by the custom all-reduce
+    of inference engines) can only be checkpointed and restored when the
+    processes belong to the same `cuda-checkpoint` *job*, which requires
+    driver R610+ (see
+    [cuda-checkpoint 610 features](https://github.com/NVIDIA/cuda-checkpoint#610-features)).
+*   `cuda-checkpoint` refuses a process that holds live *multicast* objects
+    (created via `cuMulticastCreate`, used by NCCL NVLS on NVSwitch systems and
+    by PyTorch symmetric memory) or live CUDA VMM imports
+    (`cuMemImportFromShareableHandle`).
 
-### Multicast / NVLS support (multi-GPU)
-
-`cuda-checkpoint` refuses to checkpoint a process that holds live *multicast*
-objects (created via `cuMulticastCreate`, used by NCCL NVLS on NVSwitch
-systems and by PyTorch symmetric memory) or live CUDA VMM imports
-(`cuMemImportFromShareableHandle`). Multi-GPU tensor-parallel workloads hold
-both. gVisor can checkpoint them anyway using a small LD_PRELOAD interposer,
+Multi-GPU tensor-parallel workloads hold all three. gVisor can checkpoint them
+using a small LD_PRELOAD interposer,
 [mcshim](https://github.com/google/gvisor/tree/master/tools/mcshim), that
-releases this state before the checkpoint and rebuilds it at identical GPU
-virtual addresses after restore, so application pointers and captured CUDA
-graphs remain valid.
+releases multicast objects and VMM imports before the checkpoint and rebuilds
+them at identical GPU virtual addresses after restore, so application
+pointers and captured CUDA graphs remain valid, and runs the container in a
+`cuda-checkpoint` job for CUDA IPC.
 
-The interposer requires job mode (`--cuda-checkpoint-path`, above). To enable
-it, either:
+To enable it, set the runtime `--cuda-checkpoint-path` flag to the path of the
+`cuda-checkpoint` binary inside the container filesystem, and either:
 
 *   set the runtime `--cuda-multicast-shim-source=EMBEDDED` flag: `runsc` carries
     `mcshim.so` inside its own binary and writes it into the container's
@@ -258,13 +254,19 @@ it, either:
 In both modes gVisor then arranges for the container's processes to load the
 interposer (via the `LD_PRELOAD` environment variable *and* an entry appended
 to the container's `/etc/ld.so.preload`, which covers launchers that rewrite
-their children's environment) and drives it automatically during `runsc
-checkpoint` and `runsc restore`.
+their children's environment), wraps each GPU container's command in
+`cuda-checkpoint --launch-job` so that all of its CUDA processes share a job,
+and drives the interposer automatically during `runsc checkpoint` and `runsc
+restore`. Jobs must be checkpointed sequentially, which `runsc checkpoint` then
+does automatically; it also uses the same `cuda-checkpoint` binary unless given
+its own `--cuda-checkpoint-path`. Each `cuda-checkpoint` invocation is bounded
+by `--cuda-checkpoint-timeout` (10 minutes by default). CUDA processes started
+with `runsc exec` are not part of the job.
 
 This requires driver R610+ and works when restoring onto *different* GPUs than
-the workload was checkpointed on. CUDA IPC (used, for example, by the custom
-all-reduce of inference engines) is not handled by the interposer; also set
-`--cuda-checkpoint-path` (see above).
+the workload was checkpointed on. Without the interposer, the runtime
+`--cuda-checkpoint-path` flag only sets the default binary for `runsc
+checkpoint`, and CUDA checkpoints work as described above.
 
 The interposer and gVisor rendezvous through `/tmp/mcshim` inside the
 container. It must reside on a filesystem that is part of the checkpoint image —
