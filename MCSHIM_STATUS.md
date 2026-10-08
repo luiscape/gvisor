@@ -116,15 +116,41 @@ There is no `_v2_ptsz`, so no new wrapper is needed.
     on request.
 -   **Engine cells:** a quick check on the P0.5 binary passed: `vllm_tp2`
     (44x faster to first inference than a cold boot) and `sglang_tp4_symm`
-    (19x). The full gate (15 + 3 cells) and the 72B check are running on the
-    final binary (`ea443eb56`).
+    (19x). The full gate (15 + 3 cells) is running on the final binary
+    (`ea443eb56`).
+-   **Shim suite on the final binary:** all 15 tests pass (abi, gate, mc,
+    refcount, refuse, mapwait, silent, rtres, ipc, orphan, deadline, reason,
+    optout, torch-kernel, torch-symm).
+
+### Large model on all 8 GPUs
+
+vLLM 0.29.0 serving Qwen2.5-72B-Instruct (bf16, 145 GB) at TP=8 with the
+final binary: **PASS**, identical output at temperature 0, restored onto all 8
+GPUs.
+
+| Step | Time |
+| :--- | :--- |
+| Cold boot | 386 s |
+| Checkpoint (engine asleep) | 61.8 s, image 172 GB |
+| `runsc restore` returns | 8.3 s |
+| First inference after restore | 35.5 s (10.8x faster than a cold boot) |
+
+Where the time goes:
+
+-   **Interposer:** 10 processes managed; 0.1 s to arm the gate, 0.8 s for
+    the teardown, 1.2 s for the rebuild. The run created 10 multicast
+    (NVLS) objects.
+-   **`cuda-checkpoint`:** lock and checkpoint took 31.8 s, and the restore
+    toggle 23.7 s, one process at a time as job mode requires. That is most
+    of the checkpoint and of the time to first inference. Running it in
+    parallel (which job mode forbids) is the main remaining lever (P2.5).
 
 ## Next
 
 1.  The full shim suite and the 15 + 3 engine cells on the final binary
     (running).
-2.  A large workload on all 8 GPUs: vLLM serving Qwen2.5-72B-Instruct at
-    TP=8 (running), then SGLang if time allows.
+2.  A large workload on all 8 GPUs: vLLM with Qwen2.5-72B at TP=8 passed
+    (above); SGLang next if time allows.
 3.  After the first merge: R615 (P2.4), then P1.
 
 ---
