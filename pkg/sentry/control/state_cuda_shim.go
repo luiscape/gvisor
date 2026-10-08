@@ -54,8 +54,10 @@ import (
 // multicast on a context whose device state has not been restored yet latches
 // an unrecoverable fault into that context (sticky CUDA_ERROR_LAUNCH_FAILED,
 // 719), which then surfaces much later as a collective failure on a single,
-// arbitrary rank. Driving the transition from here -- after restoreCudaProcs
-// returns, while tasks are still frozen -- removes that race by construction.
+// arbitrary rank. Tasks are already running when this code runs, but the
+// interposer rebuilds only when the sentry removes the suspend marker, which it
+// does only after restoreCudaProcs has returned for every process. That removes
+// the race by construction.
 //
 // The protocol is existence-based, which keeps it race-free for any number of
 // ranks sharing one directory:
@@ -312,13 +314,14 @@ func cudaShimProcsWith(sctx context.Context, k *kernel.Kernel, cudaProcs []*kern
 // managing, i.e. that announced a control thread.
 //
 // cudaProcs is selected by looking for open NVIDIA device FDs, which is
-// deliberately broad. Processes such as a vLLM API server or engine-core hold
-// those FDs without ever resolving a multicast entry point, so the interposer
-// never starts a control thread in them and they can never acknowledge a
-// transition. Waiting on them would hang every checkpoint.
+// deliberately broad. Processes such as a vLLM API server hold those FDs (e.g.
+// through NVML) without initializing CUDA, so the interposer never starts a
+// control thread in them and they can never acknowledge a transition. Waiting
+// on them would hang every checkpoint.
 //
-// A process that does hold multicast state necessarily resolved a tracked entry
-// point first, so it is always in this set.
+// The control thread starts at cuInit and at the first tracked create or
+// import, so a process holding state the interposer saw is always in this set.
+// One holding state it did not see is not, and the blocker check refuses it.
 func cudaShimManagedProcs(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup) []*kernel.ThreadGroup {
 	return cudaShimProcsWith(sctx, k, cudaProcs, "present")
 }

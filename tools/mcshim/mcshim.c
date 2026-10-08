@@ -546,7 +546,7 @@ typedef struct {
    * (see publish_fd). */
   int pub_fd;
   /* Contents of a multicast-bound exporter freed across the checkpoint (see
-   * do_suspend); NULL if none. */
+   * suspend_locked); NULL if none. */
   void* uc_content;
 } Alloc;
 
@@ -1632,7 +1632,7 @@ static CUdevice rw_dev(const Mapping* mp, unsigned mask) {
   return best;
 }
 
-/* Must hold g_lock. Whether do_suspend releases alloc i. */
+/* Must hold g_lock. Whether suspend_locked releases alloc i. */
 static int torn_down(int i) {
   const Alloc* a = &g_alloc[i];
   return a->kind == KIND_MC || a->kind == KIND_IMP ||
