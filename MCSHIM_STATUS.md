@@ -127,26 +127,25 @@ There is no `_v2_ptsz`, so no new wrapper is needed.
 
 ### Large model on all 8 GPUs
 
-vLLM 0.29.0 serving Qwen2.5-72B-Instruct (bf16, 145 GB) at TP=8 with the
-final binary: **PASS**, identical output at temperature 0, restored onto all 8
+Qwen2.5-72B-Instruct (bf16, 145 GB) at TP=8 with the final binary: **PASS**
+with both engines, identical output at temperature 0, restored onto all 8
 GPUs.
 
-| Step | Time |
-| :--- | :--- |
-| Cold boot | 386 s |
-| Checkpoint (engine asleep) | 61.8 s, image 172 GB |
-| `runsc restore` returns | 8.3 s |
-| First inference after restore | 35.5 s (10.8x faster than a cold boot) |
+| Step | vLLM 0.29.0 | SGLang 0.5.20 |
+| :--- | :--- | :--- |
+| Cold boot | 386 s | 245 s |
+| Checkpoint (engine asleep) | 61.8 s, image 172 GB | 85.9 s, image 169 GB |
+| `runsc restore` returns | 8.3 s | 7.9 s |
+| First inference after restore | 35.5 s (10.8x faster than a cold boot) | 45.2 s (5.4x) |
+| Processes managed by the interposer | 10 | 10 |
+| Multicast (NVLS) objects created | 10 | 4 |
+| Gate / teardown / rebuild | 0.1 s / 0.8 s / 1.2 s | 0.1 s / 0.2 s / 0.6 s |
+| `cuda-checkpoint` lock and checkpoint | 31.8 s | 54.7 s |
+| `cuda-checkpoint` restore toggle | 23.7 s | 25.6 s |
 
-Where the time goes:
-
--   **Interposer:** 10 processes managed; 0.1 s to arm the gate, 0.8 s for
-    the teardown, 1.2 s for the rebuild. The run created 10 multicast
-    (NVLS) objects.
--   **`cuda-checkpoint`:** lock and checkpoint took 31.8 s, and the restore
-    toggle 23.7 s, one process at a time as job mode requires. That is most
-    of the checkpoint and of the time to first inference. Running it in
-    parallel (which job mode forbids) is the main remaining lever (P2.5).
+`cuda-checkpoint` runs one process at a time, as job mode requires, and that
+is most of the checkpoint and of the time to first inference. Running it in
+parallel (which job mode forbids) is the main remaining lever (P2.5).
 
 ## Next
 
