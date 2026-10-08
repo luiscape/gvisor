@@ -1424,7 +1424,38 @@ static int t_mapwait(void) {
   return g_failed;
 }
 
-/* orphan */
+/* orphan, beat */
+
+/* Launches kernels forever, counting them in path. */
+static void beat_forever(const char* path) {
+  CUdeviceptr p;
+  CK(cuMemAlloc_v2(&p, 4));
+  void* args[] = {&p};
+  char tmp[80];
+  snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+  for (unsigned long n = 1;; n++) {
+    CK(launch1(g_bump, args, NULL));
+    CK(cuCtxSynchronize());
+    FILE* f = fopen(tmp, "w");
+    if (!f) exit(3);
+    fprintf(f, "%lu\n", n);
+    fclose(f);
+    rename(tmp, path);
+    msleep(20);
+  }
+}
+
+/* One CUDA process for run.sh's sentry tests, optionally holding state the
+ * shim refuses ("managed"). */
+static int t_beat(const char* kind) {
+  setup(1);
+  if (!strcmp(kind, "managed")) {
+    CUdeviceptr m;
+    CK(cuMemAllocManaged(&m, 1 << 20, 1 /* GLOBAL */));
+  }
+  beat_forever("/mnt/beat");
+  return 0;
+}
 
 /* Rank 1 maps memory that rank 0 exports and then frees, so no process can
  * re-export it after a restore. Both ranks then launch kernels until killed. */
@@ -1448,22 +1479,9 @@ static int orphan_rank(int d, int sock) {
     map(h, size, 0, 1);
     sync_byte(sock, 'i');
   }
-  CUdeviceptr p;
-  CK(cuMemAlloc_v2(&p, 4));
-  void* args[] = {&p};
-  char path[64], tmp[64];
+  char path[64];
   snprintf(path, sizeof(path), "/mnt/orphan.%d", d);
-  snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-  for (unsigned long n = 1;; n++) {
-    CK(launch1(g_bump, args, NULL));
-    CK(cuCtxSynchronize());
-    FILE* f = fopen(tmp, "w");
-    if (!f) exit(3);
-    fprintf(f, "%lu\n", n);
-    fclose(f);
-    rename(tmp, path);
-    msleep(20);
-  }
+  beat_forever(path);
 }
 
 static int t_orphan(void) {
@@ -1478,6 +1496,8 @@ static int t_orphan(void) {
 }
 
 int main(int argc, char** argv) {
+  if (argc >= 2 && !strcmp(argv[1], "beat"))
+    return t_beat(argc > 2 ? argv[2] : "");
   if (argc == 3 && !strcmp(argv[1], "refuse1")) {
     clear_markers();
     return refuse_case(argv[2]) ? 1 : 0;

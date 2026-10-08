@@ -732,6 +732,9 @@ func (l *Loader) save(o *control.SaveOpts) error {
 		}
 		o.CudaCheckpointSequential = true
 	}
+	if o.CudaCheckpointTimeout == 0 {
+		o.CudaCheckpointTimeout = l.root.conf.CUDACheckpointTimeout
+	}
 	saveOpts, err := control.ConvertToStateSaveOpts(o)
 	if err != nil {
 		l.k.OnCheckpointAttempt(err)

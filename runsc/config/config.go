@@ -403,6 +403,11 @@ type Config struct {
 	// https://github.com/NVIDIA/cuda-checkpoint#610-features.
 	CUDACheckpointPath string `flag:"cuda-checkpoint-path"`
 
+	// CUDACheckpointTimeout bounds each cuda-checkpoint invocation during a
+	// checkpoint or restore; one still running is killed and the operation
+	// fails. cuda-checkpoint can hang on state it does not support.
+	CUDACheckpointTimeout time.Duration `flag:"cuda-checkpoint-timeout"`
+
 	// CUDAMulticastShimPath is the path, inside the container filesystem, to
 	// the multicast suspend/resume interposer (mcshim.so). When it is set for
 	// a GPU container (nvproxy enabled) on driver R610+, the container's

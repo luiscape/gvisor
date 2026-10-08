@@ -22,6 +22,10 @@
 #   orphan                       under runsc (-r): `runsc checkpoint` refuses an
 #                                import whose exporter freed the object, and
 #                                the application keeps running
+#   deadline reason              under runsc (-r), with a stub cuda-checkpoint:
+#                                a hung invocation is killed and the checkpoint
+#                                fails, with the application still running; a
+#                                refusal's reason reaches the sentry's error
 #   torch-kernel torch-symm      under runsc (-r) in a rootfs with PyTorch and
 #                                the host driver's userspace (-i, -e: its env)
 #
@@ -40,8 +44,8 @@ while getopts r:i:e: o; do
 done
 shift $((OPTIND - 1))
 if [ $# -eq 0 ]; then
-  set -- abi gate mc refcount refuse mapwait silent ipc orphan torch-kernel \
-    torch-symm
+  set -- abi gate mc refcount refuse mapwait silent ipc orphan deadline reason \
+    torch-kernel torch-symm
 fi
 GPUS=${MCSHIM_TEST_GPUS:-0,1}
 
@@ -60,6 +64,7 @@ trap cleanup EXIT
 gcc -O2 -g -Wall -Wextra -fPIC -shared -o "$W/mcshim.so" ../mcshim.c -ldl -lpthread
 gcc -O2 -g -Wall -Wextra -rdynamic -o "$W/mcshim_test" mcshim_test.c -ldl \
   -lpthread
+gcc -O2 -g -Wall -Wextra -o "$W/ckpt_stub" ckpt_stub.c
 cp torch_gate_test.py "$W/"
 
 native() {
@@ -84,7 +89,7 @@ sandboxed() {
     mkdir -p "$root"/{usr/lib,usr/lib64,lib,lib64,etc,proc,dev,sys,tmp,mnt}
   fi
   NAME=$name ROOT=$root SHIM=$shim W=$W GPUS=$GPUS ENVFILE=$ENVFILE \
-    python3 - "$@" > "$W/config.json" <<'EOF'
+    NOLOG=${NOLOG:-} python3 - "$@" > "$W/config.json" <<'EOF'
 import json, os, sys
 e = os.environ
 gpus = e["GPUS"].split(",")
@@ -96,9 +101,11 @@ def dev(path):
 env = ["PATH=/usr/local/bin:/usr/bin:/bin"]
 if e["ENVFILE"]:
     env = [l for l in open(e["ENVFILE"]).read().splitlines() if "=" in l]
-env += ["HOME=/root", "LD_PRELOAD=/mnt/" + e["SHIM"],
-        "MCSHIM_LOG=/mnt/%s.log" % e["NAME"],
-        "NVIDIA_VISIBLE_DEVICES=" + ",".join(gpus)]
+env += ["HOME=/root", "NVIDIA_VISIBLE_DEVICES=" + ",".join(gpus)]
+if e["SHIM"]:
+    env += ["LD_PRELOAD=/mnt/" + e["SHIM"]]
+if not e.get("NOLOG"):
+    env += ["MCSHIM_LOG=/mnt/%s.log" % e["NAME"]]
 mounts = []
 if e["ROOT"] == e["W"] + "/rootfs":
     mounts = [{"destination": d, "type": "bind", "source": d,
@@ -180,6 +187,93 @@ count() {
   echo "${n:-0}"
 }
 
+# stub_start NAME ARGS...: runs `mcshim_test ARGS...` detached under runsc, with
+# RUNSC_FLAGS, and waits for its heartbeat. The stub cuda-checkpoint logs its
+# invocations to $W/ckpt_stub.log.
+stub_start() {
+  local name=$1
+  shift
+  rm -f "$W/beat" "$W/ckpt_stub.log" "$W/ckpt_stub.hang"
+  DETACH=1 sandboxed "$name" "" "" /mnt/mcshim_test "$@" || return 1
+  for _ in $(seq 600); do
+    [ "$(count "$W/beat")" -gt 0 ] && return 0
+    sleep 0.1
+  done
+  echo "$name: no heartbeat"
+  return 1
+}
+
+# stub_ckpt NAME: `runsc checkpoint` of NAME's container; its output is in
+# $W/NAME.ckpt.
+stub_ckpt() {
+  local rc=0
+  runsc checkpoint --image-path "$W/ckpt-$1" "mcshim-test-$$-$1" \
+    > "$W/$1.ckpt" 2>&1 || rc=$?
+  sudo cat "$W/$1.ckpt"
+  return $rc
+}
+
+# beating: the application is still launching kernels.
+beating() {
+  local n
+  n=$(count "$W/beat")
+  sleep 2
+  [ "$(count "$W/beat")" -gt "$n" ]
+}
+
+# hung NAME HANG: a checkpoint whose cuda-checkpoint invocation matching HANG
+# never returns must fail within the deadline, kill it, and leave the
+# application running.
+hung() {
+  local name=$1 start rc=0
+  stub_start "$name" beat || return 1
+  echo "$2" > "$W/ckpt_stub.hang"
+  start=$(date +%s)
+  stub_ckpt "$name" || rc=$?
+  echo "$name: checkpoint rc=$rc after $(($(date +%s) - start))s; cuda-checkpoint calls:"
+  sed 's/^/  /' "$W/ckpt_stub.log"
+  if [ $rc -eq 0 ] || ! grep -q "did not finish in time and was killed" "$W/$name.ckpt"; then
+    echo "$name: the checkpoint did not fail on the deadline"
+    return 1
+  fi
+  if [ $(($(date +%s) - start)) -gt 60 ]; then
+    echo "$name: the checkpoint took too long"
+    return 1
+  fi
+  if ! beating; then
+    echo "$name: the application stopped"
+    return 1
+  fi
+  runsc kill "mcshim-test-$$-$name" KILL || true
+}
+
+deadline() {
+  local flags="${RUNSC_FLAGS:-} --cuda-checkpoint-path=/mnt/ckpt_stub --cuda-checkpoint-timeout=5s"
+  # Without the interposer: the first action after --get-state hangs.
+  RUNSC_FLAGS="$flags" hung deadline-plain "--pid" || return 1
+  # With it: lock and unlock succeed, the checkpoint phase hangs.
+  RUNSC_FLAGS="$flags --cuda-multicast-shim-path=/mnt/mcshim.so" \
+    hung deadline-shim "--action checkpoint"
+}
+
+# reason: a shim refusal names its cause in the sentry's error, including the
+# shim's default log.
+reason() {
+  local rc=0
+  export RUNSC_FLAGS="${RUNSC_FLAGS:-} --cuda-checkpoint-path=/mnt/ckpt_stub --cuda-multicast-shim-path=/mnt/mcshim.so"
+  NOLOG=1 stub_start reason beat managed || return 1
+  stub_ckpt reason || rc=$?
+  if [ $rc -eq 0 ] || ! grep -q '"managed memory"; last log lines: .*GATE: refusing: managed memory' "$W/reason.ckpt"; then
+    echo "reason: the refusal's reason is not in the error"
+    return 1
+  fi
+  if ! beating; then
+    echo "reason: the application stopped"
+    return 1
+  fi
+  runsc kill "mcshim-test-$$-reason" KILL || true
+}
+
 orphan() {
   local id=mcshim-test-$$-orphan
   cp "$(command -v cuda-checkpoint)" "$W/" || return 77
@@ -220,6 +314,13 @@ for t in "$@"; do
   rc=0
   case $t in
     silent) silent || rc=$? ;;
+    deadline | reason)
+      if [ -z "$RUNSC" ]; then
+        echo "SKIP $t: needs -r RUNSC"
+        continue
+      fi
+      ("$t") || rc=$?
+      ;;
     ipc) sandboxed "$t" "" mcshim.so /mnt/mcshim_test ipc || rc=$? ;;
     orphan)
       if [ -z "$RUNSC" ]; then

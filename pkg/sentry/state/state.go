@@ -81,6 +81,10 @@ type SaveOpts struct {
 	// sequentially (rather than in parallel).
 	CudaCheckpointSequential bool
 
+	// CudaCheckpointTimeout bounds each cuda-checkpoint invocation; zero means
+	// the default.
+	CudaCheckpointTimeout time.Duration
+
 	// FSSaveOpts contains options for filesystem checkpoint. If non-nil, we
 	// should split filesystem to separate pages from the full checkpoint.
 	FSSaveOpts *kernel.FSSaveOpts
