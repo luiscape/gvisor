@@ -156,7 +156,9 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	}
 	k.AddStateToCheckpoint(cudaCheckpointPathKey, o.CudaCheckpointPath)
 	k.AddStateToCheckpoint(cudaCheckpointSequentialKey, o.CudaCheckpointSequential)
-	k.AddStateToCheckpoint(cudaCheckpointTimeoutKey, int64(timeout))
+	if o.CudaMulticastShim {
+		k.AddStateToCheckpoint(cudaCheckpointTimeoutKey, int64(timeout))
+	}
 	k.AddStateToCheckpoint(cudaProcsKey, cudaProcs)
 	return nil
 }
