@@ -15,9 +15,9 @@
  */
 
 /* A stand-in for cuda-checkpoint (see run.sh). It appends each invocation to
- * /mnt/ckpt_stub.log, answers --get-state with "running", hangs on any
- * invocation containing the text in /mnt/ckpt_stub.hang, fails any containing
- * the text in /mnt/ckpt_stub.fail, and otherwise succeeds without touching
+ * /mnt/ckpt_stub.log, hangs on any invocation containing the text in
+ * /mnt/ckpt_stub.hang, fails any containing the text in /mnt/ckpt_stub.fail,
+ * answers --get-state with "running", and otherwise succeeds without touching
  * the process. --launch-job execs the rest of argv. */
 
 #include <fcntl.h>
@@ -53,11 +53,9 @@ int main(int argc, char** argv) {
     perror("execv");
     return 127;
   }
-  if (argc > 1 && strcmp(argv[1], "--get-state") == 0) {
-    puts("running");
-    return 0;
-  }
   if (matches("/mnt/ckpt_stub.hang", line))
     for (;;) pause();
-  return matches("/mnt/ckpt_stub.fail", line) ? 1 : 0;
+  if (matches("/mnt/ckpt_stub.fail", line)) return 1;
+  if (argc > 1 && strcmp(argv[1], "--get-state") == 0) puts("running");
+  return 0;
 }

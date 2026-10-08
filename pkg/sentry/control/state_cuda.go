@@ -98,12 +98,15 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 			timeout = cudaCheckpointTimeoutDefault
 		}
 	}
-	cudaProcs := cudaProcs(sctx, k, o.CudaCheckpointPath, k.NvidiaDriverVersion.Major(), timeout)
 	fail := func(err error) error {
 		if wasPaused {
 			k.Pause()
 		}
 		return err
+	}
+	cudaProcs, err := cudaProcs(sctx, k, o.CudaCheckpointPath, k.NvidiaDriverVersion.Major(), timeout)
+	if err != nil {
+		return fail(err)
 	}
 
 	shim := false
@@ -127,7 +130,6 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	for _, tg := range cudaProcs {
 		tg.SigsegvLock()
 	}
-	var err error
 	if o.CudaMulticastShim {
 		err = checkpointCudaProcs(sctx, k, o.CudaCheckpointPath, cudaProcs, o.CudaCheckpointSequential, shim, timeout)
 	} else {
@@ -165,11 +167,12 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 
 // cudaProcs returns a list of all CUDA processes in the sandbox. It selects
 // them by collecting processes whose FD table has an open file descriptor to
-// any CUDA device.
+// any CUDA device. With a timeout, it fails if a process cannot be classified
+// in time (see filterCudaProcsUsingGetState).
 //
 // Callers must not hold any thread-group leader's Task.mu in k.
 // checklocks cannot name the leader mutexes selected by ForEachThreadGroup.
-func cudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, nvidiaDriverVersionMajor int, timeout time.Duration) []*kernel.ThreadGroup {
+func cudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, nvidiaDriverVersionMajor int, timeout time.Duration) ([]*kernel.ThreadGroup, error) {
 	var procs []*kernel.ThreadGroup
 	k.TaskSet().ForEachThreadGroup(func(tg *kernel.ThreadGroup, tgLeader *kernel.Task) {
 		found := false
@@ -212,9 +215,9 @@ func cudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string
 	} else if nvidiaDriverVersionMajor < 555 {
 		procs = filterCudaProcsUsingThreadName(sctx, procs)
 	} else {
-		procs = filterCudaProcsUsingGetState(sctx, k, cudaCheckpointPath, procs, timeout)
+		return filterCudaProcsUsingGetState(sctx, k, cudaCheckpointPath, procs, timeout)
 	}
-	return procs
+	return procs, nil
 }
 
 // postRestoreCuda restores CUDA processes that were checkpointed by
@@ -404,7 +407,14 @@ func filterCudaProcsUsingThreadName(sctx context.Context, cudaProcs []*kernel.Th
 	return res
 }
 
-func filterCudaProcsUsingGetState(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, timeout time.Duration) []*kernel.ThreadGroup {
+// filterCudaProcsUsingGetState returns the processes in cudaProcs that
+// cuda-checkpoint --get-state reports as CUDA processes. One that fails
+// --get-state is not one (NVML-only, say) and is left out. One whose
+// --get-state does not finish within timeout, if there is one, is an error:
+// it is a CUDA process in some state cuda-checkpoint cannot handle, and
+// skipping it would leave its live GPU objects to fail the save later, after
+// the other processes have been checkpointed.
+func filterCudaProcsUsingGetState(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, timeout time.Duration) ([]*kernel.ThreadGroup, error) {
 	log.Debugf("Filtering CUDA processes using 'cuda-checkpoint --get-state'")
 	// Open /dev/null once for the stdin of all cuda-checkpoint processes.
 	nullVD := k.VFS().NewAnonVirtualDentry("null")
@@ -433,11 +443,13 @@ func filterCudaProcsUsingGetState(sctx context.Context, k *kernel.Kernel, cudaCh
 		defer cleanup()
 	}
 	// Check the output of all cuda-checkpoint processes. We want the ones with
-	// output "running".
+	// output "running". Every invocation is reaped before a timeout is
+	// reported, so none is left running in the sandbox.
 	var res []*kernel.ThreadGroup
+	var errs []error
 	for cudaProc, ckptProc := range ckptProcs {
 		if err := ckptProc.wait(deadline); err != nil {
-			log.Warningf("%v; skipping CUDA checkpoint for PID %d", err, cudaProc.ID())
+			errs = append(errs, fmt.Errorf("cannot checkpoint PID %d: %w", cudaProc.ID(), err))
 			continue
 		}
 		if status := ckptProc.tg.ExitStatus(); status == 0 {
@@ -457,7 +469,10 @@ func filterCudaProcsUsingGetState(sctx context.Context, k *kernel.Kernel, cudaCh
 			}
 		}
 	}
-	return res
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+	return res, nil
 }
 
 // openCudaCheckpointNullFD opens /dev/null to use as stdin for cuda-checkpoint

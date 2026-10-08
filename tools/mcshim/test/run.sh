@@ -32,7 +32,8 @@
 #                                import whose exporter freed the object, and
 #                                the application keeps running
 #   deadline reason optout       under runsc (-r), with a stub cuda-checkpoint:
-#                                a hung invocation is killed and the checkpoint
+#                                a hung invocation (--get-state, lock or
+#                                checkpoint) is killed and the checkpoint
 #                                fails, with the application still running; a
 #                                refusal's reason reaches the sentry's error;
 #                                without the interposer, no job and one
@@ -323,9 +324,13 @@ hung() {
   runsc kill "mcshim-test-$$-$name" KILL || true
 }
 
-# deadline: with the interposer, a lock and a checkpoint that hang are killed.
+# deadline: with the interposer, a --get-state, a lock and a checkpoint that
+# hang are killed. A hung --get-state fails the checkpoint rather than
+# leaving its process out of it: the process would keep its GPU state, and
+# the save would fail later on it.
 deadline() {
   local flags="${RUNSC_FLAGS:-} --cuda-checkpoint-path=/mnt/ckpt_stub --cuda-checkpoint-timeout=5s --cuda-multicast-shim-path=/mnt/mcshim.so"
+  RUNSC_FLAGS="$flags" hung deadline-state "--get-state" || return 1
   RUNSC_FLAGS="$flags" hung deadline-lock "--action lock" || return 1
   RUNSC_FLAGS="$flags" hung deadline-ckpt "--action checkpoint" || return 1
   if ! grep -q -- "--launch-job /mnt/mcshim_test beat" "$W/ckpt_stub.log"; then
