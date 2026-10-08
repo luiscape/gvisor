@@ -598,9 +598,13 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 			return err
 		}
 	}
+	// On a lock failure, unlock every process, not just the ones reported
+	// locked: a lock invocation that was killed on timeout may have left its
+	// process locked. Unlocking a process that is not locked only fails, and
+	// unlock logs that.
 	locked, err := runCudaAction(sctx, k, cudaCheckpointPath, cudaProcs, lockArgs, true /* parallel */, nullFD, timeout)
 	if err != nil {
-		unlock(locked)
+		unlock(cudaProcs)
 		return fmt.Errorf("cuda-checkpoint lock phase failed: %w", err)
 	}
 
@@ -619,7 +623,7 @@ func checkpointCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 			return fmt.Errorf("multicast interposer suspended but resources remain: %s", blockers)
 		}
 		if locked, err = runCudaAction(sctx, k, cudaCheckpointPath, cudaProcs, lockArgs, true /* parallel */, nullFD, timeout); err != nil {
-			unlock(locked)
+			unlock(cudaProcs)
 			return fmt.Errorf("cuda-checkpoint re-lock after multicast teardown failed: %w", err)
 		}
 	}
