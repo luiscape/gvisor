@@ -22,26 +22,38 @@ interposer is enabled. runsc therefore rejects the interposer flags without
 unchanged: one `cuda-checkpoint --toggle` per process, no job.
 
 Build with `./build.sh` (toolkit-free; runs in a pinned ubuntu:22.04 container
-by default so the result loads under older glibc). The Bazel target
-`//tools/mcshim:mcshim` builds the same artifact, and `//runsc` embeds it
-(through `//runsc/mcshimbin`) so that a stock runsc binary can inject the
-interposer into containers whose images do not carry it
-(`--cuda-multicast-shim-source=EMBEDDED`).
+by default). The Bazel target `//tools/mcshim:mcshim` builds the same
+artifact, and `//runsc` embeds it (through `//runsc/mcshimbin`) so that a
+stock runsc binary can inject the interposer into containers whose images do
+not carry it (`--cuda-multicast-shim-source=EMBEDDED`). Either way the result
+needs no glibc symbol version newer than **GLIBC_2.17** (CentOS 7, Amazon
+Linux 2; see Known limitations), whatever the build environment's glibc.
 
 ## How it gets into a container
 
 With `runsc --cuda-checkpoint-path=... --cuda-multicast-shim-path=/path/to/mcshim.so`
-(plus nvproxy and an R610+ driver) -- or with
-`--cuda-multicast-shim-source=EMBEDDED`, in which case runsc first writes its
-embedded copy of `mcshim.so` into the container filesystem at that path
-(default `/usr/local/lib/mcshim.so`) -- `Loader.setupCudaMulticastShim`
-(`runsc/boot/loader.go`) prepends the shim to the container's `LD_PRELOAD`
-**and** appends it to `/etc/ld.so.preload` through the container's VFS
-(launchers like SGLang's `torch_memory_saver` rewrite `LD_PRELOAD` for exactly
-the worker processes that matter; `ld.so.preload` is immune). In IMAGE mode,
-a path that is not a file in the container is not preloaded at all, since the
-dynamic loader would print an error on every exec. `Loader.setupCudaCheckpointJob`
-wraps the container's command in `cuda-checkpoint --launch-job`.
+(plus nvproxy and driver R610, the release the interposer has been validated
+on; `--cuda-multicast-shim-unvalidated-driver=ALLOW` accepts a newer one, with
+a warning) -- or with `--cuda-multicast-shim-source=EMBEDDED`, in which case
+runsc first writes its embedded copy of `mcshim.so` into the container
+filesystem at that path (default `/usr/local/lib/mcshim.so`) --
+`Loader.setupCudaMulticastShim` (`runsc/boot/loader.go`) appends the shim to
+the container's `LD_PRELOAD` **and** to `/etc/ld.so.preload` through the
+container's VFS (launchers like SGLang's `torch_memory_saver` rewrite
+`LD_PRELOAD` for exactly the worker processes that matter; `ld.so.preload` is
+immune). In IMAGE mode, a path that is not a file in the container is not
+preloaded at all, since the dynamic loader would print an error on every exec.
+`Loader.setupCudaCheckpointJob` wraps the container's command in
+`cuda-checkpoint --launch-job`.
+
+Either way the shim ends up in **every** process of the container, most of
+which never checkpoint, so a problem in the shim may refuse a checkpoint but
+must never change the behavior of a process that does not checkpoint. Two
+consequences: the shim's `dlsym` forwards every `RTLD_NEXT` lookup, and every
+name it does not rewrite (`cu[A-Z]*` and `cudaGetDriverEntryPoint*`), to the
+real `dlsym` with a tail call, so glibc resolves `RTLD_NEXT` and
+`RTLD_DEFAULT` relative to the real caller; and it needs no glibc newer than
+the images it is preloaded into (below).
 
 The shim and the sentry (`pkg/sentry/control/state_cuda_shim.go`)
 rendezvous in `/tmp/mcshim`, which must be part of the checkpoint image (not
@@ -262,8 +274,8 @@ it or exited, or runs in another container).
 ## Testing
 
 `test/run.sh [-r RUNSC] [-i ROOTFS -e ENVFILE] [test...]` runs the tests on a
-host with two NVLS-capable GPUs (`MCSHIM_TEST_GPUS`, default `0,1`). Each test
-but `orphan` plays the sentry's side of the protocol, with a suspend and
+host with two NVLS-capable GPUs (`MCSHIM_TEST_GPUS`, default `0,1`). The
+native tests play the sentry's side of the protocol, with a suspend and
 resume in place of a checkpoint and restore:
 
 *   `abi`: every lookup returns the wrapper of the symbol the driver returned;
@@ -282,7 +294,23 @@ resume in place of a checkpoint and restore:
     object, and the application keeps running (under runsc, `-r`);
 *   `torch-kernel`, `torch-symm`: the gate stops kernels that PyTorch submits,
     including a multimem all-reduce on symmetric memory across two ranks
-    (under runsc, in a rootfs with PyTorch: `-i`, with its env file `-e`).
+    (under runsc, in a rootfs with PyTorch: `-i`, with its env file `-e`);
+*   `rtres`: cudart's resolvers reach each caller's own runtime, including
+    one under a soname nothing could know (`MCSHIM_TEST_CUDART`);
+*   `deadline`, `reason`, `optout`: with a stub `cuda-checkpoint` (under
+    runsc, `-r`): a hung `--get-state`, lock or checkpoint is killed and the
+    checkpoint fails with the application running; a refusal's reason
+    reaches the sentry's error; without the interposer, no job and one
+    `--toggle` per process.
+
+Two tests need no GPU, and cover the processes that never checkpoint:
+
+*   `preload`: an interposer preloaded after the shim finds the next
+    definition with `dlsym(RTLD_NEXT)`, in either order;
+*   `glibc` (docker): the shim needs no symbol version above its glibc
+    floor, and `test/glibc_smoke.sh` loads it in ubuntu:20.04, debian:11,
+    rockylinux:8 and centos:7, through `LD_PRELOAD` and through
+    `/etc/ld.so.preload`.
 
 ## Threat model
 
@@ -334,3 +362,28 @@ inside the container's trust domain, not gVisor's:
     create no checkpoint blockers), so an application thread freeing its own
     VA reservation during the suspend window would go unnoticed; the
     identical-VA rebuild would then fail loudly at re-map time.
+*   **glibc floor: GLIBC_2.17.** The shim is preloaded into every process of
+    the container, and a library that needs a symbol version the image's
+    glibc lacks makes the dynamic linker exit each process with status 1, so
+    nothing in the image can start -- not even the `--launch-job` wrapper.
+    The shim therefore needs no symbol version newer than GLIBC_2.17 (CentOS
+    7, Amazon Linux 2; the base version of aarch64 glibc), whatever the glibc
+    it was built against: it links against stubs of `libdl.so.2` and
+    `libpthread.so.0` that pin the entry points glibc 2.34 re-versioned
+    (`glibc_stubs.sh`), and parses text without `scanf`/`strtoul`, which
+    glibc 2.38 re-versioned. `//runsc/mcshimbin:mcshimbin_test` checks the
+    embedded copy, `build.sh` the standalone one, and `test/run.sh glibc`
+    loads it in old images. Images with glibc older than 2.17 are not
+    supported.
+*   **`dlsym` is interposed for every process.** The shim rewrites only
+    `cu[A-Z]*` and `cudaGetDriverEntryPoint*` lookups, and forwards everything
+    else, and every `RTLD_NEXT` lookup, to the real `dlsym` with a tail call.
+    Before, it called the real `dlsym` from inside itself, so glibc resolved
+    `RTLD_NEXT` and `RTLD_DEFAULT` relative to the shim: any `LD_PRELOAD`
+    library loaded after the shim recursed forever, and `RTLD_DEFAULT`
+    lookups from `RTLD_LOCAL` libraries missed their own dependencies. The
+    tail call needs optimization under GCC older than 15 (no `musttail`),
+    hence `-O2` in BUILD; `test/run.sh preload` catches a build without it.
+*   **Driver release.** Validated on R610 only; runsc keeps the interposer and
+    the job off any other release unless
+    `--cuda-multicast-shim-unvalidated-driver=ALLOW`.

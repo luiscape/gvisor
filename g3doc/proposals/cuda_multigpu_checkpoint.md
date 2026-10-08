@@ -180,11 +180,21 @@ absent by default, so frameworks choose POSIX fds).
     IPC to `cuda-checkpoint`, which carries it only for processes in a job.
 -   It does nothing without nvproxy, and logs a warning and does nothing on
     drivers older than R610.
--   The loader prepends the interposer to `LD_PRELOAD` and appends it to
+-   It is on by default only on R610, the release it has been validated on;
+    `--cuda-multicast-shim-unvalidated-driver=ALLOW` enables it on a newer
+    one, with a warning, and the default (`REFUSE`) leaves checkpoints there
+    as without the interposer.
+-   The loader appends the interposer to `LD_PRELOAD` and to
     `/etc/ld.so.preload`. The second is needed because launchers rewrite
     `LD_PRELOAD` for exactly the worker processes that hold GPU state (SGLang's
     `torch_memory_saver`), and the failure is silent: the checkpoint succeeds
     and the restore fails.
+-   Preloaded into every process of the container, the interposer must change
+    nothing for the ones that never checkpoint: its `dlsym` forwards the
+    lookups it does not rewrite with a tail call, so `RTLD_NEXT` resolves
+    relative to the real caller, and it needs no glibc symbol version newer
+    than GLIBC_2.17 (CentOS 7, Amazon Linux 2), since one the image's glibc
+    lacks would make the dynamic linker fail every process at startup.
 
 ### Control protocol
 

@@ -14,8 +14,76 @@ opening upstream PRs.
 -   **Engineering brief, P0 tier:** all seven tasks are done and pushed. On
     the final binary (`ea443eb56`), the shim suite, all 15 engine cells, the
     3 cells without `CAP_SYS_PTRACE`, and Qwen2.5-72B on all 8 GPUs pass.
--   **Scope for the first merge:** R610 only. R615 comes after the first
-    version is merged.
+-   **Round after P0 (CPU only, this machine has no GPU):** the review of
+    `45bd3f7b0` found three problems that hit processes that never
+    checkpoint, since `/etc/ld.so.preload` puts the shim in every process:
+    `dlsym` re-anchoring, missed cudart resolvers, and a glibc floor of 2.34.
+    All three are fixed, with the small sentry items, and every check that
+    runs on a CPU passes (below). GPU validation of the new binary is the
+    next round.
+-   **Scope for the first merge:** R610 only, now enforced: the interposer
+    and the job are off on any other release unless
+    `--cuda-multicast-shim-unvalidated-driver=ALLOW`. R615 comes after the
+    first version is merged.
+
+## Round after P0: processes that never checkpoint
+
+Rule adopted this round: a problem in the shim may refuse a checkpoint, but
+it must never change the behavior of a process that does not checkpoint.
+The gate, `suspend_locked`, `resume_locked`, the marker protocol and the
+R610 workarounds are untouched.
+
+| Item | Commit | CPU evidence | Left for the GPU round |
+| :--- | :--- | :--- | :--- |
+| `dlsym` re-anchoring: every `RTLD_NEXT` lookup, and every name not rewritten (`cu[A-Z]*`, `cudaGetDriverEntryPoint*`), is forwarded with a tail call | `d1b1d1823` | `run.sh preload` passes (interposer before and after the shim). `mcshim-repro.sh` checks 1 and 2 pass on the fastbuild and `-c opt` Bazel shims and on `build.sh`'s; on `45bd3f7b0`'s shim, check 1 recursed (exit 99) and check 2 failed. The patched source at `-O0` under GCC 11 fails check 1, which is what `copts = ["-O2"]` is for; clang passes at `-O0` through `musttail`. | `abi` and the suite: every redirected lookup still redirects. |
+| cudart resolvers per caller: whatever the caller's dependencies define, unless it is the shim's wrapper; vendored copies (`libcudart-<hash>.so.12`) count; a per-thread depth counter treats a call that came back through another interposer as unplaced | `d1b1d1823` | `mcshim-repro.sh` checks 3 (vendored alone, static alone, each next to `libcudart.so.12`) and 4 (unplaced caller with two runtimes refuses) pass on every shim; all five failed on `45bd3f7b0`'s. | `rtres`, extended with a renamed copy (`patchelf --set-soname libcudart-1a2b3c4d.so.12`). |
+| umask: `/tmp/mcshim` is 01777 and the log 0666 regardless of the first process's umask | `d1b1d1823` | centos:7 under the preload: `/tmp/mcshim` is `drwxrwxrwt`. | Acks from a process under another uid, in a cell. |
+| glibc floor of the embedded shim: GLIBC_2.17 | `c0ebf9590` | Newest `GLIBC_` version in the `-c opt` shim `make` embeds: 2.17 (`clock_gettime`), was 2.34; NEEDED gains `libdl.so.2` and `libpthread.so.0`. `//runsc/mcshimbin:mcshimbin_test` checks that on the embedded bytes (fails on the old shim). `run.sh glibc` and `test/glibc_smoke.sh`: `sh -c true` and `/bin/true` exit 0 with empty output on ubuntu:20.04 (2.31), debian:11 (2.31), rockylinux:8 (2.28) and centos:7 (2.17), through `LD_PRELOAD` and through `/etc/ld.so.preload`; also fine on the host (2.34) and ubuntu:24.04 (2.39) with `LD_BIND_NOW=1`. gcc 11 and clang 20 build it with `-Wall -Wextra` and no warnings. | The suite on the new binary. |
+| `--get-state` timeout fails the checkpoint instead of skipping the process | `c42b42acd` | Build, nogo and `control_test` pass. The `deadline-state` case is written (`ckpt_stub` now hangs on `--get-state` too). | `run.sh deadline` (needs a CUDA process). |
+| Unlock every process after a failed lock or re-lock | `bcb3c6c7e` | Build, nogo and `control_test` pass. | `deadline-lock`: the lock that was killed is unlocked. |
+| R615 opt-in: on by default only on R610; `--cuda-multicast-shim-unvalidated-driver=ALLOW` for anything newer, with a warning | `2a284f526` | `TestCudaMulticastShimEnabled`: 10 cases, including 615 refused, 615 allowed, 580 refused even when allowed. The flag is an enum (REFUSE/ALLOW), since `runsc/config` rejects new boolean flags. **Ask Luis before merging**: he may prefer to enforce this in Modal's scheduler instead. | A run on R615 with `ALLOW`. |
+| Append the shim to `LD_PRELOAD` | `6888d9e0f` | `TestCudaMulticastShimPreloadOrder`. Same order as `/etc/ld.so.preload` already gave. | `torch-symm` under SGLang, whose launcher rewrites `LD_PRELOAD`. |
+
+Notes on the floor. The approach in the brief (`.symver` on the seven
+symbols, `-l:libdl.so.2 -l:libpthread.so.0`) builds and drops every 2.34
+requirement, and loads under lazy binding, but fails on glibc 2.17 and 2.28
+under `-z now`, which Bazel's toolchain links with: the version need then
+names `libc.so.6`, and the old loader reports `symbol dlopen, version
+GLIBC_2.2.5 not defined in file libc.so.6 with link time reference`. Linking
+against stubs of `libdl.so.2` and `libpthread.so.0` that define the seven
+symbols at the base version (`tools/mcshim/glibc_stubs.sh`, a genrule in
+Bazel) records the right file, and both old and new loaders accept it.
+`sscanf`, `fscanf` and `strtoul` are replaced by hand parsers, so a host
+with glibc 2.38+ builds the same floor. `build.sh` and `run.sh` link the same
+way. 2.17 was practical, so the 2.28 fallback was not needed.
+
+`mcshim-fixes.patch` lacked a trailing newline (`git apply`: "corrupt patch
+at line 311"); applied from a copy with one added. `mcshim-repro.sh`'s
+`unplaced_main.c` needs `#define _GNU_SOURCE` for `RTLD_DEFAULT` with this
+glibc; run from a copy with that line added, no other change.
+
+Go validation: `//runsc` builds; `control_test`, `boot_test`, `config_test`,
+`mcshimbin_test` and the `nogo` targets of those four packages pass.
+
+### For the GPU round (not run; one binary)
+
+Run everything on the new binary:
+
+-   The full shim suite, including `preload` and `glibc`.
+-   `rtres`, extended with a renamed copy
+    (`patchelf --set-soname libcudart-1a2b3c4d.so.12`).
+-   The stub tests, including the `--get-state` hang (`deadline-state`).
+-   The 15 engine cells and the 3 without `CAP_SYS_PTRACE`.
+-   Qwen2.5-72B at TP=8 on vLLM and SGLang.
+-   72B restored onto other GPUs.
+-   A tokens/s A/B with and without the shim, on one config that does not
+    use CUDA graphs.
+
+R615 is a separate run, with `--cuda-multicast-shim-unvalidated-driver=ALLOW`:
+`abi` with lookups up to 13.4, the suite, the engine cells and the fabric
+measurement.
+
+Not this round: P1 table work (the 4096-entry cap fails safely).
 
 ## P0 status
 
@@ -161,11 +229,8 @@ Also passing on the final binary:
 
 ## Next
 
-1.  The full shim suite and the 15 + 3 engine cells on the final binary
-    (running).
-2.  A large workload on all 8 GPUs: vLLM with Qwen2.5-72B at TP=8 passed
-    (above); SGLang next if time allows.
-3.  After the first merge: R615 (P2.4), then P1.
+1.  The GPU round on the new binary (list above).
+2.  After the first merge: R615 (P2.4), then P1.
 
 ---
 

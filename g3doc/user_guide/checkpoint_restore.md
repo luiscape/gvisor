@@ -263,10 +263,13 @@ its own `--cuda-checkpoint-path`. Each `cuda-checkpoint` invocation is bounded
 by `--cuda-checkpoint-timeout` (10 minutes by default). CUDA processes started
 with `runsc exec` are not part of the job.
 
-This requires driver R610+ and works when restoring onto *different* GPUs than
-the workload was checkpointed on. Without the interposer, the runtime
-`--cuda-checkpoint-path` flag only sets the default binary for `runsc
-checkpoint`, and CUDA checkpoints work as described above.
+This requires driver R610, the release it has been validated on, and works
+when restoring onto *different* GPUs than the workload was checkpointed on. On
+a newer driver release the interposer stays off unless the runtime
+`--cuda-multicast-shim-unvalidated-driver=ALLOW` flag is set. Without the
+interposer, the runtime `--cuda-checkpoint-path` flag only sets the default
+binary for `runsc checkpoint`, and CUDA checkpoints work as described above.
+The interposer loads in any image whose glibc is 2.17 or newer.
 
 The interposer and gVisor rendezvous through `/tmp/mcshim` inside the
 container. It must reside on a filesystem that is part of the checkpoint image —
