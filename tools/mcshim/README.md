@@ -140,8 +140,14 @@ interposer's rebuild runs against the same ordinals it recorded.
     example `cuMulticastBindMem` resolves to the 7-argument
     `cuMulticastBindMem_v2` at CUDA 13.1+, and PTDS lookups to `_ptsz` /
     `_ptds`). Every exported variant has a wrapper with its own prototype. A
-    lookup of a tracked entry point that returns a symbol the shim has no
-    wrapper for (a future `_v3`) refuses checkpoints.
+    lookup of a tracked entry point, or of a resolver, that returns a symbol
+    the shim has no wrapper for (a future `_v3`) refuses checkpoints. A cudart
+    resolver answers with the ABI of its own runtime, and libraries can load
+    different runtimes `RTLD_LOCAL`, so each call goes to the runtime the
+    caller's own dependencies resolve the resolver to, and a resolver found
+    by `dlsym` stays bound to that handle's runtime. A caller the shim cannot
+    place (e.g. through libffi) gets the only `libcudart` loaded; with
+    several loaded, checkpoints are refused.
 *   **Tracking tables.** Fixed-size (`MAXN` = 4096 each): objects (`g_alloc`),
     mappings (`g_map`), multicast binds (`g_bind`). This is live state: an
     object is forgotten once it has no application reference, mapping or

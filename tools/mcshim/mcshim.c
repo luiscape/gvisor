@@ -42,6 +42,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <link.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -2232,6 +2233,14 @@ static int tracked_symbol(const char* symbol, int from_resolver) {
   return 0;
 }
 
+/* Lock-free: refuse checkpoints because of a lookup (why), logging detail. */
+static void bad_lookup(const char* why, const char* detail) {
+  const char* prev = NULL;
+  if (__atomic_compare_exchange_n(&g_bad_lookup, &prev, why, 0,
+                                  __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    mclog("NOTE: checkpoint disabled for this process: %s (%s)", why, detail);
+}
+
 /* The wrapper for the libcuda function at p, or p. */
 static void* redirect(const char* symbol, void* p, int from_resolver) {
   if (!p) return p;
@@ -2241,17 +2250,9 @@ static void* redirect(const char* symbol, void* p, int from_resolver) {
   resolve_hooks();
   for (int i = 0; i < NHOOKS; i++)
     if (*g_hooks[i].real == p) return g_hooks[i].wrapper;
-  if (symbol && tracked_symbol(symbol, from_resolver)) {
-    const char* prev = NULL;
-    if (__atomic_compare_exchange_n(&g_bad_lookup, &prev,
-                                    "lookup of an unknown ABI version of a "
-                                    "tracked entry point",
-                                    0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-      mclog(
-          "NOTE: checkpoint disabled for this process: no wrapper for the "
-          "ABI %s resolved to",
-          symbol);
-  }
+  if (symbol && tracked_symbol(symbol, from_resolver))
+    bad_lookup("lookup of an unknown ABI version of a tracked entry point",
+               symbol);
   return p;
 }
 
@@ -2277,37 +2278,160 @@ CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion,
 /* Interposed cudart resolvers. torch >= 2.11 resolves its driver API through
  * cudaGetDriverEntryPointByVersion, and cudart reaches libcuda by a path
  * neither hook sees, so interpose the resolver, let cudart look the symbol up,
- * and redirect the result. The reals live in libcudart: resolve via RTLD_NEXT,
- * then in an already-loaded libcudart (torch dlopens it RTLD_LOCAL). Never
- * force-load it. */
+ * and redirect the result.
+ *
+ * A resolver answers with the ABI of its own runtime, and a process can load
+ * several runtimes RTLD_LOCAL, one per library. So each call goes to the
+ * runtime the caller's own dependencies resolve the resolver to; if the caller
+ * cannot be identified (e.g. a libffi call), to the only libcudart loaded. A
+ * resolver found by dlsym is bound to that handle's runtime. Never force-load
+ * a runtime. */
 
 #define CUDA_ERROR_RT_SYMBOL_NOT_FOUND 500 /* cudaErrorSymbolNotFound */
 
-static void* libcudart_sym(const char* name) {
-  init_real_dlsym();
-  if (!real_dlsym) return NULL;
-  void* s = real_dlsym(RTLD_NEXT, name);
-  if (s) return s;
-  static void* h;
-  if (!h) {
-    static const char* const sonames[] = {"libcudart.so.13", "libcudart.so.12",
-                                          "libcudart.so.11.0", "libcudart.so",
-                                          NULL};
-    for (int i = 0; !h && sonames[i]; i++)
-      h = dlopen(sonames[i], RTLD_NOW | RTLD_NOLOAD);
-  }
-  return h ? real_dlsym(h, name) : NULL;
+enum { RT_GDEP, RT_GDEP_PTSZ, RT_BYVER, RT_BYVER_PTSZ, RT_NFN };
+static const char* const kRtNames[RT_NFN] = {
+    "cudaGetDriverEntryPoint", "cudaGetDriverEntryPoint_ptsz",
+    "cudaGetDriverEntryPointByVersion",
+    "cudaGetDriverEntryPointByVersion_ptsz"};
+
+typedef int (*GdepFn)(const char*, void**, unsigned long long, int*);
+typedef int (*ByVerFn)(const char*, void**, unsigned int, unsigned long long,
+                       int*);
+
+int cudaGetDriverEntryPoint(const char*, void**, unsigned long long, int*);
+int cudaGetDriverEntryPoint_ptsz(const char*, void**, unsigned long long, int*);
+int cudaGetDriverEntryPointByVersion(const char*, void**, unsigned int,
+                                     unsigned long long, int*);
+int cudaGetDriverEntryPointByVersion_ptsz(const char*, void**, unsigned int,
+                                          unsigned long long, int*);
+
+static void* rt_wrapper(int fn) {
+  static void* const w[RT_NFN] = {(void*)cudaGetDriverEntryPoint,
+                                  (void*)cudaGetDriverEntryPoint_ptsz,
+                                  (void*)cudaGetDriverEntryPointByVersion,
+                                  (void*)cudaGetDriverEntryPointByVersion_ptsz};
+  return w[fn];
 }
 
-#define RTREAL(var, name)                                \
-  do {                                                   \
-    if (!(var)) *(void**)(&(var)) = libcudart_sym(name); \
-  } while (0)
+/* If path's basename is libcudart.so followed by zero or more .N parts, the
+ * address of those parts; else NULL. */
+static const char* cudart_suffix(const char* path) {
+  const char* b = strrchr(path, '/');
+  b = b ? b + 1 : path;
+  if (strncmp(b, "libcudart.so", 12) != 0) return NULL;
+  const char* v = b + 12;
+  for (b = v; *b;) {
+    if (*b++ != '.' || *b < '0' || *b > '9') return NULL;
+    while (*b >= '0' && *b <= '9') b++;
+  }
+  return v;
+}
+
+/* Keep the object holding p loaded, so that a cached pointer into it stays
+ * valid. */
+static void pin(void* p) {
+  Dl_info di;
+  if (dladdr(p, &di) && di.dli_fname && di.dli_fname[0])
+    dlopen(di.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+}
+
+/* Resolver fn in the runtime that the object at address caller resolves it
+ * to, or NULL. */
+static void* rt_from_caller(int fn, void* caller) {
+  Dl_info di;
+  if (!caller || !dladdr(caller, &di) || !di.dli_fname) return NULL;
+  void* h = dlopen(di.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+  if (!h) return NULL;
+  void* r = real_dlsym(h, kRtNames[fn]);
+  dlclose(h);
+  Dl_info ri;
+  if (!r || r == rt_wrapper(fn) || !dladdr(r, &ri) || !ri.dli_fname ||
+      !cudart_suffix(ri.dli_fname))
+    return NULL;
+  return r;
+}
+
+typedef struct {
+  char path[512];
+  unsigned long ver[4];
+  int n;
+} RtScan;
+
+static int rt_scan(struct dl_phdr_info* info, size_t size, void* arg) {
+  (void)size;
+  RtScan* s = arg;
+  const char* v = info->dlpi_name ? cudart_suffix(info->dlpi_name) : NULL;
+  if (!v) return 0;
+  unsigned long ver[4] = {0};
+  for (int i = 0; i < 4 && *v == '.'; i++)
+    ver[i] = strtoul(v + 1, (char**)&v, 10);
+  int cmp = 0;
+  for (int i = 0; i < 4 && !cmp; i++)
+    cmp = (ver[i] > s->ver[i]) - (ver[i] < s->ver[i]);
+  if (s->n++ == 0 || cmp > 0) {
+    snprintf(s->path, sizeof(s->path), "%s", info->dlpi_name);
+    memcpy(s->ver, ver, sizeof(ver));
+  }
+  return 0;
+}
+
+/* Resolver fn in the only libcudart loaded, or NULL. With several, the newest
+ * one's, and checkpoints are refused: the caller may expect another ABI. */
+static void* rt_from_loaded(int fn) {
+  RtScan s;
+  memset(&s, 0, sizeof(s));
+  dl_iterate_phdr(rt_scan, &s);
+  if (s.n == 0) return NULL;
+  if (s.n > 1)
+    bad_lookup("a CUDA runtime resolver called with several runtimes loaded",
+               kRtNames[fn]);
+  void* h = dlopen(s.path, RTLD_NOW | RTLD_NOLOAD);
+  if (!h) return NULL;
+  void* r = real_dlsym(h, kRtNames[fn]);
+  dlclose(h);
+  return r == rt_wrapper(fn) ? NULL : r;
+}
+
+/* Resolvers per calling object, keyed by its load address. */
+#define RT_CACHE 64
+static struct {
+  void* base;
+  void* real[RT_NFN];
+} g_rtc[RT_CACHE];
+static int g_nrtc;
+static pthread_mutex_t g_rtlock = PTHREAD_MUTEX_INITIALIZER;
+
+/* The real resolver fn for a call from address caller, or NULL. The loader
+ * calls run without g_rtlock: a constructor may call a resolver while the
+ * loader lock is held. */
+static void* rt_real(int fn, void* caller) {
+  init_real_dlsym();
+  if (!real_dlsym) return NULL;
+  Dl_info di;
+  void* base = caller && dladdr(caller, &di) ? di.dli_fbase : NULL;
+  void* r = NULL;
+  pthread_mutex_lock(&g_rtlock);
+  for (int i = 0; i < g_nrtc && !r; i++)
+    if (g_rtc[i].base == base) r = g_rtc[i].real[fn];
+  pthread_mutex_unlock(&g_rtlock);
+  if (r) return r;
+  r = rt_from_caller(fn, caller);
+  if (!r) r = rt_from_loaded(fn);
+  if (!r || !base) return r;
+  pin(r);
+  pthread_mutex_lock(&g_rtlock);
+  int i = 0;
+  while (i < g_nrtc && g_rtc[i].base != base) i++;
+  if (i == g_nrtc && g_nrtc < RT_CACHE) g_rtc[g_nrtc++].base = base;
+  if (i < g_nrtc) g_rtc[i].real[fn] = r;
+  pthread_mutex_unlock(&g_rtlock);
+  return r;
+}
 
 int cudaGetDriverEntryPoint(const char* symbol, void** pfn,
                             unsigned long long flags, int* driverStatus) {
-  static int (*real)(const char*, void**, unsigned long long, int*);
-  RTREAL(real, "cudaGetDriverEntryPoint");
+  GdepFn real = (GdepFn)rt_real(RT_GDEP, __builtin_return_address(0));
   if (!real) return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
   int rc = real(symbol, pfn, flags, driverStatus);
   if (rc == 0 && pfn) *pfn = redirect(symbol, *pfn, 1);
@@ -2316,8 +2440,7 @@ int cudaGetDriverEntryPoint(const char* symbol, void** pfn,
 
 int cudaGetDriverEntryPoint_ptsz(const char* symbol, void** pfn,
                                  unsigned long long flags, int* driverStatus) {
-  static int (*real)(const char*, void**, unsigned long long, int*);
-  RTREAL(real, "cudaGetDriverEntryPoint_ptsz");
+  GdepFn real = (GdepFn)rt_real(RT_GDEP_PTSZ, __builtin_return_address(0));
   if (!real) return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
   int rc = real(symbol, pfn, flags, driverStatus);
   if (rc == 0 && pfn) *pfn = redirect(symbol, *pfn, 1);
@@ -2328,9 +2451,7 @@ int cudaGetDriverEntryPointByVersion(const char* symbol, void** pfn,
                                      unsigned int cudaVersion,
                                      unsigned long long flags,
                                      int* driverStatus) {
-  static int (*real)(const char*, void**, unsigned int, unsigned long long,
-                     int*);
-  RTREAL(real, "cudaGetDriverEntryPointByVersion");
+  ByVerFn real = (ByVerFn)rt_real(RT_BYVER, __builtin_return_address(0));
   if (!real) return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
   int rc = real(symbol, pfn, cudaVersion, flags, driverStatus);
   if (rc == 0 && pfn) *pfn = redirect(symbol, *pfn, 1);
@@ -2341,31 +2462,64 @@ int cudaGetDriverEntryPointByVersion_ptsz(const char* symbol, void** pfn,
                                           unsigned int cudaVersion,
                                           unsigned long long flags,
                                           int* driverStatus) {
-  static int (*real)(const char*, void**, unsigned int, unsigned long long,
-                     int*);
-  RTREAL(real, "cudaGetDriverEntryPointByVersion_ptsz");
+  ByVerFn real = (ByVerFn)rt_real(RT_BYVER_PTSZ, __builtin_return_address(0));
   if (!real) return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
   int rc = real(symbol, pfn, cudaVersion, flags, driverStatus);
   if (rc == 0 && pfn) *pfn = redirect(symbol, *pfn, 1);
   return rc;
 }
 
-/* Covers apps that dlsym the resolvers from a dlopen'd libcudart. */
-static void* cudart_wrapper(const char* name) {
-  static const struct {
-    const char* name;
-    void* fn;
-  } t[] = {
-      {"cudaGetDriverEntryPoint", (void*)cudaGetDriverEntryPoint},
-      {"cudaGetDriverEntryPoint_ptsz", (void*)cudaGetDriverEntryPoint_ptsz},
-      {"cudaGetDriverEntryPointByVersion",
-       (void*)cudaGetDriverEntryPointByVersion},
-      {"cudaGetDriverEntryPointByVersion_ptsz",
-       (void*)cudaGetDriverEntryPointByVersion_ptsz},
-  };
-  for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++)
-    if (strcmp(t[i].name, name) == 0) return t[i].fn;
-  return NULL;
+/* Wrappers bound to the resolver dlsym found in a handle: slot s of resolver
+ * fn forwards to g_rt_slot[fn][s]. */
+#define RT_SLOTS 4
+static void* g_rt_slot[RT_NFN][RT_SLOTS];
+
+#define RT_GDEP_SLOT(fn, s)                                           \
+  static int rt_slot_##fn##_##s(const char* symbol, void** pfn,       \
+                                unsigned long long flags, int* st) {  \
+    GdepFn real =                                                     \
+        (GdepFn)__atomic_load_n(&g_rt_slot[fn][s], __ATOMIC_ACQUIRE); \
+    int rc = real(symbol, pfn, flags, st);                            \
+    if (rc == 0 && pfn) *pfn = redirect(symbol, *pfn, 1);             \
+    return rc;                                                        \
+  }
+#define RT_BYVER_SLOT(fn, s)                                                \
+  static int rt_slot_##fn##_##s(const char* symbol, void** pfn,             \
+                                unsigned int ver, unsigned long long flags, \
+                                int* st) {                                  \
+    ByVerFn real =                                                          \
+        (ByVerFn)__atomic_load_n(&g_rt_slot[fn][s], __ATOMIC_ACQUIRE);      \
+    int rc = real(symbol, pfn, ver, flags, st);                             \
+    if (rc == 0 && pfn) *pfn = redirect(symbol, *pfn, 1);                   \
+    return rc;                                                              \
+  }
+#define RT_SLOTS_OF(DEF, fn) DEF(fn, 0) DEF(fn, 1) DEF(fn, 2) DEF(fn, 3)
+RT_SLOTS_OF(RT_GDEP_SLOT, 0)
+RT_SLOTS_OF(RT_GDEP_SLOT, 1)
+RT_SLOTS_OF(RT_BYVER_SLOT, 2)
+RT_SLOTS_OF(RT_BYVER_SLOT, 3)
+#define RT_SLOT_ROW(fn)                                                       \
+  {(void*)rt_slot_##fn##_0, (void*)rt_slot_##fn##_1, (void*)rt_slot_##fn##_2, \
+   (void*)rt_slot_##fn##_3}
+static void* const g_rt_slot_fn[RT_NFN][RT_SLOTS] = {
+    RT_SLOT_ROW(0), RT_SLOT_ROW(1), RT_SLOT_ROW(2), RT_SLOT_ROW(3)};
+
+/* The resolver wrapper for a dlsym lookup of symbol that found real. */
+static void* rt_dlsym(const char* symbol, void* real) {
+  int fn = 0;
+  while (fn < RT_NFN && strcmp(kRtNames[fn], symbol) != 0) fn++;
+  if (fn == RT_NFN || real == rt_wrapper(fn)) return real;
+  for (int s = 0; s < RT_SLOTS; s++) {
+    void* cur = NULL;
+    if (__atomic_compare_exchange_n(&g_rt_slot[fn][s], &cur, real, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+      pin(real);
+    else if (cur != real)
+      continue;
+    return g_rt_slot_fn[fn][s];
+  }
+  bad_lookup("too many CUDA runtimes", symbol);
+  return real;
 }
 
 /* Interposed dlsym. Delegating through a dlvsym-resolved dlsym re-anchors
@@ -2375,10 +2529,8 @@ void* dlsym(void* handle, const char* symbol) {
   if (!real_dlsym) return NULL;
   void* r = real_dlsym(handle, symbol);
   if (!r || symbol[0] != 'c' || symbol[1] != 'u') return r;
-  if (strncmp(symbol, "cudaGetDriverEntryPoint", 23) == 0) {
-    void* w = cudart_wrapper(symbol);
-    return w ? w : r;
-  }
+  if (strncmp(symbol, "cudaGetDriverEntryPoint", 23) == 0)
+    return rt_dlsym(symbol, r);
   return redirect(symbol, r, 0);
 }
 
@@ -2589,6 +2741,7 @@ static void ensure_control_thread(void) {
  * checkpoint. */
 static void mcshim_atfork_child(void) {
   g_loglock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+  g_rtlock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
   g_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
   g_gate_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
   g_gate_cv = (pthread_cond_t)PTHREAD_COND_INITIALIZER;

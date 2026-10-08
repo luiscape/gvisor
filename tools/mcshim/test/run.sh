@@ -17,6 +17,9 @@
 #
 #   abi gate mc refcount refuse mapwait  native (mcshim_test.c)
 #   silent                       native: the preloaded shim prints nothing
+#   rtres                        native: cudart's resolvers reach each caller's
+#                                own runtime; needs MCSHIM_TEST_CUDART, two
+#                                libcudart.so files of different majors
 #   ipc                          under runsc (-r), over the host's libraries:
 #                                needs nvproxy's exported-object identity
 #   orphan                       under runsc (-r): `runsc checkpoint` refuses an
@@ -46,8 +49,8 @@ while getopts r:i:e: o; do
 done
 shift $((OPTIND - 1))
 if [ $# -eq 0 ]; then
-  set -- abi gate mc refcount refuse mapwait silent ipc orphan deadline reason \
-    optout torch-kernel torch-symm
+  set -- abi gate mc refcount refuse mapwait silent rtres ipc orphan deadline \
+    reason optout torch-kernel torch-symm
 fi
 GPUS=${MCSHIM_TEST_GPUS:-0,1}
 
@@ -71,7 +74,33 @@ cp torch_gate_test.py "$W/"
 
 native() {
   CUDA_VISIBLE_DEVICES=$GPUS MCSHIM_LOG="$W/$1.log" LD_PRELOAD="$W/mcshim.so" \
-    "$W/mcshim_test" "$1"
+    "$W/mcshim_test" "$@"
+}
+
+# rtres: two CUDA runtimes in one process, each library linked against one and
+# loaded RTLD_LOCAL; then a runtime under a soname nothing could know.
+rtres() {
+  local rts=(${MCSHIM_TEST_CUDART:-}) pairs=() f so
+  if [ ${#rts[@]} -lt 2 ]; then
+    echo "needs MCSHIM_TEST_CUDART"
+    return 77
+  fi
+  mkdir -p "$W/rt"
+  rtlib() { # NAME SONAME
+    gcc -O2 -fPIC -shared -o "$W/rt/$1" rtlib.c -L"$W/rt" -l:"$2" \
+      -Wl,-rpath,"$W/rt"
+  }
+  for f in "${rts[0]}" "${rts[1]}"; do
+    so=$(objdump -p "$f" | awk '/SONAME/ {print $2}')
+    cp "$f" "$W/rt/$so"
+    rtlib "lib-$so.so" "$so"
+    pairs+=("$W/rt/lib-$so.so:$W/rt/$so")
+  done
+  native rtres "${pairs[@]}" || return 1
+  cp "$W/rt/$so" "$W/rt/libcudart.so.99"
+  patchelf --set-soname libcudart.so.99 "$W/rt/libcudart.so.99" || return 77
+  rtlib lib-99.so libcudart.so.99
+  native rtres "$W/rt/lib-99.so:$W/rt/libcudart.so.99"
 }
 
 # sandboxed NAME ROOT SHIM ARGS...: runs ARGS under runsc with SHIM preloaded,
@@ -342,6 +371,7 @@ for t in "$@"; do
   rc=0
   case $t in
     silent) silent || rc=$? ;;
+    rtres) rtres || rc=$? ;;
     deadline | reason | optout)
       if [ -z "$RUNSC" ]; then
         echo "SKIP $t: needs -r RUNSC"

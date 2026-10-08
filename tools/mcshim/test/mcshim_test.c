@@ -1495,7 +1495,98 @@ static int t_orphan(void) {
   return 0;
 }
 
+/* rtres */
+
+typedef int (*GdepFn)(const char*, void**, unsigned long long, int*);
+
+/* rtres LIB:CUDART...: each library LIB, linked against the CUDA runtime
+ * CUDART and loaded RTLD_LOCAL, calls cudaGetDriverEntryPoint, which must
+ * reach CUDART, whatever else is loaded. So must the resolver dlsym finds in
+ * CUDART. cuMemcpyBatchAsync has a different ABI in CUDA 12.8 and 13.0. */
+static int t_rtres(int n, char** pairs) {
+  static const char sym[] = "cuMemcpyBatchAsync";
+  resolve();
+  Dl_info di;
+  dladdr((void*)dlsym, &di);
+  void* shim = dlopen(di.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+  void *libs[8], *rts[8], *wants[8];
+  const char* abi[8] = {0};
+  if (n > 8) n = 8;
+  for (int i = 0; i < n; i++) {
+    char* c = strchr(pairs[i], ':');
+    if (!c) return 2;
+    *c = 0;
+    libs[i] = dlopen(pairs[i], RTLD_NOW | RTLD_LOCAL);
+    rts[i] = dlopen(c + 1, RTLD_NOW | RTLD_NOLOAD);
+    if (!libs[i] || !rts[i]) {
+      fprintf(stderr, "FAIL: loading %s: %s\n", pairs[i], dlerror());
+      return 1;
+    }
+    pairs[i] = c + 1;
+  }
+  for (int i = 0; i < n; i++) {
+    GdepFn real;
+    *(void**)&real = rdlsym(rts[i], "cudaGetDriverEntryPoint");
+    void *pr = NULL, *pw = NULL, *pd = NULL;
+    int st;
+    CK(real(sym, &pr, 0, &st));
+    abi[i] = dladdr(pr, &di) && di.dli_sname ? di.dli_sname : "(none)";
+    void* want = rdlsym(shim, abi[i]);
+    if (!want) want = pr;
+    wants[i] = want;
+    int (*res)(const char*, void**);
+    *(void**)&res = rdlsym(libs[i], "rt_resolve");
+    CK(res(sym, &pw));
+    EXPECT(pw == want, "%s: a caller of this runtime got %p, want %s (%p)",
+           pairs[i], pw, abi[i], want);
+    GdepFn viadlsym;
+    *(void**)&viadlsym = dlsym(rts[i], "cudaGetDriverEntryPoint");
+    EXPECT(viadlsym && viadlsym != real, "%s: dlsym returned the resolver %p",
+           pairs[i], (void*)viadlsym);
+    if (viadlsym) {
+      CK(viadlsym(sym, &pd, 0, &st));
+      EXPECT(pd == want, "%s: its resolver from dlsym gave %p, want %s (%p)",
+             pairs[i], pd, abi[i], want);
+    }
+    printf("rtres: %s resolves %s to %s\n", pairs[i], sym, abi[i]);
+  }
+  if (n > 1)
+    EXPECT(strcmp(abi[0], abi[1]) != 0,
+           "both runtimes chose %s, so the test cannot tell them apart",
+           abi[0]);
+  /* None of this may make the process uncheckpointable. */
+  pid_t me = getpid();
+  EXPECT(gate_up(&me, 1) == 0, "gate refused after the lookups");
+  gate_down();
+
+  /* A caller the shim cannot place (here the main program, which links no
+   * runtime) gets the only runtime loaded. With several, it gets the newest,
+   * and checkpoints are refused. */
+  GdepFn generic;
+  *(void**)&generic = dlsym(RTLD_DEFAULT, "cudaGetDriverEntryPoint");
+  void* pg = NULL;
+  int st;
+  CK(generic(sym, &pg, 0, &st));
+  int refused = gate_up(&me, 1) != 0;
+  char err[64];
+  snprintf(err, sizeof(err), "error.%d", (int)me);
+  if (n == 1) {
+    EXPECT(pg == wants[0], "unplaced caller got %p, want %p", pg, wants[0]);
+    EXPECT(!refused, "gate refused with one runtime: %s", body(err));
+  } else {
+    EXPECT(refused && strstr(body(err), "several runtimes"),
+           "gate after an ambiguous call: refused=%d (%s)", refused, body(err));
+  }
+  gate_down();
+  printf("rtres: %s\n", g_failed ? "FAILED" : "ok");
+  return g_failed;
+}
+
 int main(int argc, char** argv) {
+  if (argc >= 3 && !strcmp(argv[1], "rtres")) {
+    clear_markers();
+    return t_rtres(argc - 2, argv + 2) ? 1 : 0;
+  }
   if (argc >= 2 && !strcmp(argv[1], "beat"))
     return t_beat(argc > 2 ? argv[2] : "");
   if (argc == 3 && !strcmp(argv[1], "refuse1")) {
