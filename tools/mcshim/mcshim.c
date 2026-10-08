@@ -839,10 +839,12 @@ CUresult cuInit(unsigned int flags) {
   return r_cuInit(flags);
 }
 
-/* Fabric handle types create an NV_MEMORY_FABRIC (00f8) object at allocation
- * time, which cuda-checkpoint cannot serialize. On a single node POSIX fds are
- * equivalent. Masking the device attribute is not enough, since statically
- * linked runtimes bypass it. */
+/* Fabric handles are shared through IMEX, which the shim cannot rebuild after a
+ * restore; on a single node POSIX fds are equivalent. (Measured on R610: one
+ * process's fabric-capable allocation checkpoints and restores fine, exported
+ * or not; without an IMEX channel, creating one fails with NOT_PERMITTED.)
+ * Masking the device attribute is not enough, since statically linked runtimes
+ * bypass it. */
 static unsigned long long strip_fabric(unsigned long long types,
                                        const char* what) {
   if (!(types & CU_MEM_HANDLE_TYPE_FABRIC) || allow_fabric()) return types;
@@ -1683,6 +1685,11 @@ static const char* can_carry(void) {
         if (g_map[m].used && g_map[m].allocIdx == i &&
             rw_dev(&g_map[m], mask) < 0)
           return "multicast-bound export without read-write access";
+    /* Only under MCSHIM_ALLOW_FABRIC, which keeps FABRIC. Fine on R610 (see
+     * strip_fabric), but unmeasured on other drivers. */
+    if (a->kind == KIND_UC &&
+        (a->uprop.requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC))
+      return "a live fabric-capable allocation (MCSHIM_ALLOW_FABRIC)";
   }
   return NULL;
 }

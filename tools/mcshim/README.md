@@ -112,7 +112,7 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 | :----------------------- | :-------------- | :---------------------------------------------------------------- |
 | `MCSHIM_LOG`             | `/tmp/mcshim/mcshim.log` | append the log to this path; `stderr` for stderr. The shim never prints otherwise: every process in the container loads it |
 | `MCSHIM_DISABLE`         | unset           | silent: no control thread, acks, or gate (interposition/tracking stay active) |
-| `MCSHIM_ALLOW_FABRIC`    | unset           | keep fabric handle types (not checkpointable; see below)          |
+| `MCSHIM_ALLOW_FABRIC`    | unset           | keep fabric handle types; the gate refuses while a fabric-capable allocation is alive (see below) |
 | `MCSHIM_HOST_BUILD`      | unset           | build.sh: build with the host toolchain instead of docker         |
 | `MCSHIM_BUILD_IMAGE`     | pinned 22.04    | build.sh: alternative base image                                  |
 
@@ -210,12 +210,15 @@ interposer's rebuild runs against the same ordinals it recorded.
     and the process is neither torn down nor broken, so a gate removed and
     re-created while it is torn down neither releases it early nor strands
     it. After a failed teardown or rebuild, the shim refuses to release it.
-*   **Fabric handles.** Fabric handle types create `NV_MEMORY_FABRIC` (0x00f8)
-    objects that `cuda-checkpoint` cannot serialize. Unless
-    `MCSHIM_ALLOW_FABRIC=1`, the shim strips them from `cuMemCreate` and
-    `cuMulticastCreate`, refuses fabric exports and reports
-    `CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED` as 0; on a single node
-    POSIX fds are equivalent.
+*   **Fabric handles.** Fabric handles are shared through IMEX, which the shim
+    cannot rebuild after a restore. Unless `MCSHIM_ALLOW_FABRIC=1`, the shim
+    strips them from `cuMemCreate` and `cuMulticastCreate`, refuses fabric
+    exports and reports `CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED` as
+    0; on a single node POSIX fds are equivalent. With it, the gate refuses
+    while a fabric-capable allocation is alive. Measured on R610:
+    `cuda-checkpoint` checkpoints and restores one process's fabric-capable
+    allocation, exported or not; creating one needs an IMEX channel
+    (`NOT_PERMITTED` without).
 
 ## What refuses a checkpoint
 

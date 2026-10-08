@@ -90,6 +90,7 @@ typedef struct {
 } CopyAttr;
 
 #define POSIX_FD 1
+#define FABRIC 8
 #define DEVICE 1
 #define RW 3
 #define ATTR_CLOCK_RATE 13
@@ -269,6 +270,14 @@ static void clear_acks(const pid_t* pids, int n) {
 }
 
 static int gate_up(const pid_t* pids, int n) {
+  /* Like the sentry: a stale ack must not answer this request. */
+  for (int i = 0; i < n; i++) {
+    char a[64];
+    snprintf(a, sizeof(a), "gated.%d", (int)pids[i]);
+    rm(a);
+    snprintf(a, sizeof(a), "error.%d", (int)pids[i]);
+    rm(a);
+  }
   mk("gate");
   return wait_ack("gated", pids, n);
 }
@@ -1059,14 +1068,30 @@ static H plain_group(size_t size) {
 }
 
 /* One refusal case, in a fresh process. Returns 0 if the gate accepted
- * ("clean", "add-only") or refused (the rest) as expected, and the
- * application kept running. */
+ * ("clean", "add-only", "fabric" once released) or refused (the rest) as
+ * expected, and the application kept running. */
 static int refuse_case(const char* name) {
-  int accept = !strcmp(name, "clean") || !strcmp(name, "add-only");
+  int accept = !strcmp(name, "clean") || !strcmp(name, "add-only") ||
+               !strcmp(name, "fabric");
   int multicast = !accept && strcmp(name, "pool") && strcmp(name, "managed");
   setup(multicast ? 2 : 1);
   pid_t me = getpid();
-  if (!strcmp(name, "add-only")) {
+  if (!strcmp(name, "fabric")) {
+    /* Under MCSHIM_ALLOW_FABRIC, a live fabric-capable allocation refuses,
+     * until it is released. */
+    setenv("MCSHIM_ALLOW_FABRIC", "1", 1);
+    AllocProp up = uc_prop(0, POSIX_FD | FABRIC);
+    H f;
+    CUresult rc = cuMemCreate(&f, 2 << 20, &up, 0);
+    if (rc == 800) {
+      fprintf(stderr, "SKIP: no IMEX channel for fabric allocations\n");
+      exit(77);
+    }
+    CK(rc);
+    EXPECT(gate_up(&me, 1) != 0, "gate accepted a live fabric allocation");
+    gate_down();
+    CK(cuMemRelease(f));
+  } else if (!strcmp(name, "add-only")) {
     /* A device added to a group needs no context of its own. */
     int n, mc = 0;
     CK(cuDeviceGetCount(&n));
@@ -1130,8 +1155,9 @@ static int refuse_case(const char* name) {
 }
 
 static int t_refuse(void) {
-  static const char* const cases[] = {"clean",   "add-only",       "pool",
-                                      "managed", "untracked-bind", "span"};
+  static const char* const cases[] = {"clean", "add-only", "fabric",
+                                      "pool",  "managed",  "untracked-bind",
+                                      "span"};
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     pid_t pid = fork();
     if (pid == 0) {

@@ -28,7 +28,8 @@ import (
 // hangs: NVLink multicast groups (NCCL NVLS, PyTorch symmetric memory) and
 // imports of another process's fabric memory. NV_MEMORY_FABRIC itself is not
 // included: libcuda allocates it per context on fabric-attached GPUs and it
-// checkpoints fine.
+// checkpoints fine. (Measured on R610: cuda-checkpoint also carries a process's
+// fabric-capable allocations, exported or not.)
 var checkpointBlockerClasses = map[nvgpu.ClassID]string{
 	nvgpu.NV_MEMORY_MULTICAST_FABRIC:    "multicast",
 	nvgpu.NV_MEMORY_FABRIC_IMPORTED_REF: "fabric-import",
