@@ -56,7 +56,8 @@ cleanup() {
 }
 trap cleanup EXIT
 gcc -O2 -g -Wall -Wextra -fPIC -shared -o "$W/mcshim.so" ../mcshim.c -ldl -lpthread
-gcc -O2 -g -Wall -Wextra -o "$W/mcshim_test" mcshim_test.c -ldl -lpthread
+gcc -O2 -g -Wall -Wextra -rdynamic -o "$W/mcshim_test" mcshim_test.c -ldl \
+  -lpthread
 cp torch_gate_test.py "$W/"
 
 native() {

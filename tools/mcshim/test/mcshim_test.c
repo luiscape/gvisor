@@ -220,6 +220,21 @@ static int exists(const char* name) {
   return access(p, F_OK) == 0;
 }
 
+/* The body of a marker or ack, or "". */
+static const char* body(const char* name) {
+  static char b[256];
+  char p[256];
+  mpath(p, name);
+  b[0] = 0;
+  FILE* f = fopen(p, "r");
+  if (f) {
+    size_t n = fread(b, 1, sizeof(b) - 1, f);
+    b[n] = 0;
+    fclose(f);
+  }
+  return b;
+}
+
 /* Waits for <prefix>.<pid> from every pid: 0, or -1 on error.<pid>. */
 static int wait_ack(const char* prefix, const pid_t* pids, int n) {
   for (double end = now() + 120; now() < end; msleep(10)) {
@@ -343,6 +358,10 @@ static unsigned read32(int d, CUdeviceptr p) {
 
 /* abi */
 
+/* A resolver ABI the shim has no wrapper for. run.sh links with -rdynamic, so
+ * that dlsym finds it. */
+int cuGetProcAddress_v3(void) { return 0; }
+
 static const char* const kBases[] = {"cuInit",
                                      "cuDeviceGetAttribute",
                                      "cuGetProcAddress",
@@ -432,8 +451,8 @@ static int t_abi(void) {
   *(void**)&real_gpa = rdlsym(lib, "cuGetProcAddress_v2");
   EXPECT((void*)cuGetProcAddress_v2 == rdlsym(shim, "cuGetProcAddress_v2"),
          "dlsym(cuGetProcAddress_v2) not redirected");
-  static const int vers[] = {11030, 12000, 12030, 12080,
-                             13000, 13010, 13020, 13030};
+  static const int vers[] = {11030, 12000, 12030, 12080, 13000,
+                             13010, 13020, 13030, 13040};
   int checked = 0, wrapped = 0;
   for (int b = 0; kBases[b]; b++)
     for (size_t v = 0; v < sizeof(vers) / sizeof(vers[0]); v++)
@@ -470,6 +489,16 @@ static int t_abi(void) {
   /* None of those lookups may have made the process uncheckpointable. */
   pid_t me = getpid();
   EXPECT(gate_up(&me, 1) == 0, "gate refused after lookups");
+  gate_down();
+
+  /* A resolver ABI the shim has no wrapper for makes it refuse. */
+  void* v3 = dlsym(RTLD_DEFAULT, "cuGetProcAddress_v3");
+  EXPECT(v3 == (void*)cuGetProcAddress_v3, "dlsym(cuGetProcAddress_v3) = %p",
+         v3);
+  EXPECT(gate_up(&me, 1) != 0, "gate accepted after an unknown resolver ABI");
+  char err[64];
+  snprintf(err, sizeof(err), "error.%d", (int)me);
+  EXPECT(strstr(body(err), "unknown ABI"), "refusal reason: %s", body(err));
   gate_down();
   return g_failed;
 }

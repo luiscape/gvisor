@@ -2133,11 +2133,13 @@ typedef struct {
 #define GATED_HOOK(name, sfx, proto, args) HOOK(name, 1) HOOK(name##sfx, 1)
 #define REFUSED_HOOK(name, proto, args, why) HOOK(name, 1)
 
+/* The resolvers are tracked: a lookup returning an ABI without a wrapper (a
+ * future _v3) would hand out unwrapped lookups from then on. */
 static const Hook g_hooks[] = {
     HOOK(cuInit, 0)                                 /**/
     HOOK(cuDeviceGetAttribute, 0)                   /**/
-    HOOK(cuGetProcAddress, 0)                       /**/
-    HOOK(cuGetProcAddress_v2, 0)                    /**/
+    HOOK(cuGetProcAddress, 1)                       /**/
+    HOOK(cuGetProcAddress_v2, 1)                    /**/
     HOOK(cuMemCreate, 1)                            /**/
     HOOK(cuMemRelease, 1)                           /**/
     HOOK(cuMemMap, 1)                               /**/
