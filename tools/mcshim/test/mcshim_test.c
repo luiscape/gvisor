@@ -1427,7 +1427,7 @@ static int t_mapwait(void) {
 /* orphan, beat */
 
 /* Launches kernels forever, counting them in path. */
-static void beat_forever(const char* path) {
+__attribute__((noreturn)) static void beat_forever(const char* path) {
   CUdeviceptr p;
   CK(cuMemAlloc_v2(&p, 4));
   void* args[] = {&p};

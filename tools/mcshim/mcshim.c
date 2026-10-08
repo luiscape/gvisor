@@ -193,6 +193,7 @@ static void mclog(const char* fmt, ...) {
         p = def;
       }
       g_logfd = open(p, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0666);
+      if (g_logfd >= 0) fchmod(g_logfd, 0666); /* fails harmlessly unless ours */
     }
   }
   int fd = g_logfd;
@@ -2314,13 +2315,17 @@ static void* rt_wrapper(int fn) {
   return w[fn];
 }
 
-/* If path's basename is libcudart.so followed by zero or more .N parts, the
- * address of those parts; else NULL. */
+/* If path's basename is a CUDA runtime's (libcudart.so[.N...], or a vendored
+ * copy such as libcudart-1a2b3c4d.so.12), the address of its ".N..." version
+ * suffix ("" if none); else NULL. */
 static const char* cudart_suffix(const char* path) {
   const char* b = strrchr(path, '/');
   b = b ? b + 1 : path;
-  if (strncmp(b, "libcudart.so", 12) != 0) return NULL;
-  const char* v = b + 12;
+  if (strncmp(b, "libcudart", 9) != 0 || (b[9] != '.' && b[9] != '-'))
+    return NULL;
+  const char* so = strstr(b, ".so");
+  if (!so) return NULL;
+  const char* v = so + 3;
   for (b = v; *b;) {
     if (*b++ != '.' || *b < '0' || *b > '9') return NULL;
     while (*b >= '0' && *b <= '9') b++;
@@ -2336,8 +2341,9 @@ static void pin(void* p) {
     dlopen(di.dli_fname, RTLD_NOW | RTLD_NOLOAD);
 }
 
-/* Resolver fn in the runtime that the object at address caller resolves it
- * to, or NULL. */
+/* Resolver fn as the object at address caller binds it, or NULL: whatever its
+ * own dependencies define (a runtime under any name, or one linked statically
+ * into it), unless that is the shim's wrapper. */
 static void* rt_from_caller(int fn, void* caller) {
   Dl_info di;
   if (!caller || !dladdr(caller, &di) || !di.dli_fname) return NULL;
@@ -2345,11 +2351,7 @@ static void* rt_from_caller(int fn, void* caller) {
   if (!h) return NULL;
   void* r = real_dlsym(h, kRtNames[fn]);
   dlclose(h);
-  Dl_info ri;
-  if (!r || r == rt_wrapper(fn) || !dladdr(r, &ri) || !ri.dli_fname ||
-      !cudart_suffix(ri.dli_fname))
-    return NULL;
-  return r;
+  return r == rt_wrapper(fn) ? NULL : r;
 }
 
 typedef struct {
@@ -2402,10 +2404,16 @@ static struct {
 static int g_nrtc;
 static pthread_mutex_t g_rtlock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Depth of resolver wrappers on this thread. A nested call came back through
+ * an interposer of the resolver, whose own definition is not the runtime's, so
+ * it is treated as an unplaced caller. */
+static __thread int t_rt_depth;
+
 /* The real resolver fn for a call from address caller, or NULL. The loader
  * calls run without g_rtlock: a constructor may call a resolver while the
  * loader lock is held. */
 static void* rt_real(int fn, void* caller) {
+  if (t_rt_depth > 0) caller = NULL;
   init_real_dlsym();
   if (!real_dlsym) return NULL;
   Dl_info di;
@@ -2433,7 +2441,9 @@ int cudaGetDriverEntryPoint(const char* symbol, void** pfn,
                             unsigned long long flags, int* driverStatus) {
   GdepFn real = (GdepFn)rt_real(RT_GDEP, __builtin_return_address(0));
   if (!real) return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
+  t_rt_depth++;
   int rc = real(symbol, pfn, flags, driverStatus);
+  t_rt_depth--;
   if (rc == 0 && pfn) *pfn = redirect(symbol, *pfn, 1);
   return rc;
 }
@@ -2442,7 +2452,9 @@ int cudaGetDriverEntryPoint_ptsz(const char* symbol, void** pfn,
                                  unsigned long long flags, int* driverStatus) {
   GdepFn real = (GdepFn)rt_real(RT_GDEP_PTSZ, __builtin_return_address(0));
   if (!real) return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
+  t_rt_depth++;
   int rc = real(symbol, pfn, flags, driverStatus);
+  t_rt_depth--;
   if (rc == 0 && pfn) *pfn = redirect(symbol, *pfn, 1);
   return rc;
 }
@@ -2453,7 +2465,9 @@ int cudaGetDriverEntryPointByVersion(const char* symbol, void** pfn,
                                      int* driverStatus) {
   ByVerFn real = (ByVerFn)rt_real(RT_BYVER, __builtin_return_address(0));
   if (!real) return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
+  t_rt_depth++;
   int rc = real(symbol, pfn, cudaVersion, flags, driverStatus);
+  t_rt_depth--;
   if (rc == 0 && pfn) *pfn = redirect(symbol, *pfn, 1);
   return rc;
 }
@@ -2464,7 +2478,9 @@ int cudaGetDriverEntryPointByVersion_ptsz(const char* symbol, void** pfn,
                                           int* driverStatus) {
   ByVerFn real = (ByVerFn)rt_real(RT_BYVER_PTSZ, __builtin_return_address(0));
   if (!real) return CUDA_ERROR_RT_SYMBOL_NOT_FOUND;
+  t_rt_depth++;
   int rc = real(symbol, pfn, cudaVersion, flags, driverStatus);
+  t_rt_depth--;
   if (rc == 0 && pfn) *pfn = redirect(symbol, *pfn, 1);
   return rc;
 }
@@ -2479,7 +2495,9 @@ static void* g_rt_slot[RT_NFN][RT_SLOTS];
                                 unsigned long long flags, int* st) {  \
     GdepFn real =                                                     \
         (GdepFn)__atomic_load_n(&g_rt_slot[fn][s], __ATOMIC_ACQUIRE); \
+    t_rt_depth++;                                                     \
     int rc = real(symbol, pfn, flags, st);                            \
+    t_rt_depth--;                                                     \
     if (rc == 0 && pfn) *pfn = redirect(symbol, *pfn, 1);             \
     return rc;                                                        \
   }
@@ -2489,7 +2507,9 @@ static void* g_rt_slot[RT_NFN][RT_SLOTS];
                                 int* st) {                                  \
     ByVerFn real =                                                          \
         (ByVerFn)__atomic_load_n(&g_rt_slot[fn][s], __ATOMIC_ACQUIRE);      \
+    t_rt_depth++;                                                           \
     int rc = real(symbol, pfn, ver, flags, st);                             \
+    t_rt_depth--;                                                           \
     if (rc == 0 && pfn) *pfn = redirect(symbol, *pfn, 1);                   \
     return rc;                                                              \
   }
@@ -2522,16 +2542,32 @@ static void* rt_dlsym(const char* symbol, void* real) {
   return real;
 }
 
-/* Interposed dlsym. Delegating through a dlvsym-resolved dlsym re-anchors
- * RTLD_NEXT at mcshim, which can confuse interposers stacked after it. */
+static void* __attribute__((noinline)) dlsym_rewrite(void* handle,
+                                                      const char* symbol) {
+  void* r = real_dlsym(handle, symbol);
+  if (!r) return r;
+  if (symbol[2] == 'd') return rt_dlsym(symbol, r);
+  return redirect(symbol, r, 0);
+}
+
+/* Interposed dlsym. glibc resolves RTLD_NEXT and RTLD_DEFAULT relative to the
+ * object that called dlsym, so a lookup the shim only forwards must be a tail
+ * call: a nested call would make the shim the caller, and an interposer loaded
+ * after it would find itself as "next" and recurse. Only lookups of driver
+ * entry points (cu[A-Z]...) and cudart's resolvers are rewritten; RTLD_NEXT
+ * lookups never are, since interposers use them to find the definition after
+ * their own. */
 void* dlsym(void* handle, const char* symbol) {
   init_real_dlsym();
   if (!real_dlsym) return NULL;
-  void* r = real_dlsym(handle, symbol);
-  if (!r || symbol[0] != 'c' || symbol[1] != 'u') return r;
-  if (strncmp(symbol, "cudaGetDriverEntryPoint", 23) == 0)
-    return rt_dlsym(symbol, r);
-  return redirect(symbol, r, 0);
+  if (handle != RTLD_NEXT && symbol[0] == 'c' && symbol[1] == 'u' &&
+      ((symbol[2] >= 'A' && symbol[2] <= 'Z') ||
+       strncmp(symbol, "cudaGetDriverEntryPoint", 23) == 0))
+    return dlsym_rewrite(handle, symbol);
+#if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 15)
+  __attribute__((musttail))
+#endif
+  return real_dlsym(handle, symbol);
 }
 
 /* Control thread: polls /tmp/mcshim for markers. */
@@ -2769,5 +2805,5 @@ __attribute__((constructor)) static void mcshim_init(void) {
   /* Create the control dir, which also holds the default log. Print nothing:
    * every process in the container loads the shim. The control thread starts
    * from cuInit. */
-  mkdir(g_dir, 0777);
+  if (mkdir(g_dir, 01777) == 0) chmod(g_dir, 01777);
 }

@@ -17,6 +17,9 @@
 #
 #   abi gate mc refcount refuse mapwait  native (mcshim_test.c)
 #   silent                       native: the preloaded shim prints nothing
+#   preload                      native, no GPU: an interposer preloaded after
+#                                the shim still finds the next definition with
+#                                dlsym(RTLD_NEXT)
 #   rtres                        native: cudart's resolvers reach each caller's
 #                                own runtime; needs MCSHIM_TEST_CUDART, two
 #                                libcudart.so files of different majors
@@ -49,8 +52,8 @@ while getopts r:i:e: o; do
 done
 shift $((OPTIND - 1))
 if [ $# -eq 0 ]; then
-  set -- abi gate mc refcount refuse mapwait silent rtres ipc orphan deadline \
-    reason optout torch-kernel torch-symm
+  set -- abi gate mc refcount refuse mapwait silent preload rtres ipc orphan \
+    deadline reason optout torch-kernel torch-symm
 fi
 GPUS=${MCSHIM_TEST_GPUS:-0,1}
 
@@ -209,6 +212,22 @@ silent() {
     echo "MCSHIM_LOG=stderr logged nothing to stderr"
     return 1
   fi
+}
+
+# preload: the shim forwards dlsym lookups it does not rewrite with a tail
+# call, so RTLD_NEXT resolves relative to the real caller, whatever the order.
+preload() {
+  local order out rc
+  gcc -O2 -fPIC -shared -o "$W/libinterp.so" interp.c -ldl || return 1
+  gcc -O2 -DMAIN -o "$W/interp_main" interp.c || return 1
+  for order in "$W/mcshim.so:$W/libinterp.so" "$W/libinterp.so:$W/mcshim.so"; do
+    rc=0
+    out=$(LD_PRELOAD="$order" "$W/interp_main" 2>&1) || rc=$?
+    if [ $rc -ne 0 ] || [ "$out" != ok ]; then
+      echo "LD_PRELOAD=$order: exit $rc (99: RTLD_NEXT found the interposer itself), output: $out"
+      return 1
+    fi
+  done
 }
 
 # count FILE: the number in FILE, or 0.
@@ -371,6 +390,7 @@ for t in "$@"; do
   rc=0
   case $t in
     silent) silent || rc=$? ;;
+    preload) preload || rc=$? ;;
     rtres) rtres || rc=$? ;;
     deadline | reason | optout)
       if [ -z "$RUNSC" ]; then

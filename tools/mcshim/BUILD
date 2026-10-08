@@ -17,6 +17,9 @@ package(
 cc_binary(
     name = "mcshim",
     srcs = ["mcshim.c"],
+    # The dlsym interposer must forward with a tail call (see dlsym in
+    # mcshim.c), which GCC only emits when optimizing; fastbuild is -O0.
+    copts = ["-O2"],
     # This library is preloaded into binaries from arbitrary container
     # images, whose dynamic linkers may not support RELR relocations
     # (glibc < 2.36). Same rationale as //tools/ioctl_sniffer:ioctl_hook.
