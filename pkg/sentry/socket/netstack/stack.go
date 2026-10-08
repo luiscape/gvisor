@@ -1043,25 +1043,28 @@ func (s *Stack) localRoute(msg *nlmsg.Message) (tcpip.Route, *syserr.Error) {
 	var dest tcpip.Subnet
 	// When no destination address is provided, the new route might be the default route.
 	if route.DstAddr == nil {
-		if route.GatewayAddr == nil {
-			return tcpip.Route{}, syserr.ErrInvalidArgument
-		}
-		switch len(route.GatewayAddr) {
-		case header.IPv4AddressSize:
-			subnet, err := tcpip.NewSubnet(tcpip.AddrFromSlice(tcpip.IPv4Zero), tcpip.MaskFromBytes(tcpip.IPv4Zero))
-			if err != nil {
-				return tcpip.Route{}, syserr.ErrInvalidArgument
-			}
-			dest = subnet
-		case header.IPv6AddressSize:
-			subnet, err := tcpip.NewSubnet(tcpip.AddrFromSlice(tcpip.IPv6Zero), tcpip.MaskFromBytes(tcpip.IPv6Zero))
-			if err != nil {
-				return tcpip.Route{}, syserr.ErrInvalidArgument
-			}
-			dest = subnet
+		var zero []byte
+		switch route.Family {
+		case linux.AF_INET:
+			zero = tcpip.IPv4Zero
+		case linux.AF_INET6:
+			zero = tcpip.IPv6Zero
 		default:
+			return tcpip.Route{}, syserr.ErrNotSupported
+		}
+		if route.GatewayAddr != nil {
+			if len(route.GatewayAddr) < len(zero) {
+				return tcpip.Route{}, syserr.ErrRange
+			}
+			route.GatewayAddr = route.GatewayAddr[:len(zero)]
+		} else if route.OutputInterface == 0 && msg.Header().Type == linux.RTM_NEWROUTE {
+			return tcpip.Route{}, syserr.ErrNoDevice
+		}
+		subnet, err := tcpip.NewSubnet(tcpip.AddrFromSlice(zero), tcpip.MaskFromBytes(zero))
+		if err != nil {
 			return tcpip.Route{}, syserr.ErrInvalidArgument
 		}
+		dest = subnet
 	} else {
 		dest = tcpip.AddressWithPrefix{
 			Address:   tcpip.AddrFromSlice(route.DstAddr),
@@ -1087,7 +1090,12 @@ func (s *Stack) RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Err
 	if err != nil {
 		return err
 	}
+	found := false
 	if removed := s.Stack.RemoveRoutes(func(rt tcpip.Route) bool {
+		// Like Linux, remove only the first matching route.
+		if found {
+			return false
+		}
 		// Both gateway and NIC are compared with existing routes
 		// only when they are present in the netlink message.
 		if localRoute.Gateway.Len() > 0 && !localRoute.Gateway.Equal(rt.Gateway) {
@@ -1096,7 +1104,8 @@ func (s *Stack) RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Err
 		if localRoute.NIC > 0 && localRoute.NIC != rt.NIC {
 			return false
 		}
-		return rt.Destination.Equal(localRoute.Destination)
+		found = rt.Destination.Equal(localRoute.Destination)
+		return found
 	}); removed == 0 {
 		return syserr.ErrNoProcess
 	}
@@ -1107,6 +1116,9 @@ func (s *Stack) RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Err
 func (s *Stack) NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
 	localRoute, err := s.localRoute(msg)
 	if err != nil {
+		return err
+	}
+	if err := s.checkGateway(msg, &localRoute); err != nil {
 		return err
 	}
 	found := false
@@ -1127,6 +1139,39 @@ func (s *Stack) NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error 
 		s.Stack.ReplaceRoute(localRoute)
 	}
 	return nil
+}
+
+func (s *Stack) checkGateway(msg *nlmsg.Message, route *tcpip.Route) *syserr.Error {
+	var rtMsg linux.RouteMessage
+	if _, ok := msg.GetData(&rtMsg); !ok {
+		return syserr.ErrInvalidArgument
+	}
+	gw := route.Gateway
+	if gw.Unspecified() || header.IsV6LinkLocalUnicastAddress(gw) || rtMsg.Flags&linux.RTNH_F_ONLINK != 0 {
+		return nil
+	}
+	for _, rt := range s.Stack.GetRouteTable() {
+		if rt.Gateway.Unspecified() && (route.NIC == 0 || rt.NIC == route.NIC) && rt.Destination.Contains(gw) {
+			route.NIC = rt.NIC
+			return nil
+		}
+	}
+	nics := s.Stack.NICInfo()
+	for _, id := range slices.Sorted(maps.Keys(nics)) {
+		if route.NIC != 0 && id != route.NIC {
+			continue
+		}
+		for _, a := range nics[id].ProtocolAddresses {
+			if subnet := a.AddressWithPrefix.Subnet(); subnet.Contains(gw) {
+				route.NIC = id
+				return nil
+			}
+		}
+	}
+	if rtMsg.Family == linux.AF_INET6 {
+		return syserr.ErrHostUnreachable
+	}
+	return syserr.ErrNetworkUnreachable
 }
 
 // IPTables returns the stack's iptables.

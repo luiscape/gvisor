@@ -147,6 +147,7 @@ type SaveRestoreExecConfig struct {
 // Init() or LoadFrom().
 //
 // +stateify savable
+// +checklocksalias:CheckpointWait.k.checkpointMu=checkpointMu
 type Kernel struct {
 	// extMu serializes external changes to the Kernel with calls to
 	// Kernel.SaveTo. (Kernel.SaveTo requires that the state of the Kernel
@@ -191,6 +192,10 @@ type Kernel struct {
 	// signalUnkillable controls protection of PID namespace init processes from
 	// signals under Linux SIGNAL_UNKILLABLE semantics (see SignalUnkillablePolicy).
 	signalUnkillable SignalUnkillablePolicy
+
+	// dumpGoroutinesSignal is the signal that triggers a non-fatal goroutine
+	// stack dump. If 0, goroutine dumping on signal is disabled.
+	dumpGoroutinesSignal linux.Signal
 
 	// futexes is the "root" futex.Manager, from which all others are forked.
 	// This is necessary to ensure that shared futexes are coherent across all
@@ -428,23 +433,28 @@ type Kernel struct {
 	// It's protected by extMu.
 	containerNames map[string]string
 
-	// checkpointMu is used to protect the checkpointing related fields below.
+	// Lock order: checkpointMu precedes CheckpointWait.mu.
 	checkpointMu sync.Mutex `state:"nosave"`
 
 	// additionalCheckpointState stores additional state that needs
-	// to be checkpointed. It's protected by checkpointMu.
+	// to be checkpointed.
+	//
+	// +checklocks:checkpointMu
 	additionalCheckpointState map[any]any
 
 	// saver implements the Saver interface, which (as of writing) supports
-	// asynchronous checkpointing. It's protected by checkpointMu.
+	// asynchronous checkpointing.
+	//
+	// +checklocks:checkpointMu
 	saver Saver `state:"nosave"`
 
 	// CheckpointWait is used to wait for a checkpoint to complete.
 	CheckpointWait CheckpointWaitable
 
-	// checkpointGen aims to track the number of times the kernel has been
-	// successfully checkpointed. Callers of checkpoint must notify the kernel
-	// when checkpoint/restore are done. It's protected by checkpointMu.
+	// checkpointGen describes the latest checkpoint attempt or restore.
+	// Callers must notify the kernel when checkpoint/restore are done.
+	//
+	// +checklocks:checkpointMu
 	checkpointGen CheckpointGeneration
 
 	// SaveRestoreExecConfig stores configuration options for the save/restore
@@ -464,9 +474,11 @@ type Kernel struct {
 	// MaxKeySetSize is the maximum number of keys in a key set.
 	MaxKeySetSize atomicbitops.Int32
 
-	// fsSaveWaiters holds waiters for Kernel.WaitForFSSave. fsSaveWaiters is
-	// protected by fsSaveMu.
-	fsSaveMu      fsSaveMutex  `state:"nosave"`
+	fsSaveMu fsSaveMutex `state:"nosave"`
+
+	// fsSaveWaiters holds waiters for Kernel.WaitForFSSave.
+	//
+	// +checklocks:fsSaveMu
 	fsSaveWaiters []chan error `state:"nosave"`
 
 	// HostNamePoller is notified when the system hostname changes in *any*
@@ -552,6 +564,10 @@ type InitKernelArgs struct {
 	// SignalUnkillable controls protection of PID namespace init processes from
 	// signals under Linux SIGNAL_UNKILLABLE semantics.
 	SignalUnkillable SignalUnkillablePolicy
+
+	// DumpGoroutinesSignal is the signal that triggers a non-fatal goroutine
+	// stack dump. If 0, goroutine dumping on signal is disabled.
+	DumpGoroutinesSignal linux.Signal
 }
 
 // Init initializes the Kernel with no tasks.
@@ -576,6 +592,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 
 	k.featureSet = args.FeatureSet
 	k.signalUnkillable = args.SignalUnkillable
+	k.dumpGoroutinesSignal = args.DumpGoroutinesSignal
 	k.timekeeper = args.Timekeeper
 	k.tasks = newTaskSet(args.RootPIDNamespace)
 	k.rootUserNamespace = args.RootUserNamespace
@@ -1651,7 +1668,7 @@ func (k *Kernel) pauseTimeLocked(ctx context.Context) {
 		// This means we'll iterate FDTables shared by multiple tasks repeatedly,
 		// but ktime.Timer.Pause is idempotent so this is harmless.
 		if t.fdTable != nil {
-			t.fdTable.ForEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) bool {
+			t.fdTable.forEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) bool { // +checklocksignore
 				if tfd, ok := fd.Impl().(*timerfd.TimerFileDescription); ok {
 					tfd.PauseTimer()
 				}
@@ -1682,7 +1699,7 @@ func (k *Kernel) resumeTimeLocked(ctx context.Context) {
 			}
 		}
 		if t.fdTable != nil {
-			t.fdTable.ForEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) bool {
+			t.fdTable.forEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) bool { // +checklocksignore
 				if tfd, ok := fd.Impl().(*timerfd.TimerFileDescription); ok {
 					tfd.ResumeTimer()
 				}

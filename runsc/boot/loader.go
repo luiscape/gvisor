@@ -906,6 +906,7 @@ func New(args Args) (*Loader, error) {
 		MaxFDLimit:           maxFDLimit,
 		Cgroup2FSInit:        cgroup2fs.NewFilesystem,
 		SignalUnkillable:     signalUnkillablePolicy(args.Conf.SignalUnkillablePolicy),
+		DumpGoroutinesSignal: linux.Signal(args.Conf.DumpGoroutinesSignal),
 	}); err != nil {
 		return nil, fmt.Errorf("initializing kernel: %w", err)
 	}
@@ -1097,6 +1098,7 @@ func createProcessArgs(id string, spec *specs.Spec, conf *config.Config, creds *
 // a panic in a control server rpc would then hang forever.
 //
 // +checklocksexclude:l.mu
+// +checklocksexclude:l.k.fsSaveMu
 func (l *Loader) Destroy() {
 	if l.stopSignalForwarding != nil {
 		l.stopSignalForwarding()
@@ -1406,6 +1408,11 @@ func (l *Loader) run() error {
 		// Panic signal should cause a panic.
 		if l.root.conf.PanicSignal != -1 && sig == linux.Signal(l.root.conf.PanicSignal) {
 			panic("Signal-induced panic")
+		}
+
+		if l.root.conf.DumpGoroutinesSignal > 0 && sig == linux.Signal(l.root.conf.DumpGoroutinesSignal) {
+			log.TracebackAll("Received non-fatal dump signal %s (%d)", unix.Signal(sig), sig)
+			return
 		}
 
 		// Otherwise forward to root container.

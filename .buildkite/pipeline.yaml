@@ -79,6 +79,7 @@ env:
   # Optional filter for syscall tests.
   SYSCALL_TEST_FILTERS: ''
 
+priority: ${PRIORITY:-0}
 steps:
   # Run basic smoke tests before preceding to other tests.
   - <<: *common
@@ -668,6 +669,17 @@ steps:
       - sudo RUNTIME_ARGS=--directfs=true ./test/podman/run.sh
     agents:
       <<: *ubuntu_agents
+      cgroup: "v2"
+      queue: "default"
+  # TODO: b/568426030 - Enable Moby tests on ARM64.
+  - <<: *common
+    <<: *docker
+    <<: *source_test
+    label: ":docker: Moby tests"
+    command: make moby-tests
+    agents:
+      <<: *ubuntu_agents
+      arch: "amd64"
       cgroup: "v2"
       queue: "default"
 
