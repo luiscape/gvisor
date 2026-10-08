@@ -1648,6 +1648,11 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 		if err := l.materializeCudaMulticastShim(info, shimPath); err != nil {
 			return err
 		}
+	} else if ok, err := l.containerFileExists(info, shimPath); !ok {
+		// Preloading a missing library makes the dynamic loader print an
+		// error on every exec in the container.
+		log.Warningf("Multicast interposer %q is not a file in container %q (%v); not preloading it", shimPath, info.containerName, err)
+		return nil
 	}
 	// Append to any LD_PRELOAD the container already sets rather than
 	// clobbering it.
@@ -1709,6 +1714,29 @@ func (l *Loader) materializeCudaMulticastShim(info *containerInfo, shimPath stri
 	}
 	log.Infof("Materialized embedded multicast interposer at %q in container %q", shimPath, info.containerName)
 	return nil
+}
+
+// containerFileExists reports whether p is a regular file in the container's
+// filesystem, following symlinks.
+func (l *Loader) containerFileExists(info *containerInfo, p string) (bool, error) {
+	mntns := info.procArgs.MountNamespace
+	if mntns == nil {
+		return false, fmt.Errorf("container mount namespace is not set up yet")
+	}
+	ctx := info.procArgs.NewContext(l.k)
+	creds := auth.NewRootCredentials(l.k.RootUserNamespace())
+	root := mntns.Root(ctx)
+	defer root.DecRef(ctx)
+	stat, err := root.Mount().Filesystem().VirtualFilesystem().StatAt(ctx, creds, &vfs.PathOperation{
+		Root:               root,
+		Start:              root,
+		Path:               fspath.Parse(p),
+		FollowFinalSymlink: true,
+	}, &vfs.StatOptions{Mask: linux.STATX_TYPE})
+	if err != nil {
+		return false, err
+	}
+	return stat.Mode&linux.S_IFMT == linux.S_IFREG, nil
 }
 
 // writeContainerFile creates (or truncates) dstPath inside the container's

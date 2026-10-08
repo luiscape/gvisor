@@ -154,9 +154,15 @@ typedef struct {
 } CUarrayMapInfo;
 _Static_assert(sizeof(CUarrayMapInfo) == 96, "CUarrayMapInfo layout");
 
-/* Logging. */
+/* Fixed; see cudaShimDir in pkg/sentry/control/state_cuda_shim.go. */
+static const char g_dir[] = "/tmp/mcshim";
 
-static FILE* g_log;
+/* Logging. /etc/ld.so.preload loads the shim into every process in the
+ * container, so it never writes to stderr unless asked to: the log goes to
+ * MCSHIM_LOG ("stderr" for stderr), else to mcshim.log in the control
+ * directory, where the sentry reads it when a process reports an error. */
+
+static int g_logfd = -2; /* -2: not opened yet; -1: no log */
 static pthread_mutex_t g_loglock = PTHREAD_MUTEX_INITIALIZER;
 
 static void mclog(const char* fmt, ...) {
@@ -166,22 +172,33 @@ static void mclog(const char* fmt, ...) {
   localtime_r(&ts.tv_sec, &tm);
   char t[32], line[1024];
   strftime(t, sizeof(t), "%H:%M:%S", &tm);
-  int n = snprintf(line, sizeof(line), "[mcshim %s.%03ld pid=%d] ", t,
+  int n = snprintf(line, sizeof(line) - 1, "[mcshim %s.%03ld pid=%d] ", t,
                    ts.tv_nsec / 1000000, (int)getpid());
   va_list ap;
   va_start(ap, fmt);
-  vsnprintf(line + n, sizeof(line) - n, fmt, ap);
+  vsnprintf(line + n, sizeof(line) - 1 - n, fmt, ap);
   va_end(ap);
+  size_t len = strlen(line);
+  line[len++] = '\n';
   pthread_mutex_lock(&g_loglock);
-  if (!g_log) {
+  if (g_logfd == -2) {
     const char* p = getenv("MCSHIM_LOG");
-    g_log = p && *p ? fopen(p, "a") : stderr;
-    if (!g_log) g_log = stderr;
+    char def[sizeof(g_dir) + 16];
+    if (p && strcmp(p, "stderr") == 0) {
+      g_logfd = STDERR_FILENO;
+    } else {
+      if (!p || !*p) {
+        snprintf(def, sizeof(def), "%s/mcshim.log", g_dir);
+        p = def;
+      }
+      g_logfd = open(p, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0666);
+    }
   }
-  /* One write per line: ranks share the log file. */
-  fprintf(g_log, "%s\n", line);
-  fflush(g_log);
+  int fd = g_logfd;
   pthread_mutex_unlock(&g_loglock);
+  /* One write per line: processes share the log file. */
+  if (fd >= 0 && write(fd, line, len) < 0) {
+  }
 }
 
 static int allow_fabric(void) { return getenv("MCSHIM_ALLOW_FABRIC") != NULL; }
@@ -1476,8 +1493,6 @@ CUresult cuLogicalEndpointBindMem(cuuint32_t id, CUdevice dev, cuuint64_t off,
  * any tracer (PR_SET_PTRACER_ANY) while it has fds published, which is until
  * the sentry removes the gate after every process has resumed. */
 
-/* Fixed; see cudaShimDir in pkg/sentry/control/state_cuda_shim.go. */
-static const char g_dir[] = "/tmp/mcshim";
 static int g_ptracer_any; /* under g_lock */
 
 static void pub_path(const Alloc* a, char* out, size_t n) {
@@ -2585,14 +2600,14 @@ static void mcshim_atfork_child(void) {
 __attribute__((constructor)) static void mcshim_init(void) {
   pthread_atfork(NULL, NULL, mcshim_atfork_child);
   if (getenv("MCSHIM_DISABLE")) {
-    /* Silent: the sentry parses the output of the cuda-checkpoint processes it
-     * runs with MCSHIM_DISABLE. */
+    /* No control thread and no log: the sentry runs cuda-checkpoint with
+     * MCSHIM_DISABLE. */
     g_disabled = 1;
+    g_logfd = -1;
     return;
   }
-  /* Create the control dir, which may also hold MCSHIM_LOG, before the first
-   * mclog. */
+  /* Create the control dir, which also holds the default log. Print nothing:
+   * every process in the container loads the shim. The control thread starts
+   * from cuInit. */
   mkdir(g_dir, 0777);
-  /* Markers belong to the sentry; the control thread starts from cuInit. */
-  mclog("loaded; control dir=%s", g_dir);
 }

@@ -16,6 +16,7 @@
 # Runs the interposer tests on a host with two or more NVLS-capable GPUs.
 #
 #   abi gate mc refcount refuse mapwait  native (mcshim_test.c)
+#   silent                       native: the preloaded shim prints nothing
 #   ipc                          under runsc (-r), over the host's libraries:
 #                                needs nvproxy's exported-object identity
 #   orphan                       under runsc (-r): `runsc checkpoint` refuses an
@@ -39,7 +40,8 @@ while getopts r:i:e: o; do
 done
 shift $((OPTIND - 1))
 if [ $# -eq 0 ]; then
-  set -- abi gate mc refcount refuse mapwait ipc orphan torch-kernel torch-symm
+  set -- abi gate mc refcount refuse mapwait silent ipc orphan torch-kernel \
+    torch-symm
 fi
 GPUS=${MCSHIM_TEST_GPUS:-0,1}
 
@@ -143,6 +145,34 @@ runsc() {
     ${RUNSC_FLAGS:-} "$@"
 }
 
+# silent: every process in a container loads the shim, so it must not print
+# unless MCSHIM_LOG=stderr; by default it logs to /tmp/mcshim/mcshim.log.
+silent() {
+  local out log=/tmp/mcshim/mcshim.log
+  out=$(env -u MCSHIM_LOG LD_PRELOAD="$W/mcshim.so" sh -c true 2>&1)
+  if [ -n "$out" ]; then
+    echo "sh -c true printed: $out"
+    return 1
+  fi
+  rm -f "$log"
+  out=$(env -u MCSHIM_LOG CUDA_VISIBLE_DEVICES="$GPUS" \
+    LD_PRELOAD="$W/mcshim.so" "$W/mcshim_test" abi 2>&1)
+  if echo "$out" | grep -q '\[mcshim'; then
+    echo "a CUDA process logged to stderr: $out"
+    return 1
+  fi
+  if ! grep -q "control thread started" "$log"; then
+    echo "nothing logged to $log"
+    return 1
+  fi
+  out=$(MCSHIM_LOG=stderr CUDA_VISIBLE_DEVICES="$GPUS" \
+    LD_PRELOAD="$W/mcshim.so" "$W/mcshim_test" abi 2>&1)
+  if ! echo "$out" | grep -q '\[mcshim'; then
+    echo "MCSHIM_LOG=stderr logged nothing to stderr"
+    return 1
+  fi
+}
+
 # count FILE: the number in FILE, or 0.
 count() {
   local n
@@ -189,6 +219,7 @@ for t in "$@"; do
   echo "=== $t"
   rc=0
   case $t in
+    silent) silent || rc=$? ;;
     ipc) sandboxed "$t" "" mcshim.so /mnt/mcshim_test ipc || rc=$? ;;
     orphan)
       if [ -z "$RUNSC" ]; then

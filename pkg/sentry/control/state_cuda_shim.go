@@ -17,6 +17,7 @@ package control
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -28,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // Multicast interposer (mcshim) integration.
@@ -235,7 +237,7 @@ func cudaShimWaitAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kerne
 			_, err = k.VFS().StatAt(ctx, creds, pop, &vfs.StatOptions{})
 			cleanup()
 			if err == nil {
-				return fmt.Errorf("multicast interposer: process %d reported an error during %q (see its MCSHIM_LOG for the cause)", tg.ID(), prefix)
+				return fmt.Errorf("multicast interposer: process %d reported an error during %q: %s", tg.ID(), prefix, cudaShimErrorDetail(sctx, k, tg))
 			}
 		}
 		if len(pending) == 0 {
@@ -251,6 +253,53 @@ func cudaShimWaitAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kerne
 		}
 		time.Sleep(cudaShimPollInterval)
 	}
+}
+
+// cudaShimErrorDetail describes the error tg reported: the reason in its
+// error.<pid> ack, and its last lines in the interposer's default log.
+func cudaShimErrorDetail(sctx context.Context, k *kernel.Kernel, tg *kernel.ThreadGroup) string {
+	reason := strings.TrimSpace(cudaShimReadTail(sctx, k, tg, fmt.Sprintf("%s/error.%d", cudaShimDir, tg.ID()), 512))
+	detail := fmt.Sprintf("%q", reason)
+	var lines []string
+	tag := fmt.Sprintf(" pid=%d] ", tg.ID())
+	for _, l := range strings.Split(cudaShimReadTail(sctx, k, tg, cudaShimDir+"/mcshim.log", 64<<10), "\n") {
+		if strings.Contains(l, tag) {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) > 5 {
+		lines = lines[len(lines)-5:]
+	}
+	if len(lines) > 0 {
+		detail += fmt.Sprintf("; last log lines: %q", strings.Join(lines, " | "))
+	}
+	return detail
+}
+
+// cudaShimReadTail returns at most max bytes from the end of path, resolved in
+// tg's mount namespace, or "" if it cannot be read.
+func cudaShimReadTail(sctx context.Context, k *kernel.Kernel, tg *kernel.ThreadGroup, path string, max int64) string {
+	ctx, pop, cleanup, ok := cudaShimPathOp(sctx, tg, path)
+	if !ok {
+		return ""
+	}
+	defer cleanup()
+	fd, err := k.VFS().OpenAt(ctx, cudaShimCreds(k), pop, &vfs.OpenOptions{Flags: linux.O_RDONLY})
+	if err != nil {
+		return ""
+	}
+	defer fd.DecRef(ctx)
+	stat, err := fd.Stat(ctx, vfs.StatOptions{Mask: linux.STATX_SIZE})
+	if err != nil {
+		return ""
+	}
+	off := int64(stat.Size) - max
+	if off < 0 {
+		off = 0
+	}
+	buf := make([]byte, int64(stat.Size)-off)
+	n, _ := fd.PRead(ctx, usermem.BytesIOSequence(buf), off, vfs.ReadOptions{})
+	return string(buf[:n])
 }
 
 // cudaShimClearAcks removes the error.<pid> and <prefix>.<pid> acks of

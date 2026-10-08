@@ -641,6 +641,47 @@ func TestCreateMountPoint(t *testing.T) {
 	}
 }
 
+// TestContainerFileExists covers the check that keeps a missing IMAGE-mode
+// multicast interposer out of the container's preload list.
+func TestContainerFileExists(t *testing.T) {
+	spec := testSpec()
+	spec.Root = &specs.Root{Path: os.TempDir()}
+	spec.Mounts = append(spec.Mounts, specs.Mount{Destination: "/test", Type: "tmpfs"})
+	l, loaderCleanup, err := createLoader(testConfig(), spec)
+	if err != nil {
+		t.Fatalf("failed to create loader: %v", err)
+	}
+	defer l.Destroy()
+	defer loaderCleanup()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	mntr := l.newContainerMounter(&l.root)
+	ctx := l.k.SupervisorContext()
+	creds := auth.NewRootCredentials(l.root.procArgs.Credentials.UserNamespace)
+	mns, err := mntr.mountAll(ctx, creds, l.root.spec, l.root.conf, &l.root.procArgs)
+	if err != nil {
+		t.Fatalf("mountAll: %v", err)
+	}
+	info := &containerInfo{procArgs: l.root.procArgs}
+	info.procArgs.MountNamespace = mns
+	if err := l.writeContainerFile(info, "/test/lib/mcshim.so", []byte("x"), 0755); err != nil {
+		t.Fatalf("writeContainerFile: %v", err)
+	}
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{"/test/lib/mcshim.so", true},
+		{"/test/lib/missing.so", false},
+		{"/test/lib", false},
+	} {
+		if got, err := l.containerFileExists(info, tc.path); got != tc.want {
+			t.Errorf("containerFileExists(%q) = %v (%v), want %v", tc.path, got, err, tc.want)
+		}
+	}
+}
+
 func TestMain(m *testing.M) {
 	cpuid.Initialize()
 	seccheck.Initialize()

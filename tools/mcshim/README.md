@@ -37,7 +37,9 @@ embedded copy of `mcshim.so` into the container filesystem at that path
 (`runsc/boot/loader.go`) prepends the shim to the container's `LD_PRELOAD`
 **and** appends it to `/etc/ld.so.preload` through the container's VFS
 (launchers like SGLang's `torch_memory_saver` rewrite `LD_PRELOAD` for exactly
-the worker processes that matter; `ld.so.preload` is immune).
+the worker processes that matter; `ld.so.preload` is immune). In IMAGE mode,
+a path that is not a file in the container is not preloaded at all, since the
+dynamic loader would print an error on every exec.
 
 The shim and the sentry (`pkg/sentry/control/state_cuda_shim.go`)
 rendezvous in `/tmp/mcshim`, which must be part of the checkpoint image (not
@@ -108,7 +110,7 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
 
 | Variable                 | Default         | Effect                                                            |
 | :----------------------- | :-------------- | :---------------------------------------------------------------- |
-| `MCSHIM_LOG`             | stderr          | append log to this path instead of stderr                         |
+| `MCSHIM_LOG`             | `/tmp/mcshim/mcshim.log` | append the log to this path; `stderr` for stderr. The shim never prints otherwise: every process in the container loads it |
 | `MCSHIM_DISABLE`         | unset           | silent: no control thread, acks, or gate (interposition/tracking stay active) |
 | `MCSHIM_ALLOW_FABRIC`    | unset           | keep fabric handle types (not checkpointable; see below)          |
 | `MCSHIM_HOST_BUILD`      | unset           | build.sh: build with the host toolchain instead of docker         |
