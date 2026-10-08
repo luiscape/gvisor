@@ -147,6 +147,18 @@ GPUs.
 is most of the checkpoint and of the time to first inference. Running it in
 parallel (which job mode forbids) is the main remaining lever (P2.5).
 
+Also passing on the final binary:
+
+-   **Large model onto other GPUs:** vLLM with Qwen2.5-72B at TP=4,
+    checkpointed on GPUs 0-3 and restored onto GPUs 4-7 (`--device-map`).
+    Checkpoint 34.9 s (image 154 GB); first inference after restore 23.0 s
+    (14.6x faster than a cold boot).
+-   **Single GPU without the interposer** (the existing path: `runsc
+    checkpoint --cuda-checkpoint-path` only): vLLM 70x, SGLang 52x. The
+    sentry ran exactly `--get-state`, then `--toggle` per process, and
+    `--toggle` again on restore, with no job wrap.
+-   **Single GPU with the interposer:** vLLM 68x.
+
 ## Next
 
 1.  The full shim suite and the 15 + 3 engine cells on the final binary
