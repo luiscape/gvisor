@@ -11,8 +11,9 @@ opening upstream PRs.
     brief work started, the branch passed every test on H100 ×8 with driver
     610.57.04: the shim suite, all 15 engine cells and the 3 cells without
     `CAP_SYS_PTRACE`.
--   **Engineering brief, P0 tier:** six of seven tasks are done and pushed;
-    P0.1 (cudart resolvers per caller) is next.
+-   **Engineering brief, P0 tier:** all seven tasks are done and pushed. The
+    full engine gate and a large-model check (Qwen2.5-72B on all 8 GPUs) are
+    running on the final binary.
 -   **Scope for the first merge:** R610 only. R615 comes after the first
     version is merged.
 
@@ -20,7 +21,7 @@ opening upstream PRs.
 
 | Task | Status | Commit | Validation |
 | :--- | :--- | :--- | :--- |
-| P0.1 cudart resolvers per caller | Not started | | |
+| P0.1 cudart resolvers per caller | Done | `ea443eb56` | `rtres` (cudart 12.8 and 13.0 in one process): each caller gets its own runtime's `cuMemcpyBatchAsync` ABI, by call and through `dlsym`; the old shim gave the 12.8 caller `cuMemcpyBatchAsync_v2`. An unplaced caller with two runtimes refuses checkpoints. A runtime renamed `libcudart.so.99` resolves. `torch-kernel` and `torch-symm` still pass. |
 | P0.2 track the resolver hooks | Done | `5fd7d9c25` | `abi`: an unknown `cuGetProcAddress_v3` refuses the gate; the old shim accepted. 1,132 lookups up to CUDA 13.4 still redirect. |
 | P0.3 silent preload | Done | `b86d14b83` | `silent`: `sh -c true` under the preload prints nothing; logs go to `/tmp/mcshim/mcshim.log`. `reason`: a refusal's cause and last log lines reach `runsc checkpoint`'s error. `TestContainerFileExists` covers the IMAGE-mode check. |
 | P0.4 bound every cuda-checkpoint call | Done | `3592a60f1` | `deadline`: a hung lock, and a hung checkpoint, are killed after the timeout (5 s in the test); the checkpoint fails with the reason, and the application keeps running. |
@@ -113,15 +114,18 @@ There is no `_v2_ptsz`, so no new wrapper is needed.
     `reason` and `optout` use a stub `cuda-checkpoint`
     (`tools/mcshim/test/ckpt_stub.c`) that logs its calls and hangs or fails
     on request.
--   **Engine cells:** a quick check (`vllm_tp2`, `sglang_tp4_symm`) is
-    running on the P0.5 binary. The full gate waits for P0.1.
+-   **Engine cells:** a quick check on the P0.5 binary passed: `vllm_tp2`
+    (44x faster to first inference than a cold boot) and `sglang_tp4_symm`
+    (19x). The full gate (15 + 3 cells) and the 72B check are running on the
+    final binary (`ea443eb56`).
 
 ## Next
 
-1.  P0.1: resolve cudart's entry-point resolvers per caller.
-2.  The full shim suite and the 15 + 3 engine cells on the final binary.
-3.  A large workload on all 8 GPUs with a large model (requested).
-4.  After the first merge: R615 (P2.4), then P1.
+1.  The full shim suite and the 15 + 3 engine cells on the final binary
+    (running).
+2.  A large workload on all 8 GPUs: vLLM serving Qwen2.5-72B-Instruct at
+    TP=8 (running), then SGLang if time allows.
+3.  After the first merge: R615 (P2.4), then P1.
 
 ---
 
