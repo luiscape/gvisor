@@ -32,9 +32,8 @@ Linux 2; see Known limitations), whatever the build environment's glibc.
 ## How it gets into a container
 
 With `runsc --cuda-checkpoint-path=... --cuda-multicast-shim-path=/path/to/mcshim.so`
-(plus nvproxy and driver R610, the release the interposer has been validated
-on; `--cuda-multicast-shim-unvalidated-driver=ALLOW` accepts a newer one, with
-a warning) -- or with `--cuda-multicast-shim-source=EMBEDDED`, in which case
+(plus nvproxy and driver R610 or newer) -- or with
+`--cuda-multicast-shim-source=EMBEDDED`, in which case
 runsc first writes its embedded copy of `mcshim.so` into the container
 filesystem at that path (default `/usr/local/lib/mcshim.so`) --
 `Loader.setupCudaMulticastShim` (`runsc/boot/loader.go`) appends the shim to
@@ -387,6 +386,6 @@ inside the container's trust domain, not gVisor's:
     lookups from `RTLD_LOCAL` libraries missed their own dependencies. The
     tail call needs optimization under GCC older than 15 (no `musttail`),
     hence `-O2` in BUILD; `test/run.sh preload` catches a build without it.
-*   **Driver release.** Validated on R610 only; runsc keeps the interposer and
-    the job off any other release unless
-    `--cuda-multicast-shim-unvalidated-driver=ALLOW`.
+*   **Driver release.** runsc enables the interposer and the job on R610 and
+    newer, and keeps them off, with a warning, on older drivers. It has been
+    validated on R610 only.

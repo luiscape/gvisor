@@ -180,10 +180,6 @@ absent by default, so frameworks choose POSIX fds).
     IPC to `cuda-checkpoint`, which carries it only for processes in a job.
 -   It does nothing without nvproxy, and logs a warning and does nothing on
     drivers older than R610.
--   It is on by default only on R610, the release it has been validated on;
-    `--cuda-multicast-shim-unvalidated-driver=ALLOW` enables it on a newer
-    one, with a warning, and the default (`REFUSE`) leaves checkpoints there
-    as without the interposer.
 -   The loader appends the interposer to `LD_PRELOAD` and to
     `/etc/ld.so.preload`. The second is needed because launchers rewrite
     `LD_PRELOAD` for exactly the worker processes that hold GPU state (SGLang's

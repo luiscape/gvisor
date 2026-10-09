@@ -436,13 +436,6 @@ type Config struct {
 	// had mapped at checkpoint time, even across runsc upgrades.
 	CUDAMulticastShimSource CUDAMulticastShimSource `flag:"cuda-multicast-shim-source"`
 
-	// CUDAMulticastShimUnvalidatedDriver selects what to do with the multicast
-	// interposer, and with it the cuda-checkpoint job, on a driver release
-	// newer than the one they have been validated on (R610): REFUSE (the
-	// default) leaves them off on such a driver, so CUDA checkpoints are as
-	// without the interposer; ALLOW enables them, with a warning.
-	CUDAMulticastShimUnvalidatedDriver CUDAMulticastShimUnvalidatedDriver `flag:"cuda-multicast-shim-unvalidated-driver"`
-
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 
@@ -746,45 +739,6 @@ func (s *CUDAMulticastShimSource) Get() any {
 
 // String implements flag.String.
 func (s CUDAMulticastShimSource) String() string {
-	return string(s)
-}
-
-// CUDAMulticastShimUnvalidatedDriver selects what to do with the multicast
-// interposer on a driver release it has not been validated on.
-type CUDAMulticastShimUnvalidatedDriver string
-
-// CUDAMulticastShimUnvalidatedDriver values.
-const (
-	// CUDAMulticastShimUnvalidatedDriverRefuse: leave the interposer and the
-	// cuda-checkpoint job off, as if they were not configured.
-	CUDAMulticastShimUnvalidatedDriverRefuse CUDAMulticastShimUnvalidatedDriver = "REFUSE"
-	// CUDAMulticastShimUnvalidatedDriverAllow: use them anyway, with a warning.
-	CUDAMulticastShimUnvalidatedDriverAllow CUDAMulticastShimUnvalidatedDriver = "ALLOW"
-)
-
-// Set implements flag.Value. Set(String()) should be idempotent.
-func (s *CUDAMulticastShimUnvalidatedDriver) Set(v string) error {
-	val := CUDAMulticastShimUnvalidatedDriver(strings.ToUpper(v))
-	switch val {
-	case CUDAMulticastShimUnvalidatedDriverRefuse, CUDAMulticastShimUnvalidatedDriverAllow:
-		*s = val
-		return nil
-	}
-	return fmt.Errorf("invalid value %q; must be %s or %s", v, CUDAMulticastShimUnvalidatedDriverRefuse, CUDAMulticastShimUnvalidatedDriverAllow)
-}
-
-// Ptr returns a pointer to `s`. Useful in flag declaration line.
-func (s CUDAMulticastShimUnvalidatedDriver) Ptr() *CUDAMulticastShimUnvalidatedDriver {
-	return &s
-}
-
-// Get implements flag.Get.
-func (s *CUDAMulticastShimUnvalidatedDriver) Get() any {
-	return *s
-}
-
-// String implements flag.String.
-func (s CUDAMulticastShimUnvalidatedDriver) String() string {
 	return string(s)
 }
 

@@ -644,26 +644,23 @@ func TestCreateMountPoint(t *testing.T) {
 
 // TestCudaMulticastShimEnabled covers the opt-in that alone enables the
 // cuda-checkpoint job and the interposer's checkpoint protocol: both paths,
-// and the driver release they have been validated on, or the flag that
-// accepts a newer one.
+// and driver R610 or newer.
 func TestCudaMulticastShimEnabled(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		path, shim string
 		embedded   bool
 		major      int
-		allow      bool
 		want       bool
 	}{
 		{name: "cuda-checkpoint-path only", path: "/cc", major: 610},
 		{name: "shim path", path: "/cc", shim: "/s.so", major: 610, want: true},
 		{name: "embedded shim", path: "/cc", embedded: true, major: 610, want: true},
 		{name: "old driver", path: "/cc", shim: "/s.so", major: 580},
-		{name: "old driver, unvalidated allowed", path: "/cc", shim: "/s.so", major: 580, allow: true},
-		{name: "unvalidated driver", path: "/cc", shim: "/s.so", major: 615},
-		{name: "unvalidated driver, embedded shim", path: "/cc", embedded: true, major: 615},
-		{name: "unvalidated driver allowed", path: "/cc", shim: "/s.so", major: 615, allow: true, want: true},
-		{name: "unvalidated driver allowed, no shim", path: "/cc", major: 615, allow: true},
+		{name: "driver just below R610", path: "/cc", shim: "/s.so", major: 609},
+		{name: "newer driver", path: "/cc", shim: "/s.so", major: 615, want: true},
+		{name: "newer driver, embedded shim", path: "/cc", embedded: true, major: 615, want: true},
+		{name: "newer driver, no shim", path: "/cc", major: 615},
 		{name: "nothing", major: 610},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -673,9 +670,7 @@ func TestCudaMulticastShimEnabled(t *testing.T) {
 			if tc.embedded {
 				conf.CUDAMulticastShimSource = config.CUDAMulticastShimSourceEmbedded
 			}
-			if tc.allow {
-				conf.CUDAMulticastShimUnvalidatedDriver = config.CUDAMulticastShimUnvalidatedDriverAllow
-			}
+
 			if got := cudaMulticastShimEnabled(conf, tc.major); got != tc.want {
 				t.Errorf("cudaMulticastShimEnabled() = %v, want %v", got, tc.want)
 			}

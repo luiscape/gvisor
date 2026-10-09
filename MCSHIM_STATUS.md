@@ -21,10 +21,10 @@ opening upstream PRs.
     All three are fixed, with the small sentry items, and every check that
     runs on a CPU passes (below). GPU validation of the new binary is the
     next round.
--   **Scope for the first merge:** R610 only, now enforced: the interposer
-    and the job are off on any other release unless
-    `--cuda-multicast-shim-unvalidated-driver=ALLOW`. R615 comes after the
-    first version is merged.
+-   **Scope for the first merge:** validated on R610 only. runsc enables the
+    interposer and the job on R610 or newer (an R615-opt-in flag was added
+    this round and then removed), so keeping unvalidated releases off is up
+    to the scheduler. R615 comes after the first version is merged.
 
 ## Round after P0: processes that never checkpoint
 
@@ -41,7 +41,7 @@ R610 workarounds are untouched.
 | glibc floor of the embedded shim: GLIBC_2.17 | `c0ebf9590` | Newest `GLIBC_` version in the `-c opt` shim `make` embeds: 2.17 (`clock_gettime`), was 2.34; NEEDED gains `libdl.so.2` and `libpthread.so.0`. `//runsc/mcshimbin:mcshimbin_test` checks that on the embedded bytes (fails on the old shim). `run.sh glibc` and `test/glibc_smoke.sh`: `sh -c true` and `/bin/true` exit 0 with empty output on ubuntu:20.04 (2.31), debian:11 (2.31), rockylinux:8 (2.28) and centos:7 (2.17), through `LD_PRELOAD` and through `/etc/ld.so.preload`; also fine on the host (2.34) and ubuntu:24.04 (2.39) with `LD_BIND_NOW=1`. gcc 11 and clang 20 build it with `-Wall -Wextra` and no warnings. | The suite on the new binary. |
 | `--get-state` timeout fails the checkpoint instead of skipping the process | `c42b42acd` | Build, nogo and `control_test` pass. The `deadline-state` case is written (`ckpt_stub` now hangs on `--get-state` too). | `run.sh deadline` (needs a CUDA process). |
 | Unlock every process after a failed lock or re-lock | `bcb3c6c7e` | Build, nogo and `control_test` pass. | `deadline-lock`: the lock that was killed is unlocked. |
-| R615 opt-in: on by default only on R610; `--cuda-multicast-shim-unvalidated-driver=ALLOW` for anything newer, with a warning | `2a284f526` | `TestCudaMulticastShimEnabled`: 10 cases, including 615 refused, 615 allowed, 580 refused even when allowed. The flag is an enum (REFUSE/ALLOW), since `runsc/config` rejects new boolean flags. **Ask Luis before merging**: he may prefer to enforce this in Modal's scheduler instead. | A run on R615 with `ALLOW`. |
+| R615 opt-in: on by default only on R610; `--cuda-multicast-shim-unvalidated-driver=ALLOW` for anything newer, with a warning | `2a284f526` | `TestCudaMulticastShimEnabled`: 10 cases, including 615 refused, 615 allowed, 580 refused even when allowed. The flag is an enum (REFUSE/ALLOW), since `runsc/config` rejects new boolean flags. **Superseded:** the flag was removed afterwards; runsc enables the interposer on R610 or newer, and the scheduler decides which releases to use. | A run on R615. |
 | Append the shim to `LD_PRELOAD` | `6888d9e0f` | `TestCudaMulticastShimPreloadOrder`. Same order as `/etc/ld.so.preload` already gave. | `torch-symm` under SGLang, whose launcher rewrites `LD_PRELOAD`. |
 
 Notes on the floor. The approach in the brief (`.symver` on the seven
@@ -79,7 +79,7 @@ Run everything on the new binary:
 -   A tokens/s A/B with and without the shim, on one config that does not
     use CUDA graphs.
 
-R615 is a separate run, with `--cuda-multicast-shim-unvalidated-driver=ALLOW`:
+R615 is a separate run:
 `abi` with lookups up to 13.4, the suite, the engine cells and the fabric
 measurement.
 
