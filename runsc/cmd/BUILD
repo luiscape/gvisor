@@ -57,7 +57,6 @@ go_library(
     visibility = ["//runsc:__subpackages__"],
     deps = [
         "//pkg/cleanup",
-        "//pkg/coverage",
         "//pkg/cpuid",
         "//pkg/lisafs",
         "//pkg/log",
@@ -123,7 +122,7 @@ go_test(
         "//:release",  # keep
         "//runsc",  # keep
     ],
-    library = ":cmd",
+    embed = [":cmd"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/log",
@@ -140,6 +139,7 @@ go_test(
         "//runsc/container",
         "//runsc/flag",
         "//runsc/mitigate",
+        "//runsc/sandbox",
         "//runsc/specutils",
         "//sandboxexec/proto:sandbox_options_go_proto",
         "@com_github_google_go_cmp//cmp:go_default_library",

@@ -101,7 +101,7 @@ go_test(
         "proc_test.go",
         "state_cuda_test.go",
     ],
-    library = ":control",
+    embed = [":control"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/context",

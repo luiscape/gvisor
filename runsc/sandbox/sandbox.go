@@ -50,7 +50,6 @@ import (
 	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
-	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -219,6 +218,10 @@ type Sandbox struct {
 	// StartTime is the time the sandbox was started.
 	StartTime time.Time `json:"startTime"`
 
+	// NoRootContainer records how the sandbox was booted. See
+	// Args.NoRootContainer.
+	NoRootContainer bool `json:"noRootContainer"`
+
 	// rootDir is the same as config.Config.RootDir. It represents the runtime
 	// root directory being used by the current runsc invocation. It's not saved
 	// to json, because the RootDir can change across runsc invocations.
@@ -336,6 +339,10 @@ type Args struct {
 	// open filesystem checkpoint files using O_DIRECT.
 	FSRestoreImagePath string
 	FSRestoreDirect    bool
+
+	// NoRootContainer boots without a root container: no gofer FDs, no root
+	// process. See container.Args.NoRootContainer.
+	NoRootContainer bool
 }
 
 // New creates the sandbox process. The caller must call Destroy() on the
@@ -352,6 +359,7 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 		MetricServerAddress: conf.MetricServer,
 		MountHints:          args.MountHints,
 		StartTime:           starttime.Get(),
+		NoRootContainer:     args.NoRootContainer,
 	}
 	if args.Spec != nil && args.Spec.Annotations != nil {
 		s.PodName = args.Spec.Annotations[podNameAnnotation]
@@ -907,8 +915,7 @@ func (s *Sandbox) connError(err error) error {
 }
 
 type sandboxProcessEnvOptions struct {
-	enforceRelease bool
-	sentryUsesCgo  bool
+	sentryUsesCgo bool
 }
 
 func sandboxProcessEnv(conf *config.Config, opts sandboxProcessEnvOptions) []string {
@@ -925,9 +932,7 @@ func sandboxProcessEnv(conf *config.Config, opts sandboxProcessEnvOptions) []str
 			env = append(env, "TMPDIR="+tmpDir)
 		}
 	}
-	if opts.enforceRelease {
-		env = gvisorbinaries.WithEnforceRelease(env)
-	}
+	env = gvisorbinaries.WithEnforceRelease(env)
 	if opts.sentryUsesCgo {
 		// Platforms that use stub processes are not compatible with
 		// the glibc rseq, because they unmap everything from a process
@@ -1025,15 +1030,11 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		sentryBin = &gvisorbinaries.GvisorSentryPluginStack
 		sentryUsesCgo = true
 	}
-	bootBinPath := specutils.ExePath
-	if p, err := sentryBin.Path(); err == nil {
-		log.Infof("Sidecar %q found: booting sandbox with %s", sentryBin.Name, p)
-		bootBinPath = p
-	} else if conf.SidecarUsagePolicy.AllowEmbeddedFallback() {
-		sentryBin.WarnUnavailable(fmt.Sprintf("Sidecar %q not usable (%v): booting sandbox with runsc itself", sentryBin.Name, err))
-	} else {
-		return fmt.Errorf("sidecar %q not usable (%v) and --sidecar-usage-policy is set to STRICT", sentryBin.Name, err)
+	bootBinPath, err := sentryBin.Path()
+	if err != nil {
+		return fmt.Errorf("sidecar %q not usable: %w", sentryBin.Name, err)
 	}
+	log.Infof("Sidecar %q found: booting sandbox with %s", sentryBin.Name, bootBinPath)
 	// Open with `O_PATH`, which is sufficient for exec and makes the FD
 	// effectively execute-only (no read/write).
 	bootBin, err := os.OpenFile(bootBinPath, unix.O_PATH, 0)
@@ -1070,10 +1071,12 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	//
 	// All flags after this must be for the boot command
 	cmd.Args = append(cmd.Args, "boot", "--bundle="+args.BundleDir)
+	if args.NoRootContainer {
+		cmd.Args = append(cmd.Args, "--no-root-container")
+	}
 
 	cmd.Env = sandboxProcessEnv(conf, sandboxProcessEnvOptions{
-		enforceRelease: bootBinPath != specutils.ExePath,
-		sentryUsesCgo:  sentryUsesCgo,
+		sentryUsesCgo: sentryUsesCgo,
 	})
 
 	// If there is a gofer, sends all socket ends to the sandbox.
@@ -1106,7 +1109,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	}
 
 	// Pass gofer mount configs.
-	cmd.Args = append(cmd.Args, "--gofer-mount-confs="+args.GoferMountConfs.String())
+	if len(args.GoferMountConfs) > 0 {
+		cmd.Args = append(cmd.Args, "--gofer-mount-confs="+args.GoferMountConfs.String())
+	}
 
 	// Create a socket for the control server and donate it to the sandbox.
 	controlSocketPath, sockFD, err := createControlSocket(conf.RootDir, s.ID)
@@ -1332,7 +1337,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 	// If the console control socket file is provided, then create a new
 	// pty master/replica pair and set the TTY on the sandbox process.
-	if args.Spec.Process.Terminal && args.ConsoleSocket != "" {
+	if args.Spec.Process != nil && args.Spec.Process.Terminal && args.ConsoleSocket != "" {
 		// console.NewWithSocket will send the master on the given
 		// socket, and return the replica.
 		tty, err := console.NewWithSocket(args.ConsoleSocket)
@@ -1571,6 +1576,10 @@ func SandboxUserGroupIDs(spec *specs.Spec) (uint32, uint32) {
 	uid := uint32(0)
 	gid := uint32(0)
 
+	if spec.Process == nil {
+		return uid, gid
+	}
+
 	if !rootMappedInContainer(spec.Linux.UIDMappings) {
 		uid = spec.Process.User.UID
 	}
@@ -1627,6 +1636,9 @@ func (s *Sandbox) Wait(cid string) (unix.WaitStatus, error) {
 		return unix.WaitStatus(0), err
 	}
 	if !s.child {
+		if s.NoRootContainer && s.IsRootContainer(cid) {
+			return unix.WaitStatus(0), nil
+		}
 		return unix.WaitStatus(0), fmt.Errorf("sandbox no longer running and its exit status is unavailable")
 	}
 
@@ -2566,14 +2578,13 @@ func deviceFileForPlatform(name, devicePath string) (*fd.FD, error) {
 }
 
 // getNvproxyDriverVersion returns the NVIDIA driver ABI version to use by
-// nvproxy.
+// nvproxy, or "latest", which the sentry resolves to the newest supported ABI.
 func getNvproxyDriverVersion(conf *config.Config) (string, error) {
 	switch conf.NVProxyDriverVersion {
 	case "":
-		return nvproxy.HostDriverVersion()
+		return nvconf.HostDriverVersion()
 	case "latest":
-		nvproxy.Init()
-		return nvproxy.LatestDriver().String(), nil
+		return conf.NVProxyDriverVersion, nil
 	default:
 		version, err := nvconf.DriverVersionFrom(conf.NVProxyDriverVersion)
 		return version.String(), err

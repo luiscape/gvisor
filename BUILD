@@ -1,7 +1,9 @@
+load("@bazel_lib//lib:write_source_files.bzl", "write_source_files")
 load("@bazel_skylib//rules:native_binary.bzl", "native_test")
 load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@rules_license//rules:license.bzl", "license")
 load("//tools:defs.bzl", "build_test", "gazelle", "go_path")
+load("//tools:gazelle.bzl", "GAZELLE_PACKAGES")
 load("//tools:release.bzl", "RELEASE_RUNSC", "RELEASE_SIDECARS", "release_files")
 load("//tools/nogo:defs.bzl", "nogo_config")
 load("//tools/yamltest:defs.bzl", "yaml_test")
@@ -18,6 +20,7 @@ license(
 )
 
 exports_files([
+    "CODEOWNERS",
     "LICENSE",
     "README.md",
     "SECURITY.md",
@@ -25,6 +28,19 @@ exports_files([
     "MAINTAINERS.md",
     "ADOPTERS.md",
 ])
+
+write_source_files(
+    name = "governance-regen",
+    files = {
+        "CODEOWNERS": "//governance:generated/CODEOWNERS",
+        "MAINTAINERS.md": "//governance:generated/MAINTAINERS.md",
+    },
+)
+
+test_suite(
+    name = "governance-check",
+    tests = [":governance-regen_tests"],
+)
 
 release_files(
     name = "release",
@@ -257,11 +273,47 @@ toolchain(
     toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
 )
 
-# gazelle is a set of build tools.
+# gazelle generates Go BUILD rules from sources.
 #
-# To update the WORKSPACE from go.mod, use:
-#   bazel run //:gazelle -- update-repos -from_file=go.mod
+# Packages listed in GAZELLE_PACKAGES must match gazelle's output; presubmit
+# runs //:gazelle_check to enforce this. To fix them, run:
+#   bazel run //:gazelle_fix
+#
+# gazelle:prefix gvisor.dev/gvisor
+# gazelle:go_naming_convention import
+# gazelle:go_naming_convention_external go_default_library
+# gazelle:map_kind go_binary go_binary //tools:defs.bzl
+# gazelle:map_kind go_library go_library //tools:defs.bzl
+# gazelle:map_kind go_test go_test //tools:defs.bzl
+#
+# proto_library is a macro whose Go targets gazelle cannot see.
+# gazelle:proto disable_global
+# gazelle:resolve_regexp go ^gvisor\.dev/gvisor/(.+)/([^/]+)_go_proto$ //$1:${2}_go_proto
+#
+# These packages name a proto_library and a go_library alike, which gazelle
+# rejects when loading the BUILD file.
+# gazelle:exclude pkg/eventchannel
+# gazelle:exclude pkg/metric
+# gazelle:exclude pkg/sentry/strace
 gazelle(name = "gazelle")
+
+# Gazelle indexes go_library rules by importpath, which unmigrated BUILD files
+# omit, so resolve gvisor.dev/gvisor imports by path instead (-index=none).
+GAZELLE_ARGS = [
+    "-index=none",
+    "-r=false",
+] + GAZELLE_PACKAGES
+
+gazelle(
+    name = "gazelle_check",
+    args = GAZELLE_ARGS,
+    mode = "diff",
+)
+
+gazelle(
+    name = "gazelle_fix",
+    args = GAZELLE_ARGS,
+)
 
 exports_files([
     "go.sum",

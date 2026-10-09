@@ -52,7 +52,6 @@ import (
 	"gvisor.dev/gvisor/pkg/eventchannel"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/fspath"
-	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -815,10 +814,6 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 	}
 	defer fsCleanup.Clean()
 
-	if hostarch.PageSize != 4096 {
-		return fmt.Errorf("save is not supported with %dK page size", hostarch.PageSize/1024)
-	}
-
 	return k.quiescePausedAnd(ctx, func() error {
 		return k.saveToLocked(ctx, stateFile, pagesMetadata, pagesFile, appMFExcludeCommittedZeroPages, resume, fsOpts, &stateFileCleanup, &pagesCleanup, &fsCleanup)
 	})
@@ -1052,9 +1047,6 @@ func (k *Kernel) invalidateUnsavableMappings(ctx context.Context) error {
 // Preconditions: k is not in use.
 func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *AsyncMFLoader, timeReady chan struct{}, networkArgs inet.NetworkArgs, clocks sentrytime.Clocks, vfsOpts *vfs.CompleteRestoreOptions, timeline *timing.Timeline) error {
 	defer timeline.End()
-	if hostarch.PageSize != 4096 {
-		return fmt.Errorf("restore is not supported with %dK page size", hostarch.PageSize/1024)
-	}
 	loadStart := time.Now()
 
 	k.runningTasksCond.L = &k.runningTasksMu
@@ -1159,9 +1151,6 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *Async
 //
 // Preconditions: k is not in use.
 func (k *Kernel) ExtractRootfsUpperLayer(ctx context.Context, r io.Reader, asyncMFLoader *AsyncMFLoader, timeReady chan struct{}, clocks sentrytime.Clocks, outFD *os.File) error {
-	if hostarch.PageSize != 4096 {
-		return fmt.Errorf("restore is not supported with %dK page size", hostarch.PageSize/1024)
-	}
 	loadStart := time.Now()
 
 	k.runningTasksCond.L = &k.runningTasksMu
@@ -1208,7 +1197,11 @@ func (k *Kernel) ExtractRootfsUpperLayer(ctx context.Context, r io.Reader, async
 	log.Infof("Overall load took [%s] after async work", time.Since(loadStart))
 
 	// Now call TarRootfsUpperLayer on the root filesystem
-	root := k.GlobalInit().Leader().MountNamespace().Root(ctx)
+	mntns := k.GlobalInitMountNamespace()
+	if mntns == nil {
+		return fmt.Errorf("cannot serialize rootfs upper layer: sandbox has no root mount namespace")
+	}
+	root := mntns.Root(ctx)
 	defer root.DecRef(ctx)
 	ts, ok := root.Mount().Filesystem().Impl().(vfs.TarSerializer)
 	if !ok {
@@ -1363,12 +1356,11 @@ func (ctx *createProcessContext) Value(key any) any {
 		root := ctx.args.MountNamespace.Root(ctx)
 		return root
 	case vfs.CtxMountNamespace:
-		if ctx.kernel.globalInit == nil {
+		if ctx.args.MountNamespace == nil {
 			return nil
 		}
-		mntns := ctx.kernel.GlobalInit().Leader().MountNamespace()
-		mntns.IncRef()
-		return mntns
+		ctx.args.MountNamespace.IncRef()
+		return ctx.args.MountNamespace
 	case devutil.CtxDevGoferClient:
 		return ctx.kernel.GetDevGoferClient(ctx.kernel.ContainerName(ctx.args.ContainerID))
 	case inet.CtxStack:
@@ -1434,11 +1426,10 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	ctx := args.NewContext(k)
 	mntns := args.MountNamespace
 	if mntns == nil {
-		if k.globalInit == nil {
+		if mntns = k.globalInitMountNamespaceLocked(); mntns == nil {
 			return nil, 0, fmt.Errorf("mount namespace is nil")
 		}
 		// Add a reference to the namespace, which is transferred to the new process.
-		mntns = k.globalInit.Leader().MountNamespace()
 		mntns.IncRef()
 	}
 	// Get the root directory from the MountNamespace.
@@ -1578,7 +1569,8 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	// Success.
 	cu.Release()
 	tgid := k.tasks.Root.IDOfThreadGroup(tg)
-	if k.globalInit == nil {
+	// A namespace with a reserved init TID never gets a global init.
+	if k.globalInit == nil && !k.tasks.Root.noInit {
 		k.globalInit = tg
 	}
 	return tg, tgid, nil
@@ -1917,8 +1909,6 @@ func (k *Kernel) Unpause() {
 //
 // context is used only for debugging to describe how the signal was received.
 //
-// Preconditions: Kernel must have an init process.
-//
 // +checklocksexclude:k.extMu
 // +checklocksexclude:k.tasks.mu
 // +checklocksexclude:k.globalInit.signalHandlers.mu
@@ -2088,6 +2078,30 @@ func (k *Kernel) GlobalInit() *ThreadGroup {
 // configuration before the kernel is started.
 func (k *Kernel) SetSignalUnkillablePolicy(p SignalUnkillablePolicy) {
 	k.signalUnkillable = p
+}
+
+// GlobalInitMountNamespace returns the mount namespace of the global init task
+// without taking a reference, or nil if there is none.
+func (k *Kernel) GlobalInitMountNamespace() *vfs.MountNamespace {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	return k.globalInitMountNamespaceLocked()
+}
+
+// globalInitMountNamespaceLocked returns the mount namespace of the global
+// init task, or nil if there is no global init or it has already exited.
+//
+// +checklocks:k.extMu
+func (k *Kernel) globalInitMountNamespaceLocked() *vfs.MountNamespace {
+	tg := k.globalInit
+	if tg == nil {
+		return nil
+	}
+	leader := tg.Leader()
+	if leader == nil {
+		return nil
+	}
+	return leader.MountNamespace()
 }
 
 // TestOnlySetGlobalInit sets the thread group with ID 1 in the root PID namespace.
@@ -2325,16 +2339,17 @@ func (ctx *supervisorContext) Value(key any) any {
 		// The supervisor context is global root.
 		return auth.NewRootCredentials(ctx.Kernel.rootUserNamespace)
 	case vfs.CtxRoot:
-		if ctx.Kernel.globalInit == nil || ctx.Kernel.globalInit.Leader() == nil {
+		mntns := ctx.Kernel.GlobalInitMountNamespace()
+		if mntns == nil {
 			return vfs.VirtualDentry{}
 		}
-		root := ctx.Kernel.GlobalInit().Leader().MountNamespace().Root(ctx)
+		root := mntns.Root(ctx)
 		return root
 	case vfs.CtxMountNamespace:
-		if ctx.Kernel.globalInit == nil || ctx.Kernel.globalInit.Leader() == nil {
+		mntns := ctx.Kernel.GlobalInitMountNamespace()
+		if mntns == nil {
 			return nil
 		}
-		mntns := ctx.Kernel.GlobalInit().Leader().MountNamespace()
 		mntns.IncRef()
 		return mntns
 	case inet.CtxStack:

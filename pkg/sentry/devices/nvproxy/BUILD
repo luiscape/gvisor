@@ -109,7 +109,7 @@ go_test(
         "exported_objects_test.go",
         "nvproxy_test.go",
     ],
-    library = ":nvproxy",
+    embed = [":nvproxy"],
     deps = [
         "//pkg/abi/nvgpu",
         "//pkg/context",

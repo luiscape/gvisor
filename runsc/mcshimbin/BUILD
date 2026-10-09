@@ -29,5 +29,5 @@ go_test(
     name = "mcshimbin_test",
     size = "small",
     srcs = ["mcshimbin_test.go"],
-    library = ":mcshimbin",
+    embed = [":mcshimbin"],
 )

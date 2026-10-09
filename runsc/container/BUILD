@@ -25,7 +25,7 @@ go_library(
         "//pkg/sentry/control",
         "//pkg/sentry/fsimpl/erofs",
         "//pkg/sentry/fsimpl/tmpfs",
-        "//pkg/sentry/pgalloc",
+        "//pkg/sentry/hostmm",
         "//pkg/sentry/state/checkpointfiles",
         "//pkg/sighandling",
         "//pkg/sync",
@@ -73,7 +73,7 @@ go_test(
         "//:release",
         "//test/cmd/test_app",
     ],
-    library = ":container",
+    embed = [":container"],
     shard_count = most_shards,
     tags = ["requires-kvm"],
     deps = [
@@ -142,7 +142,7 @@ go_test(
         "//:release",
         "//test/cmd/test_app",
     ],
-    library = ":container",
+    embed = [":container"],
     tags = [
         "manual",
         "notap",

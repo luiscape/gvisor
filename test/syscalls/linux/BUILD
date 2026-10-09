@@ -2138,6 +2138,7 @@ cc_binary(
     deps = select_gtest() + [
         ":ip_socket_test_util",
         "//test/util:file_descriptor",
+        "//test/util:memory_util",
         "//test/util:posix_error",
         "//test/util:save_util",
         "//test/util:socket_util",
@@ -4890,6 +4891,7 @@ cc_binary(
         "//test/util:logging",
         "//test/util:multiprocess_util",
         "//test/util:posix_error",
+        "//test/util:save_util",
         "//test/util:socket_util",
         "//test/util:test_main",
         "//test/util:test_util",

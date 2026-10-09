@@ -9,8 +9,10 @@ go_library(
     name = "netutils",
     testonly = 1,
     srcs = ["utils.go"],
+    importpath = "gvisor.dev/gvisor/test/netutils",
     visibility = [
         "//test/iptables:__subpackages__",
+        "//test/netutils:__subpackages__",
         "//test/nftables:__subpackages__",
     ],
     deps = ["//pkg/test/testutil"],

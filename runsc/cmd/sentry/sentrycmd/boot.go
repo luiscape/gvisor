@@ -40,6 +40,7 @@ import (
 	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/ring0"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -220,7 +221,8 @@ type Boot struct {
 	// used to synchronize rootless user namespace initialization.
 	syncUsernsFD int
 
-	// nvidiaDriverVersion is the Nvidia driver version on the host.
+	// nvidiaDriverVersion is the Nvidia driver ABI version to use, or "latest"
+	// for the newest supported one.
 	nvidiaDriverVersion string
 
 	// These correspond to fields in nvconf.HostSettings, which is not used
@@ -236,6 +238,9 @@ type Boot struct {
 
 	// rootfsUpperTarFD is the file descriptor to a tar file that has rootfs change at startup.
 	rootfsUpperTarFD int
+
+	// noRootContainer boots without a root container. See Create.noRootContainer.
+	noRootContainer bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -278,6 +283,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&b.hostTHP.Defrag, "host-thp-defrag", "", "value of /sys/kernel/mm/transparent_hugepage/defrag on the host")
 	f.IntVar(&b.uid, "uid", 0, "user ID")
 	f.IntVar(&b.gid, "gid", 0, "user ID")
+	f.BoolVar(&b.noRootContainer, "no-root-container", false, "if true, boot the sandbox without a root container; containers are added later as subcontainers")
 
 	// Open FDs that are donated to the sandbox.
 	f.IntVar(&b.specFD, "spec-fd", -1, "required fd with the container spec")
@@ -311,7 +317,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&b.profilingMetricsLossy, "profiling-metrics-fd-lossy", false, "if true, treat the sentry profiling metrics FD as lossy and write a checksum to it.")
 
 	// Nvidia driver properties.
-	f.StringVar(&b.nvidiaDriverVersion, "nvidia-driver-version", "", "Nvidia driver version on the host")
+	f.StringVar(&b.nvidiaDriverVersion, "nvidia-driver-version", "", "Nvidia driver ABI version to use, or 'latest' for the newest supported one")
 	f.StringVar(&b.procDriverNvidiaParams, "nvidia-host-params", "", "value of /proc/driver/nvidia/params on the host")
 	f.Int64Var(&b.nvidiaFabricIMEXManagementDevMinor, "nvidia-fabric-imex-mgmt-minor", -1, "DeviceFileMinor in /proc/driver/nvidia/capabilities/fabric-imex-mgmt on the host")
 }
@@ -421,7 +427,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	// the call setCapsAndCallSelf, otherwise the FD will be closed and the
 	// child process cannot read it
 	specFile := os.NewFile(uintptr(b.specFD), "spec file")
-	spec, err := specutils.ReadSpecFromFile(b.bundleDir, specFile, conf)
+	spec, err := specutils.ReadSpecFromFile(b.bundleDir, specFile, specutils.SpecOpts{Conf: conf, NoRootContainer: b.noRootContainer})
 	if err != nil {
 		util.Fatalf("reading spec: %v", err)
 	}
@@ -666,7 +672,10 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	}
 
 	var nvidiaDriverVersion nvconf.DriverVersion
-	if b.nvidiaDriverVersion != "" {
+	if b.nvidiaDriverVersion == "latest" {
+		nvproxy.Init()
+		nvidiaDriverVersion = nvproxy.LatestDriver()
+	} else if b.nvidiaDriverVersion != "" {
 		nvidiaDriverVersion, err = nvconf.DriverVersionFrom(b.nvidiaDriverVersion)
 		if err != nil {
 			util.Fatalf("Failed to parse nvidia driver version: %v", err)
@@ -726,6 +735,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		FSRestoreFDs:             b.fsRestoreFDs.GetFDs(),
 		FSRestoreCheckpointGofer: b.fsRestoreCheckpointGofer,
 		RootfsUpperTarFD:         b.rootfsUpperTarFD,
+		NoRootContainer:          b.noRootContainer,
 		StartupTimer:             timer,
 	}
 	l, err := boot.New(bootArgs)
