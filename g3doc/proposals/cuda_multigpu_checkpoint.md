@@ -274,7 +274,10 @@ today: one unbounded `cuda-checkpoint --toggle` per process, no job, and no
 blocker inventory. With it, the checkpoint uses `cuda-checkpoint`'s two-phase
 lock/checkpoint instead of a per-process `--toggle`, because a rank spinning
 in a collective can only be quiesced while its peers are locking too, and
-every `cuda-checkpoint` invocation is bounded (`--cuda-checkpoint-timeout`).
+the `cuda-checkpoint` invocations that precede saving GPU state
+(`--get-state`, lock, unlock) are bounded, since one killed there can be
+undone. Checkpoint and restore invocations are not: their duration grows with
+GPU memory, and killing one partway cannot be undone.
 Refusing up front what `cuda-checkpoint` would hang on, and bounding its
 invocations, would help without the interposer too; both are left for later,
 since they change the behavior of existing configurations.

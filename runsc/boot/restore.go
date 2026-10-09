@@ -735,9 +735,6 @@ func (l *Loader) save(o *control.SaveOpts) error {
 	if cudaMulticastShimEnabled(conf, l.k.NvidiaDriverVersion.Major()) {
 		o.CudaCheckpointSequential = true
 		o.CudaMulticastShim = true
-		if o.CudaCheckpointTimeout == 0 {
-			o.CudaCheckpointTimeout = conf.CUDACheckpointTimeout
-		}
 	}
 	saveOpts, err := control.ConvertToStateSaveOpts(o)
 	if err != nil {

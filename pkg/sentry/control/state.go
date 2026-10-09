@@ -116,10 +116,6 @@ type SaveOpts struct {
 	// with one cuda-checkpoint --toggle.
 	CudaMulticastShim bool `json:"cuda_multicast_shim"`
 
-	// CudaCheckpointTimeout bounds each cuda-checkpoint invocation when
-	// CudaMulticastShim is set; zero means the default.
-	CudaCheckpointTimeout time.Duration `json:"cuda_checkpoint_timeout"`
-
 	// SplitFSCheckpointPaths is the list of paths to include in the filesystem
 	// for split checkpoint. If non-empty, split filesystem checkpoint is enabled.
 	// For capturing all of tmpfs, the ResourceID Path should be "all-tmpfs".
@@ -155,7 +151,6 @@ func ConvertToStateSaveOpts(o *SaveOpts) (*state.SaveOpts, error) {
 		CudaCheckpointPath:             o.CudaCheckpointPath,
 		CudaCheckpointSequential:       o.CudaCheckpointSequential,
 		CudaMulticastShim:              o.CudaMulticastShim,
-		CudaCheckpointTimeout:          o.CudaCheckpointTimeout,
 	}
 	if err := setSaveOpts(o, saveOpts); err != nil {
 		saveOpts.Close()

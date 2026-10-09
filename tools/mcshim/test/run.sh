@@ -32,9 +32,9 @@
 #                                import whose exporter freed the object, and
 #                                the application keeps running
 #   deadline reason optout       under runsc (-r), with a stub cuda-checkpoint:
-#                                a hung invocation (--get-state, lock or
-#                                checkpoint) is killed and the checkpoint
-#                                fails, with the application still running; a
+#                                a hung --get-state or lock is killed and the
+#                                checkpoint fails (after about 2 minutes),
+#                                with the application still running; a
 #                                refusal's reason reaches the sentry's error;
 #                                without the interposer, no job and one
 #                                --toggle per process, as before it
@@ -299,8 +299,9 @@ beating() {
 }
 
 # hung NAME HANG: a checkpoint whose cuda-checkpoint invocation matching HANG
-# never returns must fail within the deadline, kill it, and leave the
-# application running.
+# never returns must fail within the sentry's bound on such invocations (2
+# minutes, cudaCheckpointControlTimeout), kill it, and leave the application
+# running.
 hung() {
   local name=$1 start rc=0
   stub_start "$name" beat || return 1
@@ -313,7 +314,7 @@ hung() {
     echo "$name: the checkpoint did not fail on the deadline"
     return 1
   fi
-  if [ $(($(date +%s) - start)) -gt 60 ]; then
+  if [ $(($(date +%s) - start)) -gt 180 ]; then
     echo "$name: the checkpoint took too long"
     return 1
   fi
@@ -324,15 +325,15 @@ hung() {
   runsc kill "mcshim-test-$$-$name" KILL || true
 }
 
-# deadline: with the interposer, a --get-state, a lock and a checkpoint that
-# hang are killed. A hung --get-state fails the checkpoint rather than
-# leaving its process out of it: the process would keep its GPU state, and
-# the save would fail later on it.
+# deadline: with the interposer, a --get-state and a lock that hang are
+# killed. A hung --get-state fails the checkpoint rather than leaving its
+# process out of it: the process would keep its GPU state, and the save would
+# fail later on it. --action checkpoint is deliberately not bounded (see
+# cudaCheckpointControlTimeout), so there is no case for it.
 deadline() {
-  local flags="${RUNSC_FLAGS:-} --cuda-checkpoint-path=/mnt/ckpt_stub --cuda-checkpoint-timeout=5s --cuda-multicast-shim-path=/mnt/mcshim.so"
+  local flags="${RUNSC_FLAGS:-} --cuda-checkpoint-path=/mnt/ckpt_stub --cuda-multicast-shim-path=/mnt/mcshim.so"
   RUNSC_FLAGS="$flags" hung deadline-state "--get-state" || return 1
   RUNSC_FLAGS="$flags" hung deadline-lock "--action lock" || return 1
-  RUNSC_FLAGS="$flags" hung deadline-ckpt "--action checkpoint" || return 1
   if ! grep -q -- "--launch-job /mnt/mcshim_test beat" "$W/ckpt_stub.log"; then
     echo "deadline: the container did not run in a cuda-checkpoint job"
     return 1

@@ -85,10 +85,6 @@ type SaveOpts struct {
 	// (see control.SaveOpts).
 	CudaMulticastShim bool
 
-	// CudaCheckpointTimeout bounds each cuda-checkpoint invocation when
-	// CudaMulticastShim is set; zero means the default.
-	CudaCheckpointTimeout time.Duration
-
 	// FSSaveOpts contains options for filesystem checkpoint. If non-nil, we
 	// should split filesystem to separate pages from the full checkpoint.
 	FSSaveOpts *kernel.FSSaveOpts

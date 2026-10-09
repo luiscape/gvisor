@@ -120,9 +120,12 @@ From `pkg/sentry/control/state_cuda.go` / `state_cuda_shim.go`:
     a rank released at its own resume could reach a group a peer is still
     binding.
 
-Every `cuda-checkpoint` invocation is bounded by `--cuda-checkpoint-timeout`
-(10 minutes by default): one still running is killed, and the checkpoint or
-restore fails.
+The `cuda-checkpoint` invocations that run before any GPU state is saved
+(`--get-state`, lock, unlock) are bounded at 2 minutes each: one still
+running is killed, and the checkpoint fails with the application running.
+`--action checkpoint` and every invocation on restore are not bounded, as
+without the interposer: their duration grows with GPU memory, and killing one
+partway leaves the process in a state `cuda-checkpoint` does not define.
 
 ## Environment variables
 
@@ -298,7 +301,7 @@ resume in place of a checkpoint and restore:
 *   `rtres`: cudart's resolvers reach each caller's own runtime, including
     one under a soname nothing could know (`MCSHIM_TEST_CUDART`);
 *   `deadline`, `reason`, `optout`: with a stub `cuda-checkpoint` (under
-    runsc, `-r`): a hung `--get-state`, lock or checkpoint is killed and the
+    runsc, `-r`): a hung `--get-state` or lock is killed and the
     checkpoint fails with the application running; a refusal's reason
     reaches the sentry's error; without the interposer, no job and one
     `--toggle` per process.

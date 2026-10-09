@@ -111,7 +111,10 @@ the following together:
 -   two-phase lock/checkpoint;
 -   the interposer protocol (gate, suspend, resume);
 -   the blocker inventory;
--   bounded invocations (`--cuda-checkpoint-timeout`, default 10 minutes).
+-   bounded invocations before GPU state is saved (`--get-state`, lock,
+    unlock: 2 minutes each, fixed). The `--cuda-checkpoint-timeout` flag
+    was removed after this round: checkpoint and restore invocations are
+    unbounded again, since killing one partway cannot be undone.
 
 Without the flag, CUDA checkpoints are exactly as upstream's: one unbounded
 `--toggle` per process, parallel unless `--cuda-checkpoint-sequential`, toggled
@@ -368,9 +371,11 @@ to look at them:
     sentry quotes a refusal's reason and the shim's last log lines in its
     error. In IMAGE mode, a missing interposer file is not added to
     `/etc/ld.so.preload`.
--   **Bounded `cuda-checkpoint`.** With the interposer, every invocation has a
-    deadline (`--cuda-checkpoint-timeout`); one still running is killed, and
-    the operation fails.
+-   **Bounded `cuda-checkpoint`.** With the interposer, every invocation that
+    runs before GPU state is saved has a fixed 2-minute deadline; one still
+    running is killed, and the checkpoint fails with the application
+    running. (This replaced a `--cuda-checkpoint-timeout` flag that bounded
+    checkpoint and restore too.)
 -   **Opt-in only.** Without the interposer, checkpoints are exactly as
     upstream's: no job, one `--toggle` per process, no blocker inventory.
 -   **Resolvers tracked.** A lookup returning an unknown `cuGetProcAddress`

@@ -259,9 +259,10 @@ their children's environment), wraps each GPU container's command in
 and drives the interposer automatically during `runsc checkpoint` and `runsc
 restore`. Jobs must be checkpointed sequentially, which `runsc checkpoint` then
 does automatically; it also uses the same `cuda-checkpoint` binary unless given
-its own `--cuda-checkpoint-path`. Each `cuda-checkpoint` invocation is bounded
-by `--cuda-checkpoint-timeout` (10 minutes by default). CUDA processes started
-with `runsc exec` are not part of the job.
+its own `--cuda-checkpoint-path`. A `cuda-checkpoint` invocation that runs
+before any GPU state is saved and does not finish within 2 minutes is killed,
+and the checkpoint fails with the application still running. CUDA processes
+started with `runsc exec` are not part of the job.
 
 This requires driver R610, the release it has been validated on, and works
 when restoring onto *different* GPUs than the workload was checkpointed on. On
