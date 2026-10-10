@@ -1,8 +1,8 @@
 # Multi-GPU CUDA checkpoint/restore: status and reviewer reply
 
-Status as of 2026-10-08. Branch `luis/multicast-xgpu-upstream`, merged with
-upstream master at `c66c2773d`. This is a dev-only file: drop it before
-opening upstream PRs.
+Status as of 2026-10-10. Branch `luis/multicast-xgpu-upstream`, merged with
+upstream master at `2834ad887` (`dc93d60ef`). This is a dev-only file: drop
+it before opening upstream PRs.
 
 ## Summary
 
@@ -21,10 +21,82 @@ opening upstream PRs.
     All three are fixed, with the small sentry items, and every check that
     runs on a CPU passes (below). GPU validation of the new binary is the
     next round.
+-   **GPU round on the merged binary (`dc93d60ef`): everything passes**
+    (below): the full shim suite, the 15 engine cells, the 3 without
+    `CAP_SYS_PTRACE`, the three Qwen2.5-72B cells, the tokens/s A/B, and a
+    new largest-model run, Qwen3-235B-A22B (bf16, 490 GB image) at TP=8 on
+    both engines, with throughput under load before and after restore.
 -   **Scope for the first merge:** validated on R610 only. runsc enables the
     interposer and the job on R610 or newer (an R615-opt-in flag was added
     this round and then removed), so keeping unvalidated releases off is up
     to the scheduler. R615 comes after the first version is merged.
+
+## GPU round on the merged binary (`dc93d60ef`, 2026-10-10)
+
+H100 ×8, 610.57.04. Every item in "For the GPU round" below, on one binary,
+with no Xid and the fabric `Completed/Success` after every phase.
+
+-   **Shim suite:** all 17 pass (abi gate mc refcount refuse mapwait silent
+    preload glibc rtres ipc orphan deadline reason optout torch-kernel
+    torch-symm). `glibc` loads on ubuntu:20.04, debian:11, rockylinux:8 and
+    centos:7. `rtres` now also covers a vendored copy
+    (`libcudart-1a2b3c4d.so.12`, set by `patchelf`) next to
+    `libcudart.so.13`: each caller reaches its own runtime. `refuse fabric`
+    skipped (no IMEX channel).
+-   **Engine cells:** all 15 pass, and so do the 3 without `CAP_SYS_PTRACE`
+    (`vllm_tp4`, `sglang_tp4_symm`, `sglang_tp4_nvls_xgpu`). Timings match
+    the last round (`vllm_tp2` 44x, `sglang_tp4_symm` 18x, `sglang_tp8`
+    9.5x).
+-   **Qwen2.5-72B:** `vllm_tp8_72b` 9.6x (checkpoint 60.9 s, 172 GB),
+    `sglang_tp8_72b` 5.6x (86.9 s, 169 GB), `vllm_tp4_72b_xgpu` 14.8x onto
+    GPUs 4-7.
+-   **Tokens/s A/B** (Qwen2.5-72B, vLLM TP=8, `--enforce-eager`, 512
+    prompts, 1024 in / 256 out, 64 concurrent, two boots each): output
+    816 / 805 tok/s without the interposer, 808 / 807 with it. The
+    difference (-0.4%) is smaller than the spread between boots (1.4%).
+
+### Largest model: Qwen3-235B-A22B-Instruct-2507, bf16, TP=8
+
+The largest open model that fits 8 × 80 GB in bf16 (438 GiB of weights, MoE).
+One cycle per engine: load test, sleep, checkpoint, restore, wake, identical
+output at temperature 0, the same load test again. Then the same image is
+restored a second time after `drop_caches`, as a restore from storage would
+be (the first restore reads an image the checkpoint just left in the page
+cache). Both **PASS**.
+
+| Step | vLLM 0.29.0 | SGLang 0.5.20 |
+| :--- | :--- | :--- |
+| Cold boot | 1049 s | 582 s |
+| Load before checkpoint (output tok/s, TPOT mean) | 2130, 27.2 ms | 2142, 24.3 ms |
+| Checkpoint (engine asleep) | 134 s, image 490 GB | 174 s, image 496 GB |
+| `cuda-checkpoint` lock and checkpoint | 45 s | 90 s |
+| Sentry memory save | 86 s (6.1 GB/s) | 79 s (6.7 GB/s) |
+| `runsc restore` returns (warm / cold cache) | 48 s / 79 s | 135 s / 82 s |
+| `cuda-checkpoint` restore toggle (warm / cold) | 87 s / 62 s | 72 s / 38 s |
+| First inference after restore (warm / cold) | 142 s / 148 s | 230 s / 141 s |
+| Speedup over cold boot (warm / cold) | 7.3x / 7.0x | 2.5x / 4.1x |
+| Load after restore (output tok/s, TPOT mean) | 2278, 25.3 ms | 2153, 24.2 ms |
+| Processes managed by the interposer | 10 | 10 |
+| Suspend / resume | 0.8 s / 1.5 s | 0.2 s / 0.8 s |
+
+Notes:
+
+-   Throughput after restore is at least what it was before (vLLM's +7% is
+    likely warm-up), so the rebuilt multicast and all-reduce paths run at
+    full speed.
+-   SGLang's warm restore was slower than its cold one (page loading at
+    3.9 GB/s, then 6.5 GB/s cold). The host then held about 1 TB of page
+    cache (the vLLM image, the SGLang image and the sentry's memory), so I
+    suspect reclaim during the warm restore. That is not verified; a rerun
+    with the cache dropped before the checkpoint would settle it.
+-   The cold boots read weights from the page cache, so the speedups are
+    conservative. vLLM's boot includes `torch.compile` and graph capture.
+-   Image and page loading now dominate (about 500 GB at 6-11 GB/s), along
+    with the sequential `cuda-checkpoint` calls (P2.5).
+-   Harness: `~/bench/bench.sh` gained `LOAD`, `LOAD_ONLY`, `COLD_RESTORE`,
+    `GPU_UTIL`, `MAX_LEN`, `gpu.csv`/`host.csv` sampling and the sentry's
+    timing lines in `summary.txt`. Logs: `/data/bench/overnight/` and
+    `/data/bench/runs/on-*`.
 
 ## Round after P0: processes that never checkpoint
 
@@ -232,7 +304,7 @@ Also passing on the final binary:
 
 ## Next
 
-1.  The GPU round on the new binary (list above).
+1.  ~~The GPU round on the new binary~~ done on `dc93d60ef` (above).
 2.  After the first merge: R615 (P2.4), then P1.
 
 ---
