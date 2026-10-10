@@ -89,9 +89,10 @@ native() {
 }
 
 # rtres: two CUDA runtimes in one process, each library linked against one and
-# loaded RTLD_LOCAL; then a runtime under a soname nothing could know.
+# loaded RTLD_LOCAL; then a runtime under a soname nothing could know, and one
+# renamed as wheels vendor it (libcudart-<hash>.so.N).
 rtres() {
-  local rts=(${MCSHIM_TEST_CUDART:-}) pairs=() f so
+  local rts=(${MCSHIM_TEST_CUDART:-}) pairs=() f so first
   if [ ${#rts[@]} -lt 2 ]; then
     echo "needs MCSHIM_TEST_CUDART"
     return 77
@@ -103,6 +104,7 @@ rtres() {
   }
   for f in "${rts[0]}" "${rts[1]}"; do
     so=$(objdump -p "$f" | awk '/SONAME/ {print $2}')
+    first=${first:-$so}
     cp "$f" "$W/rt/$so"
     rtlib "lib-$so.so" "$so"
     pairs+=("$W/rt/lib-$so.so:$W/rt/$so")
@@ -111,7 +113,14 @@ rtres() {
   cp "$W/rt/$so" "$W/rt/libcudart.so.99"
   patchelf --set-soname libcudart.so.99 "$W/rt/libcudart.so.99" || return 77
   rtlib lib-99.so libcudart.so.99
-  native rtres "$W/rt/lib-99.so:$W/rt/libcudart.so.99"
+  native rtres "$W/rt/lib-99.so:$W/rt/libcudart.so.99" || return 1
+  # A vendored copy of the first runtime, next to the other one (two majors,
+  # so the test can tell which runtime each caller reached).
+  f=libcudart-1a2b3c4d.so.${first##*.so.}
+  cp "$W/rt/$first" "$W/rt/$f"
+  patchelf --set-soname "$f" "$W/rt/$f" || return 77
+  rtlib lib-vendored.so "$f"
+  native rtres "$W/rt/lib-vendored.so:$W/rt/$f" "$W/rt/lib-$so.so:$W/rt/$so"
 }
 
 # sandboxed NAME ROOT SHIM ARGS...: runs ARGS under runsc with SHIM preloaded,
