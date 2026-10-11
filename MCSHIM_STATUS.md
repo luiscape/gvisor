@@ -512,3 +512,38 @@ to look at them:
 -   **Fabric allocations.** Measured on R610: `cuda-checkpoint` carries a
     process's fabric-capable allocations. Under `MCSHIM_ALLOW_FABRIC`, the
     gate still refuses while one is alive.
+
+<!-- numa2-raw:begin -->
+
+### NUMA policy rerun (raw, in progress)
+
+Unanalyzed output of `/data/bench/numa2/run.sh` (see its header). Times in s; reclaim columns are deltas over the cycle (pages, stalls, refaults); n1 peak is node 1 use above its start.
+
+| Engine | Policy | ckpt lock+ckpt | ckpt total | warm page load | warm toggle | warm first inf | cold page load | cold first inf | direct reclaim | alloc stalls | refaults | cold boot | n1 peak | result |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| sglang | preferred | 87 | 181.3 | 19 | 41 | 83.3 | 79 | 143.2 | 0 | 1 | 26560 | 579.4 | 506G | PASS |
+
+```
+[2026-10-11 16:56:28] START runsc=runsc version dc93d60ef9dd node0 free=989G file=0G, node1 free=995G file=0G
+[2026-10-11 16:57:47] numa2-sglang-preferred: start, node0 free=500G file=489G, node1 free=995G file=0G
+[2026-10-11 17:19:24] numa2-sglang-preferred: rc=0, end node0 free=504G file=483G, node1 free=989G file=6G
+    engine=sglang tp=8 gpus=0,1,2,3,4,5,6,7 restore-gpus=0,1,2,3,4,5,6,7 shim=1 sleep=1 runsc=dc93d60ef9dd pin=numactl --cpunodebind=0 --preferred=0 job=1 noptrace=0 ckpt_flags=none model=Qwen/Qwen3-2
+    cold boot 579.4s
+    load pre: n=512 c=64 in=1024 out=256 completed=512 output_tok/s=2138.3 total_tok/s=10691.6 req/s=8.3 ttft_ms mean/p99=1425.7/2396.5 tpot_ms mean/p99=24.3/29.7 itl_ms p99=24.7
+    checkpoint 181.3s image 496G
+    restore returned 18.7s
+    first inference after restore 83.3s
+    load post: n=512 c=64 in=1024 out=256 completed=512 output_tok/s=2157.1 total_tok/s=10785.8 req/s=8.4 ttft_ms mean/p99=1394.4/2244.6 tpot_ms mean/p99=24.2/29.3 itl_ms p99=24.1
+    cold restore returned 79.3s
+    cold first inference after restore 143.2s (speedup 4.0x)
+    sentry: 17:11:14 cuda-checkpoint lock+checkpoint on 10 processes took [1m27.167251838s]
+    sentry: 17:12:44 Async page saving completed in 1m28.894s (531613372416 bytes, 5980.290 MB/s); queue full for 1m26.218s (529958031360 bytes, 6146.739 MB/s)
+    sentry: 17:13:09 Async page loading completed in 18.519s (531613372416 bytes, 28707.034 MB/s); 0 waiters waited 0s~0s for 0 bytes
+    sentry: 17:13:51 cuda-checkpoint restore toggle on 10 processes took [41.47205483s]
+    sentry: 17:18:12 Async page loading completed in 1m19.016s (531613372416 bytes, 6727.915 MB/s); 0 waiters waited 0s~0s for 0 bytes
+    sentry: 17:18:53 cuda-checkpoint restore toggle on 10 processes took [40.606863059s]
+    RESULT: PASS (speedup to first inference 6.9x)
+[2026-10-11 17:19:24]   vmstat deltas: pgscan_direct=0 allocstall_normal=0 allocstall_movable=1 workingset_refault_file=26560 pgscan_kswapd=130959731 
+```
+
+<!-- numa2-raw:end -->
