@@ -522,6 +522,7 @@ Unanalyzed output of `/data/bench/numa2/run.sh` (see its header). Times in s; re
 | Engine | Policy | ckpt lock+ckpt | ckpt total | warm page load | warm toggle | warm first inf | cold page load | cold first inf | direct reclaim | alloc stalls | refaults | cold boot | n1 peak | result |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
 | sglang | preferred | 87 | 181.3 | 19 | 41 | 83.3 | 79 | 143.2 | 0 | 1 | 26560 | 579.4 | 506G | PASS |
+| sglang | interleave | 53 | 149.5 | 24 | 40 | 74.5 | 88 | 133.7 | 0 | 3 | 5665182 | 598.7 | 903G | PASS |
 
 ```
 [2026-10-11 16:56:28] START runsc=runsc version dc93d60ef9dd node0 free=989G file=0G, node1 free=995G file=0G
@@ -544,6 +545,25 @@ Unanalyzed output of `/data/bench/numa2/run.sh` (see its header). Times in s; re
     sentry: 17:18:53 cuda-checkpoint restore toggle on 10 processes took [40.606863059s]
     RESULT: PASS (speedup to first inference 6.9x)
 [2026-10-11 17:19:24]   vmstat deltas: pgscan_direct=0 allocstall_normal=0 allocstall_movable=1 workingset_refault_file=26560 pgscan_kswapd=130959731 
+[2026-10-11 17:21:32] numa2-sglang-interleave: start, node0 free=500G file=489G, node1 free=995G file=0G
+[2026-10-11 17:43:00] numa2-sglang-interleave: rc=0, end node0 free=741G file=247G, node1 free=747G file=247G
+    engine=sglang tp=8 gpus=0,1,2,3,4,5,6,7 restore-gpus=0,1,2,3,4,5,6,7 shim=1 sleep=1 runsc=dc93d60ef9dd pin=numactl --cpunodebind=0 --interleave=all job=1 noptrace=0 ckpt_flags=none model=Qwen/Qwen
+    cold boot 598.7s
+    load pre: n=512 c=64 in=1024 out=256 completed=512 output_tok/s=2138.2 total_tok/s=10691.4 req/s=8.3 ttft_ms mean/p99=1422.5/2399.2 tpot_ms mean/p99=24.3/29.8 itl_ms p99=25
+    checkpoint 149.5s image 495G
+    restore returned 24.3s
+    first inference after restore 74.5s
+    load post: n=512 c=64 in=1024 out=256 completed=512 output_tok/s=2157 total_tok/s=10785.3 req/s=8.4 ttft_ms mean/p99=1390.4/2274.5 tpot_ms mean/p99=24.2/30 itl_ms p99=24.9
+    cold restore returned 87.9s
+    cold first inference after restore 133.7s (speedup 4.4x)
+    sentry: 17:34:46 cuda-checkpoint lock+checkpoint on 10 processes took [52.527013513s]
+    sentry: 17:36:20 Async page saving completed in 1m33.765s (530799964160 bytes, 5660.988 MB/s); queue full for 1m31.018s (528977580032 bytes, 5811.781 MB/s)
+    sentry: 17:36:52 Async page loading completed in 24.112s (530799964160 bytes, 22014.220 MB/s); 0 waiters waited 0s~0s for 0 bytes
+    sentry: 17:37:31 cuda-checkpoint restore toggle on 10 processes took [39.656319608s]
+    sentry: 17:42:06 Async page loading completed in 1m27.638s (530799964160 bytes, 6056.728 MB/s); 0 waiters waited 0s~0s for 0 bytes
+    sentry: 17:42:41 cuda-checkpoint restore toggle on 10 processes took [35.051086266s]
+    RESULT: PASS (speedup to first inference 8.0x)
+[2026-10-11 17:43:00]   vmstat deltas: pgscan_direct=0 allocstall_normal=0 allocstall_movable=3 workingset_refault_file=5665182 pgscan_kswapd=21915783 
 ```
 
 <!-- numa2-raw:end -->
