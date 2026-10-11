@@ -624,6 +624,14 @@ Unanalyzed output of `/data/bench/numa2/run.sh` (see its header). Times in s; re
     sentry: 19:26:25 cuda-checkpoint restore toggle on 10 processes took [51.635819189s]
     RESULT: PASS (speedup to first inference 6.9x)
 [2026-10-11 19:26:51]   vmstat deltas: pgscan_direct=830333 allocstall_normal=808 allocstall_movable=0 workingset_refault_file=41821 pgscan_kswapd=37376400 
+[2026-10-11 19:27:47] better policy: interleave (score preferred=581.3 interleave=509.6)
+[2026-10-11 19:27:47] CELLS with NUMA_MEM=interleave
+    vllm_tp2 | RESULT: PASS (speedup to first inference 48.6x) | devmap=0 0xfd=8 | checkpoint 9.4s image 12G|restore returned 1.3s|first inference after restore 5.2s|RESULT: PASS (speedup to first inference 48.6x)
+    sglang_tp4_symm | RESULT: PASS (speedup to first inference 20.2x) | devmap=0 0xfd=6 | checkpoint 16.9s image 17G|restore returned 1.9s|first inference after restore 10.1s|RESULT: PASS (speedup to first inference 20.2x)
+    vllm_tp4_72b_xgpu | RESULT: PASS (speedup to first inference 15.5x) | devmap=1 0xfd=8 | checkpoint 42.0s image 154G|restore returned 5.9s|first inference after restore 25.2s|RESULT: PASS (speedup to first inference 15.5x)
+    sglang_tp8_72b | RESULT: PASS (speedup to first inference 7.1x) | devmap=0 0xfd=4 | checkpoint 72.5s image 169G|restore returned 7.9s|first inference after restore 37.4s|RESULT: PASS (speedup to first inference 7.1x)
+    GATE_DONE
+[2026-10-11 19:51:34] ALL DONE
 ```
 
 <!-- numa2-raw:end -->
