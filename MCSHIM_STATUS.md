@@ -84,11 +84,9 @@ Notes:
 -   Throughput after restore is at least what it was before (vLLM's +7% is
     likely warm-up), so the rebuilt multicast and all-reduce paths run at
     full speed.
--   SGLang's warm restore was slower than its cold one (page loading at
-    3.9 GB/s, then 6.5 GB/s cold). The host then held about 1 TB of page
-    cache (the vLLM image, the SGLang image and the sentry's memory), so I
-    suspect reclaim during the warm restore. That is not verified; a rerun
-    with the cache dropped before the checkpoint would settle it.
+-   SGLang's warm restore was slower than its cold one. That was memory
+    reclaim on NUMA node 0 caused by the harness's `--membind=0`, not
+    SGLang or the interposer: see the NUMA rerun below.
 -   The cold boots read weights from the page cache, so the speedups are
     conservative. vLLM's boot includes `torch.compile` and graph capture.
 -   Image and page loading now dominate (about 500 GB at 6-11 GB/s), along
@@ -97,6 +95,65 @@ Notes:
     `GPU_UTIL`, `MAX_LEN`, `gpu.csv`/`host.csv` sampling and the sentry's
     timing lines in `summary.txt`. Logs: `/data/bench/overnight/` and
     `/data/bench/runs/on-*`.
+
+### NUMA rerun: the slow SGLang restore was reclaim on node 0
+
+`bench.sh` runs the sandbox, `runsc checkpoint` and `runsc restore` under
+`numactl --cpunodebind=N --membind=N`. Node 0 has 1 TB; one 235B SGLang cycle
+needs more than that on it: about 470 GB of pinned CPU weight backup while
+asleep, the 496 GB image in the page cache, then a new 500 GB sentry. Strict
+binding cannot spill to node 1 (also 1 TB, idle), so the kernel reclaims on
+node 0 instead, in the middle of the checkpoint and the restore.
+
+Three SGLang TP=8 cycles of Qwen3-235B, settings as in the table above
+(`/data/bench/numa/run.sh`). "Pre-filled" reads the vLLM image into node 0's
+page cache first, which is the state the original run started in. All three
+**PASS** with identical output and the same throughput before and after
+restore (2127-2169 output tok/s).
+
+| | No pinning, pre-filled | Pinned, pre-filled (original) | Pinned, clean |
+| :--- | :--- | :--- | :--- |
+| `cuda-checkpoint` lock and checkpoint | 49 s | 94 s | 126 s |
+| Checkpoint total | 138 s | 173 s | 215 s |
+| Page loading on restore | 18 s (29 GB/s) | 121 s (4.4 GB/s) | 71 s (7.5 GB/s) |
+| `cuda-checkpoint` restore toggle | 36 s | 73 s | 59 s |
+| First inference after restore | **65 s** | 219 s | 163 s |
+| Cold-cache restore: page loading / first inference | 122 s / 170 s | 81 s / 144 s | 81 s / 155 s |
+| Direct reclaim over the cycle (pages scanned, alloc stalls) | 0, 4 | 38.0 M, 579 k | 2.3 M, 36 k |
+| File refaults over the cycle | 1.2 M | 106 M | 58 M |
+| Cold boot | 773 s | 580 s | 583 s |
+
+What this shows:
+
+-   **Confirmed.** Without strict binding there is no direct reclaim, the
+    warm restore reads the image from the page cache at 29 GB/s, and the
+    first inference comes 3.4x sooner (65 s against 219 s; 11.8x faster than
+    a cold boot). The original run's 230 s reproduces (219 s) when pinned
+    with the same pre-fill.
+-   **It is not only the restore.** `cuda-checkpoint`'s lock and checkpoint
+    (49 s against 94-126 s) and its restore toggle (36 s against 59-73 s)
+    slow down under the same pressure: both move hundreds of GB between the
+    GPUs and host memory. So the earlier "SGLang's `cuda-checkpoint` is
+    twice vLLM's" (90 s against 45 s) was also the harness.
+-   **Pinned, clean still reclaims.** Even from empty caches, node 0
+    overflows during one cycle (kswapd scanned 199 M pages). Dropping caches
+    is not a fix.
+-   **But removing pinning altogether costs elsewhere.** Unpinned, the cold
+    boot is 33% slower and the cold-cache restore reads at 4.4 GB/s instead
+    of 6.5 GB/s, likely because the threads then run on both sockets, far
+    from GPUs 0-3 and the memory. Not verified.
+-   **Not a gVisor problem,** but a deployment one: anything that pins a
+    sandbox with a large host footprint to one node with strict binding
+    will hit this. The likely best setting is `--cpunodebind` with a
+    preferred (not strict) memory policy, or interleaving across both nodes
+    for TP=8 (its GPUs span both). Untested.
+-   **Earlier numbers.** The other cells and the 72B runs have far smaller
+    host footprints (under 175 GB) and showed no such effect; the vLLM 235B
+    cycle fit in node 0 by a small margin. The SGLang 235B row in the table
+    above (2.5x) should be read as the pinned-harness number.
+
+Next: rerun the 235B cycles with `numactl --cpunodebind=N --preferred=N`
+and with `--interleave=all`, and make the better one `bench.sh`'s default.
 
 ## Round after P0: processes that never checkpoint
 
@@ -455,66 +512,3 @@ to look at them:
 -   **Fabric allocations.** Measured on R610: `cuda-checkpoint` carries a
     process's fabric-capable allocations. Under `MCSHIM_ALLOW_FABRIC`, the
     gate still refuses while one is alive.
-
-### NUMA rerun of the SGLang 235B restore (raw, 2026-10-11)
-
-Unanalyzed output of `/data/bench/numa/run.sh` (see its header).
-
-```
-[2026-10-11 02:01:48] START runsc=runsc version dc93d60ef9dd node0 free=387G file=600G shmem=0G, node1 free=994G file=0G shmem=0G
-[2026-10-11 02:04:20] numa-off-prefill: start, node0 free=500G file=489G shmem=0G, node1 free=995G file=0G shmem=0G
-[2026-10-11 02:29:00] numa-off-prefill: rc=0, end node0 free=720G file=268G shmem=0G, node1 free=767G file=227G shmem=0G
-    cold boot 773.2s
-    load pre: n=512 c=64 in=1024 out=256 completed=512 output_tok/s=2127.2 total_tok/s=10636.3 req/s=8.3 ttft_ms mean/p99=1430/2432.4 tpot_ms mean/p99=24.4/30 itl_ms p99=26.8
-    checkpoint 138.2s image 495G
-    restore returned 18.5s
-    first inference after restore 65.3s
-    load post: n=512 c=64 in=1024 out=256 completed=512 output_tok/s=2155.9 total_tok/s=10779.8 req/s=8.4 ttft_ms mean/p99=1400.1/2296.9 tpot_ms mean/p99=24.1/29.1 itl_ms p99=24.6
-    cold restore returned 122.3s
-    cold first inference after restore 169.9s (speedup 4.5x)
-    sentry: 02:20:31 cuda-checkpoint lock+checkpoint on 10 processes took [49.153393367s]
-    sentry: 02:21:57 Async page saving completed in 1m25.462s (530825584640 bytes, 6211.219 MB/s); queue full for 1m22.131s (528803446784 bytes, 6438.546 MB/s)
-    sentry: 02:22:22 Async page loading completed in 18.225s (530825584640 bytes, 29125.925 MB/s); 0 waiters waited 0s~0s for 0 bytes
-    sentry: 02:22:58 cuda-checkpoint restore toggle on 10 processes took [35.948195721s]
-    sentry: 02:28:05 Async page loading completed in 2m1.967s (530825584640 bytes, 4352.204 MB/s); 0 waiters waited 0s~0s for 0 bytes
-    sentry: 02:28:41 cuda-checkpoint restore toggle on 10 processes took [36.521702346s]
-    RESULT: PASS (speedup to first inference 11.8x)
-[2026-10-11 02:29:00]   vmstat deltas over the run: pgscan_kswapd=7126339 pgscan_direct=0 pgsteal_kswapd=7115243 pgsteal_direct=0 allocstall_normal=0 allocstall_movable=4 workingset_refault_file=1192066 pgmajfault=287434 =0 
-[2026-10-11 02:31:06] numa-pin-prefill: start, node0 free=500G file=489G shmem=0G, node1 free=995G file=0G shmem=0G
-[2026-10-11 02:55:12] numa-pin-prefill: rc=0, end node0 free=523G file=464G shmem=0G, node1 free=995G file=0G shmem=0G
-    cold boot 579.6s
-    load pre: n=512 c=64 in=1024 out=256 completed=512 output_tok/s=2138.7 total_tok/s=10693.8 req/s=8.3 ttft_ms mean/p99=1416.3/2381 tpot_ms mean/p99=24.3/29.7 itl_ms p99=24.7
-    checkpoint 173.3s image 495G
-    restore returned 121.6s
-    first inference after restore 218.8s
-    load post: n=512 c=64 in=1024 out=256 completed=512 output_tok/s=2168.5 total_tok/s=10842.5 req/s=8.4 ttft_ms mean/p99=1386.6/2240.7 tpot_ms mean/p99=24/29.1 itl_ms p99=24.1
-    cold restore returned 80.9s
-    cold first inference after restore 143.6s (speedup 4.0x)
-    sentry: 02:44:41 cuda-checkpoint lock+checkpoint on 10 processes took [1m33.587405384s]
-    sentry: 02:45:56 Async page saving completed in 1m14.527s (530952626176 bytes, 7124.317 MB/s); queue full for 1m11.926s (529257758720 bytes, 7358.376 MB/s)
-    sentry: 02:48:04 Async page loading completed in 2m1.44s (530952626176 bytes, 4372.131 MB/s); 0 waiters waited 0s~0s for 0 bytes
-    sentry: 02:49:18 cuda-checkpoint restore toggle on 10 processes took [1m13.115533795s]
-    sentry: 02:54:02 Async page loading completed in 1m20.645s (530952626176 bytes, 6583.836 MB/s); 0 waiters waited 0s~0s for 0 bytes
-    sentry: 02:54:41 cuda-checkpoint restore toggle on 10 processes took [39.617406236s]
-    RESULT: PASS (speedup to first inference 2.6x)
-[2026-10-11 02:55:12]   vmstat deltas over the run: pgscan_kswapd=364684281 pgscan_direct=38012597 pgsteal_kswapd=364270258 pgsteal_direct=38009654 allocstall_normal=273626 allocstall_movable=305393 workingset_refault_file=106397912 pgmajfault=296160 =0 
-[2026-10-11 02:55:57] numa-pin-clean: start, node0 free=990G file=0G shmem=0G, node1 free=995G file=0G shmem=0G
-[2026-10-11 03:19:13] numa-pin-clean: rc=0, end node0 free=526G file=462G shmem=0G, node1 free=995G file=0G shmem=0G
-    cold boot 582.6s
-    load pre: n=512 c=64 in=1024 out=256 completed=512 output_tok/s=2134.8 total_tok/s=10674.3 req/s=8.3 ttft_ms mean/p99=1417.4/2389 tpot_ms mean/p99=24.4/29.7 itl_ms p99=24.9
-    checkpoint 214.7s image 496G
-    restore returned 70.8s
-    first inference after restore 162.7s
-    load post: n=512 c=64 in=1024 out=256 completed=512 output_tok/s=2158.6 total_tok/s=10793.2 req/s=8.4 ttft_ms mean/p99=1383/2230.2 tpot_ms mean/p99=24.2/29.2 itl_ms p99=24.3
-    cold restore returned 81.6s
-    cold first inference after restore 155.3s (speedup 3.7x)
-    sentry: 03:09:49 cuda-checkpoint lock+checkpoint on 10 processes took [2m6.486161577s]
-    sentry: 03:11:12 Async page saving completed in 1m22.273s (531577745408 bytes, 6461.179 MB/s); queue full for 1m19.209s (529552986112 bytes, 6685.508 MB/s)
-    sentry: 03:12:30 Async page loading completed in 1m10.638s (531577745408 bytes, 7525.380 MB/s); 0 waiters waited 0s~0s for 0 bytes
-    sentry: 03:13:29 cuda-checkpoint restore toggle on 10 processes took [59.369408878s]
-    sentry: 03:17:52 Async page loading completed in 1m21.287s (531577745408 bytes, 6539.512 MB/s); 0 waiters waited 0s~0s for 0 bytes
-    sentry: 03:18:34 cuda-checkpoint restore toggle on 10 processes took [42.101725136s]
-    RESULT: PASS (speedup to first inference 3.5x)
-[2026-10-11 03:19:13]   vmstat deltas over the run: pgscan_kswapd=199121557 pgscan_direct=2349289 pgsteal_kswapd=199077434 pgsteal_direct=2348933 allocstall_normal=390 allocstall_movable=35640 workingset_refault_file=57850600 pgmajfault=297011 =0 
-[2026-10-11 03:19:58] ALL DONE
-```
