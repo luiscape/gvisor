@@ -237,9 +237,9 @@ resolver or driver entry point that only the shim defines (no runtime or
 libcuda loaded globally, or loaded `RTLD_LOCAL` by another library) now
 returns NULL, as without the shim. Before, it returned the shim's wrapper.
 
-- **R19.** runsc no longer carries the interposer. The operator installs
-  `mcshim.so` on the host and passes its path in
-  `--cuda-multicast-shim-path`. That file must stay available at the same
+- **R19.** runsc no longer carries the interposer. The operator provides
+  `mcshim.so` inside each GPU container, in the image or through a mount,
+  at the path given in `--cuda-multicast-shim-path`. That file must stay available at the same
   path for restores, so use a versioned path per release. There is no
   version handshake between the interposer and the sentry yet (N22).
 
