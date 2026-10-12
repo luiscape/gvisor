@@ -107,43 +107,174 @@ const (
 	cudaShimSuspendedKey = "cuda-multicast-shim-suspended"
 )
 
-// cudaShimPathOp builds a PathOperation for path within tg's mount namespace.
-// The returned cleanup must be called by the caller.
-func cudaShimPathOp(sctx context.Context, tg *kernel.ThreadGroup, path string) (context.Context, *vfs.PathOperation, func(), bool) {
+// cudaShimCreds returns the credentials to use for interposer marker file
+// operations. The markers are sentry-managed control state, so full privilege
+// is appropriate and avoids depending on the container's user; cudaShimFS
+// keeps that privilege inside the control directory.
+func cudaShimCreds(k *kernel.Kernel) *auth.Credentials {
+	return auth.NewRootCredentials(k.RootUserNamespace())
+}
+
+// cudaShimFS is the control directory as one mount namespace sees it.
+//
+// The directory is world-writable, in world-writable /tmp, and the sentry acts
+// in it with root credentials, so any container user can plant things there:
+// the directory itself as a symlink (to /etc, or a writable host mount), or a
+// symlink, hard link or FIFO in place of a marker or ack. cudaShimFS resolves
+// the directory once, without following a symlink at its last component, and
+// refuses it unless it is a directory; reaches every file as a single
+// component relative to it, without following a final symlink; never opens
+// anything but a regular file, and opens non-blocking, so a FIFO cannot stall
+// the checkpoint. What a container user can still do is forge or remove
+// markers and acks, which only fails its own container's checkpoint.
+type cudaShimFS struct {
+	ctx   context.Context
+	vfs   *vfs.VirtualFilesystem
+	creds *auth.Credentials
+	root  vfs.VirtualDentry
+	dir   vfs.VirtualDentry
+	done  func()
+}
+
+// newCudaShimFS returns the control directory under root, mntns's root. The
+// caller must call release.
+func newCudaShimFS(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, mntns *vfs.MountNamespace, root vfs.VirtualDentry) (*cudaShimFS, error) {
+	// Unlinking checks for mount points in the context's mount namespace.
+	ctx = vfs.WithMountNamespace(vfs.WithRoot(ctx, root), mntns)
+	dir, err := vfsObj.GetDentryAt(ctx, creds, &vfs.PathOperation{
+		Root:  root,
+		Start: root,
+		Path:  fspath.Parse(cudaShimDir),
+	}, &vfs.GetDentryOptions{CheckSearchable: true})
+	if err != nil {
+		return nil, fmt.Errorf("multicast interposer: control directory %s: %w", cudaShimDir, err)
+	}
+	return &cudaShimFS{ctx: ctx, vfs: vfsObj, creds: creds, root: root, dir: dir}, nil
+}
+
+// openCudaShimFS returns the control directory in tg's mount namespace, or
+// ok false if tg has exited. The caller must call release.
+func openCudaShimFS(sctx context.Context, k *kernel.Kernel, tg *kernel.ThreadGroup) (fs *cudaShimFS, ok bool, err error) {
 	leader := tg.Leader()
 	if leader == nil {
-		return nil, nil, nil, false
+		return nil, false, nil
 	}
 	mntns := leader.MountNamespace()
 	if mntns == nil || !mntns.TryIncRef() {
-		return nil, nil, nil, false
+		return nil, false, nil
 	}
 	root := mntns.Root(sctx)
-	ctx := vfs.WithRoot(sctx, root)
-	cleanup := func() {
-		root.DecRef(ctx)
-		mntns.DecRef(ctx)
+	fs, err = newCudaShimFS(sctx, k.VFS(), cudaShimCreds(k), mntns, root)
+	if err != nil {
+		root.DecRef(sctx)
+		mntns.DecRef(sctx)
+		return nil, true, err
 	}
-	pop := &vfs.PathOperation{
-		Root:  root,
-		Start: root,
-		Path:  fspath.Parse(path),
+	fs.done = func() {
+		root.DecRef(sctx)
+		mntns.DecRef(sctx)
 	}
-	return ctx, pop, cleanup, true
+	return fs, true, nil
 }
 
-// cudaShimCreds returns the credentials to use for interposer marker file
-// operations. The markers are sentry-managed control state, so full privilege
-// is appropriate and avoids depending on the container's user.
-func cudaShimCreds(k *kernel.Kernel) *auth.Credentials {
-	return auth.NewRootCredentials(k.RootUserNamespace())
+func (fs *cudaShimFS) release() {
+	fs.dir.DecRef(fs.ctx)
+	if fs.done != nil {
+		fs.done()
+	}
+}
+
+// pop returns a PathOperation for name, a single path component, in the
+// directory. It does not follow a final symlink.
+func (fs *cudaShimFS) pop(name string) *vfs.PathOperation {
+	return &vfs.PathOperation{Root: fs.root, Start: fs.dir, Path: fspath.Parse(name)}
+}
+
+// open opens name, which must be a regular file with a single link, with
+// flags (plus O_NOFOLLOW and O_NONBLOCK).
+func (fs *cudaShimFS) open(name string, flags uint32, mode linux.FileMode) (*vfs.FileDescription, error) {
+	fd, err := fs.vfs.OpenAt(fs.ctx, fs.creds, fs.pop(name), &vfs.OpenOptions{
+		Flags: flags | linux.O_NOFOLLOW | linux.O_NONBLOCK,
+		Mode:  mode,
+	})
+	if err != nil {
+		return nil, err
+	}
+	stat, err := fd.Stat(fs.ctx, vfs.StatOptions{Mask: linux.STATX_TYPE | linux.STATX_NLINK})
+	switch {
+	case err != nil:
+	case stat.Mode&linux.S_IFMT != linux.S_IFREG:
+		err = fmt.Errorf("not a regular file (mode %#o)", stat.Mode)
+	case stat.Nlink != 1:
+		// A hard link to a file elsewhere (whose contents the sentry would
+		// otherwise quote in its error).
+		err = fmt.Errorf("has %d links", stat.Nlink)
+	}
+	if err != nil {
+		fd.DecRef(fs.ctx)
+		return nil, err
+	}
+	return fd, nil
+}
+
+// create creates name, or leaves it if it is already a regular file.
+func (fs *cudaShimFS) create(name string) error {
+	fd, err := fs.open(name, linux.O_CREAT|linux.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	fd.DecRef(fs.ctx)
+	return nil
+}
+
+// remove removes name; it is not an error if it does not exist.
+func (fs *cudaShimFS) remove(name string) error {
+	if err := fs.vfs.UnlinkAt(fs.ctx, fs.creds, fs.pop(name)); err != nil && !linuxerr.Equals(linuxerr.ENOENT, err) {
+		return err
+	}
+	return nil
+}
+
+// exists returns whether name exists (as anything).
+func (fs *cudaShimFS) exists(name string) bool {
+	_, err := fs.vfs.StatAt(fs.ctx, fs.creds, fs.pop(name), &vfs.StatOptions{})
+	return err == nil
+}
+
+// readTail returns at most limit bytes from the end of name, or "" if it is
+// not a regular file it can read.
+func (fs *cudaShimFS) readTail(name string, limit int64) string {
+	fd, err := fs.open(name, linux.O_RDONLY, 0)
+	if err != nil {
+		return ""
+	}
+	defer fd.DecRef(fs.ctx)
+	stat, err := fd.Stat(fs.ctx, vfs.StatOptions{Mask: linux.STATX_SIZE})
+	if err != nil {
+		return ""
+	}
+	off := max(int64(stat.Size)-limit, 0)
+	buf := make([]byte, int64(stat.Size)-off)
+	n, _ := fd.PRead(fs.ctx, usermem.BytesIOSequence(buf), off, vfs.ReadOptions{})
+	return string(buf[:n])
+}
+
+// withCudaShimFS calls f with tg's control directory. It returns false if tg
+// has exited, and an error if the directory is not usable.
+func withCudaShimFS(sctx context.Context, k *kernel.Kernel, tg *kernel.ThreadGroup, f func(fs *cudaShimFS)) (bool, error) {
+	fs, ok, err := openCudaShimFS(sctx, k, tg)
+	if !ok || err != nil {
+		return ok, err
+	}
+	defer fs.release()
+	f(fs)
+	return true, nil
 }
 
 // cudaShimSetMarker creates (set) or removes (clear) the suspend marker in
 // every distinct mount namespace among cudaProcs. Ranks of a job usually share
 // one namespace, in which case this touches the file once.
 func cudaShimSetMarker(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, marker string, set bool) error {
-	creds := cudaShimCreds(k)
 	path := cudaShimDir + "/" + marker
 	seen := make(map[*vfs.MountNamespace]bool)
 	var done bool
@@ -158,27 +289,20 @@ func cudaShimSetMarker(sctx context.Context, k *kernel.Kernel, cudaProcs []*kern
 			}
 			seen[mntns] = true
 		}
-		ctx, pop, cleanup, ok := cudaShimPathOp(sctx, tg, path)
+		var err error
+		ok, derr := withCudaShimFS(sctx, k, tg, func(fs *cudaShimFS) {
+			if set {
+				err = fs.create(marker)
+			} else {
+				err = fs.remove(marker)
+			}
+		})
+		if derr != nil {
+			err = derr
+		}
 		if !ok {
 			continue
 		}
-		var err error
-		if set {
-			var fd *vfs.FileDescription
-			fd, err = k.VFS().OpenAt(ctx, creds, pop, &vfs.OpenOptions{
-				Flags: linux.O_CREAT | linux.O_WRONLY,
-				Mode:  0666,
-			})
-			if err == nil {
-				fd.DecRef(ctx)
-			}
-		} else {
-			err = k.VFS().UnlinkAt(ctx, creds, pop)
-			if linuxerr.Equals(linuxerr.ENOENT, err) {
-				err = nil
-			}
-		}
-		cleanup()
 		if err != nil {
 			return fmt.Errorf("multicast interposer: %s marker %q: %w", markerVerb(set), path, err)
 		}
@@ -200,7 +324,6 @@ func markerVerb(set bool) string {
 // cudaShimWaitAcks waits until every process in cudaProcs has written its
 // acknowledgement file for the given prefix ("suspended" or "resumed").
 func cudaShimWaitAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, prefix string) error {
-	creds := cudaShimCreds(k)
 	deadline := time.Now().Add(cudaShimAckTimeout)
 	pending := make(map[*kernel.ThreadGroup]bool, len(cudaProcs))
 	for _, tg := range cudaProcs {
@@ -210,34 +333,31 @@ func cudaShimWaitAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kerne
 		for tg := range pending {
 			// The interposer names its ack after getpid(), which is the
 			// same value gVisor passes to cuda-checkpoint as --pid.
-			path := fmt.Sprintf("%s/%s.%d", cudaShimDir, prefix, tg.ID())
-			ctx, pop, cleanup, ok := cudaShimPathOp(sctx, tg, path)
-			if !ok {
+			var acked, failed bool
+			var detail string
+			ok, err := withCudaShimFS(sctx, k, tg, func(fs *cudaShimFS) {
+				acked = fs.exists(fmt.Sprintf("%s.%d", prefix, tg.ID()))
+				// A failed transition acks with error.<pid> instead. Fail
+				// fast: without this, a shim-side failure surfaces as this
+				// loop's full timeout. (The sentry removes stale acks
+				// before requesting each transition -- see
+				// cudaShimClearAcks -- so an error here is from the
+				// transition being waited on.)
+				if !acked && fs.exists(fmt.Sprintf("error.%d", tg.ID())) {
+					failed = true
+					detail = cudaShimErrorDetail(fs, tg)
+				}
+			})
+			switch {
+			case !ok:
 				// The process exited; it cannot hold multicast state.
 				delete(pending, tg)
-				continue
-			}
-			_, err := k.VFS().StatAt(ctx, creds, pop, &vfs.StatOptions{})
-			cleanup()
-			if err == nil {
+			case err != nil:
+				return err
+			case acked:
 				delete(pending, tg)
-				continue
-			}
-			// A failed transition acks with error.<pid> instead. Fail
-			// fast: without this, a shim-side failure surfaces as this
-			// loop's full timeout. (The sentry removes stale acks before
-			// requesting each transition -- see cudaShimClearAcks -- so an
-			// error here is from the transition being waited on.)
-			errPath := fmt.Sprintf("%s/error.%d", cudaShimDir, tg.ID())
-			ctx, pop, cleanup, ok = cudaShimPathOp(sctx, tg, errPath)
-			if !ok {
-				delete(pending, tg)
-				continue
-			}
-			_, err = k.VFS().StatAt(ctx, creds, pop, &vfs.StatOptions{})
-			cleanup()
-			if err == nil {
-				return fmt.Errorf("multicast interposer: process %d reported an error during %q: %s", tg.ID(), prefix, cudaShimErrorDetail(sctx, k, tg))
+			case failed:
+				return fmt.Errorf("multicast interposer: process %d reported an error during %q: %s", tg.ID(), prefix, detail)
 			}
 		}
 		if len(pending) == 0 {
@@ -257,12 +377,12 @@ func cudaShimWaitAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kerne
 
 // cudaShimErrorDetail describes the error tg reported: the reason in its
 // error.<pid> ack, and its last lines in the interposer's default log.
-func cudaShimErrorDetail(sctx context.Context, k *kernel.Kernel, tg *kernel.ThreadGroup) string {
-	reason := strings.TrimSpace(cudaShimReadTail(sctx, k, tg, fmt.Sprintf("%s/error.%d", cudaShimDir, tg.ID()), 512))
+func cudaShimErrorDetail(fs *cudaShimFS, tg *kernel.ThreadGroup) string {
+	reason := strings.TrimSpace(fs.readTail(fmt.Sprintf("error.%d", tg.ID()), 512))
 	detail := fmt.Sprintf("%q", reason)
 	var lines []string
 	tag := fmt.Sprintf(" pid=%d] ", tg.ID())
-	for _, l := range strings.Split(cudaShimReadTail(sctx, k, tg, cudaShimDir+"/mcshim.log", 64<<10), "\n") {
+	for _, l := range strings.Split(fs.readTail("mcshim.log", 64<<10), "\n") {
 		if strings.Contains(l, tag) {
 			lines = append(lines, l)
 		}
@@ -276,63 +396,31 @@ func cudaShimErrorDetail(sctx context.Context, k *kernel.Kernel, tg *kernel.Thre
 	return detail
 }
 
-// cudaShimReadTail returns at most max bytes from the end of path, resolved in
-// tg's mount namespace, or "" if it cannot be read.
-func cudaShimReadTail(sctx context.Context, k *kernel.Kernel, tg *kernel.ThreadGroup, path string, max int64) string {
-	ctx, pop, cleanup, ok := cudaShimPathOp(sctx, tg, path)
-	if !ok {
-		return ""
-	}
-	defer cleanup()
-	fd, err := k.VFS().OpenAt(ctx, cudaShimCreds(k), pop, &vfs.OpenOptions{Flags: linux.O_RDONLY})
-	if err != nil {
-		return ""
-	}
-	defer fd.DecRef(ctx)
-	stat, err := fd.Stat(ctx, vfs.StatOptions{Mask: linux.STATX_SIZE})
-	if err != nil {
-		return ""
-	}
-	off := int64(stat.Size) - max
-	if off < 0 {
-		off = 0
-	}
-	buf := make([]byte, int64(stat.Size)-off)
-	n, _ := fd.PRead(ctx, usermem.BytesIOSequence(buf), off, vfs.ReadOptions{})
-	return string(buf[:n])
-}
-
 // cudaShimClearAcks removes the error.<pid> and <prefix>.<pid> acks of
 // cudaProcs before a transition is requested, so that an ack left over from an
 // earlier attempt can neither fail nor satisfy cudaShimWaitAcks.
 func cudaShimClearAcks(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, prefix string) {
-	creds := cudaShimCreds(k)
 	for _, tg := range cudaProcs {
-		for _, p := range []string{"error", prefix} {
-			path := fmt.Sprintf("%s/%s.%d", cudaShimDir, p, tg.ID())
-			ctx, pop, cleanup, ok := cudaShimPathOp(sctx, tg, path)
-			if !ok {
-				continue
+		_, err := withCudaShimFS(sctx, k, tg, func(fs *cudaShimFS) {
+			for _, p := range []string{"error", prefix} {
+				name := fmt.Sprintf("%s.%d", p, tg.ID())
+				if err := fs.remove(name); err != nil {
+					log.Warningf("Failed to clear stale interposer ack %s/%s: %v", cudaShimDir, name, err)
+				}
 			}
-			if err := k.VFS().UnlinkAt(ctx, creds, pop); err != nil && !linuxerr.Equals(linuxerr.ENOENT, err) {
-				log.Warningf("Failed to clear stale interposer ack %q: %v", path, err)
-			}
-			cleanup()
+		})
+		if err != nil {
+			log.Warningf("Failed to clear stale interposer acks: %v", err)
 		}
 	}
 }
 
 // cudaShimMarkerExists returns whether marker exists for any of cudaProcs.
 func cudaShimMarkerExists(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, marker string) bool {
-	creds := cudaShimCreds(k)
 	for _, tg := range cudaProcs {
-		ctx, pop, cleanup, ok := cudaShimPathOp(sctx, tg, cudaShimDir+"/"+marker)
-		if !ok {
-			continue
-		}
-		_, err := k.VFS().StatAt(ctx, creds, pop, &vfs.StatOptions{})
-		cleanup()
-		if err == nil {
+		var exists bool
+		withCudaShimFS(sctx, k, tg, func(fs *cudaShimFS) { exists = fs.exists(marker) })
+		if exists {
 			return true
 		}
 	}
@@ -342,17 +430,11 @@ func cudaShimMarkerExists(sctx context.Context, k *kernel.Kernel, cudaProcs []*k
 // cudaShimProcsWith returns the subset of cudaProcs that have written the file
 // "<prefix>.<pid>" in the rendezvous directory.
 func cudaShimProcsWith(sctx context.Context, k *kernel.Kernel, cudaProcs []*kernel.ThreadGroup, prefix string) []*kernel.ThreadGroup {
-	creds := cudaShimCreds(k)
 	var out []*kernel.ThreadGroup
 	for _, tg := range cudaProcs {
-		path := fmt.Sprintf("%s/%s.%d", cudaShimDir, prefix, tg.ID())
-		ctx, pop, cleanup, ok := cudaShimPathOp(sctx, tg, path)
-		if !ok {
-			continue
-		}
-		_, err := k.VFS().StatAt(ctx, creds, pop, &vfs.StatOptions{})
-		cleanup()
-		if err == nil {
+		var exists bool
+		withCudaShimFS(sctx, k, tg, func(fs *cudaShimFS) { exists = fs.exists(fmt.Sprintf("%s.%d", prefix, tg.ID())) })
+		if exists {
 			out = append(out, tg)
 		}
 	}

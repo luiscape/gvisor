@@ -373,7 +373,12 @@ inside the container's trust domain, not gVisor's:
     `/tmp/mcshim` across jobs (e.g. through a volume): rendezvous keys could
     collide.
 *   The sentry side (`state_cuda_shim.go`) treats acks as liveness signals
-    with timeouts, never as data.
+    with timeouts, never as data. It acts in the directory with root
+    credentials, so it holds it to the same rules (`cudaShimFS`): it refuses
+    a `/tmp/mcshim` that is a symlink, reaches each file as one component
+    without following a final symlink, and only opens regular files with a
+    single link, non-blocking, so a planted FIFO cannot stall a checkpoint
+    and a planted link cannot point it at a file elsewhere.
 
 ## Known limitations
 
