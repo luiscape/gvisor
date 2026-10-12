@@ -31,8 +31,8 @@ groups:
 4. **Hygiene.** Dev-only files, stale docs and upstream drift.
 
 Since the first draft, R1-R6, R9-R11, R13-R17 and R20 have been fixed
-on the branch (section 4.1). That closes the first two groups above, except
-R7 (a decision) and R8 (musl images).
+on the branch (section 4.1), and R8 has been dropped. That closes the first
+two groups above, except R7 (a decision).
 
 This document describes the architecture, lists the fixes as requirements
 (must land with or before the code they fix) and nice-to-haves (follow-ups),
@@ -241,7 +241,10 @@ returns NULL, as without the shim. Before, it returned the shim's wrapper.
   created it (`rootClient.tgid`, used by the blocker inventory). It is
   bookkeeping only and changes no behavior.
 
-Not yet fixed in the same areas: musl images (R8).
+R8 (musl images) is dropped, not fixed: since R16, a GPU container is wrapped
+and preloaded only if its image has `cuda-checkpoint`, which a musl image
+does not (CUDA is glibc-only). What remains is an image with a file at that
+path that cannot run, which is a misconfiguration.
 
 ## 5. Requirements
 
@@ -264,7 +267,7 @@ Status:
 | R5 | When the caller is the main program, cudart's resolver can be answered by the newest loaded runtime instead of the caller's own (wrong ABI). | **Fixed** (`96841776a`); was: Reported; regression | Fall back to the next definition after the interposer. |
 | R6 | A successful `cu*` lookup can leave `dlerror()` set. | **Fixed** (`96841776a`); was: Reported | Clear it on success. |
 | R7 | Fabric handle types are stripped in every CUDA process, so multi-node NVLink workloads that never checkpoint lose them. | Verified (code) | Decision (section 8). Recommended: refuse the checkpoint while fabric objects are live, instead of rewriting calls. |
-| R8 | On musl images (Alpine), preloading the glibc interposer makes every process fail to start. | Reported | runsc checks for the glibc loader before preloading. |
+| R8 | On musl images (Alpine), preloading the glibc interposer makes every process fail to start. | **Dropped**; was: Reported (reproduced on alpine:3.20 through `LD_PRELOAD`; musl ignores `/etc/ld.so.preload`) | None. Since R16 the interposer is preloaded only where `cuda-checkpoint` exists, which excludes musl images in practice. |
 
 ### 5.2 Sentry (`pkg/sentry/control`)
 
@@ -361,7 +364,7 @@ in parallel with PR0, PR1 and PR2.
 | PR6 | Checkpoint-blocker inventory. | None | No callers yet | Small |
 | PR7 | Bounded pre-save invocations (fixed 2-minute bound on `--get-state`, lock and unlock), lock-then-checkpoint behind the interposer option, the `--get-state` timeout and unlock fixes. No new flag or checkpoint key. | R11, R13 | Yes | Medium |
 | PR8 | Interposer protocol: `state_cuda_shim.go`, the "suspended" checkpoint key, `MCSHIM_DISABLE`. | R9, R10 | Yes | Medium |
-| PR9 | runsc: flags, validation, `IMAGE` mode, job wrap (supersedes #13987), `LD_PRELOAD` and `ld.so.preload`, save options, the R610-or-newer driver check. May split into job wrap and preload. | R8, R16, R17, R18 (`IMAGE` parts), R20, R25 | Yes | Medium |
+| PR9 | runsc: flags, validation, `IMAGE` mode, job wrap (supersedes #13987), `LD_PRELOAD` and `ld.so.preload`, save options, the R610-or-newer driver check. May split into job wrap and preload. | R16, R17, R18 (`IMAGE` parts), R20, R25 | Yes | Medium |
 | PR10 | `EMBEDDED` mode: `runsc/mcshimbin` (amd64 only), its test, user guide section. | R18 (docs), R19, R24 (test parts) | Yes | Small |
 
 R21 and R22 apply to every PR.
