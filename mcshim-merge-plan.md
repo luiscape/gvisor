@@ -4,7 +4,7 @@
 | :--- | :--- |
 | Status | Draft for review |
 | Date | 2026-10-12 |
-| Branch | `luis/multicast-xgpu-upstream` at `c201dcf24` (github.com/luiscape/gvisor) |
+| Branch | `luis/multicast-xgpu-upstream` at `cf1bec3e8` (github.com/luiscape/gvisor) |
 | Upstream | `google/gvisor` `master` at `0a438edc9` |
 | Design doc | `g3doc/proposals/cuda_multigpu_checkpoint.md` (on the branch) |
 
@@ -36,7 +36,7 @@ keeping the current behavior. That closes the first two groups above.
 
 This document describes the architecture, lists the fixes as requirements
 (must land with or before the code they fix) and nice-to-haves (follow-ups),
-and proposes 11 PRs in merge order. Section 8 lists the decisions reviewers
+and proposes 10 PRs in merge order. Section 8 lists the decisions reviewers
 need to make.
 
 ## 2. Problem
@@ -69,15 +69,18 @@ interposer runs in the container's trust domain).
  ------------                       ----------------                     ---------
  flags, Validate                    pkg/sentry/control                   every process:
  boot/loader.go:                      state_cuda.go                        LD_PRELOAD and
-   - write mcshim.so (EMBEDDED)         cuda-checkpoint phases              /etc/ld.so.preload
-   - LD_PRELOAD + ld.so.preload         (lock / checkpoint / restore)       load mcshim.so
+   - LD_PRELOAD + ld.so.preload         cuda-checkpoint phases              /etc/ld.so.preload
+     of --cuda-multicast-shim-path      (lock / checkpoint / restore)       load mcshim.so,
    - wrap command in                  state_cuda_shim.go
      cuda-checkpoint --launch-job       marker protocol  <---------------> /tmp/mcshim/
  boot/restore.go:                   pkg/sentry/devices/nvproxy             gate, suspend,
    - save() options                   export/import tracking               present.<pid>, acks
- runsc/mcshimbin:                     checkpoint-blocker inventory       CUDA processes:
-   - embedded mcshim.so             pkg/sentry/fsimpl/proc                 mcshim control thread
+                                      checkpoint-blocker inventory       CUDA processes:
+                                    pkg/sentry/fsimpl/proc                 mcshim control thread
                                       fdinfo: nvproxy_exported_object      (started at cuInit)
+
+ (mcshim.so is provided by the operator at --cuda-multicast-shim-path,
+  in the image or through a mount; runsc does not carry it.)
 ```
 
 | Component | Location | Role |
@@ -85,7 +88,7 @@ interposer runs in the container's trust domain).
 | Interposer (`mcshim.so`) | `tools/mcshim` (C, about 2,900 lines) | Tracks multicast groups, VMM allocations, exports, imports, binds and mappings at the libcuda layer. On request, gates the application off the GPU, tears that state down, and rebuilds it later at identical virtual addresses, translating handles so the application only sees the values it was given. Interposes `cu*` entry points, `dlsym`, `cuGetProcAddress*` and cudart's `cudaGetDriverEntryPoint*`. |
 | Sentry sequencing | `pkg/sentry/control/state_cuda.go`, `state_cuda_shim.go` | Runs the `cuda-checkpoint` phases and drives the interposer through marker files. With the interposer, the invocations that run before GPU state is saved (`--get-state`, lock, unlock) are bounded at 2 minutes; checkpoint and restore invocations are not (section 3.5). |
 | nvproxy additions | `pkg/sentry/devices/nvproxy`, `pkg/sentry/fsimpl/proc` | Records exported RM objects and fd imports; reports an exported object's identity on a `nvproxy_exported_object:` line in `/proc/<pid>/fdinfo/<fd>`; provides the *checkpoint-blocker inventory* (objects `cuda-checkpoint` cannot handle), so a checkpoint is refused up front instead of hanging. |
-| runsc delivery | `runsc/boot`, `runsc/config`, `runsc/mcshimbin` | Flags; preloads the interposer through `LD_PRELOAD` and `/etc/ld.so.preload`; wraps the container command in `cuda-checkpoint --launch-job`; in `EMBEDDED` mode, writes the copy of `mcshim.so` built into runsc into the container's filesystem. |
+| runsc delivery | `runsc/boot`, `runsc/config` | Flags; preloads the interposer, which the operator provides at `--cuda-multicast-shim-path`, through `LD_PRELOAD` and `/etc/ld.so.preload`; wraps the container command in `cuda-checkpoint --launch-job`. |
 
 ### 3.2 Configuration
 
@@ -94,7 +97,6 @@ interposer runs in the container's trust domain).
 | `--cuda-checkpoint-path` | empty | `cuda-checkpoint` inside the container. Required by the interposer. |
 
 | `--cuda-multicast-shim-path` | empty | Interposer path in the container. Setting it enables the interposer. |
-| `--cuda-multicast-shim-source` | `IMAGE` | `IMAGE`: the image carries the interposer. `EMBEDDED`: runsc writes its own copy (default path `/usr/local/lib/mcshim.so`). |
 
 
 Without the interposer flags, CUDA checkpoints are meant to be unchanged
@@ -194,6 +196,7 @@ the new binary.
 | R1, R3, R4, R5, R6 (interposer effects on processes that never checkpoint) | `96841776a` | New `run.sh noeffect` (`noeffect.sh`): seven programs, each run with and without the shim. The previous shim changes six of them; the fixed one none. |
 | R14 (nvproxy tracking for every user) | `6b3db1560` | `TestProcFDInfoExtraTracking`: the fdinfo line is empty with tracking off. With tracking off the four export/import handlers delegate to `ctrlHasFrontendFD`, upstream's handler, which a code read confirms; no CPU test exercises the host call. |
 | R9, R10 (the sentry's marker operations) | `26e35715b` | `TestCudaShimFS` on a tmpfs root: the control directory as a symlink, and symlinks, a hard link and FIFOs planted as markers, acks and the log. Against the old resolution rules it fails 9 checks. |
+| R19 (single-architecture embedded interposer) | `cf1bec3e8` | EMBEDDED mode and `runsc/mcshimbin` removed. Boot, config, control and nvproxy tests, nogo, and `//tools/mcshim:glibc_floor_test` (fastbuild and `-c opt`) pass; `//runsc` builds and rejects `--cuda-multicast-shim-source`. |
 
 How each was fixed:
 
@@ -233,6 +236,12 @@ A behavior change to know about: a `dlsym(RTLD_DEFAULT)` lookup of a
 resolver or driver entry point that only the shim defines (no runtime or
 libcuda loaded globally, or loaded `RTLD_LOCAL` by another library) now
 returns NULL, as without the shim. Before, it returned the shim's wrapper.
+
+- **R19.** runsc no longer carries the interposer. The operator installs
+  `mcshim.so` on the host and passes its path in
+  `--cuda-multicast-shim-path`. That file must stay available at the same
+  path for restores, so use a versioned path per release. There is no
+  version handshake between the interposer and the sentry yet (N22).
 
 - **R14.** `nvproxy.Options.TrackExports`, set only when the interposer is
   enabled, turns on export/import tracking and the fdinfo line. The line is
@@ -292,8 +301,8 @@ Status:
 | :--- | :--- | :--- | :--- |
 | R16 | The job wrap and preload apply to every container when nvproxy is enabled globally, including the pause container; a container whose image lacks `cuda-checkpoint` fails to start. | **Fixed** (`182960ccb`); was: Verified (scope); reported (failure) | Apply only to containers that request GPUs; skip with a warning if the binary is missing; require absolute paths. |
 | R17 | With `--exec-fd`, the job wrap drops the user's program. | **Fixed** (`182960ccb`); was: Reported | Skip the wrap in that case. |
-| R18 | The interposer and `ld.so.preload` are written as root, following intermediate symlinks; without a rootfs overlay they land in the user's rootfs on the host, contrary to the docs. | **Docs fixed** (`c201dcf24`); was: Reported (two reviewers) | Docs now say where the writes land. Guard deferred (N21): it only matters with `--overlay2=none` or bind mounts over `/etc` or the interposer's directory, which Modal does not use. |
-| R19 | The embedded interposer is single-architecture; source distributions could embed x86 bytes into arm64 builds. | Reported | Embed per architecture, amd64 only, with an arm64 stub; reject `EMBEDDED` when nothing is embedded. |
+| R18 | The interposer and `ld.so.preload` are written as root, following intermediate symlinks; without a rootfs overlay they land in the user's rootfs on the host, contrary to the docs. | **Docs fixed** (`c201dcf24`); was: Reported (two reviewers) | Docs now say where the writes land. Guard deferred (N21): it only matters with `--overlay2=none` or bind mounts over `/etc` or the interposer's directory, which Modal does not use. Since EMBEDDED's removal (`cf1bec3e8`), only the `ld.so.preload` write remains. |
+| R19 | The embedded interposer is single-architecture; source distributions could embed x86 bytes into arm64 builds. | **Resolved** (`cf1bec3e8`): EMBEDDED mode removed; was: Reported | None: runsc no longer carries the interposer. |
 | R20 | Flag validation misses relative paths and separators in the interposer path. | **Fixed** (`182960ccb`); was: Reported | Add the checks and tests. |
 
 ### 5.5 Build, docs and hygiene
@@ -303,7 +312,7 @@ Status:
 | R21 | `MCSHIM_STATUS.md` is a tracked dev-only file naming internal people and companies; other scratch files are untracked but not ignored. | Exclude from every PR. |
 | R22 | Upstream drift and BUILD conventions. | Rebase on current `master`; use `embed =` and explicit `importpath` in new BUILD files. |
 | R23 | Stale or wrong docs: the README threat model says marker content is never parsed (one file is); the proposal says any `--cuda-checkpoint-path` triggers the job wrap; flag help says "R610+"; two docs disagree on whether `ld.so.preload` survives restore; the README overstates what one test catches (regression). | Correct each. |
-| R24 | CI never tests the artifact that ships. | A CPU-only Bazel `sh_test` on the built interposer; check its library dependencies in the existing Go test; pin `_FORTIFY_SOURCE` so debug and release builds need the same glibc versions. |
+| R24 | CI never tests the artifact that ships. | A CPU-only Bazel `sh_test` on the built interposer; check its library dependencies in `//tools/mcshim:glibc_floor_test` (moved from `runsc/mcshimbin`); pin `_FORTIFY_SOURCE` so debug and release builds need the same glibc versions. |
 | R25 | Open decisions block the runsc PR. | See section 8. |
 
 ## 6. Nice-to-haves
@@ -333,6 +342,7 @@ These can follow the merge as separate PRs.
 | N19 | Environment slice aliasing when appending to the spec's environment. |
 | N20 | nvproxy cleanups: a dead parameter check, a duplicated handler, structured blocker results. |
 | N21 | R18's guard: write the interposer and the `ld.so.preload` entry only into the rootfs overlay (refuse without one, and refuse a path that crosses a bind mount), treating a refusal like a missing `cuda-checkpoint` (no wrap, no interposer, checkpoints refused). Falling back to `LD_PRELOAD` alone would be worse: SGLang's workers would lose the interposer silently. |
+| N22 | A protocol version handshake between the interposer and the sentry (for example, a version in each `gated.<pid>` marker), now that runsc and the interposer ship separately. A mismatch refuses the checkpoint. |
 
 ## 7. Merge plan
 
@@ -345,8 +355,8 @@ PR4 nvproxy tracking ---+---> PR5 fdinfo line                                   
                         +---> PR6 blocker inventory ------------------------------------------+--> PR8 interposer protocol
                                                                                                           |
 PR3 tools/mcshim ---------------------------------------------------------------------------+            |
-                                                                                            +--> PR9 runsc IMAGE mode --> PR10 EMBEDDED
-PR1 design proposal (settles open questions; informs PR4, PR8, PR9, PR10)
+                                                                                            +--> PR9 runsc flags, job wrap, preload
+PR1 design proposal (settles open questions; informs PR4, PR8, PR9)
 ```
 
 PR3 depends on nothing and is the largest review, so it should start first,
@@ -366,7 +376,6 @@ in parallel with PR0, PR1 and PR2.
 | PR7 | Bounded pre-save invocations (fixed 2-minute bound on `--get-state`, lock and unlock), lock-then-checkpoint behind the interposer option, the `--get-state` timeout and unlock fixes. No new flag or checkpoint key. | R11, R13 | Yes | Medium |
 | PR8 | Interposer protocol: `state_cuda_shim.go`, the "suspended" checkpoint key, `MCSHIM_DISABLE`. | R9, R10 | Yes | Medium |
 | PR9 | runsc: flags, validation, `IMAGE` mode, job wrap (supersedes #13987), `LD_PRELOAD` and `ld.so.preload`, save options, the R610-or-newer driver check. May split into job wrap and preload. | R16, R17, R20, R25 | Yes | Medium |
-| PR10 | `EMBEDDED` mode: `runsc/mcshimbin` (amd64 only), its test, user guide section. | R19, R24 (test parts) | Yes | Small |
 
 R21 and R22 apply to every PR.
 
@@ -410,9 +419,10 @@ newer, so R615 must be validated before it is deployed there.
    R610 or newer and keeps it off, with a warning, on older drivers. There
    is no flag; whether an unvalidated newer release is used is left to the
    deployment (for example, the scheduler).
-3. **Where the interposer lives.** In-tree with `EMBEDDED` mode (PR3 and
-   PR10 as planned), or in its own repository with runsc supporting only
-   `IMAGE` mode. See section 9.
+3. **Where the interposer lives.** In-tree (PR3), or in its own repository.
+   See section 9. Either way runsc no longer carries it: `EMBEDDED` mode was
+   removed, and the operator provides the interposer at
+   `--cuda-multicast-shim-path`.
 4. **#13987.** Update it to match PR9, or close it in favour of PR9.
 
 ## 9. Alternative under consideration: a separate repository for the interposer
@@ -420,12 +430,13 @@ newer, so R615 must be validated before it is deployed there.
 Tabled for now; recorded here so reviewers can weigh it.
 
 The coupling is narrow: the marker directory and file names, the
-`MCSHIM_DISABLE` variable, the fdinfo line format, and the embedded binary.
+`MCSHIM_DISABLE` variable, and the fdinfo line format. runsc no longer
+embeds the binary.
 The interposer needs nothing from gVisor to build, and its test runner
 already takes `runsc` as an argument.
 
 | | |
 | :--- | :--- |
-| Gains | The largest and riskiest upstream review (PR3) leaves gVisor. The Bazel-specific build work (glibc stubs, architecture-specific embedding) disappears. The interposer gets its own CI (GPU runners, Docker smoke tests) and release cadence. |
-| Costs | The protocol spans two repositories and needs a version handshake. `EMBEDDED` mode either goes (recommended: upstream ships `IMAGE` only) or needs an external Bazel dependency that upstream would have to accept. With `IMAGE` mode, restore must find the same interposer bytes, which holds if the image carries it. Upstream would want a stub interposer to test the protocol on CPU. |
-| Effect on the plan | PR3 and PR10 leave the upstream plan, with R1-R7, the README part of R23 and the interposer part of R24. R19 disappears. PR8 gains the protocol version check. |
+| Gains | The largest and riskiest upstream review (PR3) leaves gVisor. The Bazel-specific build work (glibc stubs) disappears. The interposer gets its own CI (GPU runners, Docker smoke tests) and release cadence. |
+| Costs | The protocol spans two repositories and needs a version handshake (also worth having now that runsc and the interposer ship separately). Restore must find the same interposer bytes at the same path, as it must already. Upstream would want a stub interposer to test the protocol on CPU. |
+| Effect on the plan | PR3 leaves the upstream plan, with R1-R6, the README part of R23 and the interposer part of R24. PR8 gains the protocol version check. |
