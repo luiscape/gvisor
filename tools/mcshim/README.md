@@ -130,7 +130,7 @@ partway leaves the process in a state `cuda-checkpoint` does not define.
 
 | Variable                 | Default         | Effect                                                            |
 | :----------------------- | :-------------- | :---------------------------------------------------------------- |
-| `MCSHIM_LOG`             | `/tmp/mcshim/mcshim.log` | append the log to this path; `stderr` for stderr. The shim never prints otherwise: every process in the container loads it |
+| `MCSHIM_LOG`             | `/tmp/mcshim/mcshim.log` | append the log to this path; `stderr` for stderr. The shim never prints otherwise: every process in the container loads it. Ignored in setuid processes, as are the other variables |
 | `MCSHIM_DISABLE`         | unset           | silent: no control thread, acks, or gate (interposition/tracking stay active) |
 | `MCSHIM_ALLOW_FABRIC`    | unset           | keep fabric handle types; the gate refuses while a fabric-capable allocation is alive (see below) |
 | `MCSHIM_HOST_BUILD`      | unset           | build.sh: build with the host toolchain instead of docker         |
@@ -316,14 +316,18 @@ resume in place of a checkpoint and restore:
     reaches the sentry's error; without the interposer, no job and one
     `--toggle` per process.
 
-Two tests need no GPU, and cover the processes that never checkpoint:
+Three tests need no GPU, and cover the processes that never checkpoint:
 
 *   `preload`: an interposer preloaded after the shim finds the next
     definition with `dlsym(RTLD_NEXT)`, in either order;
 *   `glibc` (docker): the shim needs no symbol version above its glibc
     floor, and `test/glibc_smoke.sh` loads it in ubuntu:20.04, debian:11,
     rockylinux:8 and centos:7, through `LD_PRELOAD` and through
-    `/etc/ld.so.preload`.
+    `/etc/ld.so.preload`;
+*   `ctlsec` (docker): a symlink or hard link planted in the control
+    directory, a symlinked control directory, or `MCSHIM_LOG` in a setuid
+    process cannot make a root process write to or chmod another file
+    (`test/ctlsec.sh`, over the fake libcuda).
 
 ## Threat model
 
@@ -335,8 +339,22 @@ inside the container's trust domain, not gVisor's:
     (e.g. suspending the app spuriously, or acking a teardown that did not
     happen and failing the checkpoint at the blocker check). It gains nothing
     it could not already do to the app directly, being the same trust domain.
-*   The shim never trusts marker *content*, only existence, so nothing parses
-    attacker-controlled bytes out of the control directory.
+*   The shim acts on markers by existence, not content. The one file whose
+    content it parses is a published fd (`fd-<client>-<object>`: an
+    exporter's pid and fd), from which an importer copies the fd with
+    `pidfd_getfd`; a forged one can only make that import fail or take the
+    wrong fd, inside the container.
+*   The directory cannot be turned against processes that load the shim,
+    root and setuid ones included (`/etc/ld.so.preload` loads it into every
+    process; gVisor has no `protected_symlinks` or `protected_hardlinks`).
+    The shim opens the directory once without following a symlink and
+    reaches every file relative to it; it only creates files with
+    `O_EXCL | O_NOFOLLOW` after removing what was there; it only appends to
+    or reads an existing file that is regular and has a single link; and it
+    changes the mode only of the log it has just created. A setuid or setgid
+    process (`AT_SECURE`) skips the shim entirely, and the `MCSHIM_*`
+    variables are read with `secure_getenv`. `test/run.sh ctlsec` checks
+    this.
 *   While fds are published after a restore, any process in the container
     may ptrace the exporters (`PR_SET_PTRACER_ANY`). Do **not** share
     `/tmp/mcshim` across jobs (e.g. through a volume): rendezvous keys could

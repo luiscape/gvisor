@@ -49,6 +49,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
@@ -176,6 +177,89 @@ _Static_assert(sizeof(CUarrayMapInfo) == 96, "CUarrayMapInfo layout");
 /* Fixed; see cudaShimDir in pkg/sentry/control/state_cuda_shim.go. */
 static const char g_dir[] = "/tmp/mcshim";
 
+/* Control directory access. The directory sits in world-writable /tmp and is
+ * itself world-writable, and the shim runs in every process of the container,
+ * root and setuid ones included, so it must not be steered by what another
+ * user put there (gVisor has no protected_symlinks or protected_hardlinks):
+ *
+ *   - the directory is opened once without following a symlink, and every
+ *     file in it is reached relative to that descriptor (ctl_dirfd);
+ *   - files are only ever created fresh, with O_EXCL | O_NOFOLLOW, so neither
+ *     a planted symlink nor a hard link to a file elsewhere is written
+ *     through (ctl_create);
+ *   - an existing file is only appended to or read if it is a regular file
+ *     with a single link, opened without following a symlink and without
+ *     blocking on a FIFO (ctl_open_existing).
+ *
+ * The environment is read with secure_getenv, and setuid processes skip the
+ * shim entirely (see mcshim_init). */
+
+static int g_dirfd = -2; /* -2: not opened yet; -1: unavailable */
+static pthread_mutex_t g_dirlock = PTHREAD_MUTEX_INITIALIZER; /* leaf */
+
+static int ctl_dirfd(void) {
+  pthread_mutex_lock(&g_dirlock);
+  if (g_dirfd == -2)
+    g_dirfd = open(g_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  int fd = g_dirfd;
+  pthread_mutex_unlock(&g_dirlock);
+  return fd;
+}
+
+/* fstat(2) by system call: glibc 2.33 made fstat a versioned symbol
+ * (GLIBC_2.33), above the shim's floor. struct stat matches the kernel's on
+ * x86_64 and aarch64. */
+static int raw_fstat(int fd, struct stat* st) {
+  return (int)syscall(SYS_fstat, fd, st);
+}
+
+/* Creates name in the control directory, replacing any existing entry, and
+ * opens it for writing. -1 on failure. */
+static int ctl_create(const char* name, mode_t mode) {
+  int dfd = ctl_dirfd();
+  if (dfd < 0) return -1;
+  unlinkat(dfd, name, 0);
+  return openat(dfd, name,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode);
+}
+
+/* Opens an existing file in the control directory with flags (O_RDONLY, or
+ * O_WRONLY | O_APPEND), if it is a regular file with a single link. -1
+ * otherwise. */
+static int ctl_open_existing(const char* name, int flags) {
+  int dfd = ctl_dirfd();
+  if (dfd < 0) return -1;
+  int fd = openat(dfd, name, flags | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  if (fd < 0) return -1;
+  struct stat st;
+  if (raw_fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1) {
+    close(fd);
+    errno = EPERM;
+    return -1;
+  }
+  return fd;
+}
+
+/* Opens the shared log in the control directory for appending. The first
+ * process creates it and makes it writable by every user, since processes
+ * under other uids append to it too; nobody changes the mode of a file it
+ * did not just create. */
+static int ctl_open_log(void) {
+  static const char name[] = "mcshim.log";
+  int dfd = ctl_dirfd();
+  if (dfd < 0) return -1;
+  int fd = openat(dfd, name,
+                  O_WRONLY | O_APPEND | O_CREAT | O_EXCL | O_NOFOLLOW |
+                      O_CLOEXEC,
+                  0666);
+  if (fd >= 0) {
+    fchmod(fd, 0666);
+    return fd;
+  }
+  if (errno != EEXIST) return -1;
+  return ctl_open_existing(name, O_WRONLY | O_APPEND);
+}
+
 /* Logging. /etc/ld.so.preload loads the shim into every process in the
  * container, so it never writes to stderr unless asked to: the log goes to
  * MCSHIM_LOG ("stderr" for stderr), else to mcshim.log in the control
@@ -201,18 +285,16 @@ static void mclog(const char* fmt, ...) {
   line[len++] = '\n';
   pthread_mutex_lock(&g_loglock);
   if (g_logfd == -2) {
-    const char* p = getenv("MCSHIM_LOG");
-    char def[sizeof(g_dir) + 16];
-    if (p && strcmp(p, "stderr") == 0) {
+    /* MCSHIM_LOG is the process's own choice, opened like any program would
+     * (and ignored in setuid processes, see mcshim_init); the default log is
+     * in the shared control directory. */
+    const char* p = secure_getenv("MCSHIM_LOG");
+    if (p && strcmp(p, "stderr") == 0)
       g_logfd = STDERR_FILENO;
-    } else {
-      if (!p || !*p) {
-        snprintf(def, sizeof(def), "%s/mcshim.log", g_dir);
-        p = def;
-      }
-      g_logfd = open(p, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0666);
-      if (g_logfd >= 0) fchmod(g_logfd, 0666); /* fails harmlessly unless ours */
-    }
+    else if (p && *p)
+      g_logfd = open(p, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+    else
+      g_logfd = ctl_open_log();
   }
   int fd = g_logfd;
   pthread_mutex_unlock(&g_loglock);
@@ -221,7 +303,9 @@ static void mclog(const char* fmt, ...) {
   }
 }
 
-static int allow_fabric(void) { return getenv("MCSHIM_ALLOW_FABRIC") != NULL; }
+static int allow_fabric(void) {
+  return secure_getenv("MCSHIM_ALLOW_FABRIC") != NULL;
+}
 
 /* The real dlsym, resolved via dlvsym (not interposed) so that the dlsym
  * wrapper can delegate without recursing. */
@@ -2076,23 +2160,27 @@ static int g_ptracer_any; /* under g_lock */
  * there are none (the usual case). Under g_lock. */
 static int g_npub;
 
-static void pub_path(const Alloc* a, char* out, size_t n) {
-  snprintf(out, n, "%s/fd-%lx-%lx", g_dir, a->key_client, a->key_object);
+/* The name, in the control directory, of the file publishing a's fd. */
+static void pub_name(const Alloc* a, char* out, size_t n) {
+  snprintf(out, n, "fd-%lx-%lx", a->key_client, a->key_object);
 }
 
 /* Must hold g_lock. */
 static int publish_fd(Alloc* a, int fd) {
-  char path[600], tmp[610];
-  pub_path(a, path, sizeof(path));
-  snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+  char name[64], tmp[72], body[32];
+  pub_name(a, name, sizeof(name));
+  snprintf(tmp, sizeof(tmp), "%s.tmp", name);
   if (!g_ptracer_any) {
     prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
     g_ptracer_any = 1;
   }
-  FILE* f = fopen(tmp, "w");
-  if (!f) return -1;
-  fprintf(f, "%d %d\n", (int)getpid(), fd);
-  if (fclose(f) != 0 || rename(tmp, path) != 0) return -1;
+  int len = snprintf(body, sizeof(body), "%d %d\n", (int)getpid(), fd);
+  int tfd = ctl_create(tmp, 0644);
+  if (tfd < 0) return -1;
+  int ok = write(tfd, body, (size_t)len) == len;
+  ok = close(tfd) == 0 && ok;
+  /* renameat replaces the final name without following it. */
+  if (!ok || renameat(g_dirfd, tmp, g_dirfd, name) != 0) return -1;
   a->pub_fd = fd;
   g_npub++;
   return 0;
@@ -2101,9 +2189,9 @@ static int publish_fd(Alloc* a, int fd) {
 /* Must hold g_lock. */
 static void unpublish_fd(Alloc* a) {
   if (a->pub_fd < 0) return;
-  char path[600];
-  pub_path(a, path, sizeof(path));
-  unlink(path);
+  char name[64];
+  pub_name(a, name, sizeof(name));
+  unlinkat(g_dirfd, name, 0); /* opened by publish_fd */
   close(a->pub_fd); /* a held export fd blocks the next checkpoint */
   a->pub_fd = -1;
   g_npub--;
@@ -2121,16 +2209,18 @@ static void unpublish_all(void) {
 
 /* Copy the fd published for a, waiting up to timeout_ms for it to appear. */
 static int fetch_fd(const Alloc* a, int timeout_ms) {
-  char path[600];
-  pub_path(a, path, sizeof(path));
+  char name[64];
+  pub_name(a, name, sizeof(name));
   for (int waited = 0; waited < timeout_ms; waited += 10) {
     unsigned long pid, fd;
     char line[64];
-    FILE* f = fopen(path, "r");
-    if (f) {
-      const char* p = fgets(line, sizeof(line), f) ? line : "";
+    int rfd = ctl_open_existing(name, O_RDONLY);
+    if (rfd >= 0) {
+      ssize_t got = read(rfd, line, sizeof(line) - 1);
+      close(rfd);
+      line[got > 0 ? got : 0] = 0;
+      const char* p = line;
       int n = parse_num(&p, 10, &pid) && parse_num(&p, 10, &fd);
-      fclose(f);
       if (n) {
         int pfd = (int)syscall(SYS_pidfd_open, (int)pid, 0);
         int got =
@@ -2145,7 +2235,7 @@ static int fetch_fd(const Alloc* a, int timeout_ms) {
     struct timespec ts = {0, 10 * 1000 * 1000};
     nanosleep(&ts, NULL);
   }
-  mclog("RESUME: timed out waiting for %s", path);
+  mclog("RESUME: timed out waiting for %s/%s", g_dir, name);
   return -1;
 }
 
@@ -3154,31 +3244,27 @@ void* dlsym(void* handle, const char* symbol) {
 
 /* Control thread: polls /tmp/mcshim for markers. */
 
-static void marker(const char* name, char* out, size_t n) {
-  snprintf(out, n, "%s/%s", g_dir, name);
-}
+/* Markers are reached relative to the control directory's descriptor, which
+ * the control thread opens before polling (see ctl_dirfd). */
 
 static int marker_exists(const char* name) {
-  char p[600];
-  marker(name, p, sizeof(p));
-  return access(p, F_OK) == 0;
+  return faccessat(g_dirfd, name, F_OK, 0) == 0;
 }
 
-static void marker_rm(const char* name) {
-  char p[600];
-  marker(name, p, sizeof(p));
-  unlink(p);
-}
+static void marker_rm(const char* name) { unlinkat(g_dirfd, name, 0); }
 
 static void marker_write(const char* name, const char* body) {
-  char p[600];
-  marker(name, p, sizeof(p));
-  FILE* f = fopen(p, "w");
-  if (f) {
-    fputs(body, f);
-    fputc('\n', f);
-    fclose(f);
+  int fd = ctl_create(name, 0644);
+  if (fd < 0) return;
+  char line[256];
+  int len = snprintf(line, sizeof(line), "%s\n", body);
+  if (len > (int)sizeof(line) - 1) {
+    len = (int)sizeof(line) - 1;
+    line[len - 1] = '\n';
   }
+  if (write(fd, line, (size_t)len) < 0) {
+  }
+  close(fd);
 }
 
 typedef struct {
@@ -3287,6 +3373,12 @@ static void* control_thread(void* arg) {
    * selects CUDA processes by their open NVIDIA fds, a broader set. */
   char present[64];
   snprintf(present, sizeof(present), "present.%d", pid);
+  /* Every marker is reached through this descriptor. Without it (the
+   * directory is missing or is a symlink), nothing is acked, and the sentry
+   * refuses the checkpoint on the missing acks. */
+  if (ctl_dirfd() < 0)
+    mclog("control thread: cannot open %s (%s); no acks", g_dir,
+          strerror(errno));
   /* Clear acks left by a dead process with the same pid. */
   marker_rm(k.suspended);
   marker_rm(k.resumed);
@@ -3379,7 +3471,15 @@ static void mcshim_atfork_child(void) {
 
 __attribute__((constructor)) static void mcshim_init(void) {
   pthread_atfork(NULL, NULL, mcshim_atfork_child);
-  if (getenv("MCSHIM_DISABLE")) {
+  /* A setuid or setgid process (AT_SECURE) never takes part: no control
+   * directory, no log, no control thread. /etc/ld.so.preload loads the shim
+   * into those too, and they have no GPU state to carry. */
+  if (getauxval(AT_SECURE)) {
+    g_disabled = 1;
+    g_logfd = -1;
+    return;
+  }
+  if (secure_getenv("MCSHIM_DISABLE")) {
     /* No control thread and no log: the sentry runs cuda-checkpoint with
      * MCSHIM_DISABLE. */
     g_disabled = 1;

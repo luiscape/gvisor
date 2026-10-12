@@ -23,6 +23,10 @@
 #   glibc                        no GPU: the shim needs no symbol version above
 #                                its glibc floor, and loads in old images
 #                                (glibc_smoke.sh; needs docker)
+#   ctlsec                       no GPU: a planted symlink, hard link or
+#                                symlinked control directory, or a setuid
+#                                process, cannot make the shim write to or
+#                                chmod another file (ctlsec.sh; needs docker)
 #   tables                       no GPU: the tracking tables and their indexes
 #                                under random multi-threaded traffic with
 #                                suspend/resume cycles, and at 100k objects,
@@ -63,7 +67,7 @@ while getopts r:i:e: o; do
 done
 shift $((OPTIND - 1))
 if [ $# -eq 0 ]; then
-  set -- abi gate mc refcount refuse mapwait silent preload glibc tables \
+  set -- abi gate mc refcount refuse mapwait silent preload glibc ctlsec tables \
     rtres ipc orphan deadline reason optout torch-kernel torch-symm \
     torch-expandable
 fi
@@ -274,6 +278,22 @@ glibc() {
   ./glibc_smoke.sh "$W/mcshim.so"
 }
 
+# ctlsec: the control directory cannot be used against root or setuid
+# processes, which /etc/ld.so.preload also loads the shim into.
+ctlsec() {
+  local d=$W/ctlsec
+  if ! docker info >/dev/null 2>&1 && ! sudo docker info >/dev/null 2>&1; then
+    echo "needs docker"
+    return 77
+  fi
+  mkdir -p "$d"
+  gcc -O2 -g -Wall -Wextra -fPIC -shared -Wl,-soname,libcuda.so.1 \
+    -o "$d/libcuda.so.1" fakecuda.c -lpthread || return 1
+  gcc -O2 -g -Wall -Wextra -o "$d/ctlsec" ctlsec.c "$d/libcuda.so.1" \
+    -Wl,-rpath,/t || return 1
+  ./ctlsec.sh "$W/mcshim.so" "$d"
+}
+
 # tables: the shim built with MCSHIM_TABLE_CHECKS, which checks the tables'
 # consistency each time it releases its lock, over a fake libcuda.so.1 that
 # rejects any handle or address it did not issue.
@@ -461,6 +481,7 @@ for t in "$@"; do
     silent) silent || rc=$? ;;
     preload) preload || rc=$? ;;
     glibc) glibc || rc=$? ;;
+    ctlsec) ctlsec || rc=$? ;;
     rtres) rtres || rc=$? ;;
     tables) tables || rc=$? ;;
     deadline | reason | optout)
