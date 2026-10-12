@@ -18,9 +18,11 @@ package boot
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	gtime "time"
@@ -330,6 +332,13 @@ type Loader struct {
 	//
 	// +checklocks:mu
 	failedToStart map[string]struct{}
+
+	// cudaJobSkipped maps the name of each GPU container that the multicast
+	// interposer is enabled for but that does not run in a cuda-checkpoint job
+	// to the reason (see setupCudaCheckpointJob).
+	//
+	// +checklocks:mu
+	cudaJobSkipped map[string]string
 
 	// portForwardProxies is a list of active port forwarding connections.
 	//
@@ -709,6 +718,7 @@ func New(args Args) (*Loader, error) {
 		containerIDs:          make(map[string]string),
 		containerSpecs:        make(map[string]*specs.Spec),
 		failedToStart:         make(map[string]struct{}),
+		cudaJobSkipped:        make(map[string]string),
 		saveFDs:               args.SaveFDs,
 		saveCheckpointGofer:   args.SaveCheckpointGofer,
 		fsSaveFDs:             args.FSSaveFDs,
@@ -1672,33 +1682,78 @@ func cudaMulticastShimEnabled(conf *config.Config, driverMajor int) bool {
 }
 
 // setupCudaCheckpointJob groups a GPU container's CUDA processes into a
-// cuda-checkpoint job (when the multicast interposer is enabled, see
-// cudaMulticastShimEnabled, and nvproxy is enabled) so that CUDA IPC state
-// (cuIpcGetMemHandle) can be checkpointed/restored coherently.
+// cuda-checkpoint job, so that CUDA IPC state (cuIpcGetMemHandle) can be
+// checkpointed/restored coherently, and reports whether it did. Only a
+// container given GPU access is wrapped (not, say, a pod's pause container
+// when nvproxy is enabled for the whole sandbox), and only when the multicast
+// interposer is enabled (see cudaMulticastShimEnabled). The interposer is
+// preloaded only into a wrapped container.
 //
 // It works by prepending `cuda-checkpoint --launch-job` to the container's
 // command. See https://github.com/NVIDIA/cuda-checkpoint#610-features.
-func (l *Loader) setupCudaCheckpointJob(info *containerInfo) error {
-	if !specutils.NVProxyEnabled(info.spec, info.conf) || !cudaMulticastShimEnabled(info.conf, l.k.NvidiaDriverVersion.Major()) {
-		return nil
+//
+// A GPU container it cannot wrap still starts, with neither the job nor the
+// interposer, and is recorded in l.cudaJobSkipped: checkpoints with the
+// interposer's protocol are refused while it exists, since its processes
+// would be checkpointed outside a job.
+//
+// +checklocks:l.mu
+func (l *Loader) setupCudaCheckpointJob(info *containerInfo) bool {
+	conf := info.conf
+	if conf.CUDAMulticastShimContainerPath() == "" || !specutils.GPUFunctionalityRequested(info.spec, conf) {
+		return false
+	}
+	if major := l.k.NvidiaDriverVersion.Major(); !cudaMulticastShimEnabled(conf, major) {
+		log.Warningf("The multicast interposer is enabled but driver R%d is older than R%d; not using it in container %q", major, cudaMulticastShimMinDriverMajor, info.containerName)
+		return false
+	}
+	skip := func(why string) bool {
+		log.Warningf("Not running container %q in a cuda-checkpoint job, nor preloading the multicast interposer into it: %s. Checkpoints of the sandbox will be refused while the container exists.", info.containerName, why)
+		l.cudaJobSkipped[info.containerName] = why
+		return false
 	}
 	if len(info.procArgs.Argv) == 0 {
-		return fmt.Errorf("container has no command to wrap")
+		return skip("it has no command to wrap")
+	}
+	if info.procArgs.File != nil {
+		return skip("its entrypoint is a file descriptor (--exec-fd), which cuda-checkpoint cannot exec")
+	}
+	if ok, err := l.containerFileExists(info, conf.CUDACheckpointPath); !ok {
+		why := fmt.Sprintf("--cuda-checkpoint-path %q is not a file in it", conf.CUDACheckpointPath)
+		if err != nil {
+			why += fmt.Sprintf(" (%v)", err)
+		}
+		return skip(why)
 	}
 	// Exec cuda-checkpoint from the container filesystem; it then execs the
-	// original command. Clear any exec-FD entrypoint too (the deferred DecRef
-	// in createContainerProcess still releases it).
-	info.procArgs.File = nil
+	// original command.
 	info.procArgs.Filename = ""
-	info.procArgs.Argv = append([]string{info.conf.CUDACheckpointPath, "--launch-job"}, info.procArgs.Argv...)
+	info.procArgs.Argv = append([]string{conf.CUDACheckpointPath, "--launch-job"}, info.procArgs.Argv...)
 	log.Infof("Wrapped container %q command in a cuda-checkpoint job", info.containerName)
-	return nil
+	return true
+}
+
+// cudaJobSkippedError returns an error naming every GPU container that
+// setupCudaCheckpointJob could not wrap, or nil if there is none.
+//
+// +checklocksexclude:l.mu
+func (l *Loader) cudaJobSkippedError() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.cudaJobSkipped) == 0 {
+		return nil
+	}
+	var why []string
+	for _, name := range slices.Sorted(maps.Keys(l.cudaJobSkipped)) {
+		why = append(why, fmt.Sprintf("container %q: %s", name, l.cudaJobSkipped[name]))
+	}
+	return fmt.Errorf("cannot checkpoint with the multicast interposer: GPU containers that do not run in a cuda-checkpoint job (%s)", strings.Join(why, "; "))
 }
 
 // setupCudaMulticastShim LD_PRELOADs the multicast suspend/resume interposer
-// into a GPU container (when --cuda-multicast-shim-path and/or
-// --cuda-multicast-shim-source=EMBEDDED is set, nvproxy is enabled, and the driver
-// is R610 or newer). With
+// into a GPU container that setupCudaCheckpointJob wrapped (which requires
+// --cuda-multicast-shim-path and/or --cuda-multicast-shim-source=EMBEDDED,
+// GPU access, and driver R610 or newer). With
 // --cuda-multicast-shim-source=EMBEDDED, the interposer bundled inside the runsc
 // binary is first written into the container's filesystem; otherwise the
 // container image must carry it at --cuda-multicast-shim-path.
@@ -1710,13 +1765,6 @@ func (l *Loader) setupCudaCheckpointJob(info *containerInfo) error {
 // around the cuda-checkpoint phases via marker files in /tmp/mcshim.
 func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	shimPath := info.conf.CUDAMulticastShimContainerPath()
-	if shimPath == "" || !specutils.NVProxyEnabled(info.spec, info.conf) {
-		return nil
-	}
-	if major := l.k.NvidiaDriverVersion.Major(); major < cudaMulticastShimMinDriverMajor {
-		log.Warningf("The multicast interposer is enabled but driver R%d is older than R%d; not preloading it into container %q", major, cudaMulticastShimMinDriverMajor, info.containerName)
-		return nil
-	}
 
 	// Materialize the embedded interposer before anything references its
 	// path: if this fails, the container boots without any preload rather
@@ -2034,15 +2082,17 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	}
 	info.procArgs.StartupTimeline.Reached("exec user home resolved")
 
-	// If configured, run the container in a cuda-checkpoint job and preload the
-	// multicast suspend/resume interposer, so that its CUDA IPC and multicast
-	// state can be checkpointed/restored. Failure is non-fatal: the container
-	// still boots, but checkpoint/restore of that state may not work.
-	if err := l.setupCudaCheckpointJob(info); err != nil {
-		log.Warningf("Failed to set up cuda-checkpoint job for container %q: %v", info.containerName, err)
-	}
-	if err := l.setupCudaMulticastShim(info); err != nil {
-		log.Warningf("Failed to set up multicast interposer for container %q: %v", info.containerName, err)
+	// If configured, run a GPU container in a cuda-checkpoint job and preload
+	// the multicast suspend/resume interposer, so that its CUDA IPC and
+	// multicast state can be checkpointed/restored. Neither stops the
+	// container from starting: one that cannot be wrapped runs without both,
+	// and checkpoints are refused (see setupCudaCheckpointJob); one whose
+	// interposer cannot be set up runs in the job without it, and processes
+	// holding multicast objects or imports refuse checkpoints.
+	if l.setupCudaCheckpointJob(info) {
+		if err := l.setupCudaMulticastShim(info); err != nil {
+			log.Warningf("Failed to set up multicast interposer for container %q: %v", info.containerName, err)
+		}
 	}
 
 	// Create and start the new process.
@@ -2157,6 +2207,7 @@ func (l *Loader) destroySubcontainer(cid string) error {
 	}
 	// Cleanup the device gofer.
 	l.k.RemoveDevGofer(l.k.ContainerName(cid))
+	delete(l.cudaJobSkipped, l.k.ContainerName(cid))
 
 	if l.root.conf.InSandboxCgroup == config.InSandboxCgroupV2 {
 		l.removeContainerCgroup2(cid)

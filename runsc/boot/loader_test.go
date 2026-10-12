@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
@@ -739,6 +740,96 @@ func TestContainerFileExists(t *testing.T) {
 		if got, err := l.containerFileExists(info, tc.path); got != tc.want {
 			t.Errorf("containerFileExists(%q) = %v (%v), want %v", tc.path, got, err, tc.want)
 		}
+	}
+}
+
+// TestSetupCudaCheckpointJob covers which containers are wrapped in a
+// cuda-checkpoint job: only those given GPU access, only on driver R610 or
+// newer, and only if cuda-checkpoint is in the container; a GPU container
+// that cannot be wrapped is recorded, and checkpoints are refused while it
+// exists.
+func TestSetupCudaCheckpointJob(t *testing.T) {
+	spec := testSpec()
+	spec.Root = &specs.Root{Path: os.TempDir()}
+	spec.Mounts = append(spec.Mounts, specs.Mount{Destination: "/test", Type: "tmpfs"})
+	l, loaderCleanup, err := createLoader(testConfig(), spec)
+	if err != nil {
+		t.Fatalf("failed to create loader: %v", err)
+	}
+	defer l.Destroy()
+	defer loaderCleanup()
+
+	l.mu.Lock()
+	mntr := l.newContainerMounter(&l.root)
+	ctx := l.k.SupervisorContext()
+	creds := auth.NewRootCredentials(l.root.procArgs.Credentials.UserNamespace)
+	mns, err := mntr.mountAll(ctx, creds, l.root.spec, l.root.conf, &l.root.procArgs)
+	if err != nil {
+		l.mu.Unlock()
+		t.Fatalf("mountAll: %v", err)
+	}
+	base := &containerInfo{procArgs: l.root.procArgs}
+	base.procArgs.MountNamespace = mns
+	if err := l.writeContainerFile(base, "/test/bin/cuda-checkpoint", []byte("x"), 0755); err != nil {
+		l.mu.Unlock()
+		t.Fatalf("writeContainerFile: %v", err)
+	}
+	l.mu.Unlock()
+
+	gpu := &specs.Spec{Linux: &specs.Linux{Devices: []specs.LinuxDevice{{Path: "/dev/nvidiactl"}}}}
+	noGPU := &specs.Spec{Linux: &specs.Linux{}}
+	for _, tc := range []struct {
+		name     string
+		spec     *specs.Spec
+		nvproxy  bool
+		ckpt     string
+		major    int
+		wantWrap bool
+		wantSkip bool
+	}{
+		{name: "gpu", spec: gpu, ckpt: "/test/bin/cuda-checkpoint", major: 610, wantWrap: true},
+		{name: "newer driver", spec: gpu, ckpt: "/test/bin/cuda-checkpoint", major: 615, wantWrap: true},
+		{name: "old driver", spec: gpu, ckpt: "/test/bin/cuda-checkpoint", major: 580},
+		{name: "no gpu, nvproxy for the sandbox", spec: noGPU, nvproxy: true, ckpt: "/test/bin/cuda-checkpoint", major: 610},
+		{name: "cuda-checkpoint missing", spec: gpu, ckpt: "/test/bin/missing", major: 610, wantSkip: true},
+		{name: "cuda-checkpoint is a directory", spec: gpu, ckpt: "/test/bin", major: 610, wantSkip: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			l.k.NvidiaDriverVersion = nvconf.NewDriverVersion(tc.major, 0, 0)
+			conf := testConfig()
+			conf.NVProxy = tc.nvproxy
+			conf.CUDACheckpointPath = tc.ckpt
+			conf.CUDAMulticastShimPath = "/test/lib/mcshim.so"
+			info := &containerInfo{
+				containerName: tc.name,
+				spec:          tc.spec,
+				conf:          conf,
+				procArgs:      base.procArgs,
+			}
+			info.procArgs.Argv = []string{"/bin/app", "arg"}
+			info.procArgs.Filename = "/bin/app"
+			got := l.setupCudaCheckpointJob(info)
+			if got != tc.wantWrap {
+				t.Errorf("setupCudaCheckpointJob() = %v, want %v", got, tc.wantWrap)
+			}
+			wantArgv := []string{"/bin/app", "arg"}
+			if tc.wantWrap {
+				wantArgv = []string{tc.ckpt, "--launch-job", "/bin/app", "arg"}
+			}
+			if !reflect.DeepEqual(info.procArgs.Argv, wantArgv) {
+				t.Errorf("argv = %q, want %q", info.procArgs.Argv, wantArgv)
+			}
+			if _, skipped := l.cudaJobSkipped[tc.name]; skipped != tc.wantSkip {
+				t.Errorf("recorded as skipped = %v, want %v", skipped, tc.wantSkip)
+			}
+		})
+	}
+
+	err = l.cudaJobSkippedError()
+	if err == nil || !strings.Contains(err.Error(), `container "cuda-checkpoint missing"`) || !strings.Contains(err.Error(), `container "cuda-checkpoint is a directory"`) {
+		t.Errorf("cudaJobSkippedError() = %v, want both skipped containers named", err)
 	}
 }
 

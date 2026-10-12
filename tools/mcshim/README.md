@@ -32,7 +32,7 @@ Linux 2; see Known limitations), whatever the build environment's glibc.
 ## How it gets into a container
 
 With `runsc --cuda-checkpoint-path=... --cuda-multicast-shim-path=/path/to/mcshim.so`
-(plus nvproxy and driver R610 or newer) -- or with
+(for containers given GPU access, on driver R610 or newer) -- or with
 `--cuda-multicast-shim-source=EMBEDDED`, in which case
 runsc first writes its embedded copy of `mcshim.so` into the container
 filesystem at that path (default `/usr/local/lib/mcshim.so`) --
@@ -42,6 +42,12 @@ container's VFS (launchers like SGLang's `torch_memory_saver` rewrite
 `LD_PRELOAD` for exactly the worker processes that matter; `ld.so.preload` is
 immune). In IMAGE mode, a path that is not a file in the container is not
 preloaded at all, since the dynamic loader would print an error on every exec.
+A container without GPU access (a pod's pause container or sidecars, even
+with `--nvproxy` set for the whole sandbox) gets neither. If a GPU container
+cannot be wrapped -- `cuda-checkpoint` is not a file at the absolute path
+`--cuda-checkpoint-path` names, or the entrypoint is `--exec-fd` -- it still
+starts, without the job or the shim, and checkpoints of the sandbox are
+refused while it exists.
 `Loader.setupCudaCheckpointJob` wraps the container's command in
 `cuda-checkpoint --launch-job`.
 

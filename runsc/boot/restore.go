@@ -729,20 +729,28 @@ func (l *Loader) save(o *control.SaveOpts) error {
 	// require, and with the interposer's protocol. Otherwise CUDA checkpoints
 	// are unchanged.
 	conf := l.root.conf
-	if o.CudaCheckpointPath == "" {
-		o.CudaCheckpointPath = conf.CUDACheckpointPath
-	}
-	if cudaMulticastShimEnabled(conf, l.k.NvidiaDriverVersion.Major()) {
-		o.CudaCheckpointSequential = true
-		o.CudaMulticastShim = true
-	}
-	saveOpts, err := control.ConvertToStateSaveOpts(o)
-	if err != nil {
+	fail := func(err error) error {
 		l.k.OnCheckpointAttempt(err)
 		if len(o.SplitFSCheckpointPaths) > 0 {
 			l.k.SignalAllFSSaveWaiters(err)
 		}
 		return err
+	}
+	if o.CudaCheckpointPath == "" {
+		o.CudaCheckpointPath = conf.CUDACheckpointPath
+	}
+	if cudaMulticastShimEnabled(conf, l.k.NvidiaDriverVersion.Major()) {
+		// A GPU container outside the job would be checkpointed outside it, and
+		// cuda-checkpoint hangs on its legacy CUDA IPC there.
+		if err := l.cudaJobSkippedError(); err != nil {
+			return fail(err)
+		}
+		o.CudaCheckpointSequential = true
+		o.CudaMulticastShim = true
+	}
+	saveOpts, err := control.ConvertToStateSaveOpts(o)
+	if err != nil {
+		return fail(err)
 	}
 	defer saveOpts.Close()
 

@@ -351,6 +351,29 @@ func TestValidationFail(t *testing.T) {
 			error: "requires --cuda-checkpoint-path",
 		},
 		{
+			name: "cuda-checkpoint-path-relative",
+			flags: map[string]string{
+				"cuda-checkpoint-path": "usr/bin/cuda-checkpoint",
+			},
+			error: "--cuda-checkpoint-path=\"usr/bin/cuda-checkpoint\" must be an absolute path",
+		},
+		{
+			name: "cuda-multicast-shim-path-relative",
+			flags: map[string]string{
+				"cuda-checkpoint-path":     "/usr/bin/cuda-checkpoint",
+				"cuda-multicast-shim-path": "mcshim.so",
+			},
+			error: "must be an absolute path without colons or whitespace",
+		},
+		{
+			name: "cuda-multicast-shim-path-colon",
+			flags: map[string]string{
+				"cuda-checkpoint-path":     "/usr/bin/cuda-checkpoint",
+				"cuda-multicast-shim-path": "/lib/a.so:/lib/b.so",
+			},
+			error: "must be an absolute path without colons or whitespace",
+		},
+		{
 			name: "fsgofer-host-uds+host-uds:open",
 			flags: map[string]string{
 				"fsgofer-host-uds": "true",

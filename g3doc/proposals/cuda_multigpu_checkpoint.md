@@ -180,8 +180,13 @@ absent by default, so frameworks choose POSIX fds).
     the image to carry it.
 -   It requires `--cuda-checkpoint-path`: the interposer leaves legacy CUDA
     IPC to `cuda-checkpoint`, which carries it only for processes in a job.
--   It does nothing without nvproxy, and logs a warning and does nothing on
-    drivers older than R610.
+-   It applies only to containers given GPU access (not a pod's pause
+    container, even when nvproxy is enabled for the whole sandbox), and logs
+    a warning and does nothing on drivers older than R610.
+-   A GPU container whose image lacks `cuda-checkpoint` (both paths must be
+    absolute) still starts, without the job or the interposer, and
+    checkpoints are refused while it exists: its processes would otherwise
+    be checkpointed outside a job.
 -   The loader appends the interposer to `LD_PRELOAD` and to
     `/etc/ld.so.preload`. The second is needed because launchers rewrite
     `LD_PRELOAD` for exactly the worker processes that hold GPU state (SGLang's

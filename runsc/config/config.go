@@ -401,9 +401,9 @@ type Config struct {
 	CUDACheckpointPath string `flag:"cuda-checkpoint-path"`
 
 	// CUDAMulticastShimPath is the path, inside the container filesystem, to
-	// the multicast suspend/resume interposer (mcshim.so). When it is set for
-	// a GPU container (nvproxy enabled) on driver R610+, the container's
-	// command is run with the interposer LD_PRELOADed.
+	// the multicast suspend/resume interposer (mcshim.so). When it is set, a
+	// container given GPU access on driver R610+ is run with the interposer
+	// LD_PRELOADed.
 	//
 	// cuda-checkpoint cannot checkpoint a process holding live multicast
 	// (NV_MEMORY_MULTICAST_FABRIC, 0x00fd) objects, which NCCL NVLS and
@@ -611,6 +611,16 @@ func (c *Config) Validate() error {
 	// it only for processes in a job.
 	if c.CUDAMulticastShimContainerPath() != "" && c.CUDACheckpointPath == "" {
 		return fmt.Errorf("the multicast interposer (--cuda-multicast-shim-path or --cuda-multicast-shim-source=EMBEDDED) requires --cuda-checkpoint-path")
+	}
+	// Both are paths inside the container: the job wrap execs the first as a
+	// container's argv[0], which must be absolute, and the dynamic linker
+	// resolves a relative LD_PRELOAD entry against each process's working
+	// directory, and splits entries at colons and whitespace.
+	if c.CUDACheckpointPath != "" && !filepath.IsAbs(c.CUDACheckpointPath) {
+		return fmt.Errorf("--cuda-checkpoint-path=%q must be an absolute path", c.CUDACheckpointPath)
+	}
+	if p := c.CUDAMulticastShimPath; p != "" && (!filepath.IsAbs(p) || strings.ContainsAny(p, ": \t\n")) {
+		return fmt.Errorf("--cuda-multicast-shim-path=%q must be an absolute path without colons or whitespace", p)
 	}
 	allowedCaps, _, err := nvconf.DriverCapsFromString(c.NVProxyAllowedDriverCapabilities)
 	if err != nil {
