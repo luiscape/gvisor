@@ -40,11 +40,13 @@
 #   orphan                       under runsc (-r): `runsc checkpoint` refuses an
 #                                import whose exporter freed the object, and
 #                                the application keeps running
-#   deadline reason optout       under runsc (-r), with a stub cuda-checkpoint:
+#   deadline reason undo optout  under runsc (-r), with a stub cuda-checkpoint:
 #                                a hung --get-state or lock is killed and the
 #                                checkpoint fails (after about 2 minutes),
 #                                with the application still running; a
 #                                refusal's reason reaches the sentry's error;
+#                                a failed checkpoint is undone with an unlock
+#                                and no restore of an uncheckpointed process;
 #                                without the interposer, no job and one
 #                                --toggle per process, as before it
 #   torch-kernel torch-symm      under runsc (-r) in a rootfs with PyTorch and
@@ -68,7 +70,7 @@ done
 shift $((OPTIND - 1))
 if [ $# -eq 0 ]; then
   set -- abi gate mc refcount refuse mapwait silent preload glibc ctlsec tables \
-    rtres ipc orphan deadline reason optout torch-kernel torch-symm \
+    rtres ipc orphan deadline reason undo optout torch-kernel torch-symm \
     torch-expandable
 fi
 GPUS=${MCSHIM_TEST_GPUS:-0,1}
@@ -397,6 +399,34 @@ deadline() {
   fi
 }
 
+# undo: with the interposer, a checkpoint that fails is undone: no restore of
+# a process that was not checkpointed, an unlock, a recoverable error, and the
+# application still running.
+undo() {
+  local rc=0
+  export RUNSC_FLAGS="${RUNSC_FLAGS:-} --cuda-checkpoint-path=/mnt/ckpt_stub --cuda-multicast-shim-path=/mnt/mcshim.so"
+  stub_start undo beat || return 1
+  echo "--action checkpoint" > "$W/ckpt_stub.fail"
+  stub_ckpt undo || rc=$?
+  echo "undo: checkpoint rc=$rc; cuda-checkpoint calls:"
+  sed 's/^/  /' "$W/ckpt_stub.log"
+  if [ $rc -eq 0 ] || ! grep -q "checkpoint phase failed" "$W/undo.ckpt" ||
+    grep -q "must be restarted" "$W/undo.ckpt"; then
+    echo "undo: want a recoverable checkpoint failure"
+    return 1
+  fi
+  if grep -q -- "--action restore" "$W/ckpt_stub.log" ||
+    ! grep -q -- "--action unlock" "$W/ckpt_stub.log"; then
+    echo "undo: want an unlock and no restore"
+    return 1
+  fi
+  if ! beating; then
+    echo "undo: the application stopped"
+    return 1
+  fi
+  runsc kill "mcshim-test-$$-undo" KILL || true
+}
+
 # optout: with the runtime --cuda-checkpoint-path but no interposer, the
 # container is not wrapped in a job and is checkpointed with one --toggle per
 # process, exactly as before the interposer. A failed toggle fails the
@@ -484,7 +514,7 @@ for t in "$@"; do
     ctlsec) ctlsec || rc=$? ;;
     rtres) rtres || rc=$? ;;
     tables) tables || rc=$? ;;
-    deadline | reason | optout)
+    deadline | reason | undo | optout)
       if [ -z "$RUNSC" ]; then
         echo "SKIP $t: needs -r RUNSC"
         continue
