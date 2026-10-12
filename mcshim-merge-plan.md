@@ -4,7 +4,7 @@
 | :--- | :--- |
 | Status | Draft for review |
 | Date | 2026-10-12 |
-| Branch | `luis/multicast-xgpu-upstream` at `09df770cc` (github.com/luiscape/gvisor) |
+| Branch | `luis/multicast-xgpu-upstream` at `26e35715b` (github.com/luiscape/gvisor) |
 | Upstream | `google/gvisor` `master` at `0a438edc9` |
 | Design doc | `g3doc/proposals/cuda_multigpu_checkpoint.md` (on the branch) |
 
@@ -30,8 +30,9 @@ groups:
    tracking, the restore path and the job wrap reach them today.
 4. **Hygiene.** Dev-only files, stale docs and upstream drift.
 
-Since the first draft, R2, R11, R13, R15, R16, R17 and R20 have been fixed
-on the branch (section 4.1).
+Since the first draft, R1-R6, R9-R11, R13, R15-R17 and R20 have been fixed
+on the branch (section 4.1). That closes the first two groups above, except
+R7 (a decision) and R8 (musl images).
 
 This document describes the architecture, lists the fixes as requirements
 (must land with or before the code they fix) and nice-to-haves (follow-ups),
@@ -190,6 +191,8 @@ the new binary.
 | R16, R17, R20 (job wrap scope, missing `cuda-checkpoint`, `--exec-fd`, path validation) | `182960ccb` | `TestSetupCudaCheckpointJob` (GPU and non-GPU containers, old and newer drivers, missing or directory `cuda-checkpoint`); `config_test` cases for relative paths and separators. |
 | R11, R13 (undoing a failed checkpoint; reaping comment) | `72756209d` | `TestCheckpointLocked`: 8 failure points against a fake `cuda-checkpoint`. New `undo` stub case in `run.sh` for the GPU round. |
 | R15 (export/import recording) | `09df770cc` | `TestRecordExportImport` covers the recording. The lock held across the host call, and recording before the copy-out, need a GPU to exercise. |
+| R1, R3, R4, R5, R6 (interposer effects on processes that never checkpoint) | `96841776a` | New `run.sh noeffect` (`noeffect.sh`): seven programs, each run with and without the shim. The previous shim changes six of them; the fixed one none. |
+| R9, R10 (the sentry's marker operations) | `26e35715b` | `TestCudaShimFS` on a tmpfs root: the control directory as a symlink, and symlinks, a hard link and FIFOs planted as markers, acks and the log. Against the old resolution rules it fails 9 checks. |
 
 How each was fixed:
 
@@ -213,8 +216,25 @@ How each was fixed:
   allocations, and the result is recorded before anything is copied back
   to the application.
 
-Not yet fixed in the same areas: the sentry's own marker operations (R9,
-R10), and the nvproxy gating (R14).
+- **R1, R3-R6.** The rewritten `dlsym` lookups find what the caller would
+  find without the shim, then return the wrapper: never the shim's own
+  definition, the caller's own dependencies searched for `RTLD_DEFAULT`,
+  and `dlerror` left clear on success. A cudart resolver called from the
+  main program goes to the runtime the main program binds to. The shim
+  never loads libcuda, and its wrappers return
+  `CUDA_ERROR_NOT_INITIALIZED` without it. The control thread blocks every
+  signal.
+- **R9, R10.** The sentry resolves `/tmp/mcshim` once, refusing a symlink;
+  reaches each marker as one component without following a final symlink;
+  and opens only regular files with one link, non-blocking.
+
+A behavior change to know about: a `dlsym(RTLD_DEFAULT)` lookup of a
+resolver or driver entry point that only the shim defines (no runtime or
+libcuda loaded globally, or loaded `RTLD_LOCAL` by another library) now
+returns NULL, as without the shim. Before, it returned the shim's wrapper.
+
+Not yet fixed in the same areas: the nvproxy gating (R14), and musl images
+(R8).
 
 ## 5. Requirements
 
@@ -230,12 +250,12 @@ Status:
 
 | ID | Problem | Status | Fix |
 | :--- | :--- | :--- | :--- |
-| R1 | The exported `cu*`/`cuda*` wrappers make CUDA look installed: `dlsym(RTLD_DEFAULT, "cuInit")` succeeds in a process without CUDA, and calling a wrapper without libcuda segfaults. With libcuda installed, a process that only probes for it ends up loading it. | Verified (probe, crash); reported (forced load) | Return NULL from `dlsym` when the only definition is the interposer's own. Never `dlopen` libcuda without `RTLD_NOLOAD`. Check every real pointer and return `CUDA_ERROR_NOT_INITIALIZED`. |
+| R1 | The exported `cu*`/`cuda*` wrappers make CUDA look installed: `dlsym(RTLD_DEFAULT, "cuInit")` succeeds in a process without CUDA, and calling a wrapper without libcuda segfaults. With libcuda installed, a process that only probes for it ends up loading it. | **Fixed** (`96841776a`); was: Verified (probe, crash); reported (forced load) | Return NULL from `dlsym` when the only definition is the interposer's own. Never `dlopen` libcuda without `RTLD_NOLOAD`. Check every real pointer and return `CUDA_ERROR_NOT_INITIALIZED`. |
 | R2 | A root process run with `MCSHIM_LOG=<file>`, or a log symlink planted in `/tmp/mcshim`, makes the interposer `chmod 0666` that file. `/etc/ld.so.preload` applies to setuid programs too. | **Fixed** (`3f8f69a7c`); was: Verified; regression | `secure_getenv`; do nothing when `AT_SECURE` is set; open with `O_NOFOLLOW`, create with `O_EXCL`, change modes only on files just created. Same for marker and publish files. |
-| R3 | The control thread inherits the caller's signal mask, so a program waiting for SIGTERM with `sigwait` is killed by it instead. | Verified | Block all signals around `pthread_create`. |
-| R4 | `RTLD_DEFAULT` lookups of `cu*` names from `RTLD_LOCAL` libraries (how Python loads extensions) still search the interposer's scope. The latest round fixed this only for other names. | Reported; regression | Resolve in the caller's scope. |
-| R5 | When the caller is the main program, cudart's resolver can be answered by the newest loaded runtime instead of the caller's own (wrong ABI). | Reported; regression | Fall back to the next definition after the interposer. |
-| R6 | A successful `cu*` lookup can leave `dlerror()` set. | Reported | Clear it on success. |
+| R3 | The control thread inherits the caller's signal mask, so a program waiting for SIGTERM with `sigwait` is killed by it instead. | **Fixed** (`96841776a`); was: Verified | Block all signals around `pthread_create`. |
+| R4 | `RTLD_DEFAULT` lookups of `cu*` names from `RTLD_LOCAL` libraries (how Python loads extensions) still search the interposer's scope. The latest round fixed this only for other names. | **Fixed** (`96841776a`); was: Reported; regression | Resolve in the caller's scope. |
+| R5 | When the caller is the main program, cudart's resolver can be answered by the newest loaded runtime instead of the caller's own (wrong ABI). | **Fixed** (`96841776a`); was: Reported; regression | Fall back to the next definition after the interposer. |
+| R6 | A successful `cu*` lookup can leave `dlerror()` set. | **Fixed** (`96841776a`); was: Reported | Clear it on success. |
 | R7 | Fabric handle types are stripped in every CUDA process, so multi-node NVLink workloads that never checkpoint lose them. | Verified (code) | Decision (section 8). Recommended: refuse the checkpoint while fabric objects are live, instead of rewriting calls. |
 | R8 | On musl images (Alpine), preloading the glibc interposer makes every process fail to start. | Reported | runsc checks for the glibc loader before preloading. |
 
@@ -243,8 +263,8 @@ Status:
 
 | ID | Problem | Status | Fix |
 | :--- | :--- | :--- | :--- |
-| R9 | Marker operations run as root on `/tmp/mcshim/<name>`, protecting only the last path component from symlinks. A container user who makes `/tmp/mcshim` a symlink first gets the sentry to create and delete files as root elsewhere, including on writable bind mounts. | Verified (code) | Open the directory once without following symlinks and resolve each marker relative to it; consider the process's own credentials. |
-| R10 | A FIFO planted as a marker, error file or log hangs the checkpoint RPC forever. | Reported | Open non-blocking and require a regular file. |
+| R9 | Marker operations run as root on `/tmp/mcshim/<name>`, protecting only the last path component from symlinks. A container user who makes `/tmp/mcshim` a symlink first gets the sentry to create and delete files as root elsewhere, including on writable bind mounts. | **Fixed** (`26e35715b`); was: Verified (code) | Open the directory once without following symlinks and resolve each marker relative to it; consider the process's own credentials. |
+| R10 | A FIFO planted as a marker, error file or log hangs the checkpoint RPC forever. | **Fixed** (`26e35715b`); was: Reported | Open non-blocking and require a regular file. |
 | R11 | If the checkpoint phase fails, restore runs on every locked process, including those that did not checkpoint; the error says "unrecoverable" but the interposer is unwound anyway. | **Fixed** (`72756209d`); was: Verified (first half); reported (second) | Restore only processes that checkpointed, then unlock all; skip the unwind on the unrecoverable path. |
 | R12 | The path without the interposer differs from upstream: `--device-map` on restore, a failed save-and-resume now undoes CUDA state, a failed toggle is no longer re-toggled, exec failures continue instead of stopping, an extra environment variable, unlock/pause order, missing timeline markers. | Verified (`--device-map`); reported (rest) | Gate each on the interposer option, or justify it in its own PR. `--device-map` is resolved by landing #14817. |
 | R13 | A code comment from the latest round claims every `cuda-checkpoint` invocation is reaped; untrue when a killed one never exits. | **Fixed** (`72756209d`); was: Reported; regression | Correct it (real fix: N4). |
@@ -349,8 +369,8 @@ robustness fixes; N8 and N11 as interposer refactors; N17 as the GPU target.
 R1-R6, R11, R15 and R16 change code paths that run on GPUs. Before PR3,
 PR4, PR7 and PR9 merge, rerun on the fixed binary:
 
-- The full interposer suite, including the CPU-only `preload`, `glibc` and
-  `ctlsec` tests. (`tables` at its default size, `fuzz 20000 8`, runs past
+- The full interposer suite, including the CPU-only `preload`, `noeffect`,
+  `glibc` and `ctlsec` tests. (`tables` at its default size, `fuzz 20000 8`, runs past
   400 s with the shim both before and after these fixes; at 2,000 operations
   it passes.)
 - `rtres` with a renamed cudart (`libcudart-<hash>.so.12`).
