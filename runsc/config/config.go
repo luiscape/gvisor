@@ -403,7 +403,9 @@ type Config struct {
 	// CUDAMulticastShimPath is the path, inside the container filesystem, to
 	// the multicast suspend/resume interposer (mcshim.so). When it is set, a
 	// container given GPU access on driver R610+ is run with the interposer
-	// LD_PRELOADed.
+	// LD_PRELOADed. The operator puts it there (built from tools/mcshim):
+	// in the image, or through a mount. A path that is not a file in the
+	// container is not preloaded.
 	//
 	// cuda-checkpoint cannot checkpoint a process holding live multicast
 	// (NV_MEMORY_MULTICAST_FABRIC, 0x00fd) objects, which NCCL NVLS and
@@ -415,24 +417,6 @@ type Config struct {
 	// transitions around the cuda-checkpoint phases; see
 	// pkg/sentry/control/state_cuda.go.
 	CUDAMulticastShimPath string `flag:"cuda-multicast-shim-path"`
-
-	// CUDAMulticastShimSource selects where the multicast interposer comes
-	// from. CUDAMulticastShimSourceImage (the default) expects the container
-	// image to carry it at CUDAMulticastShimPath. CUDAMulticastShimSourceEmbedded
-	// materializes the interposer bundled inside the runsc binary (mcshim.so,
-	// built from tools/mcshim) into each GPU container's
-	// filesystem at container creation, at CUDAMulticastShimPath (or
-	// DefaultCUDAMulticastShimPath when no path is given), so the container
-	// image does not need to carry the interposer itself.
-	//
-	// The write goes through the container's VFS: with a rootfs overlay (the
-	// default --overlay2 configuration) the file lands in the overlay's upper
-	// layer, which is part of checkpoint images, so a restored process re-maps
-	// exactly the interposer bytes it had mapped at checkpoint time, even
-	// across runsc upgrades. With --overlay2=none it is written into the
-	// user's rootfs on the host, and stays there; so does the line runsc adds
-	// to /etc/ld.so.preload in either source mode.
-	CUDAMulticastShimSource CUDAMulticastShimSource `flag:"cuda-multicast-shim-source"`
 
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
@@ -611,8 +595,8 @@ func (c *Config) Validate() error {
 	}
 	// The interposer leaves CUDA IPC (cuIpc*) to cuda-checkpoint, which carries
 	// it only for processes in a job.
-	if c.CUDAMulticastShimContainerPath() != "" && c.CUDACheckpointPath == "" {
-		return fmt.Errorf("the multicast interposer (--cuda-multicast-shim-path or --cuda-multicast-shim-source=EMBEDDED) requires --cuda-checkpoint-path")
+	if c.CUDAMulticastShimPath != "" && c.CUDACheckpointPath == "" {
+		return fmt.Errorf("the multicast interposer (--cuda-multicast-shim-path) requires --cuda-checkpoint-path")
 	}
 	// Both are paths inside the container: the job wrap execs the first as a
 	// container's argv[0], which must be absolute, and the dynamic linker
@@ -704,63 +688,6 @@ func (c *Config) GetOverlay2() Overlay2 {
 		return Overlay2{rootMount: true, subMounts: true, medium: "memory"}
 	}
 	return c.Overlay2
-}
-
-// DefaultCUDAMulticastShimPath is the in-container path at which
-// CUDAMulticastShimSourceEmbedded materializes the multicast interposer when
-// CUDAMulticastShimPath does not name a path itself.
-const DefaultCUDAMulticastShimPath = "/usr/local/lib/mcshim.so"
-
-// CUDAMulticastShimSource selects where the multicast interposer comes from.
-type CUDAMulticastShimSource string
-
-// CUDAMulticastShimSource values.
-const (
-	// CUDAMulticastShimSourceImage: the container image carries the
-	// interposer at --cuda-multicast-shim-path (which enables it).
-	CUDAMulticastShimSourceImage CUDAMulticastShimSource = "IMAGE"
-	// CUDAMulticastShimSourceEmbedded: runsc writes its bundled interposer
-	// into the container at creation.
-	CUDAMulticastShimSourceEmbedded CUDAMulticastShimSource = "EMBEDDED"
-)
-
-// Set implements flag.Value. Set(String()) should be idempotent.
-func (s *CUDAMulticastShimSource) Set(v string) error {
-	src := CUDAMulticastShimSource(strings.ToUpper(v))
-	switch src {
-	case CUDAMulticastShimSourceImage, CUDAMulticastShimSourceEmbedded:
-		*s = src
-		return nil
-	}
-	return fmt.Errorf("invalid value %q; must be %s or %s", v, CUDAMulticastShimSourceImage, CUDAMulticastShimSourceEmbedded)
-}
-
-// Ptr returns a pointer to `s`. Useful in flag declaration line.
-func (s CUDAMulticastShimSource) Ptr() *CUDAMulticastShimSource {
-	return &s
-}
-
-// Get implements flag.Get.
-func (s *CUDAMulticastShimSource) Get() any {
-	return *s
-}
-
-// String implements flag.String.
-func (s CUDAMulticastShimSource) String() string {
-	return string(s)
-}
-
-// CUDAMulticastShimContainerPath returns the in-container path of the
-// multicast suspend/resume interposer, or "" if the interposer is not
-// enabled.
-func (c *Config) CUDAMulticastShimContainerPath() string {
-	if c.CUDAMulticastShimPath != "" {
-		return c.CUDAMulticastShimPath
-	}
-	if c.CUDAMulticastShimSource == CUDAMulticastShimSourceEmbedded {
-		return DefaultCUDAMulticastShimPath
-	}
-	return ""
 }
 
 // Bundle is a set of flag name-value pairs.

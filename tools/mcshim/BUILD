@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "cc_binary")
+load("//tools:defs.bzl", "cc_binary", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -37,8 +37,8 @@ filegroup(
 #
 # The result is preloaded into every process of container images whose glibc
 # may be older than the build environment's: its glibc floor is GLIBC_2.17
-# (see README.md), which //runsc/mcshimbin:mcshimbin_test checks on the
-# embedded copy and tools/mcshim/test/run.sh glibc checks in old images.
+# (see README.md), which :glibc_floor_test checks on this target's output and
+# tools/mcshim/test/run.sh glibc checks in old images.
 cc_binary(
     name = "mcshim",
     srcs = ["mcshim.c"],
@@ -63,5 +63,22 @@ cc_binary(
         "-Wl,--as-needed",
     ],
     linkshared = True,
-    visibility = ["//runsc/mcshimbin:__pkg__"],
+)
+
+# The interposer is preloaded into every process of a container image, so it
+# must not need a glibc newer than the image's, nor drop the libraries that
+# define dlopen and pthread_create before glibc 2.34. go:embed needs the
+# library in this package under a file name, hence the copy.
+genrule(
+    name = "glibc_floor_test_input",
+    srcs = [":mcshim"],
+    outs = ["glibc_floor_test_input.so"],
+    cmd = "cp $< $@",
+)
+
+go_test(
+    name = "glibc_floor_test",
+    size = "small",
+    srcs = ["glibc_floor_test.go"],
+    embedsrcs = [":glibc_floor_test_input"],  # keep
 )

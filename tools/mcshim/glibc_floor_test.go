@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package mcshimbin
+// Package mcshim holds a test of the interposer's build: the library itself
+// is C (mcshim.c).
+package mcshim
 
 import (
 	"bytes"
+	_ "embed"
 	"debug/elf"
 	"fmt"
 	"sort"
@@ -24,7 +27,12 @@ import (
 	"testing"
 )
 
-// glibcFloor is the newest glibc symbol version the embedded interposer may
+// interposer is //tools/mcshim's output, as the BUILD file builds it.
+//
+//go:embed glibc_floor_test_input.so
+var interposer []byte
+
+// glibcFloor is the newest glibc symbol version the interposer may
 // require, as a (major, minor) pair. The interposer is preloaded into every
 // process of a container, and a library that needs a symbol version the
 // image's glibc lacks makes the dynamic linker exit the process with status
@@ -55,13 +63,13 @@ func above(a, b [2]int) bool {
 	return a[0] > b[0] || (a[0] == b[0] && a[1] > b[1])
 }
 
-// TestGlibcFloor checks that the embedded interposer needs no glibc symbol
+// TestGlibcFloor checks that the interposer needs no glibc symbol
 // version above glibcFloor, and that it still depends on the libraries that
 // defined those symbols before glibc 2.34.
 func TestGlibcFloor(t *testing.T) {
-	f, err := elf.NewFile(bytes.NewReader(Interposer()))
+	f, err := elf.NewFile(bytes.NewReader(interposer))
 	if err != nil {
-		t.Fatalf("parsing the embedded mcshim.so: %v", err)
+		t.Fatalf("parsing mcshim.so: %v", err)
 	}
 	syms, err := f.ImportedSymbols()
 	if err != nil {

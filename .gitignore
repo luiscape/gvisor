@@ -14,6 +14,3 @@
 /compile_commands.json
 # Built multicast interposer artifact.
 /tools/mcshim/*.so
-# Embedded-interposer inputs (generated into bazel-out by genrules; only
-# present here if someone copies them in for non-Bazel tooling).
-/runsc/mcshimbin/mcshim.so

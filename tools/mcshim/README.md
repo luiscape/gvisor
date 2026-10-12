@@ -23,30 +23,35 @@ unchanged: one `cuda-checkpoint --toggle` per process, no job.
 
 Build with `./build.sh` (toolkit-free; runs in a pinned ubuntu:22.04 container
 by default). The Bazel target `//tools/mcshim:mcshim` builds the same
-artifact, and `//runsc` embeds it (through `//runsc/mcshimbin`) so that a
-stock runsc binary can inject the interposer into containers whose images do
-not carry it (`--cuda-multicast-shim-source=EMBEDDED`). Either way the result
-needs no glibc symbol version newer than **GLIBC_2.17** (CentOS 7, Amazon
-Linux 2; see Known limitations), whatever the build environment's glibc.
+artifact. Either way the result needs no glibc symbol version newer than
+**GLIBC_2.17** (CentOS 7, Amazon Linux 2; see Known limitations), whatever
+the build environment's glibc. runsc does not carry the interposer: the
+operator provides it in each GPU container, in the image or through a mount
+(see below).
 
 ## How it gets into a container
 
 With `runsc --cuda-checkpoint-path=... --cuda-multicast-shim-path=/path/to/mcshim.so`
-(for containers given GPU access, on driver R610 or newer) -- or with
-`--cuda-multicast-shim-source=EMBEDDED`, in which case
-runsc first writes its embedded copy of `mcshim.so` into the container
-filesystem at that path (default `/usr/local/lib/mcshim.so`) --
+(for containers given GPU access, on driver R610 or newer),
 `Loader.setupCudaMulticastShim` (`runsc/boot/loader.go`) appends the shim to
 the container's `LD_PRELOAD` **and** to `/etc/ld.so.preload` through the
 container's VFS (launchers like SGLang's `torch_memory_saver` rewrite
 `LD_PRELOAD` for exactly the worker processes that matter; `ld.so.preload` is
-immune). In IMAGE mode, a path that is not a file in the container is not
-preloaded at all, since the dynamic loader would print an error on every exec.
-Both writes (the embedded copy, and the `ld.so.preload` entry) land where the
-container's own view of the path leads: in the rootfs overlay by default,
-which is private to the sandbox and part of checkpoints, but in the user's
-rootfs on the host with `--overlay2=none`, or in a bind mount if the path
-crosses one.
+immune). A path that is not a file in the container is not preloaded at all,
+since the dynamic loader would print an error on every exec. The
+`ld.so.preload` entry lands where the container's own view of the path
+leads: in the rootfs overlay by default, which is private to the sandbox and
+part of checkpoints, but in the user's rootfs on the host with
+`--overlay2=none`, or in a bind mount if the path crosses one.
+
+The interposer itself is the operator's to provide at that path, and a
+restore needs the same bytes at the same path: a restored process maps the
+library it had mapped at checkpoint time. If it reaches the container
+through a mount rather than the image, use a path that names its version
+(say `/opt/mcshim/mcshim-<sha256>.so`) and keep every version that
+checkpoints reference available where they are restored. runsc and the
+interposer can also come from different builds; nothing yet checks that
+they speak the same marker protocol.
 A container without GPU access (a pod's pause container or sidecars, even
 with `--nvproxy` set for the whole sandbox) gets neither. If a GPU container
 cannot be wrapped -- `cuda-checkpoint` is not a file at the absolute path
@@ -429,9 +434,9 @@ inside the container's trust domain, not gVisor's:
     it was built against: it links against stubs of `libdl.so.2` and
     `libpthread.so.0` that pin the entry points glibc 2.34 re-versioned
     (`glibc_stubs.sh`), and parses text without `scanf`/`strtoul`, which
-    glibc 2.38 re-versioned. `//runsc/mcshimbin:mcshimbin_test` checks the
-    embedded copy, `build.sh` the standalone one, and `test/run.sh glibc`
-    loads it in old images. Images with glibc older than 2.17 are not
+    glibc 2.38 re-versioned. `//tools/mcshim:glibc_floor_test` checks the
+    Bazel build, `build.sh` its own, and `test/run.sh glibc` loads it in old
+    images. Images with glibc older than 2.17 are not
     supported.
 *   **`dlsym` is interposed for every process.** The shim rewrites only
     `cu[A-Z]*` and `cudaGetDriverEntryPoint*` lookups, and forwards everything

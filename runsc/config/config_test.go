@@ -344,13 +344,6 @@ func TestValidationFail(t *testing.T) {
 			error: "requires --cuda-checkpoint-path",
 		},
 		{
-			name: "cuda-multicast-shim-embedded-without-cuda-checkpoint-path",
-			flags: map[string]string{
-				"cuda-multicast-shim-source": "EMBEDDED",
-			},
-			error: "requires --cuda-checkpoint-path",
-		},
-		{
 			name: "cuda-checkpoint-path-relative",
 			flags: map[string]string{
 				"cuda-checkpoint-path": "usr/bin/cuda-checkpoint",

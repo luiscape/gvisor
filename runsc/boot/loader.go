@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"maps"
 	"os"
-	"path"
 	"runtime"
 	"slices"
 	"strconv"
@@ -95,7 +94,6 @@ import (
 	pf "gvisor.dev/gvisor/runsc/boot/portforward"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
 	"gvisor.dev/gvisor/runsc/config"
-	"gvisor.dev/gvisor/runsc/mcshimbin"
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
 
@@ -1678,7 +1676,7 @@ const cudaMulticastShimMinDriverMajor = 610
 // Only then do containers run in a cuda-checkpoint job and checkpoint with the
 // interposer's protocol; otherwise CUDA checkpoints are unchanged.
 func cudaMulticastShimEnabled(conf *config.Config, driverMajor int) bool {
-	return conf.CUDAMulticastShimContainerPath() != "" && conf.CUDACheckpointPath != "" && driverMajor >= cudaMulticastShimMinDriverMajor
+	return conf.CUDAMulticastShimPath != "" && conf.CUDACheckpointPath != "" && driverMajor >= cudaMulticastShimMinDriverMajor
 }
 
 // setupCudaCheckpointJob groups a GPU container's CUDA processes into a
@@ -1700,7 +1698,7 @@ func cudaMulticastShimEnabled(conf *config.Config, driverMajor int) bool {
 // +checklocks:l.mu
 func (l *Loader) setupCudaCheckpointJob(info *containerInfo) bool {
 	conf := info.conf
-	if conf.CUDAMulticastShimContainerPath() == "" || !specutils.GPUFunctionalityRequested(info.spec, conf) {
+	if conf.CUDAMulticastShimPath == "" || !specutils.GPUFunctionalityRequested(info.spec, conf) {
 		return false
 	}
 	if major := l.k.NvidiaDriverVersion.Major(); !cudaMulticastShimEnabled(conf, major) {
@@ -1752,32 +1750,22 @@ func (l *Loader) cudaJobSkippedError() error {
 
 // setupCudaMulticastShim LD_PRELOADs the multicast suspend/resume interposer
 // into a GPU container that setupCudaCheckpointJob wrapped (which requires
-// --cuda-multicast-shim-path and/or --cuda-multicast-shim-source=EMBEDDED,
-// GPU access, and driver R610 or newer). With
-// --cuda-multicast-shim-source=EMBEDDED, the interposer bundled inside the runsc
-// binary is first written into the container's filesystem; otherwise the
-// container image must carry it at --cuda-multicast-shim-path.
+// --cuda-multicast-shim-path, GPU access, and driver R610 or newer). The
+// operator provides the interposer at --cuda-multicast-shim-path, in the image
+// or through a mount.
 //
 // cuda-checkpoint cannot checkpoint a process holding live multicast (0x00fd)
 // objects, which NCCL NVLS and torch _symmetric_memory both create. The
 // interposer releases them before the checkpoint and rebuilds them at
 // byte-identical VAs afterwards; control/state_cuda.go drives both transitions
 // around the cuda-checkpoint phases via marker files in /tmp/mcshim.
-func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
-	shimPath := info.conf.CUDAMulticastShimContainerPath()
-
-	// Materialize the embedded interposer before anything references its
-	// path: if this fails, the container boots without any preload rather
-	// than with a dangling one.
-	if info.conf.CUDAMulticastShimSource == config.CUDAMulticastShimSourceEmbedded {
-		if err := l.materializeCudaMulticastShim(info, shimPath); err != nil {
-			return err
-		}
-	} else if ok, err := l.containerFileExists(info, shimPath); !ok {
+func (l *Loader) setupCudaMulticastShim(info *containerInfo) {
+	shimPath := info.conf.CUDAMulticastShimPath
+	if ok, err := l.containerFileExists(info, shimPath); !ok {
 		// Preloading a missing library makes the dynamic loader print an
 		// error on every exec in the container.
 		log.Warningf("Multicast interposer %q is not a file in container %q (%v); not preloading it", shimPath, info.containerName, err)
-		return nil
+		return
 	}
 	info.procArgs.Envv = appendLdPreload(info.procArgs.Envv, shimPath)
 
@@ -1801,7 +1789,6 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 		log.Warningf("Could not add the multicast interposer to /etc/ld.so.preload for container %q (continuing with env-based preload only, which a launcher that rewrites LD_PRELOAD can defeat): %v", info.containerName, err)
 	}
 	log.Infof("Preloaded multicast interposer %q into container %q", shimPath, info.containerName)
-	return nil
 }
 
 // appendLdPreload returns env with lib added to its LD_PRELOAD, after any
@@ -1827,24 +1814,6 @@ func appendLdPreload(env []string, lib string) []string {
 	return append(env, preloadKey+lib)
 }
 
-// materializeCudaMulticastShim writes the multicast interposer bundled
-// inside the runsc binary (mcshim.so) into the container's filesystem at
-// shimPath, mode 0755.
-//
-// Because the write goes through the container's VFS, the file is part
-// of the container's checkpointable filesystem state (with the default
-// --overlay2 configuration, the rootfs overlay). A checkpoint therefore
-// carries the exact interposer bytes the application has mapped, and the
-// restore re-establishes those mappings correctly even if the restoring
-// runsc bundles a different interposer build.
-func (l *Loader) materializeCudaMulticastShim(info *containerInfo, shimPath string) error {
-	if err := l.writeContainerFile(info, shimPath, mcshimbin.Interposer(), 0755); err != nil {
-		return fmt.Errorf("materializing embedded multicast interposer: %w", err)
-	}
-	log.Infof("Materialized embedded multicast interposer at %q in container %q", shimPath, info.containerName)
-	return nil
-}
-
 // containerFileExists reports whether p is a regular file in the container's
 // filesystem, following symlinks.
 func (l *Loader) containerFileExists(info *containerInfo, p string) (bool, error) {
@@ -1868,70 +1837,18 @@ func (l *Loader) containerFileExists(info *containerInfo, p string) (bool, error
 	return stat.Mode&linux.S_IFMT == linux.S_IFREG, nil
 }
 
-// writeContainerFile creates (or truncates) dstPath inside the container's
-// filesystem, creating parent directories as needed, and writes data to it
-// with the given mode.
-//
-// The write goes through the container's VFS with root credentials, following
-// symlinks in every component but the last, so it lands wherever the
-// container's own view of dstPath leads: with a rootfs overlay (the default
-// --overlay2 configuration) in the overlay's upper layer, which is private to
-// the sandbox and part of checkpoints; with --overlay2=none in the user's
-// rootfs on the host, permanently; and on a path through a bind mount, in
-// that mount.
-func (l *Loader) writeContainerFile(info *containerInfo, dstPath string, data []byte, mode linux.FileMode) error {
-	mntns := info.procArgs.MountNamespace
-	if mntns == nil {
-		return fmt.Errorf("container mount namespace is not set up yet")
-	}
-	ctx := info.procArgs.NewContext(l.k)
-	// Root credentials, not the container's: this is sentry-managed
-	// configuration (like /etc/ld.so.preload above), and a non-root container
-	// must not fail the write just because the destination is root-owned.
-	creds := auth.NewRootCredentials(l.k.RootUserNamespace())
-	root := mntns.Root(ctx)
-	defer root.DecRef(ctx)
-	vfsObj := root.Mount().Filesystem().VirtualFilesystem()
-	if dir := path.Dir(dstPath); dir != "/" && dir != "." {
-		if err := vfsObj.MkdirAllAt(ctx, dir, root, creds, &vfs.MkdirOptions{Mode: 0755}, true /* mustBeDir */); err != nil {
-			return fmt.Errorf("creating directory %q: %w", dir, err)
-		}
-	}
-	fd, err := vfsObj.OpenAt(ctx, creds, &vfs.PathOperation{
-		Root:  root,
-		Start: root,
-		Path:  fspath.Parse(dstPath),
-	}, &vfs.OpenOptions{
-		Flags: linux.O_WRONLY | linux.O_CREAT | linux.O_TRUNC,
-		Mode:  mode,
-	})
-	if err != nil {
-		return fmt.Errorf("opening %q: %w", dstPath, err)
-	}
-	defer fd.DecRef(ctx)
-	for written := 0; written < len(data); {
-		n, err := fd.Write(ctx, usermem.BytesIOSequence(data[written:]), vfs.WriteOptions{})
-		written += int(n)
-		if err != nil {
-			return fmt.Errorf("writing %q: %w", dstPath, err)
-		}
-		if n == 0 {
-			return fmt.Errorf("writing %q: short write", dstPath)
-		}
-	}
-	return nil
-}
-
 // writeLdSoPreload appends the interposer path (shimPath) to the container's
 // /etc/ld.so.preload (creating the file if absent), through the container's
 // own mount namespace. Idempotent: a path already listed is not added again,
 // which also makes container restarts and restores safe.
 //
-// It writes like writeContainerFile, with the same consequences: with a rootfs
-// overlay (the default --overlay2 configuration) the file is in the overlay's
-// upper layer, which is part of the checkpoint, so processes started after a
-// restore see it too; with --overlay2=none, or if /etc is reached through a
-// bind mount, the line is added to the file on the host and stays there.
+// The write goes through the container's VFS with root credentials,
+// following symlinks in every component but the last, so it lands wherever
+// the container's own view of /etc/ld.so.preload leads: with a rootfs overlay
+// (the default --overlay2 configuration) in the overlay's upper layer, which
+// is part of the checkpoint, so processes started after a restore see it too;
+// with --overlay2=none, or if /etc is reached through a bind mount, in the
+// file on the host, where the line stays.
 func (l *Loader) writeLdSoPreload(info *containerInfo, shimPath string) error {
 	mntns := info.procArgs.MountNamespace
 	if mntns == nil {
@@ -2091,9 +2008,7 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	// interposer cannot be set up runs in the job without it, and processes
 	// holding multicast objects or imports refuse checkpoints.
 	if l.setupCudaCheckpointJob(info) {
-		if err := l.setupCudaMulticastShim(info); err != nil {
-			log.Warningf("Failed to set up multicast interposer for container %q: %v", info.containerName, err)
-		}
+		l.setupCudaMulticastShim(info)
 	}
 
 	// Create and start the new process.

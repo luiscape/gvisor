@@ -82,7 +82,7 @@ sentry free or recreate RM objects on the application's behalf.
 ```mermaid
 flowchart TD
     subgraph runsc
-        F["flags: --cuda-checkpoint-path, --cuda-multicast-shim-path, --cuda-multicast-shim-source"] --> L["Loader: cuda-checkpoint job wrap, install and preload mcshim.so"]
+        F["flags: --cuda-checkpoint-path, --cuda-multicast-shim-path"] --> L["Loader: cuda-checkpoint job wrap, preload mcshim.so"]
     end
     subgraph Sentry
         S["control: preSaveCuda / postRestoreCuda"] -->|exec| CC[cuda-checkpoint]
@@ -173,13 +173,11 @@ absent by default, so frameworks choose POSIX fds).
     `cuda-checkpoint --launch-job`, so that its CUDA processes share a job,
     and checkpoints default to that binary and run it one process at a time,
     as jobs require (in parallel, SGLang's restore fails).
--   `--cuda-multicast-shim-path` names the interposer inside the container.
-    `--cuda-multicast-shim-source=EMBEDDED` writes runsc's embedded copy there
-    at container creation, through the container's VFS. With the default
-    rootfs overlay it lands in the overlay and is part of the checkpoint; with
-    `--overlay2=none` it is written into the user's rootfs on the host, as is
-    the `/etc/ld.so.preload` entry in either mode. `IMAGE` (the default)
-    expects the image to carry it.
+-   `--cuda-multicast-shim-path` names the interposer inside the container,
+    which the operator provides there, in the image or through a mount; runsc
+    does not carry it. A restore needs the same bytes at the same path. The
+    `/etc/ld.so.preload` entry runsc adds lands in the rootfs overlay by
+    default, and in the user's rootfs on the host with `--overlay2=none`.
 -   It requires `--cuda-checkpoint-path`: the interposer leaves legacy CUDA
     IPC to `cuda-checkpoint`, which carries it only for processes in a job.
 -   It applies only to containers given GPU access (not a pod's pause
@@ -427,9 +425,9 @@ including one that pins the fdinfo line format.
 
 ## Open questions
 
-1.  **Where the interposer lives.** In-tree (`tools/mcshim`, embedded in runsc
-    via `--cuda-multicast-shim-source=EMBEDDED`), or out of tree with runsc
-    only injecting an image-supplied path (`IMAGE`)?
+1.  **Where the interposer lives.** In-tree (`tools/mcshim`, built but not
+    carried by runsc), or out of tree, with runsc only preloading the path it
+    is given?
 2.  **Writing `/etc/ld.so.preload`** into the container rootfs (into the
     overlay by default; into the host rootfs with `--overlay2=none`).
     `LD_PRELOAD` alone fails silently for SGLang. Acceptable, or behind its
@@ -457,9 +455,9 @@ the interposer flag is set:
     `fsimpl/proc`).
 2.  Two-phase lock/checkpoint, then the
     sentry control protocol and interposer sequencing (`pkg/sentry/control`).
-3.  The `cuda-checkpoint` job wrap (#13987), then delivery and injection
-    flags with `IMAGE` mode (`runsc/boot`, `runsc/config`).
-4.  The interposer sources and `EMBEDDED` mode, if it lives in-tree.
+3.  The `cuda-checkpoint` job wrap (#13987), then the preload flag
+    (`runsc/boot`, `runsc/config`).
+4.  The interposer sources, if it lives in-tree.
 
 ## Appendix: operational notes
 
