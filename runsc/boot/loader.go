@@ -1788,10 +1788,10 @@ func (l *Loader) setupCudaMulticastShim(info *containerInfo) error {
 	// state, and the resulting failure is silent: the checkpoint succeeds and
 	// the restore toggle fails. /etc/ld.so.preload is immune, because the
 	// loader consults it on every exec regardless of environment. Write it
-	// through the container's VFS (so it lands in the overlay, never in the
-	// user's rootfs on the host), appending rather than clobbering, and treat
-	// failure (e.g. a read-only root) as non-fatal: the env append above
-	// still covers the common case.
+	// through the container's VFS (see writeLdSoPreload for where it lands),
+	// appending rather than clobbering, and treat failure (e.g. a read-only
+	// root) as non-fatal: the env append above still covers the common
+	// case.
 	//
 	// This does preload the interposer into every binary in the container,
 	// including the cuda-checkpoint processes the sentry execs, which run it
@@ -1870,9 +1870,15 @@ func (l *Loader) containerFileExists(info *containerInfo, p string) (bool, error
 
 // writeContainerFile creates (or truncates) dstPath inside the container's
 // filesystem, creating parent directories as needed, and writes data to it
-// with the given mode. The write goes through the container's VFS: with a
-// rootfs overlay (the default --overlay2 configuration) it lands in the
-// overlay rather than the user's rootfs on the host.
+// with the given mode.
+//
+// The write goes through the container's VFS with root credentials, following
+// symlinks in every component but the last, so it lands wherever the
+// container's own view of dstPath leads: with a rootfs overlay (the default
+// --overlay2 configuration) in the overlay's upper layer, which is private to
+// the sandbox and part of checkpoints; with --overlay2=none in the user's
+// rootfs on the host, permanently; and on a path through a bind mount, in
+// that mount.
 func (l *Loader) writeContainerFile(info *containerInfo, dstPath string, data []byte, mode linux.FileMode) error {
 	mntns := info.procArgs.MountNamespace
 	if mntns == nil {
@@ -1921,16 +1927,11 @@ func (l *Loader) writeContainerFile(info *containerInfo, dstPath string, data []
 // own mount namespace. Idempotent: a path already listed is not added again,
 // which also makes container restarts and restores safe.
 //
-// The write goes through the container's VFS: with a rootfs overlay (the
-// default --overlay2 configuration) it lands in the overlay rather than the
-// user's rootfs; with --overlay2=none it modifies the writable rootfs like
-// any container write would.
-//
-// Known limitation: this runs at container CREATION only. A restored
-// container gets a freshly assembled filesystem, and processes spawned after
-// the restore will not see this file unless the restore-side rootfs carries
-// it. Processes that existed at checkpoint time are unaffected (the library
-// is already mapped into them).
+// It writes like writeContainerFile, with the same consequences: with a rootfs
+// overlay (the default --overlay2 configuration) the file is in the overlay's
+// upper layer, which is part of the checkpoint, so processes started after a
+// restore see it too; with --overlay2=none, or if /etc is reached through a
+// bind mount, the line is added to the file on the host and stays there.
 func (l *Loader) writeLdSoPreload(info *containerInfo, shimPath string) error {
 	mntns := info.procArgs.MountNamespace
 	if mntns == nil {

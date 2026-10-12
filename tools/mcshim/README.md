@@ -42,6 +42,11 @@ container's VFS (launchers like SGLang's `torch_memory_saver` rewrite
 `LD_PRELOAD` for exactly the worker processes that matter; `ld.so.preload` is
 immune). In IMAGE mode, a path that is not a file in the container is not
 preloaded at all, since the dynamic loader would print an error on every exec.
+Both writes (the embedded copy, and the `ld.so.preload` entry) land where the
+container's own view of the path leads: in the rootfs overlay by default,
+which is private to the sandbox and part of checkpoints, but in the user's
+rootfs on the host with `--overlay2=none`, or in a bind mount if the path
+crosses one.
 A container without GPU access (a pod's pause container or sidecars, even
 with `--nvproxy` set for the whole sandbox) gets neither. If a GPU container
 cannot be wrapped -- `cuda-checkpoint` is not a file at the absolute path

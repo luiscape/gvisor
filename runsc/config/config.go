@@ -426,10 +426,12 @@ type Config struct {
 	// image does not need to carry the interposer itself.
 	//
 	// The write goes through the container's VFS: with a rootfs overlay (the
-	// default --overlay2 configuration) the files land in the overlay, never
-	// in the user's rootfs on the host. They are therefore part of checkpoint
-	// images, so a restored process re-maps exactly the interposer bytes it
-	// had mapped at checkpoint time, even across runsc upgrades.
+	// default --overlay2 configuration) the file lands in the overlay's upper
+	// layer, which is part of checkpoint images, so a restored process re-maps
+	// exactly the interposer bytes it had mapped at checkpoint time, even
+	// across runsc upgrades. With --overlay2=none it is written into the
+	// user's rootfs on the host, and stays there; so does the line runsc adds
+	// to /etc/ld.so.preload in either source mode.
 	CUDAMulticastShimSource CUDAMulticastShimSource `flag:"cuda-multicast-shim-source"`
 
 	// TPUProxy enables support for TPUs.

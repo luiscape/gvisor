@@ -175,9 +175,11 @@ absent by default, so frameworks choose POSIX fds).
     as jobs require (in parallel, SGLang's restore fails).
 -   `--cuda-multicast-shim-path` names the interposer inside the container.
     `--cuda-multicast-shim-source=EMBEDDED` writes runsc's embedded copy there
-    at container creation, through the container's VFS, so it lands in the
-    rootfs overlay and is part of the checkpoint. `IMAGE` (the default) expects
-    the image to carry it.
+    at container creation, through the container's VFS. With the default
+    rootfs overlay it lands in the overlay and is part of the checkpoint; with
+    `--overlay2=none` it is written into the user's rootfs on the host, as is
+    the `/etc/ld.so.preload` entry in either mode. `IMAGE` (the default)
+    expects the image to carry it.
 -   It requires `--cuda-checkpoint-path`: the interposer leaves legacy CUDA
     IPC to `cuda-checkpoint`, which carries it only for processes in a job.
 -   It applies only to containers given GPU access (not a pod's pause
@@ -428,9 +430,10 @@ including one that pins the fdinfo line format.
 1.  **Where the interposer lives.** In-tree (`tools/mcshim`, embedded in runsc
     via `--cuda-multicast-shim-source=EMBEDDED`), or out of tree with runsc
     only injecting an image-supplied path (`IMAGE`)?
-2.  **Writing `/etc/ld.so.preload`** into the container rootfs (through the
-    overlay, never the host rootfs). `LD_PRELOAD` alone fails silently for
-    SGLang. Acceptable, or behind its own flag?
+2.  **Writing `/etc/ld.so.preload`** into the container rootfs (into the
+    overlay by default; into the host rootfs with `--overlay2=none`).
+    `LD_PRELOAD` alone fails silently for SGLang. Acceptable, or behind its
+    own flag, or refused without a rootfs overlay?
 3.  **Marker files as the control channel.** Chosen because the `suspend`
     marker is naturally part of the checkpoint, it needs no new sentry ABI,
     and forged markers only affect the container's own checkpoint. Would a

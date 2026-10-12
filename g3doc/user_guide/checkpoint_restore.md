@@ -244,8 +244,9 @@ To enable it, set the runtime `--cuda-checkpoint-path` flag to the path of the
     default). The container image needs no changes, and because the write
     lands in the container's filesystem (the rootfs overlay under the
     default `--overlay2` configuration), the exact interposer bytes travel
-    inside checkpoint images — restores are immune to runsc version skew;
-    or
+    inside checkpoint images — restores are immune to runsc version skew.
+    With `--overlay2=none` the file is written into the rootfs on the host
+    and stays there; or
 *   build `mcshim.so` yourself (`tools/mcshim/build.sh` or the
     `//tools/mcshim` Bazel target), place it in the container
     image, and set `--cuda-multicast-shim-path` to the interposer's
@@ -254,7 +255,8 @@ To enable it, set the runtime `--cuda-checkpoint-path` flag to the path of the
 In both modes gVisor then arranges for the container's processes to load the
 interposer (via the `LD_PRELOAD` environment variable *and* an entry appended
 to the container's `/etc/ld.so.preload`, which covers launchers that rewrite
-their children's environment), wraps each GPU container's command in
+their children's environment; with `--overlay2=none` that entry is added to
+the rootfs on the host), wraps each GPU container's command in
 `cuda-checkpoint --launch-job` so that all of its CUDA processes share a job,
 and drives the interposer automatically during `runsc checkpoint` and `runsc
 restore`. Jobs must be checkpointed sequentially, which `runsc checkpoint` then
