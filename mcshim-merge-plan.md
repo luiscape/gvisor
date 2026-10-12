@@ -4,7 +4,7 @@
 | :--- | :--- |
 | Status | Draft for review |
 | Date | 2026-10-12 |
-| Branch | `luis/multicast-xgpu-upstream` at `26e35715b` (github.com/luiscape/gvisor) |
+| Branch | `luis/multicast-xgpu-upstream` at `6b3db1560` (github.com/luiscape/gvisor) |
 | Upstream | `google/gvisor` `master` at `0a438edc9` |
 | Design doc | `g3doc/proposals/cuda_multigpu_checkpoint.md` (on the branch) |
 
@@ -30,7 +30,7 @@ groups:
    tracking, the restore path and the job wrap reach them today.
 4. **Hygiene.** Dev-only files, stale docs and upstream drift.
 
-Since the first draft, R1-R6, R9-R11, R13, R15-R17 and R20 have been fixed
+Since the first draft, R1-R6, R9-R11, R13-R17 and R20 have been fixed
 on the branch (section 4.1). That closes the first two groups above, except
 R7 (a decision) and R8 (musl images).
 
@@ -192,6 +192,7 @@ the new binary.
 | R11, R13 (undoing a failed checkpoint; reaping comment) | `72756209d` | `TestCheckpointLocked`: 8 failure points against a fake `cuda-checkpoint`. New `undo` stub case in `run.sh` for the GPU round. |
 | R15 (export/import recording) | `09df770cc` | `TestRecordExportImport` covers the recording. The lock held across the host call, and recording before the copy-out, need a GPU to exercise. |
 | R1, R3, R4, R5, R6 (interposer effects on processes that never checkpoint) | `96841776a` | New `run.sh noeffect` (`noeffect.sh`): seven programs, each run with and without the shim. The previous shim changes six of them; the fixed one none. |
+| R14 (nvproxy tracking for every user) | `6b3db1560` | `TestProcFDInfoExtraTracking`: the fdinfo line is empty with tracking off. With tracking off the four export/import handlers delegate to `ctrlHasFrontendFD`, upstream's handler, which a code read confirms; no CPU test exercises the host call. |
 | R9, R10 (the sentry's marker operations) | `26e35715b` | `TestCudaShimFS` on a tmpfs root: the control directory as a symlink, and symlinks, a hard link and FIFOs planted as markers, acks and the log. Against the old resolution rules it fails 9 checks. |
 
 How each was fixed:
@@ -233,8 +234,14 @@ resolver or driver entry point that only the shim defines (no runtime or
 libcuda loaded globally, or loaded `RTLD_LOCAL` by another library) now
 returns NULL, as without the shim. Before, it returned the shim's wrapper.
 
-Not yet fixed in the same areas: the nvproxy gating (R14), and musl images
-(R8).
+- **R14.** `nvproxy.Options.TrackExports`, set only when the interposer is
+  enabled, turns on export/import tracking and the fdinfo line. The line is
+  shown only to readers with ptrace access to the task. One small change
+  remains for every nvproxy user: each client records the thread group that
+  created it (`rootClient.tgid`, used by the blocker inventory). It is
+  bookkeeping only and changes no behavior.
+
+Not yet fixed in the same areas: musl images (R8).
 
 ## 5. Requirements
 
@@ -273,7 +280,7 @@ Status:
 
 | ID | Problem | Status | Fix |
 | :--- | :--- | :--- | :--- |
-| R14 | Export/import tracking and the new fdinfo line are active for every nvproxy user. | Verified | Gate both on a new nvproxy option set only when the interposer is configured; add the ptrace-access check Linux applies to fdinfo. |
+| R14 | Export/import tracking and the new fdinfo line are active for every nvproxy user. | **Fixed** (`6b3db1560`); was: Verified | Gate both on a new nvproxy option set only when the interposer is configured; add the ptrace-access check Linux applies to fdinfo. |
 | R15 | Imports and exports are recorded without holding the object lock across the host call; a concurrent free and reallocation corrupts the object graph. | **Fixed** (`09df770cc`); was: Reported | Hold the lock across the call, as allocation does. |
 
 ### 5.4 runsc
