@@ -261,7 +261,11 @@ interposer's rebuild runs against the same ordinals it recorded.
     while a fabric-capable allocation is alive. Measured on R610:
     `cuda-checkpoint` checkpoints and restores one process's fabric-capable
     allocation, exported or not; creating one needs an IMEX channel
-    (`NOT_PERMITTED` without).
+    (`NOT_PERMITTED` without). The rewrite applies to every CUDA process in a
+    container with the shim, checkpointed or not, which is why the shim must
+    stay off for multi-node NVLink (IMEX) workloads, where fabric handles
+    are how memory is shared across nodes; the deployment turns it off for
+    them.
 
 ## What refuses a checkpoint
 

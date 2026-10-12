@@ -31,8 +31,8 @@ groups:
 4. **Hygiene.** Dev-only files, stale docs and upstream drift.
 
 Since the first draft, R1-R6, R9-R11, R13-R17 and R20 have been fixed
-on the branch (section 4.1), and R8 has been dropped. That closes the first
-two groups above, except R7 (a decision).
+on the branch (section 4.1), R8 has been dropped, and R7 is resolved by
+keeping the current behavior. That closes the first two groups above.
 
 This document describes the architecture, lists the fixes as requirements
 (must land with or before the code they fix) and nice-to-haves (follow-ups),
@@ -266,7 +266,7 @@ Status:
 | R4 | `RTLD_DEFAULT` lookups of `cu*` names from `RTLD_LOCAL` libraries (how Python loads extensions) still search the interposer's scope. The latest round fixed this only for other names. | **Fixed** (`96841776a`); was: Reported; regression | Resolve in the caller's scope. |
 | R5 | When the caller is the main program, cudart's resolver can be answered by the newest loaded runtime instead of the caller's own (wrong ABI). | **Fixed** (`96841776a`); was: Reported; regression | Fall back to the next definition after the interposer. |
 | R6 | A successful `cu*` lookup can leave `dlerror()` set. | **Fixed** (`96841776a`); was: Reported | Clear it on success. |
-| R7 | Fabric handle types are stripped in every CUDA process, so multi-node NVLink workloads that never checkpoint lose them. | Verified (code) | Decision (section 8). Recommended: refuse the checkpoint while fabric objects are live, instead of rewriting calls. |
+| R7 | Fabric handle types are stripped in every CUDA process, so multi-node NVLink workloads that never checkpoint lose them. | **Resolved: kept as is**; was: Verified (code) | None. The interposer is turned off at the runtime level for multi-node workloads, the only ones the rewrite would harm; on a single node it is what lets PyTorch and NCCL fall back to POSIX fds, which the shim can carry. Documented in the README. |
 | R8 | On musl images (Alpine), preloading the glibc interposer makes every process fail to start. | **Dropped**; was: Reported (reproduced on alpine:3.20 through `LD_PRELOAD`; musl ignores `/etc/ld.so.preload`) | None. Since R16 the interposer is preloaded only where `cuda-checkpoint` exists, which excludes musl images in practice. |
 
 ### 5.2 Sentry (`pkg/sentry/control`)
@@ -358,7 +358,7 @@ in parallel with PR0, PR1 and PR2.
 | PR0 | `--device-map` on restore: the existing #14817. Land it, then rebase. | Part of R12 | No: restore onto different GPUs changes, by design and already reviewed | Small, done |
 | PR1 | Design proposal, trimmed. Settles: interposer in-tree or not, writing `ld.so.preload`, the fdinfo line as a `/proc` contract, fabric policy. | R23 (proposal), N12 | Docs only | Small |
 | PR2 | `state_cuda` refactor (generic action runner, null stdin, per-action arguments) with the path without the interposer identical to upstream; nil-leader fix. | R12 | Yes | Medium |
-| PR3 | `tools/mcshim`: sources, glibc stubs, BUILD, README, CPU tests, GPU harness. | R1-R7, R23 (README), R24 | Nothing links it | Large |
+| PR3 | `tools/mcshim`: sources, glibc stubs, BUILD, README, CPU tests, GPU harness. | R1-R6, R23 (README), R24 | Nothing links it | Large |
 | PR4 | nvproxy export/import tracking, behind a new option. | R14, R15, R22 | Yes, once gated | Medium |
 | PR5 | fdinfo hook for exported objects. | R14 (gating, access check) | Yes | Small |
 | PR6 | Checkpoint-blocker inventory. | None | No callers yet | Small |
@@ -399,9 +399,12 @@ newer, so R615 must be validated before it is deployed there.
 
 ## 8. Decisions needed
 
-1. **Fabric handles (R7).** Keep rewriting allocation calls in every process,
-   or refuse the checkpoint while fabric objects are live? Recommended:
-   refuse.
+1. **Fabric handles (R7). Resolved: keep the rewrite.** The shim keeps
+   removing fabric handle types in every CUDA process of a container it is
+   enabled for. It changes nothing a single-node workload can observe
+   (POSIX fds do the same job), and the deployment turns the interposer off
+   for multi-node NVLink workloads, which are out of scope and the only ones
+   it would affect.
 2. **Driver gate (R25). Resolved.** runsc enables the interposer on driver
    R610 or newer and keeps it off, with a warning, on older drivers. There
    is no flag; whether an unvalidated newer release is used is left to the
