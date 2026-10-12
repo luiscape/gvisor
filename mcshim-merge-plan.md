@@ -3,8 +3,8 @@
 | | |
 | :--- | :--- |
 | Status | Draft for review |
-| Date | 2026-10-09 |
-| Branch | `luis/multicast-xgpu-upstream` at `860214832` (github.com/luiscape/gvisor) |
+| Date | 2026-10-12 |
+| Branch | `luis/multicast-xgpu-upstream` at `09df770cc` (github.com/luiscape/gvisor) |
 | Upstream | `google/gvisor` `master` at `0a438edc9` |
 | Design doc | `g3doc/proposals/cuda_multigpu_checkpoint.md` (on the branch) |
 
@@ -29,6 +29,9 @@ groups:
 3. **Users who never enable the interposer still see changes.** nvproxy
    tracking, the restore path and the job wrap reach them today.
 4. **Hygiene.** Dev-only files, stale docs and upstream drift.
+
+Since the first draft, R2, R11, R13, R15, R16, R17 and R20 have been fixed
+on the branch (section 4.1).
 
 This document describes the architecture, lists the fixes as requirements
 (must land with or before the code they fix) and nice-to-haves (follow-ups),
@@ -176,6 +179,43 @@ the application gated ("better blocked than corrupt").
 | History | WIP commits and files added then removed. PRs should be cut from the final tree, not cherry-picked. |
 | Validation so far | H100 x8, driver 610.57.04: the interposer suite, 15 engine configurations, 3 more without `CAP_SYS_PTRACE`, Qwen2.5-72B at TP=8 on vLLM and SGLang, 72B restored onto other GPUs. The latest round (dlsym fix, cudart resolvers, glibc floor, sentry fixes) is CPU-validated only. |
 
+### 4.1 Requirements fixed so far
+
+Each fix is CPU-validated; the GPU round (section 7.4) still has to run on
+the new binary.
+
+| Requirement | Commit | Evidence |
+| :--- | :--- | :--- |
+| R2 (interposer control directory) | `3f8f69a7c` | `run.sh ctlsec` (Docker, real control thread over the fake libcuda): a planted log symlink, log hard link, marker symlink, symlinked control directory and `MCSHIM_LOG` in a setuid process. The previous shim fails 5 of 6 cases; the fixed one passes all 6, including the shared log and acknowledgements across uids. |
+| R16, R17, R20 (job wrap scope, missing `cuda-checkpoint`, `--exec-fd`, path validation) | `182960ccb` | `TestSetupCudaCheckpointJob` (GPU and non-GPU containers, old and newer drivers, missing or directory `cuda-checkpoint`); `config_test` cases for relative paths and separators. |
+| R11, R13 (undoing a failed checkpoint; reaping comment) | `72756209d` | `TestCheckpointLocked`: 8 failure points against a fake `cuda-checkpoint`. New `undo` stub case in `run.sh` for the GPU round. |
+| R15 (export/import recording) | `09df770cc` | `TestRecordExportImport` covers the recording. The lock held across the host call, and recording before the copy-out, need a GPU to exercise. |
+
+How each was fixed:
+
+- **R2.** The interposer opens `/tmp/mcshim` once with `O_NOFOLLOW` and
+  reaches every file relative to it; it creates files only with
+  `O_EXCL | O_NOFOLLOW`; it appends to or reads an existing file only if
+  it is regular with one link; it changes the mode only of a log it just
+  created. setuid processes skip the interposer, and `MCSHIM_*` is read
+  with `secure_getenv`. The glibc floor stays at 2.17.
+- **R16, R17, R20.** The wrap and preload apply only to containers for
+  which `GPUFunctionalityRequested` is true. `Validate` requires absolute
+  paths, and no colons or whitespace in the interposer path. A GPU
+  container that cannot be wrapped (missing `cuda-checkpoint`, or
+  `--exec-fd`) starts without the job or the interposer, and checkpoints
+  are refused, naming it, until it is destroyed.
+- **R11, R13.** The checkpoint phase stops at the first failure, asks each
+  process that did not succeed for its state (bounded `--get-state`),
+  restores only checkpointed ones, and unlocks all. What cannot be undone
+  returns `errCudaUnrecoverable`, which skips the interposer unwind.
+- **R15.** The client lock is held across the host call, as for
+  allocations, and the result is recorded before anything is copied back
+  to the application.
+
+Not yet fixed in the same areas: the sentry's own marker operations (R9,
+R10), and the nvproxy gating (R14).
+
 ## 5. Requirements
 
 These must be fixed in, or before, the PR that carries the affected code.
@@ -184,13 +224,14 @@ Status:
 - **Verified**: reproduced, or confirmed by reading the code.
 - **Reported**: a reviewer reproduced it; not re-run.
 - **Regression**: introduced by the latest round of work.
+- **Fixed**: fixed on the branch (see section 4.1).
 
 ### 5.1 Interposer (`tools/mcshim`)
 
 | ID | Problem | Status | Fix |
 | :--- | :--- | :--- | :--- |
 | R1 | The exported `cu*`/`cuda*` wrappers make CUDA look installed: `dlsym(RTLD_DEFAULT, "cuInit")` succeeds in a process without CUDA, and calling a wrapper without libcuda segfaults. With libcuda installed, a process that only probes for it ends up loading it. | Verified (probe, crash); reported (forced load) | Return NULL from `dlsym` when the only definition is the interposer's own. Never `dlopen` libcuda without `RTLD_NOLOAD`. Check every real pointer and return `CUDA_ERROR_NOT_INITIALIZED`. |
-| R2 | A root process run with `MCSHIM_LOG=<file>`, or a log symlink planted in `/tmp/mcshim`, makes the interposer `chmod 0666` that file. `/etc/ld.so.preload` applies to setuid programs too. | Verified; regression | `secure_getenv`; do nothing when `AT_SECURE` is set; open with `O_NOFOLLOW`, create with `O_EXCL`, change modes only on files just created. Same for marker and publish files. |
+| R2 | A root process run with `MCSHIM_LOG=<file>`, or a log symlink planted in `/tmp/mcshim`, makes the interposer `chmod 0666` that file. `/etc/ld.so.preload` applies to setuid programs too. | **Fixed** (`3f8f69a7c`); was: Verified; regression | `secure_getenv`; do nothing when `AT_SECURE` is set; open with `O_NOFOLLOW`, create with `O_EXCL`, change modes only on files just created. Same for marker and publish files. |
 | R3 | The control thread inherits the caller's signal mask, so a program waiting for SIGTERM with `sigwait` is killed by it instead. | Verified | Block all signals around `pthread_create`. |
 | R4 | `RTLD_DEFAULT` lookups of `cu*` names from `RTLD_LOCAL` libraries (how Python loads extensions) still search the interposer's scope. The latest round fixed this only for other names. | Reported; regression | Resolve in the caller's scope. |
 | R5 | When the caller is the main program, cudart's resolver can be answered by the newest loaded runtime instead of the caller's own (wrong ABI). | Reported; regression | Fall back to the next definition after the interposer. |
@@ -204,26 +245,26 @@ Status:
 | :--- | :--- | :--- | :--- |
 | R9 | Marker operations run as root on `/tmp/mcshim/<name>`, protecting only the last path component from symlinks. A container user who makes `/tmp/mcshim` a symlink first gets the sentry to create and delete files as root elsewhere, including on writable bind mounts. | Verified (code) | Open the directory once without following symlinks and resolve each marker relative to it; consider the process's own credentials. |
 | R10 | A FIFO planted as a marker, error file or log hangs the checkpoint RPC forever. | Reported | Open non-blocking and require a regular file. |
-| R11 | If the checkpoint phase fails, restore runs on every locked process, including those that did not checkpoint; the error says "unrecoverable" but the interposer is unwound anyway. | Verified (first half); reported (second) | Restore only processes that checkpointed, then unlock all; skip the unwind on the unrecoverable path. |
+| R11 | If the checkpoint phase fails, restore runs on every locked process, including those that did not checkpoint; the error says "unrecoverable" but the interposer is unwound anyway. | **Fixed** (`72756209d`); was: Verified (first half); reported (second) | Restore only processes that checkpointed, then unlock all; skip the unwind on the unrecoverable path. |
 | R12 | The path without the interposer differs from upstream: `--device-map` on restore, a failed save-and-resume now undoes CUDA state, a failed toggle is no longer re-toggled, exec failures continue instead of stopping, an extra environment variable, unlock/pause order, missing timeline markers. | Verified (`--device-map`); reported (rest) | Gate each on the interposer option, or justify it in its own PR. `--device-map` is resolved by landing #14817. |
-| R13 | A code comment from the latest round claims every `cuda-checkpoint` invocation is reaped; untrue when a killed one never exits. | Reported; regression | Correct it (real fix: N4). |
+| R13 | A code comment from the latest round claims every `cuda-checkpoint` invocation is reaped; untrue when a killed one never exits. | **Fixed** (`72756209d`); was: Reported; regression | Correct it (real fix: N4). |
 
 ### 5.3 nvproxy
 
 | ID | Problem | Status | Fix |
 | :--- | :--- | :--- | :--- |
 | R14 | Export/import tracking and the new fdinfo line are active for every nvproxy user. | Verified | Gate both on a new nvproxy option set only when the interposer is configured; add the ptrace-access check Linux applies to fdinfo. |
-| R15 | Imports and exports are recorded without holding the object lock across the host call; a concurrent free and reallocation corrupts the object graph. | Reported | Hold the lock across the call, as allocation does. |
+| R15 | Imports and exports are recorded without holding the object lock across the host call; a concurrent free and reallocation corrupts the object graph. | **Fixed** (`09df770cc`); was: Reported | Hold the lock across the call, as allocation does. |
 
 ### 5.4 runsc
 
 | ID | Problem | Status | Fix |
 | :--- | :--- | :--- | :--- |
-| R16 | The job wrap and preload apply to every container when nvproxy is enabled globally, including the pause container; a container whose image lacks `cuda-checkpoint` fails to start. | Verified (scope); reported (failure) | Apply only to containers that request GPUs; skip with a warning if the binary is missing; require absolute paths. |
-| R17 | With `--exec-fd`, the job wrap drops the user's program. | Reported | Skip the wrap in that case. |
+| R16 | The job wrap and preload apply to every container when nvproxy is enabled globally, including the pause container; a container whose image lacks `cuda-checkpoint` fails to start. | **Fixed** (`182960ccb`); was: Verified (scope); reported (failure) | Apply only to containers that request GPUs; skip with a warning if the binary is missing; require absolute paths. |
+| R17 | With `--exec-fd`, the job wrap drops the user's program. | **Fixed** (`182960ccb`); was: Reported | Skip the wrap in that case. |
 | R18 | The interposer and `ld.so.preload` are written as root, following intermediate symlinks; without a rootfs overlay they land in the user's rootfs on the host, contrary to the docs. | Reported (two reviewers) | Refuse without a rootfs overlay, require the target inside the root mount, fix the docs. |
 | R19 | The embedded interposer is single-architecture; source distributions could embed x86 bytes into arm64 builds. | Reported | Embed per architecture, amd64 only, with an arm64 stub; reject `EMBEDDED` when nothing is embedded. |
-| R20 | Flag validation misses relative paths and separators in the interposer path. | Reported | Add the checks and tests. |
+| R20 | Flag validation misses relative paths and separators in the interposer path. | **Fixed** (`182960ccb`); was: Reported | Add the checks and tests. |
 
 ### 5.5 Build, docs and hygiene
 
@@ -305,13 +346,19 @@ robustness fixes; N8 and N11 as interposer refactors; N17 as the GPU target.
 
 ### 7.4 Validation
 
-R1-R6, R11 and R16 change code paths that run on GPUs. Before PR3, PR7 and
-PR9 merge, rerun on the fixed binary:
+R1-R6, R11, R15 and R16 change code paths that run on GPUs. Before PR3,
+PR4, PR7 and PR9 merge, rerun on the fixed binary:
 
-- The full interposer suite, including the CPU-only `preload` and `glibc`
-  tests.
+- The full interposer suite, including the CPU-only `preload`, `glibc` and
+  `ctlsec` tests. (`tables` at its default size, `fuzz 20000 8`, runs past
+  400 s with the shim both before and after these fixes; at 2,000 operations
+  it passes.)
 - `rtres` with a renamed cudart (`libcudart-<hash>.so.12`).
-- The stub `cuda-checkpoint` tests, including a hung `--get-state`.
+- The stub `cuda-checkpoint` tests, including a hung `--get-state` and the
+  `undo` case for a failed checkpoint.
+- A GPU container whose image lacks `cuda-checkpoint` starts, and
+  `runsc checkpoint` refuses with its name; a pod's pause container gets
+  neither the wrap nor the interposer.
 - The 15 engine configurations and the 3 without `CAP_SYS_PTRACE`.
 - Qwen2.5-72B at TP=8 on vLLM and SGLang, and restored onto other GPUs.
 - A tokens/s comparison with and without the interposer, on one
