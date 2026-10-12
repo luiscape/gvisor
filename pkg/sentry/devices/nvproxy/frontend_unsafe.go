@@ -44,11 +44,7 @@ func frontendIoctlInvokeNoStatus[Params any](fi *frontendIoctlState, ioctlParams
 }
 
 func rmControlInvoke[Params any](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS, ctrlParams *Params) (uintptr, error) {
-	defer runtime.KeepAlive(ctrlParams) // since we convert to non-pointer-typed P64
-	origParams := ioctlParams.Params
-	ioctlParams.Params = p64FromPtr(unsafe.Pointer(ctrlParams))
-	n, err := frontendIoctlInvoke(fi, ioctlParams)
-	ioctlParams.Params = origParams
+	n, err := rmControlInvokeHost(fi, ioctlParams, ctrlParams)
 	if err != nil {
 		return n, err
 	}
@@ -56,6 +52,17 @@ func rmControlInvoke[Params any](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS
 		return n, err
 	}
 	return n, nil
+}
+
+// rmControlInvokeHost is rmControlInvoke without copying ioctlParams back to
+// the application, for callers that must act on the result first.
+func rmControlInvokeHost[Params any](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS, ctrlParams *Params) (uintptr, error) {
+	defer runtime.KeepAlive(ctrlParams) // since we convert to non-pointer-typed P64
+	origParams := ioctlParams.Params
+	ioctlParams.Params = p64FromPtr(unsafe.Pointer(ctrlParams))
+	n, err := frontendIoctlInvoke(fi, ioctlParams)
+	ioctlParams.Params = origParams
+	return n, err
 }
 
 func ctrlClientSystemGetBuildVersionInvoke(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS, ctrlParams *nvgpu.NV0000_CTRL_SYSTEM_GET_BUILD_VERSION_PARAMS, driverVersionBuf, versionBuf, titleBuf *byte) (uintptr, error) {

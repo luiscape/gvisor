@@ -69,13 +69,25 @@ func procFDInfoExportedObjectLine(exp exportedObjInfo) string {
 		exp.client.Val, exp.object.Val, uint32(exp.class))
 }
 
+// exportRecorder records what an export or import did, for
+// ctrlExportToFDInvoke. It is called only if the host call succeeded (it must
+// still check ioctlParams.Status), with client's objsMu locked (client is nil
+// if the params' client is unknown or released), src the params frontendFD's
+// exported object as of before the call, and the populated params. It may
+// return a function to run once objsMu is released, since fdsMu is ordered
+// before it.
+type exportRecorder[PtrParams any] func(client *rootClient, src exportedObjInfo, params PtrParams, ctlFile *frontendFD) func()
+
 // ctrlExportToFDInvoke performs the frontend-FD-translating control sequence
 // shared by the export and import handlers, mirroring ctrlHasFrontendFD: CopyIn,
 // translate the params' FD to the corresponding host FD, invoke, restore the
-// application FD value, CopyOut. If the invoke succeeded, it calls post with
-// the populated params and the params' frontendFD (with a reference held);
-// post is responsible for checking ioctlParams.Status.
-func ctrlExportToFDInvoke[Params any, PtrParams hasFrontendFDPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS, post func(params PtrParams, ctlFile *frontendFD)) (uintptr, error) {
+// application FD value, CopyOut. Unlike it, the client's objsMu is held across
+// the host call, as rmAllocInvoke does for allocations, so that a concurrent
+// free cannot run between the host's import or export and record; and record
+// runs before anything is copied back to the application, so that an object
+// the host has imported is recorded even if the copy-out faults (an import
+// nvproxy did not know of would escape CheckpointBlockers).
+func ctrlExportToFDInvoke[Params any, PtrParams hasFrontendFDPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS, record exportRecorder[PtrParams]) (uintptr, error) {
 	var ctrlParamsValue Params
 	ctrlParams := PtrParams(&ctrlParamsValue)
 	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
@@ -96,17 +108,33 @@ func ctrlExportToFDInvoke[Params any, PtrParams hasFrontendFDPtr[Params]](fi *fr
 		return 0, linuxerr.EINVAL
 	}
 
+	nvp := fi.fd.dev.nvp
+	nvp.fdsMu.Lock()
+	src := ctlFile.exportedObj
+	nvp.fdsMu.Unlock()
+
+	client, unlock := nvp.getClientWithLock(fi.ctx, ioctlParams.HClient)
 	ctrlParams.SetFrontendFD(ctlFile.hostFD)
-	n, err := rmControlInvoke(fi, ioctlParams, ctrlParams)
+	n, err := rmControlInvokeHost(fi, ioctlParams, ctrlParams)
 	ctrlParams.SetFrontendFD(origFD)
+	var after func()
+	if err == nil {
+		after = record(client, src, ctrlParams, ctlFile)
+	}
+	if client != nil {
+		unlock()
+	}
+	if after != nil {
+		after()
+	}
 	if err != nil {
 		return n, err
 	}
-	// post runs before CopyOut, so the recorded identity matches the host even
-	// if the copy-out faults.
-	post(ctrlParams, ctlFile)
-	if _, cerr := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); cerr != nil {
-		return n, cerr
+	if _, err := ioctlParams.CopyOut(fi.t, fi.ioctlParamsAddr); err != nil {
+		return n, err
+	}
+	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return n, err
 	}
 	return n, nil
 }
@@ -117,50 +145,59 @@ func ctrlExportToFDInvoke[Params any, PtrParams hasFrontendFDPtr[Params]](fi *fr
 // ctrlHasFrontendFD, and records the object exported into slot 0 of the
 // destination frontendFD.
 func ctrlClientExportObjectsToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
-	return ctrlExportToFDInvoke(fi, ioctlParams, func(ctrlParams *nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECTS_TO_FD_PARAMS, ctlFile *frontendFD) {
+	return ctrlExportToFDInvoke(fi, ioctlParams, func(client *rootClient, _ exportedObjInfo, ctrlParams *nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECTS_TO_FD_PARAMS, ctlFile *frontendFD) func() {
 		// Each call writes NumObjects slots starting at Index, and a zero
 		// handle clears its slot. libcuda exports an allocation into slot 0,
 		// and sometimes companion objects into later slots.
-		if ioctlParams.Status == nvgpu.NV_OK && ctrlParams.Index == 0 && ctrlParams.NumObjects > 0 {
-			setExportedObj(fi, ctlFile, ioctlParams.HClient, ctrlParams.Objects[0])
+		if ioctlParams.Status != nvgpu.NV_OK || ctrlParams.Index != 0 || ctrlParams.NumObjects == 0 {
+			return nil
 		}
+		return setExportedObj(fi, ctlFile, exportedObjOf(client, ioctlParams.HClient, ctrlParams.Objects[0]))
 	})
 }
 
-// setExportedObj records objectH, exported from clientH, as fd's exported
-// object; a zero objectH clears it.
-func setExportedObj(fi *frontendIoctlState, fd *frontendFD, clientH, objectH nvgpu.Handle) {
-	var exp exportedObjInfo
-	nvp := fi.fd.dev.nvp
-	if objectH.Val != 0 {
-		exp = exportedObjInfo{client: clientH, object: objectH}
-		if client, unlock := nvp.getClientWithLock(fi.ctx, clientH); client != nil {
-			if obj, ok := client.resources[objectH]; ok {
-				exp.class = obj.class
-				exp.obj = obj
-			}
-			unlock()
+// exportedObjOf returns the identity of objectH, exported from clientH, whose
+// objsMu must be locked if client (clientH's rootClient, or nil if unknown) is
+// non-nil. A zero objectH returns the zero identity, which clears an fd's.
+func exportedObjOf(client *rootClient, clientH, objectH nvgpu.Handle) exportedObjInfo {
+	if objectH.Val == 0 {
+		return exportedObjInfo{}
+	}
+	exp := exportedObjInfo{client: clientH, object: objectH}
+	if client != nil {
+		if obj, ok := client.resources[objectH]; ok {
+			exp.class = obj.class
+			exp.obj = obj
 		}
 	}
-	nvp.fdsMu.Lock()
-	fd.exportedObj = exp
-	nvp.fdsMu.Unlock()
+	return exp
+}
+
+// setExportedObj returns a function that records exp as fd's exported object.
+// It takes fdsMu, so it must run with no client's objsMu locked.
+func setExportedObj(fi *frontendIoctlState, fd *frontendFD, exp exportedObjInfo) func() {
+	return func() {
+		nvp := fi.fd.dev.nvp
+		nvp.fdsMu.Lock()
+		fd.exportedObj = exp
+		nvp.fdsMu.Unlock()
+	}
 }
 
 // ctrlClientExportObjectToFD proxies NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD
 // like ctrlHasFrontendFD, and records the exported object as the destination
 // frontendFD's.
 func ctrlClientExportObjectToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
-	return ctrlExportToFDInvoke(fi, ioctlParams, func(ctrlParams *nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS, ctlFile *frontendFD) {
+	return ctrlExportToFDInvoke(fi, ioctlParams, func(client *rootClient, _ exportedObjInfo, ctrlParams *nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS, ctlFile *frontendFD) func() {
 		// With EMPTY_FD no object is attached yet (EXPORT_OBJECTS_TO_FD adds
 		// it). For type RM, the union is struct {hDevice, hParent, hObject}.
 		if ioctlParams.Status != nvgpu.NV_OK ||
 			ctrlParams.Flags&nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_FLAGS_EMPTY_FD != 0 ||
 			ctrlParams.Object.Type != nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM {
-			return
+			return nil
 		}
 		objectH := nvgpu.Handle{Val: binary.LittleEndian.Uint32(ctrlParams.Object.Data[8:12])}
-		setExportedObj(fi, ctlFile, ioctlParams.HClient, objectH)
+		return setExportedObj(fi, ctlFile, exportedObjOf(client, ioctlParams.HClient, objectH))
 	})
 }
 
@@ -184,38 +221,36 @@ func (o *importedObject) Release(ctx context.Context) func() {
 	return nil
 }
 
-// addImportedObj records objectH, duped under parentH in clientH, as
-// imported from fd slot index. Objects from any slot are attributed to the
-// allocation exported into slot 0 (see ctrlClientExportObjectsToFD).
-func addImportedObj(fi *frontendIoctlState, fd *frontendFD, clientH, parentH, objectH nvgpu.Handle, index int, multicast bool) {
-	nvp := fi.fd.dev.nvp
-	nvp.fdsMu.Lock()
-	src := fd.exportedObj
-	nvp.fdsMu.Unlock()
+// addImportedObj records objectH, duped under parentH in client, as imported
+// from slot index of an fd whose exported object is src. Objects from any
+// slot are attributed to the allocation exported into slot 0 (see
+// ctrlClientExportObjectsToFD).
+//
+// Precondition: client.objsMu must be locked, if client is non-nil.
+func addImportedObj(fi *frontendIoctlState, client *rootClient, src exportedObjInfo, parentH, objectH nvgpu.Handle, index int, multicast bool) {
+	if client == nil {
+		return
+	}
 	var class nvgpu.ClassID
 	if index == 0 {
 		class = src.class
 	}
-	client, unlock := nvp.getClientWithLock(fi.ctx, clientH)
-	if client == nil {
-		return
-	}
-	nvp.objAdd(fi.ctx, client, objectH, class, &importedObject{src: src, multicast: multicast}, parentH)
-	unlock()
+	fi.fd.dev.nvp.objAdd(fi.ctx, client, objectH, class, &importedObject{src: src, multicast: multicast}, parentH)
 }
 
 // ctrlClientImportObjectFromFD proxies
 // NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD like ctrlHasFrontendFD, and
 // records the imported object.
 func ctrlClientImportObjectFromFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
-	return ctrlExportToFDInvoke(fi, ioctlParams, func(ctrlParams *nvgpu.NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS, ctlFile *frontendFD) {
+	return ctrlExportToFDInvoke(fi, ioctlParams, func(client *rootClient, src exportedObjInfo, ctrlParams *nvgpu.NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS, _ *frontendFD) func() {
 		// For type RM, the union is struct {hDevice, hParent, hObject}.
 		if ioctlParams.Status != nvgpu.NV_OK || ctrlParams.Object.Type != nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM {
-			return
+			return nil
 		}
 		parentH := nvgpu.Handle{Val: binary.LittleEndian.Uint32(ctrlParams.Object.Data[4:8])}
 		objectH := nvgpu.Handle{Val: binary.LittleEndian.Uint32(ctrlParams.Object.Data[8:12])}
-		addImportedObj(fi, ctlFile, ioctlParams.HClient, parentH, objectH, 0, false)
+		addImportedObj(fi, client, src, parentH, objectH, 0, false)
+		return nil
 	})
 }
 
@@ -224,9 +259,9 @@ func ctrlClientImportObjectFromFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVO
 // for cuMemImportFromShareableHandle) like ctrlHasFrontendFD, and records the
 // imported objects.
 func ctrlClientImportObjectsFromFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
-	return ctrlExportToFDInvoke(fi, ioctlParams, func(ctrlParams *nvgpu.NV0000_CTRL_OS_UNIX_IMPORT_OBJECTS_FROM_FD_PARAMS, ctlFile *frontendFD) {
+	return ctrlExportToFDInvoke(fi, ioctlParams, func(client *rootClient, src exportedObjInfo, ctrlParams *nvgpu.NV0000_CTRL_OS_UNIX_IMPORT_OBJECTS_FROM_FD_PARAMS, _ *frontendFD) func() {
 		if ioctlParams.Status != nvgpu.NV_OK {
-			return
+			return nil
 		}
 		n := min(int(ctrlParams.NumObjects), len(ctrlParams.Objects))
 		for i := 0; i < n; i++ {
@@ -234,8 +269,9 @@ func ctrlClientImportObjectsFromFD(fi *frontendIoctlState, ioctlParams *nvgpu.NV
 			if ctrlParams.Objects[i].Val == 0 || t == nvgpu.NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_TYPE_NONE {
 				continue
 			}
-			addImportedObj(fi, ctlFile, ioctlParams.HClient, ctrlParams.HParent, ctrlParams.Objects[i],
+			addImportedObj(fi, client, src, ctrlParams.HParent, ctrlParams.Objects[i],
 				int(ctrlParams.Index)+i, t == nvgpu.NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_TYPE_FABRIC_MC)
 		}
+		return nil
 	})
 }
