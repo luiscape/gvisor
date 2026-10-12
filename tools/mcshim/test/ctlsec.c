@@ -33,7 +33,10 @@ int main(void) {
   snprintf(p, sizeof(p), "/tmp/mcshim/present.%d", (int)getpid());
   for (int i = 0; i < 200; i++) {
     struct stat st;
-    if (lstat(p, &st) == 0 && S_ISREG(st.st_mode)) return 0;
+    if (lstat(p, &st) == 0 && S_ISREG(st.st_mode)) {
+      usleep(200000); /* the thread logs right after writing present */
+      return 0;
+    }
     usleep(10000);
   }
   return 3;

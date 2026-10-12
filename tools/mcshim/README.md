@@ -322,7 +322,7 @@ resume in place of a checkpoint and restore:
     reaches the sentry's error; without the interposer, no job and one
     `--toggle` per process.
 
-Three tests need no GPU, and cover the processes that never checkpoint:
+Four tests need no GPU, and cover the processes that never checkpoint:
 
 *   `preload`: an interposer preloaded after the shim finds the next
     definition with `dlsym(RTLD_NEXT)`, in either order;
@@ -330,6 +330,13 @@ Three tests need no GPU, and cover the processes that never checkpoint:
     floor, and `test/glibc_smoke.sh` loads it in ubuntu:20.04, debian:11,
     rockylinux:8 and centos:7, through `LD_PRELOAD` and through
     `/etc/ld.so.preload`;
+*   `noeffect`: programs that never checkpoint print and exit the same with
+    the shim as without it: driver lookups with no driver, or one installed
+    but not loaded (which must stay unloaded); `RTLD_DEFAULT` lookups from an
+    `RTLD_LOCAL` library; `dlerror` after a successful lookup; `sigwait` in a
+    CUDA process; the main program's own cudart answering its resolver
+    calls; and weak references to driver entry points, which must fail
+    cleanly (`test/noeffect.sh`, over fake libraries);
 *   `ctlsec` (docker): a symlink or hard link planted in the control
     directory, a symlinked control directory, or `MCSHIM_LOG` in a setuid
     process cannot make a root process write to or chmod another file
@@ -420,7 +427,18 @@ inside the container's trust domain, not gVisor's:
     library loaded after the shim recursed forever, and `RTLD_DEFAULT`
     lookups from `RTLD_LOCAL` libraries missed their own dependencies. The
     tail call needs optimization under GCC older than 15 (no `musttail`),
-    hence `-O2` in BUILD; `test/run.sh preload` catches a build without it.
+    hence `-O2` in BUILD (`run.sh preload` builds its own copy at `-O2`, so it
+    does not catch a build without it). The rewritten lookups find what the
+    caller would find without the shim, then return the shim's wrapper for
+    it: never the shim's own definition (a process that has not loaded
+    libcuda does not find `cuInit`), searching the caller's own dependencies
+    for `RTLD_DEFAULT` (as glibc does for an `RTLD_LOCAL` library), and
+    leaving `dlerror` clear on success. cudart resolvers called from the main
+    program go to the runtime it binds to. The shim never loads libcuda
+    itself, and its wrappers return `CUDA_ERROR_NOT_INITIALIZED` without it
+    (a weak reference to `cuInit` still binds to the shim). Its control
+    thread blocks every signal. `test/run.sh noeffect` checks all of this
+    against the same programs without the shim.
 *   **Driver release.** runsc enables the interposer and the job on R610 and
     newer, and keeps them off, with a warning, on older drivers. It has been
     validated on R610 only.

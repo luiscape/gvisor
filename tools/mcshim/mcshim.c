@@ -44,6 +44,7 @@
 #include <fcntl.h>
 #include <link.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -62,6 +63,13 @@
 #endif
 #ifndef SYS_pidfd_getfd
 #define SYS_pidfd_getfd 438
+#endif
+#ifndef SYS_renameat2
+#if defined(__x86_64__)
+#define SYS_renameat2 316
+#elif defined(__aarch64__)
+#define SYS_renameat2 276
+#endif
 #endif
 
 /* glibc floor: GLIBC_2.17 (see README.md). The shim is preloaded into every
@@ -248,15 +256,23 @@ static int ctl_open_log(void) {
   static const char name[] = "mcshim.log";
   int dfd = ctl_dirfd();
   if (dfd < 0) return -1;
-  int fd = openat(dfd, name,
-                  O_WRONLY | O_APPEND | O_CREAT | O_EXCL | O_NOFOLLOW |
-                      O_CLOEXEC,
-                  0666);
-  if (fd >= 0) {
-    fchmod(fd, 0666);
+  int fd = ctl_open_existing(name, O_WRONLY | O_APPEND);
+  if (fd >= 0 || errno != ENOENT) return fd;
+  /* Create it under a private name, make it writable by everyone, then put
+   * it in place unless another process got there first: created in place,
+   * the umask's mode would show until the fchmod, and stay if the process
+   * exited in between. renameat2 by system call, which glibc only has since
+   * 2.28; RENAME_NOREPLACE is 1. */
+  char tmp[48];
+  snprintf(tmp, sizeof(tmp), "%s.%d", name, (int)getpid());
+  fd = ctl_create(tmp, 0600);
+  if (fd < 0) return -1;
+  fchmod(fd, 0666);
+  if (syscall(SYS_renameat2, dfd, tmp, dfd, name, 1 /* RENAME_NOREPLACE */) ==
+      0)
     return fd;
-  }
-  if (errno != EEXIST) return -1;
+  close(fd);
+  unlinkat(dfd, tmp, 0);
   return ctl_open_existing(name, O_WRONLY | O_APPEND);
 }
 
@@ -312,6 +328,56 @@ static int allow_fabric(void) {
 
 static void* (*real_dlsym)(void*, const char*);
 
+/* Whether p is in the main program: in a PT_LOAD segment of the first object
+ * dl_iterate_phdr reports. dladdr names the main program by argv[0], which
+ * dlopen does not match. */
+typedef struct {
+  uintptr_t addr;
+  int found;
+} InMain;
+
+static int in_main_cb(struct dl_phdr_info* info, size_t size, void* arg) {
+  (void)size;
+  InMain* m = arg;
+  for (int i = 0; i < info->dlpi_phnum; i++) {
+    const ElfW(Phdr)* ph = &info->dlpi_phdr[i];
+    uintptr_t start = info->dlpi_addr + ph->p_vaddr;
+    if (ph->p_type == PT_LOAD && m->addr >= start &&
+        m->addr - start < ph->p_memsz)
+      m->found = 1;
+  }
+  return 1; /* only the first object */
+}
+
+static int in_main(const void* p) {
+  InMain m = {(uintptr_t)p, 0};
+  dl_iterate_phdr(in_main_cb, &m);
+  return m.found;
+}
+
+/* A handle on the scope the object at address caller searches: the global
+ * scope for the main program, else the object and its dependencies. NULL if
+ * the object cannot be identified; else release it with dlclose. */
+static void* caller_handle(const void* caller) {
+  if (!caller) return NULL;
+  if (in_main(caller)) return dlopen(NULL, RTLD_NOW);
+  Dl_info di;
+  if (!dladdr(caller, &di) || !di.dli_fname || !di.dli_fname[0]) return NULL;
+  return dlopen(di.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+}
+
+/* Whether p is in the shim itself (one of its own definitions). */
+static int is_self(const void* p) {
+  static void* base; /* atomic */
+  Dl_info di;
+  void* b = __atomic_load_n(&base, __ATOMIC_ACQUIRE);
+  if (!b && dladdr((void*)is_self, &di)) {
+    b = di.dli_fbase;
+    __atomic_store_n(&base, b, __ATOMIC_RELEASE);
+  }
+  return p && b && dladdr(p, &di) && di.dli_fbase == b;
+}
+
 static void init_real_dlsym(void) {
   if (real_dlsym) return;
   /* glibc >= 2.34 exports dlsym as GLIBC_2.34, older glibc at its base. */
@@ -325,12 +391,16 @@ static void init_real_dlsym(void) {
  * consumers often dlopen libcuda RTLD_LOCAL. Uses real_dlsym, since the
  * interposed dlsym would return our own wrappers. */
 
+/* The loaded libcuda, or NULL. Never loads it: a process that has not loaded
+ * the driver itself does not use CUDA, and must not have the shim load it
+ * (say, by calling a wrapper it found through a weak reference). */
 static void* libcuda_handle(void) {
-  static void* h;
-  if (!h) h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
-  if (!h) h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
-  if (!h) mclog("FATAL: dlopen(libcuda.so.1) failed: %s", dlerror());
-  return h;
+  static void* h; /* atomic */
+  void* got = __atomic_load_n(&h, __ATOMIC_ACQUIRE);
+  if (got) return got;
+  got = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
+  if (got) __atomic_store_n(&h, got, __ATOMIC_RELEASE);
+  return got;
 }
 
 /* Whether libcuda is loaded, without loading it. */
@@ -351,6 +421,15 @@ static int libcuda_loaded(void) {
       void* h_ = libcuda_handle();                                    \
       if (real_dlsym && h_) *(void**)(&(var)) = real_dlsym(h_, name); \
     }                                                                 \
+  } while (0)
+
+/* REAL in a wrapper: without the driver's entry point (no libcuda loaded,
+ * e.g. a weak reference bound to the shim), fail like an uninitialized
+ * driver rather than call through NULL. */
+#define REAL_OR_FAIL(var, name)                     \
+  do {                                              \
+    REAL(var, name);                                \
+    if (!(var)) return CUDA_ERROR_NOT_INITIALIZED; \
   } while (0)
 
 /* Reals the shim calls but does not interpose. */
@@ -1515,8 +1594,8 @@ static unsigned long long strip_fabric(unsigned long long types,
 CUresult cuMemCreate(CUmemGenericAllocationHandle* h, size_t size,
                      const CUmemAllocationProp* prop,
                      unsigned long long flags) {
-  REAL(r_cuMemCreate, "cuMemCreate");
-  REAL(r_cuMemRelease, "cuMemRelease");
+  REAL_OR_FAIL(r_cuMemCreate, "cuMemCreate");
+  REAL_OR_FAIL(r_cuMemRelease, "cuMemRelease");
   resolve_internal();
   CUmemAllocationProp fixed;
   if (prop) {
@@ -1551,8 +1630,8 @@ CUresult cuMemCreate(CUmemGenericAllocationHandle* h, size_t size,
 
 CUresult cuMulticastCreate(CUmemGenericAllocationHandle* h,
                            const CUmulticastObjectProp* prop) {
-  REAL(r_cuMulticastCreate, "cuMulticastCreate");
-  REAL(r_cuMemRelease, "cuMemRelease");
+  REAL_OR_FAIL(r_cuMulticastCreate, "cuMulticastCreate");
+  REAL_OR_FAIL(r_cuMemRelease, "cuMemRelease");
   resolve_internal();
   CUmulticastObjectProp fixed;
   if (prop) {
@@ -1584,7 +1663,7 @@ CUresult cuMulticastCreate(CUmemGenericAllocationHandle* h,
 CUresult cuMemExportToShareableHandle(void* shHandle,
                                       CUmemGenericAllocationHandle h, int type,
                                       unsigned long long flags) {
-  REAL(r_cuMemExportToShareableHandle, "cuMemExportToShareableHandle");
+  REAL_OR_FAIL(r_cuMemExportToShareableHandle, "cuMemExportToShareableHandle");
   /* Refuse fabric exports. The driver fabric-exports memory that never asked
    * for fabric handles, so torch's export-as-FABRIC probe would succeed and
    * create one 00f8 object per pool chunk. Failing it makes torch fall back to
@@ -1615,8 +1694,8 @@ CUresult cuMemExportToShareableHandle(void* shHandle,
 
 CUresult cuMemImportFromShareableHandle(CUmemGenericAllocationHandle* h,
                                         void* osHandle, int type) {
-  REAL(r_cuMemImportFromShareableHandle, "cuMemImportFromShareableHandle");
-  REAL(r_cuMemRelease, "cuMemRelease");
+  REAL_OR_FAIL(r_cuMemImportFromShareableHandle, "cuMemImportFromShareableHandle");
+  REAL_OR_FAIL(r_cuMemRelease, "cuMemRelease");
   resolve_internal();
   gate_enter();
   pthread_mutex_lock(&g_lock);
@@ -1664,7 +1743,7 @@ CUresult cuDeviceGetAttribute(int* pi, int attrib, CUdevice dev) {
 
 CUresult cuMemRetainAllocationHandle(CUmemGenericAllocationHandle* h,
                                      void* addr) {
-  REAL(r_cuMemRetainAllocationHandle, "cuMemRetainAllocationHandle");
+  REAL_OR_FAIL(r_cuMemRetainAllocationHandle, "cuMemRetainAllocationHandle");
   gate_enter();
   pthread_mutex_lock(&g_lock);
   CUresult rc = r_cuMemRetainAllocationHandle(h, addr);
@@ -1693,7 +1772,7 @@ CUresult cuMemGetAllocationPropertiesFromHandle(
 }
 
 CUresult cuMemRelease(CUmemGenericAllocationHandle h) {
-  REAL(r_cuMemRelease, "cuMemRelease");
+  REAL_OR_FAIL(r_cuMemRelease, "cuMemRelease");
   gate_enter();
   pthread_mutex_lock(&g_lock);
   int i = alloc_by_app(h);
@@ -1708,7 +1787,7 @@ CUresult cuMemRelease(CUmemGenericAllocationHandle h) {
 }
 
 CUresult cuMulticastAddDevice(CUmemGenericAllocationHandle h, CUdevice dev) {
-  REAL(r_cuMulticastAddDevice, "cuMulticastAddDevice");
+  REAL_OR_FAIL(r_cuMulticastAddDevice, "cuMulticastAddDevice");
   gate_enter();
   pthread_mutex_lock(&g_lock);
   int i = alloc_by_app(h);
@@ -1843,14 +1922,14 @@ static CUresult do_bind(int v2, int by_addr, CUmemGenericAllocationHandle mc,
 CUresult cuMulticastBindMem(CUmemGenericAllocationHandle mc, size_t mcOffset,
                             CUmemGenericAllocationHandle mem, size_t memOffset,
                             size_t size, unsigned long long flags) {
-  REAL(r_cuMulticastBindMem, "cuMulticastBindMem");
+  REAL_OR_FAIL(r_cuMulticastBindMem, "cuMulticastBindMem");
   return do_bind(0, 0, mc, -1, mcOffset, mem, 0, memOffset, size, flags);
 }
 
 CUresult cuMulticastBindAddr(CUmemGenericAllocationHandle mc, size_t mcOffset,
                              CUdeviceptr memptr, size_t size,
                              unsigned long long flags) {
-  REAL(r_cuMulticastBindAddr, "cuMulticastBindAddr");
+  REAL_OR_FAIL(r_cuMulticastBindAddr, "cuMulticastBindAddr");
   return do_bind(0, 1, mc, -1, mcOffset, 0, memptr, 0, size, flags);
 }
 
@@ -1859,20 +1938,20 @@ CUresult cuMulticastBindMem_v2(CUmemGenericAllocationHandle mc, CUdevice dev,
                                CUmemGenericAllocationHandle mem,
                                size_t memOffset, size_t size,
                                unsigned long long flags) {
-  REAL(r_cuMulticastBindMem_v2, "cuMulticastBindMem_v2");
+  REAL_OR_FAIL(r_cuMulticastBindMem_v2, "cuMulticastBindMem_v2");
   return do_bind(1, 0, mc, dev, mcOffset, mem, 0, memOffset, size, flags);
 }
 
 CUresult cuMulticastBindAddr_v2(CUmemGenericAllocationHandle mc, CUdevice dev,
                                 size_t mcOffset, CUdeviceptr memptr,
                                 size_t size, unsigned long long flags) {
-  REAL(r_cuMulticastBindAddr_v2, "cuMulticastBindAddr_v2");
+  REAL_OR_FAIL(r_cuMulticastBindAddr_v2, "cuMulticastBindAddr_v2");
   return do_bind(1, 1, mc, dev, mcOffset, 0, memptr, 0, size, flags);
 }
 
 CUresult cuMulticastUnbind(CUmemGenericAllocationHandle mc, CUdevice dev,
                            size_t mcOffset, size_t size) {
-  REAL(r_cuMulticastUnbind, "cuMulticastUnbind");
+  REAL_OR_FAIL(r_cuMulticastUnbind, "cuMulticastUnbind");
   gate_enter();
   pthread_mutex_lock(&g_lock);
   int gi = alloc_by_app(mc);
@@ -1899,7 +1978,7 @@ CUresult cuMulticastUnbind(CUmemGenericAllocationHandle mc, CUdevice dev,
 
 CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
                   CUmemGenericAllocationHandle h, unsigned long long flags) {
-  REAL(r_cuMemMap, "cuMemMap");
+  REAL_OR_FAIL(r_cuMemMap, "cuMemMap");
   resolve_internal();
   gate_enter();
   pthread_mutex_lock(&g_lock);
@@ -1960,7 +2039,7 @@ static int sel_same(const Sel* e) {
  * affected mappings are selected before and updated after. */
 
 CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) {
-  REAL(r_cuMemUnmap, "cuMemUnmap");
+  REAL_OR_FAIL(r_cuMemUnmap, "cuMemUnmap");
   SelVec sel;
   sel_init(&sel);
   gate_enter();
@@ -2005,7 +2084,7 @@ static int same_location(const CUmemLocation* a, const CUmemLocation* b) {
 
 CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size,
                         const CUmemAccessDesc* desc, size_t count) {
-  REAL(r_cuMemSetAccess, "cuMemSetAccess");
+  REAL_OR_FAIL(r_cuMemSetAccess, "cuMemSetAccess");
   SelVec sel;
   sel_init(&sel);
   gate_enter();
@@ -2071,13 +2150,13 @@ static CUresult (*r_cuMemMapArrayAsync_ptsz)(CUarrayMapInfo*, unsigned,
                                              CUstream);
 
 CUresult cuMemMapArrayAsync(CUarrayMapInfo* list, unsigned count, CUstream st) {
-  REAL(r_cuMemMapArrayAsync, "cuMemMapArrayAsync");
+  REAL_OR_FAIL(r_cuMemMapArrayAsync, "cuMemMapArrayAsync");
   return map_array(r_cuMemMapArrayAsync, list, count, st);
 }
 
 CUresult cuMemMapArrayAsync_ptsz(CUarrayMapInfo* list, unsigned count,
                                  CUstream st) {
-  REAL(r_cuMemMapArrayAsync_ptsz, "cuMemMapArrayAsync_ptsz");
+  REAL_OR_FAIL(r_cuMemMapArrayAsync_ptsz, "cuMemMapArrayAsync_ptsz");
   return map_array(r_cuMemMapArrayAsync_ptsz, list, count, st);
 }
 
@@ -3015,13 +3094,14 @@ static void pin(void* p) {
  * own dependencies define (a runtime under any name, or one linked statically
  * into it), unless that is the shim's wrapper. */
 static void* rt_from_caller(int fn, void* caller) {
-  Dl_info di;
-  if (!caller || !dladdr(caller, &di) || !di.dli_fname) return NULL;
-  void* h = dlopen(di.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+  void* h = caller_handle(caller);
   if (!h) return NULL;
   void* r = real_dlsym(h, kRtNames[fn]);
   dlclose(h);
-  return r == rt_wrapper(fn) ? NULL : r;
+  /* The main program's handle searches the global scope, where the shim
+   * comes before the runtimes: its call bound to what follows the shim. */
+  if (is_self(r)) r = real_dlsym(RTLD_NEXT, kRtNames[fn]);
+  return is_self(r) ? NULL : r;
 }
 
 typedef struct {
@@ -3214,12 +3294,44 @@ static void* rt_dlsym(const char* symbol, void* real) {
   return real;
 }
 
+/* symbol as dlsym(RTLD_DEFAULT) would find it if called from the object at
+ * address caller: in that object's own scope, its dependencies included
+ * (glibc searches the caller's scope after the global one, and an RTLD_LOCAL
+ * library's dependencies are only there). NULL if not found. */
+static void* caller_scope_dlsym(void* caller, const char* symbol) {
+  /* The main program's scope is the global one, already searched. */
+  if (!caller || in_main(caller)) return NULL;
+  void* h = caller_handle(caller);
+  if (!h) return NULL;
+  void* r = real_dlsym(h, symbol);
+  dlclose(h);
+  return is_self(r) ? NULL : r;
+}
+
+/* A dlsym lookup of a name the shim rewrites, from the object at address
+ * caller. It must find what the caller would find without the shim, then
+ * return the shim's wrapper for it:
+ *
+ *   - The shim's own definition is not something the caller would find: a
+ *     process that has not loaded libcuda must not see cuInit. Look past it,
+ *     to the next definition in the global scope.
+ *   - real_dlsym is called from the shim, so glibc searches RTLD_DEFAULT from
+ *     the shim's scope; also search the caller's (see caller_scope_dlsym).
+ *   - The shim's own lookups (resolving its hooks, say) can leave dlerror set;
+ *     a successful dlsym leaves it clear. */
 static void* __attribute__((noinline)) dlsym_rewrite(void* handle,
-                                                      const char* symbol) {
+                                                      const char* symbol,
+                                                      void* caller) {
   void* r = real_dlsym(handle, symbol);
-  if (!r) return r;
-  if (symbol[2] == 'd') return rt_dlsym(symbol, r);
-  return redirect(symbol, r, 0);
+  if (is_self(r)) {
+    r = real_dlsym(RTLD_NEXT, symbol);
+    if (is_self(r)) r = NULL;
+  }
+  if (!r && handle == RTLD_DEFAULT) r = caller_scope_dlsym(caller, symbol);
+  if (!r) return NULL; /* dlerror reports the last failed lookup */
+  r = symbol[2] == 'd' ? rt_dlsym(symbol, r) : redirect(symbol, r, 0);
+  dlerror();
+  return r;
 }
 
 /* Interposed dlsym. glibc resolves RTLD_NEXT and RTLD_DEFAULT relative to the
@@ -3235,7 +3347,7 @@ void* dlsym(void* handle, const char* symbol) {
   if (handle != RTLD_NEXT && symbol[0] == 'c' && symbol[1] == 'u' &&
       ((symbol[2] >= 'A' && symbol[2] <= 'Z') ||
        strncmp(symbol, "cudaGetDriverEntryPoint", 23) == 0))
-    return dlsym_rewrite(handle, symbol);
+    return dlsym_rewrite(handle, symbol, __builtin_return_address(0));
 #if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 15)
   __attribute__((musttail))
 #endif
@@ -3421,8 +3533,17 @@ static int g_disabled;
  * consume or ack markers. */
 static void control_thread_start(void) {
   if (g_disabled) return;
+  /* The thread blocks every signal, which it inherits from the mask in
+   * effect here: a process-directed signal must go to the application's
+   * threads as without the shim (say, one it collects with sigwait). */
+  /* sigprocmask sets the calling thread's mask in glibc, like
+   * pthread_sigmask, which glibc 2.32 re-versioned above the shim's floor. */
+  sigset_t all, old;
+  sigfillset(&all);
+  sigprocmask(SIG_SETMASK, &all, &old);
   pthread_t t;
   int err = pthread_create(&t, NULL, control_thread, NULL);
+  sigprocmask(SIG_SETMASK, &old, NULL);
   if (err == 0)
     pthread_detach(t);
   else

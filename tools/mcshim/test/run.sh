@@ -23,6 +23,11 @@
 #   glibc                        no GPU: the shim needs no symbol version above
 #                                its glibc floor, and loads in old images
 #                                (glibc_smoke.sh; needs docker)
+#   noeffect                     no GPU: programs that never checkpoint behave
+#                                the same with the shim as without it: driver
+#                                lookups without a driver, RTLD_LOCAL lookups,
+#                                dlerror, sigwait, the main program's cudart
+#                                (noeffect.sh, over fake libraries)
 #   ctlsec                       no GPU: a planted symlink, hard link or
 #                                symlinked control directory, or a setuid
 #                                process, cannot make the shim write to or
@@ -69,7 +74,7 @@ while getopts r:i:e: o; do
 done
 shift $((OPTIND - 1))
 if [ $# -eq 0 ]; then
-  set -- abi gate mc refcount refuse mapwait silent preload glibc ctlsec tables \
+  set -- abi gate mc refcount refuse mapwait silent preload noeffect glibc ctlsec tables \
     rtres ipc orphan deadline reason undo optout torch-kernel torch-symm \
     torch-expandable
 fi
@@ -512,6 +517,7 @@ for t in "$@"; do
     preload) preload || rc=$? ;;
     glibc) glibc || rc=$? ;;
     ctlsec) ctlsec || rc=$? ;;
+    noeffect) ./noeffect.sh "$W/mcshim.so" || rc=$? ;;
     rtres) rtres || rc=$? ;;
     tables) tables || rc=$? ;;
     deadline | reason | undo | optout)
