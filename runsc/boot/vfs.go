@@ -1969,6 +1969,9 @@ func nvproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem, 
 		AllowUnsupportedDriver: info.conf.NVProxyAllowUnsupportedDriver,
 		HostSettings:           info.nvidiaHostSettings,
 		UseDevGofer:            true,
+		// Only the multicast interposer needs export and import tracking;
+		// without it, nvproxy behaves as before the interposer existed.
+		TrackExports: cudaMulticastShimEnabled(info.conf, nvidiaDriverVersion.Major()),
 	})
 	if err != nil {
 		return fmt.Errorf("registering nvproxy driver: %w", err)

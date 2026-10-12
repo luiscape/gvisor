@@ -58,6 +58,15 @@ type Options struct {
 
 	// If UseDevGofer is true, open device files via gofer.
 	UseDevGofer bool
+
+	// If TrackExports is true, nvproxy records which RM object each exported
+	// fd carries and which objects were imported from one, reports the
+	// exported object's identity in /proc/[pid]/fdinfo/[fd] (see
+	// frontendFD.ProcFDInfoExtra), and counts imports as checkpoint blockers
+	// (see CheckpointBlockers). The CUDA multicast interposer relies on all
+	// three; without it they are off, and exports and imports are proxied
+	// like any control with a frontend fd.
+	TrackExports bool
 }
 
 // Register registers all devices implemented by this package, and specified by
@@ -85,6 +94,7 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		version:                opts.DriverVersion,
 		capsEnabled:            opts.DriverCaps,
 		useDevGofer:            opts.UseDevGofer,
+		trackExports:           opts.TrackExports,
 		procDriverNvidiaParams: opts.HostSettings.ProcDriverNvidiaParams,
 		frontendFDs:            make(map[*frontendFD]struct{}),
 		clients:                make(map[nvgpu.Handle]*rootClient),
@@ -210,6 +220,7 @@ type nvproxy struct {
 	version                nvconf.DriverVersion
 	capsEnabled            nvconf.DriverCaps
 	useDevGofer            bool
+	trackExports           bool
 	procDriverNvidiaParams string
 	devInfo                DeviceInfo
 	regularDevs            [nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1]*frontendDevice

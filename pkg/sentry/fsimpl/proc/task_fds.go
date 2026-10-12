@@ -390,7 +390,10 @@ func (d *fdInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	mntID := file.Mount().ID
 	fmt.Fprintf(buf, "pos:\t%d\nflags:\t0%o\nmnt_id:\t%d\n", pos, flags, mntID)
 
-	if x, ok := file.Impl().(procFDInfoExtra); ok {
+	// Type-specific lines describe the open file beyond what the reader could
+	// learn without ptrace access to the task, which Linux requires to read
+	// fdinfo at all (proc_fdinfo_access_allowed).
+	if x, ok := file.Impl().(procFDInfoExtra); ok && kernel.ContextCanTrace(ctx, d.task, false) {
 		buf.WriteString(x.ProcFDInfoExtra(ctx))
 	}
 

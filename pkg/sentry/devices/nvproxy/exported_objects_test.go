@@ -105,3 +105,27 @@ func TestRecordExportImport(t *testing.T) {
 	// An unknown client records nothing (and does not crash).
 	addImportedObj(fi, nil, exp, importerH, nvgpu.Handle{Val: 0x5c000012}, 0, false)
 }
+
+// TestProcFDInfoExtraTracking checks that the fdinfo line is only shown with
+// Options.TrackExports: without the multicast interposer, /proc shows nothing
+// new.
+func TestProcFDInfoExtraTracking(t *testing.T) {
+	ctx := context.Background()
+	exp := exportedObjInfo{
+		client: nvgpu.Handle{Val: 0xc1d00922},
+		object: nvgpu.Handle{Val: 0x5c000123},
+		class:  nvgpu.NV01_MEMORY_LOCAL_USER,
+	}
+	for _, track := range []bool{false, true} {
+		nvp := &nvproxy{trackExports: track}
+		fd := &frontendFD{dev: &frontendDevice{nvp: nvp}, exportedObj: exp}
+		got := fd.ProcFDInfoExtra(ctx)
+		want := ""
+		if track {
+			want = procFDInfoExportedObjectLine(exp)
+		}
+		if got != want {
+			t.Errorf("TrackExports=%v: ProcFDInfoExtra() = %q, want %q", track, got, want)
+		}
+	}
+}

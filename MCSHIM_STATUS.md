@@ -401,11 +401,9 @@ There is no `_v2_ptsz`, so no new wrapper is needed.
 
 -   **The blocker inventory for configurations that don't opt in.** I
     recommend leaving it out of the first merge (see P0.5).
--   **The fdinfo line.** nvproxy now adds an `nvproxy_exported_object` line to
-    `/proc/<pid>/fdinfo` for exported `/dev/nvidiactl` fds, for every nvproxy
-    user. Applications can see it, but it is harmless (dmabuf has the same
-    pattern); this is open question 4 in the design doc. Gating it on the flag
-    means plumbing the flag into nvproxy's options.
+-   **The fdinfo line.** Resolved (R14): the `nvproxy_exported_object` line,
+    and export/import tracking, are on only with the interposer
+    (`nvproxy.Options.TrackExports`), and the line needs ptrace access.
 -   **Correction to an earlier status.** Upstream master has #14850 (FLA) but
     not #14817 (`--device-map`): master's `state_cuda.go` still has the FIXME
     for it.

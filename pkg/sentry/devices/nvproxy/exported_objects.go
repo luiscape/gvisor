@@ -53,6 +53,9 @@ type exportedObjInfo struct {
 // format is a contract, locked by TestProcFDInfoExtraFormat.
 func (fd *frontendFD) ProcFDInfoExtra(ctx context.Context) string {
 	nvp := fd.dev.nvp
+	if !nvp.trackExports {
+		return ""
+	}
 	nvp.fdsMu.Lock()
 	exp := fd.exportedObj
 	nvp.fdsMu.Unlock()
@@ -87,7 +90,12 @@ type exportRecorder[PtrParams any] func(client *rootClient, src exportedObjInfo,
 // runs before anything is copied back to the application, so that an object
 // the host has imported is recorded even if the copy-out faults (an import
 // nvproxy did not know of would escape CheckpointBlockers).
+//
+// Without Options.TrackExports, it is exactly ctrlHasFrontendFD.
 func ctrlExportToFDInvoke[Params any, PtrParams hasFrontendFDPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS, record exportRecorder[PtrParams]) (uintptr, error) {
+	if !fi.fd.dev.nvp.trackExports {
+		return ctrlHasFrontendFD[Params, PtrParams](fi, ioctlParams)
+	}
 	var ctrlParamsValue Params
 	ctrlParams := PtrParams(&ctrlParamsValue)
 	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {

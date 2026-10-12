@@ -308,6 +308,11 @@ since they change the behavior of existing configurations.
     checkpoint blockers, since `cuda-checkpoint` cannot restore them, and the
     sentry checks that each import's source still exists before a teardown.
 
+Both are off unless the interposer is enabled (`nvproxy.Options.TrackExports`):
+without it, the export and import controls are proxied exactly as before and
+fdinfo shows nothing new. With it, the fdinfo line is shown only to a reader
+with ptrace access to the task, as Linux requires for fdinfo.
+
 This builds on #14525 (merged) and #14817 (approved) for restore onto other
 GPUs, and #14850 (merged), a control libcuda issues on NVSwitch systems when
 allocating and exporting VMM memory. It also uses a checkpoint blocker
@@ -430,8 +435,8 @@ including one that pins the fdinfo line format.
     marker is naturally part of the checkpoint, it needs no new sentry ABI,
     and forged markers only affect the container's own checkpoint. Would a
     sentry-provided device or socket be preferred?
-4.  **The fdinfo line as a `/proc` contract.** Acceptable as is, or behind a
-    flag?
+4.  **The fdinfo line as a `/proc` contract.** It is now shown only with the
+    interposer enabled, and only to readers with ptrace access. Acceptable?
 5.  **Testing.** `tools/mcshim/test` drives the interposer through the marker
     protocol on two NVLS GPUs (lookup ABIs, gate draining, multicast rebuild,
     references, refusals, two-process imports), and checks that
