@@ -4,7 +4,7 @@
 | :--- | :--- |
 | Status | Draft for review |
 | Date | 2026-10-12 |
-| Branch | `luis/multicast-xgpu-upstream` at `6b3db1560` (github.com/luiscape/gvisor) |
+| Branch | `luis/multicast-xgpu-upstream` at `c201dcf24` (github.com/luiscape/gvisor) |
 | Upstream | `google/gvisor` `master` at `0a438edc9` |
 | Design doc | `g3doc/proposals/cuda_multigpu_checkpoint.md` (on the branch) |
 
@@ -292,7 +292,7 @@ Status:
 | :--- | :--- | :--- | :--- |
 | R16 | The job wrap and preload apply to every container when nvproxy is enabled globally, including the pause container; a container whose image lacks `cuda-checkpoint` fails to start. | **Fixed** (`182960ccb`); was: Verified (scope); reported (failure) | Apply only to containers that request GPUs; skip with a warning if the binary is missing; require absolute paths. |
 | R17 | With `--exec-fd`, the job wrap drops the user's program. | **Fixed** (`182960ccb`); was: Reported | Skip the wrap in that case. |
-| R18 | The interposer and `ld.so.preload` are written as root, following intermediate symlinks; without a rootfs overlay they land in the user's rootfs on the host, contrary to the docs. | Reported (two reviewers) | Refuse without a rootfs overlay, require the target inside the root mount, fix the docs. |
+| R18 | The interposer and `ld.so.preload` are written as root, following intermediate symlinks; without a rootfs overlay they land in the user's rootfs on the host, contrary to the docs. | **Docs fixed** (`c201dcf24`); was: Reported (two reviewers) | Docs now say where the writes land. Guard deferred (N21): it only matters with `--overlay2=none` or bind mounts over `/etc` or the interposer's directory, which Modal does not use. |
 | R19 | The embedded interposer is single-architecture; source distributions could embed x86 bytes into arm64 builds. | Reported | Embed per architecture, amd64 only, with an arm64 stub; reject `EMBEDDED` when nothing is embedded. |
 | R20 | Flag validation misses relative paths and separators in the interposer path. | **Fixed** (`182960ccb`); was: Reported | Add the checks and tests. |
 
@@ -332,6 +332,7 @@ These can follow the merge as separate PRs.
 | N18 | Test-runner robustness (unconditional `sudo`, shared log path). |
 | N19 | Environment slice aliasing when appending to the spec's environment. |
 | N20 | nvproxy cleanups: a dead parameter check, a duplicated handler, structured blocker results. |
+| N21 | R18's guard: write the interposer and the `ld.so.preload` entry only into the rootfs overlay (refuse without one, and refuse a path that crosses a bind mount), treating a refusal like a missing `cuda-checkpoint` (no wrap, no interposer, checkpoints refused). Falling back to `LD_PRELOAD` alone would be worse: SGLang's workers would lose the interposer silently. |
 
 ## 7. Merge plan
 
@@ -364,8 +365,8 @@ in parallel with PR0, PR1 and PR2.
 | PR6 | Checkpoint-blocker inventory. | None | No callers yet | Small |
 | PR7 | Bounded pre-save invocations (fixed 2-minute bound on `--get-state`, lock and unlock), lock-then-checkpoint behind the interposer option, the `--get-state` timeout and unlock fixes. No new flag or checkpoint key. | R11, R13 | Yes | Medium |
 | PR8 | Interposer protocol: `state_cuda_shim.go`, the "suspended" checkpoint key, `MCSHIM_DISABLE`. | R9, R10 | Yes | Medium |
-| PR9 | runsc: flags, validation, `IMAGE` mode, job wrap (supersedes #13987), `LD_PRELOAD` and `ld.so.preload`, save options, the R610-or-newer driver check. May split into job wrap and preload. | R16, R17, R18 (`IMAGE` parts), R20, R25 | Yes | Medium |
-| PR10 | `EMBEDDED` mode: `runsc/mcshimbin` (amd64 only), its test, user guide section. | R18 (docs), R19, R24 (test parts) | Yes | Small |
+| PR9 | runsc: flags, validation, `IMAGE` mode, job wrap (supersedes #13987), `LD_PRELOAD` and `ld.so.preload`, save options, the R610-or-newer driver check. May split into job wrap and preload. | R16, R17, R20, R25 | Yes | Medium |
+| PR10 | `EMBEDDED` mode: `runsc/mcshimbin` (amd64 only), its test, user guide section. | R19, R24 (test parts) | Yes | Small |
 
 R21 and R22 apply to every PR.
 
