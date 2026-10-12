@@ -124,8 +124,10 @@ process calls `cuInit`.
     `BindMem`, `BindAddr` and their `_v2` forms, `Unbind`), and VMM
     export/import. Legacy IPC is not interposed. Tracking is live state: an
     object is forgotten once it has no application reference, mapping or
-    bind. Tables are fixed-size (4096 entries; Qwen2.5-72B at TP=8 fits);
-    overflow makes every later checkpoint fail up front.
+    bind. Tables grow on demand (up to 1M entries each) and are indexed, so
+    no wrapper scans them: 100,000 live allocations cost under 0.5 µs per
+    create, map or release. Running out makes every later checkpoint fail
+    up front.
 -   **Suspend.** Unbind and release multicast groups, unmap (keeping the VA
     reservations), and release imports.
     Multicast-bound exporter allocations are copied to host memory (which the

@@ -23,6 +23,11 @@
 #   glibc                        no GPU: the shim needs no symbol version above
 #                                its glibc floor, and loads in old images
 #                                (glibc_smoke.sh; needs docker)
+#   tables                       no GPU: the tracking tables and their indexes
+#                                under random multi-threaded traffic with
+#                                suspend/resume cycles, and at 100k objects,
+#                                against a fake libcuda (tables.c, fakecuda.c),
+#                                with every index checked at each unlock
 #   rtres                        native: cudart's resolvers reach each caller's
 #                                own runtime; needs MCSHIM_TEST_CUDART, two
 #                                libcudart.so files of different majors
@@ -39,7 +44,9 @@
 #                                without the interposer, no job and one
 #                                --toggle per process, as before it
 #   torch-kernel torch-symm      under runsc (-r) in a rootfs with PyTorch and
-#                                the host driver's userspace (-i, -e: its env)
+#   torch-expandable             the host driver's userspace (-i, -e: its env);
+#                                expandable: over 4096 VMM allocations through
+#                                a suspend/resume cycle
 #
 # Usage: run.sh [-r RUNSC] [-i ROOTFS] [-e ENVFILE] [test...]   (default: all)
 # MCSHIM_TEST_GPUS picks the two GPUs (default 0,1).
@@ -56,8 +63,9 @@ while getopts r:i:e: o; do
 done
 shift $((OPTIND - 1))
 if [ $# -eq 0 ]; then
-  set -- abi gate mc refcount refuse mapwait silent preload glibc rtres ipc \
-    orphan deadline reason optout torch-kernel torch-symm
+  set -- abi gate mc refcount refuse mapwait silent preload glibc tables \
+    rtres ipc orphan deadline reason optout torch-kernel torch-symm \
+    torch-expandable
 fi
 GPUS=${MCSHIM_TEST_GPUS:-0,1}
 
@@ -266,6 +274,26 @@ glibc() {
   ./glibc_smoke.sh "$W/mcshim.so"
 }
 
+# tables: the shim built with MCSHIM_TABLE_CHECKS, which checks the tables'
+# consistency each time it releases its lock, over a fake libcuda.so.1 that
+# rejects any handle or address it did not issue.
+tables() {
+  local fake=$W/fake seed
+  mkdir -p "$fake"
+  gcc -O2 -g -Wall -Wextra -fPIC -shared -Wl,-soname,libcuda.so.1 \
+    -o "$fake/libcuda.so.1" fakecuda.c -lpthread || return 1
+  gcc -O1 -g -Wall -Wextra -DMCSHIM_TABLE_CHECKS -fPIC -shared \
+    -o "$W/mcshim-checks.so" ../mcshim.c -ldl -lpthread || return 1
+  gcc -O2 -g -Wall -Wextra -o "$W/tables" tables.c "$fake/libcuda.so.1" \
+    -Wl,-rpath,"$fake" -lpthread || return 1
+  for seed in 1 2 3; do
+    MCSHIM_LOG="$W/tables.log" LD_PRELOAD="$W/mcshim-checks.so" \
+      "$W/tables" fuzz "$seed" 20000 8 || return 1
+  done
+  # The production build, for the cost per call.
+  MCSHIM_LOG="$W/tables.log" LD_PRELOAD="$W/mcshim.so" "$W/tables" scale 100000
+}
+
 # count FILE: the number in FILE, or 0.
 count() {
   local n
@@ -434,6 +462,7 @@ for t in "$@"; do
     preload) preload || rc=$? ;;
     glibc) glibc || rc=$? ;;
     rtres) rtres || rc=$? ;;
+    tables) tables || rc=$? ;;
     deadline | reason | optout)
       if [ -z "$RUNSC" ]; then
         echo "SKIP $t: needs -r RUNSC"

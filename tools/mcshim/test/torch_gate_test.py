@@ -19,8 +19,13 @@ parent plays the sentry: it creates the gate marker, waits for the workers'
 gated acks, and checks that their submission loops stop until it removes the
 gate.
 
-  torch_gate_test.py kernel  elementwise kernels, one process
-  torch_gate_test.py symm    multimem all-reduce on symmetric memory, 2 ranks
+  torch_gate_test.py kernel      elementwise kernels, one process
+  torch_gate_test.py symm        multimem all-reduce on symmetric memory, 2
+                                 ranks
+  torch_gate_test.py expandable  12 GiB of small tensors with expandable
+                                 segments (thousands of VMM allocations), then
+                                 a full suspend/resume cycle; the tensors must
+                                 keep their contents
 """
 
 import multiprocessing as mp
@@ -39,7 +44,24 @@ def wait_for(path, timeout=120):
     time.sleep(0.01)
 
 
-def worker(rank, world, counter, pids):
+EXPANDABLE_TENSORS = 24576  # 512 KiB each: the small pool's 2 MiB pages
+
+
+def wait_ack(name, pid, timeout=120):
+  """Waits for ack NAME from PID; fails with its error file's reason."""
+  end = time.time() + timeout
+  while not os.path.exists(f"{D}/{name}"):
+    if os.path.exists(f"{D}/error.{pid}"):
+      with open(f"{D}/error.{pid}") as f:
+        raise SystemExit(f"FAIL: {pid} refused: {f.read().strip()}")
+    if time.time() > end:
+      raise SystemExit(f"FAIL: timed out waiting for {name}")
+    time.sleep(0.01)
+
+
+def worker(rank, world, counter, pids, mode, bad):
+  if mode == "expandable":
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
   import torch  # pylint: disable=g-import-not-at-top
 
   torch.cuda.set_device(rank)
@@ -60,6 +82,23 @@ def worker(rank, world, counter, pids):
 
     def step():
       torch.ops.symm_mem.multimem_all_reduce_(buf, "sum", name)
+
+  elif mode == "expandable":
+    n = 128 << 10
+    held = [torch.full((n,), float(i % 1000), device="cuda")
+            for i in range(EXPANDABLE_TENSORS)]
+    want = float(sum(i % 1000 for i in range(EXPANDABLE_TENSORS))) * n
+    x = held[0]
+    iters = [0]
+
+    def step():
+      x.add_(1)
+      x.sub_(1)
+      iters[0] += 1
+      if iters[0] % 200 == 0:
+        sums = torch.stack([t.sum(dtype=torch.float64) for t in held])
+        if sums.sum().item() != want:
+          bad.value = 1
 
   else:
     x = torch.zeros(1 << 20, device="cuda")
@@ -83,9 +122,11 @@ def main():
   world = 2 if mode == "symm" else 1
   ctx = mp.get_context("spawn")
   counter = ctx.Value("q", 0)
+  bad = ctx.Value("i", 0)
   pids = ctx.Queue()
   procs = [
-      ctx.Process(target=worker, args=(r, world, counter, pids), daemon=True)
+      ctx.Process(target=worker, args=(r, world, counter, pids, mode, bad),
+                  daemon=True)
       for r in range(world)
   ]
   for p in procs:
@@ -101,9 +142,21 @@ def main():
   c0 = counter.value
   time.sleep(0.5)
   check(counter.value > c0, "no progress before the gate")
+  for pid in ranks:
+    for kind in ("gated", "suspended", "resumed", "error"):
+      if os.path.exists(f"{D}/{kind}.{pid}"):
+        os.unlink(f"{D}/{kind}.{pid}")
   open(f"{D}/gate", "w").close()
   for pid in ranks:
-    wait_for(f"{D}/gated.{pid}")
+    wait_ack(f"gated.{pid}", pid)
+  if mode == "expandable":
+    # The whole checkpoint protocol, minus the images.
+    open(f"{D}/suspend", "w").close()
+    for pid in ranks:
+      wait_ack(f"suspended.{pid}", pid)
+    os.unlink(f"{D}/suspend")
+    for pid in ranks:
+      wait_ack(f"resumed.{pid}", pid)
   time.sleep(0.3)  # an iteration already past its launch may still finish
   c1 = counter.value
   time.sleep(1.5)
@@ -113,6 +166,9 @@ def main():
   c3 = counter.value
   check(c2 == c1, f"{c2 - c1} iterations while gated")
   check(c3 > c2, "no progress after the gate was removed")
+  if mode == "expandable":
+    time.sleep(2)  # at least one more contents check
+    check(not bad.value, "tensor contents changed")
   for p in procs:
     p.terminate()
   print(f"{mode}: before={c1 - c0} gated={c2 - c1} after={c3 - c2}: "

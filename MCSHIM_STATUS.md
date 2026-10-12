@@ -31,6 +31,44 @@ it before opening upstream PRs.
     this round and then removed), so keeping unvalidated releases off is up
     to the scheduler. R615 comes after the first version is merged.
 
+## Growable, indexed tables (2026-10-12)
+
+The interposer's three 4096-entry tables are replaced by tables that grow in
+chunks of 1024 entries that never move (up to 1M each), so the cap is gone
+without invalidating the indices and pointers that calls dropping `g_lock`
+keep. Wrappers no longer scan: hash indexes on the application value and the
+driver handle, per-object lists of mappings and binds, and an interval treap
+for lookups by address. A process that never uses CUDA allocates no table
+memory (the `.so`'s bss went from 2.2 MB to 31 KB).
+
+Cost per call with N live allocations (fake driver, so shim cost only):
+
+| Call | Old, N = 3,000 | Old, N = 20,000 | New, N = 3,000 | New, N = 100,000 |
+| :--- | ---: | ---: | ---: | ---: |
+| `cuMemCreate` | 2.2 µs | 6.2 µs | 0.28 µs | 0.30 µs |
+| `cuMemMap` | 4.5 µs | 9.0 µs | 1.1 µs | 0.47 µs |
+| `cuMemRelease` | 4.4 µs | 10.0 µs | 0.18 µs | 0.21 µs |
+| retain + release | 3.7 µs | 11.8 µs | 0.10 µs | 0.37 µs |
+| `cuMemUnmap` of 64 mappings | 477 µs | n/a | 25 µs | 26 µs |
+| Checkpoint gate | accepts | **refuses** (overflow) | accepts | accepts |
+
+Tests:
+
+-   New `run.sh tables` (no GPU): a fake `libcuda` (`test/fakecuda.c`) that
+    rejects any handle or address it did not issue, and `test/tables.c`:
+    random VMM and multicast traffic from 3-16 threads with suspend/resume
+    cycles running concurrently, with the shim built with
+    `MCSHIM_TABLE_CHECKS` so every index is checked each time `g_lock` is
+    released, plus a 100k-allocation scale run. About 9,000 cycles across
+    seven seeds pass, also under UBSan.
+-   New `run.sh torch-expandable` (GPU, under runsc): PyTorch with
+    `expandable_segments:True` holds 12 GiB of small tensors, then runs a
+    full suspend/resume; contents must survive. The old shim refuses it
+    ("object table overflow"); the new one passes.
+-   The full shim suite passes on the new shim (all 19 tests), and so do
+    `sglang_tp4_symm`, `vllm_tp4_72b_xgpu` and `sglang_tp8_72b` with a
+    release build embedding it.
+
 ## GPU round on the merged binary (`dc93d60ef`, 2026-10-10)
 
 H100 ×8, 610.57.04. Every item in "For the GPU round" below, on one binary,
@@ -280,7 +318,8 @@ R615 is a separate run:
 `abi` with lookups up to 13.4, the suite, the engine cells and the fabric
 measurement.
 
-Not this round: P1 table work (the 4096-entry cap fails safely).
+Not this round: P1 table work (the 4096-entry cap fails safely). **Done
+since:** see "Growable, indexed tables" below.
 
 ## P0 status
 

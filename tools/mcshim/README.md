@@ -162,12 +162,23 @@ interposer's rebuild runs against the same ordinals it recorded.
     by `dlsym` stays bound to that handle's runtime. A caller the shim cannot
     place (e.g. through libffi) gets the only `libcudart` loaded; with
     several loaded, checkpoints are refused.
-*   **Tracking tables.** Fixed-size (`MAXN` = 4096 each): objects (`g_alloc`),
-    mappings (`g_map`), multicast binds (`g_bind`). This is live state: an
-    object is forgotten once it has no application reference, mapping or
-    bind. Slots fill first-free, and scans stop at each table's high-water
-    mark. Any overflow is loud and sticky (`g_untracked`): arming the gate
-    refuses thereafter, failing the checkpoint before anything is torn down.
+*   **Tracking tables.** Objects (`g_at`), mappings (`g_mt`) and multicast
+    binds (`g_bt`) grow on demand, in chunks of 1024 entries that never
+    move, so indices and entry pointers stay valid as a table grows, and a
+    process that never uses CUDA allocates none. Each table holds up to 1M
+    entries. This is live state: an object is forgotten once it has no
+    application reference, mapping or bind, and freed slots are reused
+    first. Wrappers never scan a table: objects are found through hash
+    indexes on the application value and on the driver handle; each object
+    lists its mappings and the binds into and of it; and mappings are found
+    by address through an interval treap (keyed by address, with each
+    subtree's highest end), so a call covering many mappings costs one
+    lookup plus one step per mapping. Only checkpoint transitions iterate the
+    tables. Running out of entries or memory is loud and sticky
+    (`g_untracked`): arming the gate refuses thereafter, failing the
+    checkpoint before anything is torn down. `test/run.sh tables` checks the
+    tables and indexes after every call, under random multi-threaded traffic
+    with suspend/resume cycles, against a fake `libcuda` (no GPU).
 *   **Handles.** The application only ever sees the handle values it was
     given. A rebuild gives objects new driver handles, and every
     handle-taking entry point translates (`xlate`), including
@@ -250,8 +261,8 @@ interposer's rebuild runs against the same ordinals it recorded.
 
 The gate refuses, before anything is torn down, when a process has:
 
-*   overflowed a tracking table, or resolved an unknown ABI of a tracked
-    entry point;
+*   run out of tracking entries (1M per table) or memory for them, or
+    resolved an unknown ABI of a tracked entry point;
 *   exported or imported a memory pool (`cuMemPool{Export,Import}*`), created,
     imported or bound a logical endpoint, exported or imported a handle type
     other than POSIX fds, mapped a sparse array (`cuMemMapArrayAsync`), or
