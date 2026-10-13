@@ -1,3 +1,4 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//tools:defs.bzl", "cc_binary", "go_test")
 
 package(
@@ -47,8 +48,15 @@ cc_binary(
         ":libpthread_stub",
     ],
     # The dlsym interposer must forward with a tail call (see dlsym in
-    # mcshim.c), which GCC only emits when optimizing; fastbuild is -O0.
-    copts = ["-O2"],
+    # mcshim.c), which GCC only emits when optimizing; fastbuild is -O0
+    # (:preload_test checks). _FORTIFY_SOURCE is pinned, as in build.sh and
+    # test/run.sh, because toolchains and compilation modes set it
+    # differently, and it decides which glibc symbols the result needs.
+    copts = [
+        "-O2",
+        "-U_FORTIFY_SOURCE",
+        "-D_FORTIFY_SOURCE=2",
+    ],
     # This library is preloaded into binaries from arbitrary container
     # images, whose dynamic linkers may not support RELR relocations
     # (glibc < 2.36). Same rationale as //tools/ioctl_sniffer:ioctl_hook.
@@ -81,4 +89,39 @@ go_test(
     size = "small",
     srcs = ["glibc_floor_test.go"],
     embedsrcs = [":glibc_floor_test_input"],  # keep
+)
+
+# A typical LD_PRELOAD interposer and a program for it to wrap, for
+# :preload_test.
+cc_binary(
+    name = "test/libinterp.so",
+    testonly = True,
+    srcs = ["test/interp.c"],
+    linkopts = ["-ldl"],
+    linkshared = True,
+)
+
+cc_binary(
+    name = "test/interp_main",
+    testonly = True,
+    srcs = ["test/interp.c"],
+    copts = ["-DMAIN"],
+)
+
+# The shim as built here forwards dlsym(RTLD_NEXT) with a tail call, whatever
+# the compilation mode: test/run.sh preload checks only its own build.
+sh_test(
+    name = "preload_test",
+    size = "small",
+    srcs = ["test/preload_test.sh"],
+    args = [
+        "$(location :mcshim)",
+        "$(location :test/libinterp.so)",
+        "$(location :test/interp_main)",
+    ],
+    data = [
+        ":mcshim",
+        ":test/interp_main",
+        ":test/libinterp.so",
+    ],
 )
