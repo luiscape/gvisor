@@ -1427,12 +1427,30 @@ static void check_tables(void) {
   TCHECK(g_at.nfree + nalloc <= g_at.n && g_mt.nfree + nmap <= g_mt.n &&
          g_bt.nfree + nbind <= g_bt.n);
 }
+
+/* Unlocks since the last check_tables. Guarded by g_lock. */
+static int g_check_skipped;
+
+/* A check costs time linear in the size of the tables, so checking at every
+ * unlock made a long fuzz run quadratic: 8 threads of 20,000 operations took
+ * more than 20 minutes. Check at every unlock while the tables are small,
+ * then once every size/64 unlocks: a bounded cost per unlock, and an
+ * inconsistency still surfaces within a few hundred operations of the one
+ * that caused it. While the gate is armed (around every transition), every
+ * unlock checks. Must hold g_lock. */
+static void check_tables_amortized(void) {
+  if (++g_check_skipped < (g_at.n + g_mt.n + g_bt.n) / 64 &&
+      !__atomic_load_n(&g_suspended, __ATOMIC_SEQ_CST))
+    return;
+  g_check_skipped = 0;
+  check_tables();
+}
 #endif
 
 /* Releases g_lock. Test builds check the tables' consistency first. */
 static void unlock_tables(void) {
 #ifdef MCSHIM_TABLE_CHECKS
-  check_tables();
+  check_tables_amortized();
 #endif
   pthread_mutex_unlock(&g_lock);
 }

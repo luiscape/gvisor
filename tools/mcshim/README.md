@@ -193,8 +193,10 @@ interposer's rebuild runs against the same ordinals it recorded.
     tables. Running out of entries or memory is loud and sticky
     (`g_untracked`): arming the gate refuses thereafter, failing the
     checkpoint before anything is torn down. `test/run.sh tables` checks the
-    tables and indexes after every call, under random multi-threaded traffic
-    with suspend/resume cycles, against a fake `libcuda` (no GPU).
+    tables and indexes under random multi-threaded traffic with
+    suspend/resume cycles, against a fake `libcuda` (no GPU): after every
+    call while the tables are small or the gate is armed, and otherwise
+    every size/64 calls, which keeps the run to seconds.
 *   **Handles.** The application only ever sees the handle values it was
     given. A rebuild gives objects new driver handles, and every
     handle-taking entry point translates (`xlate`), including

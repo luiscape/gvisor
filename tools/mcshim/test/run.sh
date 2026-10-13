@@ -36,7 +36,7 @@
 #                                under random multi-threaded traffic with
 #                                suspend/resume cycles, and at 100k objects,
 #                                against a fake libcuda (tables.c, fakecuda.c),
-#                                with every index checked at each unlock
+#                                with every index checked as it runs
 #   rtres                        native: cudart's resolvers reach each caller's
 #                                own runtime; needs MCSHIM_TEST_CUDART, two
 #                                libcudart.so files of different majors
@@ -296,8 +296,8 @@ ctlsec() {
 }
 
 # tables: the shim built with MCSHIM_TABLE_CHECKS, which checks the tables'
-# consistency each time it releases its lock, over a fake libcuda.so.1 that
-# rejects any handle or address it did not issue.
+# consistency as it releases its lock (see check_tables_amortized), over a
+# fake libcuda.so.1 that rejects any handle or address it did not issue.
 tables() {
   local fake=$W/fake seed
   mkdir -p "$fake"

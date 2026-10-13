@@ -15,8 +15,9 @@
  */
 
 /* The shim's tracking tables, without a GPU: run against fakecuda.c, with the
- * shim (built with -DMCSHIM_TABLE_CHECKS, which checks every index each time
- * g_lock is released) LD_PRELOADed. See run.sh's "tables" test.
+ * shim (built with -DMCSHIM_TABLE_CHECKS, which checks every index as g_lock
+ * is released; see check_tables_amortized) LD_PRELOADed. See run.sh's
+ * "tables" test.
  *
  *   fuzz SEED OPS THREADS  random VMM and multicast traffic from THREADS
  *                          threads, each against its own model, with
