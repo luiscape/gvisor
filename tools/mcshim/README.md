@@ -297,8 +297,9 @@ it or exited, or runs in another container).
 ## Testing
 
 `test/run.sh [-r RUNSC] [-i ROOTFS -e ENVFILE] [test...]` runs the tests on a
-host with two NVLS-capable GPUs (`MCSHIM_TEST_GPUS`, default `0,1`). The
-native tests play the sentry's side of the protocol, with a suspend and
+host with two NVLS-capable GPUs (`MCSHIM_TEST_GPUS`, default `0,1`). Tests
+that need two GPUs skip without them; the rest run on one GPU of compute
+capability 8.0 or newer (`MCSHIM_TEST_GPUS=0`). The native tests play the sentry's side of the protocol, with a suspend and
 resume in place of a checkpoint and restore:
 
 *   `abi`: every lookup returns the wrapper of the symbol the driver returned;

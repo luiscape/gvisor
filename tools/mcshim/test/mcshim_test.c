@@ -94,6 +94,7 @@ typedef struct {
 #define DEVICE 1
 #define RW 3
 #define ATTR_CLOCK_RATE 13
+#define ATTR_CC_MAJOR 75
 #define ATTR_MULTICAST 132
 
 static void* lib;
@@ -303,9 +304,12 @@ static CUcontext g_ctx[2];
 static CUfunction g_spin, g_bump, g_bcast;
 
 /* spin(p, cycles): busy-wait, then add 1 to *p. bump(p): add 1 to *p.
- * bcast(p, v): multimem store of v through the multicast VA p. */
+ * bcast(p, v): multimem store of v through the multicast VA p.
+ * bcast needs sm_90 and is only loaded by multi-GPU tests (which require
+ * multicast, so Hopper or newer); the rest target sm_80 so that the
+ * single-GPU tests run on any GPU of compute capability 8.0 or newer. */
 static const char kPTX[] =
-    ".version 8.1\n.target sm_90\n.address_size 64\n"
+    ".version 8.1\n.target sm_80\n.address_size 64\n"
     ".visible .entry spin(.param .u64 p, .param .u64 c) {\n"
     " .reg .u64 %a<6>; .reg .pred %q;\n"
     " ld.param.u64 %a1, [p]; ld.param.u64 %a2, [c];\n"
@@ -315,7 +319,9 @@ static const char kPTX[] =
     " red.global.add.u32 [%a1], 1; ret; }\n"
     ".visible .entry bump(.param .u64 p) {\n"
     " .reg .u64 %a1; ld.param.u64 %a1, [p];\n"
-    " red.global.add.u32 [%a1], 1; ret; }\n"
+    " red.global.add.u32 [%a1], 1; ret; }\n";
+static const char kPTXMulticast[] =
+    ".version 8.1\n.target sm_90\n.address_size 64\n"
     ".visible .entry bcast(.param .u64 p, .param .u32 v) {\n"
     " .reg .u64 %a1; .reg .b32 %b1;\n"
     " ld.param.u64 %a1, [p]; ld.param.u32 %b1, [v];\n"
@@ -333,6 +339,12 @@ static int setup(int ndev) {
     exit(77);
   }
   for (int d = 0; d < ndev; d++) {
+    int major = 0;
+    CK(cuDeviceGetAttribute(&major, ATTR_CC_MAJOR, d));
+    if (major < 8) {
+      fprintf(stderr, "SKIP: need compute capability 8.0 or newer\n");
+      exit(77);
+    }
     CK(cuDevicePrimaryCtxRetain(&g_ctx[d], d));
     int mc = 0;
     CK(cuDeviceGetAttribute(&mc, ATTR_MULTICAST, d));
@@ -346,7 +358,10 @@ static int setup(int ndev) {
   CK(cuModuleLoadData(&m, kPTX));
   CK(cuModuleGetFunction(&g_spin, m, "spin"));
   CK(cuModuleGetFunction(&g_bump, m, "bump"));
-  CK(cuModuleGetFunction(&g_bcast, m, "bcast"));
+  if (ndev > 1) {
+    CK(cuModuleLoadData(&m, kPTXMulticast));
+    CK(cuModuleGetFunction(&g_bcast, m, "bcast"));
+  }
   /* present.<pid> appears once cuInit starts the control thread. */
   char p[64];
   snprintf(p, sizeof(p), "present.%d", (int)getpid());

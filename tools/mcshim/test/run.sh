@@ -14,6 +14,8 @@
 # limitations under the License.
 
 # Runs the interposer tests on a host with two or more NVLS-capable GPUs.
+# Tests that need two GPUs skip without them; the rest run on one GPU of
+# compute capability 8.0 or newer (MCSHIM_TEST_GPUS=0).
 #
 #   abi gate mc refcount refuse mapwait  native (mcshim_test.c)
 #   silent                       native: the preloaded shim prints nothing
@@ -60,7 +62,7 @@
 #                                a suspend/resume cycle
 #
 # Usage: run.sh [-r RUNSC] [-i ROOTFS] [-e ENVFILE] [test...]   (default: all)
-# MCSHIM_TEST_GPUS picks the two GPUs (default 0,1).
+# MCSHIM_TEST_GPUS picks the GPUs (default 0,1).
 set -euo pipefail
 cd "$(dirname "$0")"
 RUNSC="" ROOTFS="" ENVFILE=""
