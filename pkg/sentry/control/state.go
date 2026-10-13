@@ -309,15 +309,16 @@ func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *SaveRestoreExec
 		return err
 	}
 	if err := saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog); err != nil {
-		// preSaveCuda has already released the GPU state, gated the
-		// application, and stashed the checkpoint keys; if the kernel will
-		// resume running, undo all of that -- postRestoreCuda is exactly that
-		// inverse and is a no-op if preSaveCuda did not run. Skip it while the
-		// kernel is paused (the docker flow, where preSaveCuda re-took
-		// docker's pause): exec'd cuda-checkpoint processes would be born
-		// frozen and hang this RPC. The keys survive, and docker's eventual
-		// unpause runs the same inverse via Resume -> PostResume.
-		if saveOpts.Resume && !s.Kernel.IsPaused() {
+		// With the multicast interposer, preSaveCuda has already released the
+		// GPU state, gated the application, and stashed the checkpoint keys;
+		// if the kernel will resume running, undo all of that -- postRestoreCuda
+		// is exactly that inverse and is a no-op if preSaveCuda did not run.
+		// Skip it while the kernel is paused (the docker flow, where
+		// preSaveCuda re-took docker's pause): exec'd cuda-checkpoint processes
+		// would be born frozen and hang this RPC. The keys survive, and
+		// docker's eventual unpause runs the same inverse via Resume ->
+		// PostResume.
+		if saveOpts.CudaMulticastShim && saveOpts.Resume && !s.Kernel.IsPaused() {
 			if rerr := postRestoreCuda(s.Kernel, nil, nil); rerr != nil {
 				log.Warningf("Failed to resume CUDA processes after failed save: %v", rerr)
 			}

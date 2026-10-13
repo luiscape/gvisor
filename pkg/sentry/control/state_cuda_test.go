@@ -97,8 +97,8 @@ type fakeCuda struct {
 
 func (f *fakeCuda) actions() cudaActions[int] {
 	return cudaActions[int]{
-		run: func(procs []int, opArgs []string, parallel, stopOnError bool, timeout time.Duration) ([]int, error) {
-			action := opArgs[len(opArgs)-1]
+		run: func(procs []int, op cudaCheckpointOp, parallel, stopOnError bool, timeout time.Duration) ([]int, error) {
+			action := op.desc
 			f.calls = append(f.calls, fmt.Sprintf("%s %v", action, procs))
 			var ok []int
 			var errs []error
