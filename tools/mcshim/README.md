@@ -90,7 +90,7 @@ processes sharing one directory.
 | :-------------------- | :--------- | :------------------------------------------------------------- |
 | `gate`                | sentry     | created: arm the gate, wait for tracked calls in flight, check the state can be carried (else `error.<pid>` and disarm); removed: release the application, once this process is not torn down (refused after a failed transition) |
 | `suspend`             | sentry     | created: tear down tracked state; removed: rebuild it          |
-| `present.<pid>`       | shim       | this pid runs a control thread and will ack transitions        |
+| `present.<pid>`       | shim       | this pid runs a control thread and will ack transitions; contains `mcshim protocol N` (see below) |
 | `gated.<pid>`         | shim       | gate armed and drained                                         |
 | `suspended.<pid>` / `resumed.<pid>` | shim | teardown / rebuild finished                      |
 | `error.<pid>`         | shim       | the transition in flight failed (sentry fails fast on this)    |
@@ -99,6 +99,17 @@ The sentry waits up to 5 minutes for acks, and removes stale acks of the kind
 it waits for before each request. On startup the control thread removes any
 stale acks a dead predecessor with the same (reused) pid left behind, then
 writes `present.<pid>`.
+
+**Versioning.** runsc and the shim ship separately, so `present.<pid>`
+carries the protocol version the shim speaks (`MCSHIM_PROTOCOL` in
+`mcshim.c`), written under a temporary name and renamed into place so it
+never appears empty. The sentry (`cudaShimProtocol` in
+`state_cuda_shim.go`) checks every announcing process before a checkpoint,
+which it refuses on a mismatch before gating anything, and again before the
+rebuild after a restore, which it fails rather than drive a shim it may
+misread. A shim built before versioning writes `ok` and is refused. Bump
+both constants together with any change the other side would misread; a
+test (`TestCudaShimProtocolMatchesInterposer`) checks that they agree.
 
 The markers live in the container filesystem, so they are **part of the
 checkpoint image**: after a restore they still exist, and the shim stays
@@ -373,6 +384,11 @@ inside the container's trust domain, not gVisor's:
     exporter's pid and fd), from which an importer copies the fd with
     `pidfd_getfd`; a forged one can only make that import fail or take the
     wrong fd, inside the container.
+*   The sentry reads the content of `present.<pid>` (at most 64 bytes, a
+    regular file with one link, opened without following a symlink or
+    blocking), for the protocol version. A forged one can only refuse that
+    container's checkpoint, or let a mismatched shim through, which running
+    a mismatched shim could do anyway.
 *   The directory cannot be turned against processes that load the shim,
     root and setuid ones included (`/etc/ld.so.preload` loads it into every
     process; gVisor has no `protected_symlinks` or `protected_hardlinks`).

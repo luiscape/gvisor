@@ -6,6 +6,10 @@ package(
     licenses = ["notice"],
 )
 
+# For //pkg/sentry/control:control_test, which checks that the sentry and the
+# interposer speak the same protocol version.
+exports_files(["mcshim.c"])
+
 # Link-time stubs of libdl.so.2 and libpthread.so.0 (see glibc_stubs.sh):
 # mcshim.so takes dlopen and pthread_create from them at their original
 # symbol versions, so its glibc floor does not follow the build environment's

@@ -123,6 +123,9 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		// (checkpointCudaProcs re-checks afterwards).
 		managed := cudaShimManagedProcs(sctx, k, cudaProcs)
 		shim = len(managed) != 0
+		if err := cudaShimCheckProtocol(sctx, k, managed); err != nil {
+			return fail(err)
+		}
 		except := make(map[kernel.ThreadID]bool, len(managed))
 		for _, tg := range managed {
 			except[tg.ID()] = true

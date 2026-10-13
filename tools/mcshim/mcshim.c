@@ -185,6 +185,15 @@ _Static_assert(sizeof(CUarrayMapInfo) == 96, "CUarrayMapInfo layout");
 /* Fixed; see cudaShimDir in pkg/sentry/control/state_cuda_shim.go. */
 static const char g_dir[] = "/tmp/mcshim";
 
+/* The version of the protocol with the sentry, which the shim announces in
+ * present.<pid> ("mcshim protocol N") and the sentry checks before a
+ * checkpoint and before a rebuild after a restore: runsc and the shim ship
+ * separately. Must equal cudaShimProtocol in
+ * pkg/sentry/control/state_cuda_shim.go; bump both with any change the other
+ * side would misread (marker names or meanings, acks, the order of
+ * transitions, the published fd format, the fdinfo line the shim parses). */
+#define MCSHIM_PROTOCOL 1
+
 /* Control directory access. The directory sits in world-writable /tmp and is
  * itself world-writable, and the shim runs in every process of the container,
  * root and setuid ones included, so it must not be steered by what another
@@ -3397,6 +3406,16 @@ static void marker_write(const char* name, const char* body) {
   close(fd);
 }
 
+/* marker_write, but the file appears with its contents: written under a
+ * private name and renamed into place (replacing a stale one without
+ * following it), since the sentry reads present.<pid>. */
+static void marker_publish(const char* name, const char* body) {
+  char tmp[80];
+  snprintf(tmp, sizeof(tmp), ".%s", name);
+  marker_write(tmp, body);
+  if (renameat(g_dirfd, tmp, g_dirfd, name) != 0) marker_rm(tmp);
+}
+
 typedef struct {
   char suspended[64], resumed[64], error[64], gated[64];
 } Acks;
@@ -3514,8 +3533,11 @@ static void* control_thread(void* arg) {
   marker_rm(k.resumed);
   marker_rm(k.error);
   marker_rm(k.gated);
-  marker_write(present, "ok");
-  mclog("control thread started (dir=%s)", g_dir);
+  char version[32];
+  snprintf(version, sizeof(version), "mcshim protocol %d", MCSHIM_PROTOCOL);
+  marker_publish(present, version);
+  mclog("control thread started (dir=%s, protocol %d)", g_dir,
+        MCSHIM_PROTOCOL);
   int prev_suspend = 0, prev_gate = 0, logged = 0;
   for (;;) {
     /* Gate first, so that a process that starts while both markers exist is

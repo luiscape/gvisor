@@ -204,14 +204,18 @@ absent by default, so frameworks choose POSIX fds).
 
 The sentry and the interposer communicate through files in `/tmp/mcshim`,
 which must be part of the checkpoint image (not a host mount). Markers are
-existence-based and edge-triggered; content is never parsed. The sentry drives
-the interposer in the processes that announced themselves (`present.<pid>`).
+existence-based and edge-triggered. The sentry drives the interposer in the
+processes that announced themselves (`present.<pid>`), whose one line,
+`mcshim protocol N`, is the only content the sentry parses: runsc and the
+interposer ship separately, so the sentry refuses a checkpoint, before gating
+anything, if any interposer speaks another version, and fails a restore
+rather than drive a rebuild it may get wrong.
 
 File                                | Writer      | Meaning
 ----------------------------------- | ----------- | -------
 `gate`                              | sentry      | created: block GPU submission, drain calls in flight, check the state can be carried; removed: release the application
 `suspend`                           | sentry      | created: tear down; removed: rebuild
-`present.<pid>`                     | interposer  | this process participates
+`present.<pid>`                     | interposer  | this process participates; carries the protocol version
 `gated.<pid>`                       | interposer  | gate armed and drained
 `suspended.<pid>`, `resumed.<pid>`  | interposer  | teardown / rebuild finished
 `error.<pid>`                       | interposer  | the transition failed; the sentry fails fast

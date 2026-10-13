@@ -17,6 +17,7 @@ package control
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -105,6 +106,18 @@ const (
 	// cudaShimSuspendedKey records, in the checkpoint, that the interposer was
 	// suspended, which tells postRestoreCuda that a rebuild is owed.
 	cudaShimSuspendedKey = "cuda-multicast-shim-suspended"
+
+	// cudaShimProtocol is the version of the protocol with the interposer,
+	// which each interposer announces in its present.<pid> marker ("mcshim
+	// protocol N"); runsc and the interposer ship separately. It must equal
+	// MCSHIM_PROTOCOL in tools/mcshim/mcshim.c. Bump both with any change the
+	// other side would misread: marker names or meanings, acks, the order of
+	// transitions, the published fd format, or the fdinfo line the interposer
+	// parses.
+	cudaShimProtocol = 1
+
+	// cudaShimProtocolPrefix starts the body of a present.<pid> marker.
+	cudaShimProtocolPrefix = "mcshim protocol "
 )
 
 // cudaShimCreds returns the credentials to use for interposer marker file
@@ -457,6 +470,44 @@ func cudaShimManagedProcs(sctx context.Context, k *kernel.Kernel, cudaProcs []*k
 	return cudaShimProcsWith(sctx, k, cudaProcs, "present")
 }
 
+// protocolMismatch returns why the interposer in the process with the given
+// pid cannot be driven by this sentry, from its present.<pid> marker, or ""
+// if it speaks cudaShimProtocol. The marker's contents come from the
+// container; a forged one can only refuse that container's checkpoint, or let
+// a mismatched interposer through, as running a mismatched one could anyway.
+func (fs *cudaShimFS) protocolMismatch(pid kernel.ThreadID) string {
+	body := strings.TrimSpace(fs.readTail(fmt.Sprintf("present.%d", pid), 64))
+	v, ok := strings.CutPrefix(body, cudaShimProtocolPrefix)
+	if !ok {
+		// Interposers built before the protocol was versioned write "ok".
+		return fmt.Sprintf("PID %d announces no protocol version (%q)", pid, body)
+	}
+	if n, err := strconv.Atoi(v); err != nil || n != cudaShimProtocol {
+		return fmt.Sprintf("PID %d speaks protocol %q", pid, v)
+	}
+	return ""
+}
+
+// cudaShimCheckProtocol returns an error naming every process in managed whose
+// interposer does not speak cudaShimProtocol.
+func cudaShimCheckProtocol(sctx context.Context, k *kernel.Kernel, managed []*kernel.ThreadGroup) error {
+	var bad []string
+	for _, tg := range managed {
+		var why string
+		ok, err := withCudaShimFS(sctx, k, tg, func(fs *cudaShimFS) { why = fs.protocolMismatch(tg.ID()) })
+		if err != nil {
+			return err
+		}
+		if ok && why != "" {
+			bad = append(bad, why)
+		}
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("multicast interposer: this runsc speaks protocol %d, but %s; use the interposer built from the same gVisor release as runsc", cudaShimProtocol, strings.Join(bad, "; "))
+	}
+	return nil
+}
+
 // errCudaShimTornDown reports that the interposer's teardown failed. Other
 // processes may already have released state that a rebuild needs from the one
 // that failed, so the application is left blocked rather than unwound.
@@ -563,11 +614,16 @@ func resumeCudaMulticastShim(sctx context.Context, k *kernel.Kernel, cudaProcs [
 		return nil
 	}
 	start := time.Now()
+	// The restoring runsc may not be the one that checkpointed. Fail the
+	// restore rather than drive a rebuild this sentry may get wrong.
+	managed := cudaShimManagedProcs(sctx, k, cudaProcs)
+	if err := cudaShimCheckProtocol(sctx, k, managed); err != nil {
+		return err
+	}
 	cudaShimClearAcks(sctx, k, cudaProcs, "resumed")
 	if err := cudaShimSetMarker(sctx, k, cudaProcs, cudaShimSuspendMarker, false /* set */); err != nil {
 		return err
 	}
-	managed := cudaShimManagedProcs(sctx, k, cudaProcs)
 	if err := cudaShimWaitAcks(sctx, k, managed, "resumed"); err != nil {
 		return err
 	}

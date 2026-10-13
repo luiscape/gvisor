@@ -245,7 +245,10 @@ A restore needs the same interposer bytes at the same path as the
 checkpoint, since restored processes map the library they had mapped. If the
 interposer reaches containers through a mount, give its path a version (for
 example `/opt/mcshim/mcshim-<sha256>.so`) and keep every version that
-existing checkpoints use available on the hosts that restore them.
+existing checkpoints use available on the hosts that restore them. Use the
+interposer built from the same gVisor release as `runsc`: `runsc checkpoint`
+refuses, and `runsc restore` fails, if the interposer speaks a different
+version of their protocol.
 
 gVisor then arranges for the container's processes to load the
 interposer (via the `LD_PRELOAD` environment variable *and* an entry appended

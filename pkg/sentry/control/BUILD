@@ -102,6 +102,7 @@ go_test(
         "state_cuda_shim_test.go",
         "state_cuda_test.go",
     ],
+    data = ["//tools/mcshim:mcshim.c"],
     embed = [":control"],
     deps = [
         "//pkg/abi/linux",
@@ -112,10 +113,12 @@ go_test(
         "//pkg/sentry/contexttest",
         "//pkg/sentry/devices/nvproxy",
         "//pkg/sentry/fsimpl/tmpfs",
+        "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/ktime",
         "//pkg/sentry/usage",
         "//pkg/sentry/vfs",
+        "//pkg/test/testutil",
         "//pkg/usermem",
     ],
 )
