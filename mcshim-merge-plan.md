@@ -4,8 +4,8 @@
 | :--- | :--- |
 | Status | Draft for review |
 | Date | 2026-10-12 |
-| Branch | `luis/multicast-xgpu-upstream` at `cf1bec3e8` (github.com/luiscape/gvisor) |
-| Upstream | `google/gvisor` `master` at `0a438edc9` |
+| Branch | `luis/multicast-xgpu-upstream` at `43da4f2fb` (github.com/luiscape/gvisor) |
+| Upstream | `google/gvisor` `master` at `a676ebdd0` (merged into the branch) |
 | Design doc | `g3doc/proposals/cuda_multigpu_checkpoint.md` (on the branch) |
 
 ## 1. Summary
@@ -30,9 +30,11 @@ groups:
    tracking, the restore path and the job wrap reach them today.
 4. **Hygiene.** Dev-only files, stale docs and upstream drift.
 
-Since the first draft, R1-R6, R9-R11, R13-R17 and R20 have been fixed
-on the branch (section 4.1), R8 has been dropped, and R7 is resolved by
-keeping the current behavior. That closes the first two groups above.
+Since the first draft, R1-R6, R9-R24 have been fixed or resolved on the
+branch (section 4.1), R8 has been dropped, and R7 is resolved by keeping
+the current behavior. That closes all four groups above. What remains is
+applying R21 when each PR is cut, the two open decisions in section 8
+(R25), and the GPU validation round (section 7.4).
 
 This document describes the architecture, lists the fixes as requirements
 (must land with or before the code they fix) and nice-to-haves (follow-ups),
@@ -99,9 +101,8 @@ interposer runs in the container's trust domain).
 | `--cuda-multicast-shim-path` | empty | Interposer path in the container. Setting it enables the interposer. |
 
 
-Without the interposer flags, CUDA checkpoints are meant to be unchanged
-from upstream: no job wrap, one `cuda-checkpoint --toggle` per process.
-(Requirement R12 lists where the branch currently falls short of that.)
+Without the interposer flags, CUDA checkpoints are unchanged from upstream
+with #14817: no job wrap, one `cuda-checkpoint --toggle` per process (R12).
 
 ### 3.3 Control protocol
 
@@ -176,9 +177,9 @@ the application gated ("better blocked than corrupt").
 
 | | |
 | :--- | :--- |
-| Size against upstream | 71 commits, 47 files, about 9.4k added lines. A `pgalloc` diff is an upstream rollback already in `master`; ignore it. |
-| Upstream drift | 35 commits. A trial merge has one conflict, `pkg/sentry/devices/nvproxy/BUILD`: upstream replaced `library =` with `embed =` in every `go_test` and added a gazelle presubmit. `runsc/boot/loader.go` (about 200 changed upstream lines) merges cleanly. |
-| Related open upstream PRs | #14817 (`--device-map` on restore): labelled *ready to pull*; the branch already contains it. #13987 (job wrap): unreviewed, and its flag names no longer match the branch. |
+| Size against upstream | About 52 files and 11k added lines, of which `MCSHIM_STATUS.md` and this plan (about 1k lines) stay out of every PR (R21). |
+| Upstream drift | None: upstream `master` at `a676ebdd0` was merged in `daa5614de` with no conflicts, and builds and tests pass on it. The `nvproxy/BUILD` conflict seen earlier no longer occurs. |
+| Related open upstream PRs | #14817 (`--device-map` on restore): labelled *ready to pull*, not merged; the branch contains it, and without the interposer runs exactly its code (R12). #13987 (job wrap): unreviewed, and its flag names no longer match the branch. |
 | History | WIP commits and files added then removed. PRs should be cut from the final tree, not cherry-picked. |
 | Validation so far | H100 x8, driver 610.57.04: the interposer suite, 15 engine configurations, 3 more without `CAP_SYS_PTRACE`, Qwen2.5-72B at TP=8 on vLLM and SGLang, 72B restored onto other GPUs. The latest round (dlsym fix, cudart resolvers, glibc floor, sentry fixes) is CPU-validated only. |
 
@@ -197,6 +198,10 @@ the new binary.
 | R14 (nvproxy tracking for every user) | `6b3db1560` | `TestProcFDInfoExtraTracking`: the fdinfo line is empty with tracking off. With tracking off the four export/import handlers delegate to `ctrlHasFrontendFD`, upstream's handler, which a code read confirms; no CPU test exercises the host call. |
 | R9, R10 (the sentry's marker operations) | `26e35715b` | `TestCudaShimFS` on a tmpfs root: the control directory as a symlink, and symlinks, a hard link and FIFOs planted as markers, acks and the log. Against the old resolution rules it fails 9 checks. |
 | R19 (single-architecture embedded interposer) | `cf1bec3e8` | EMBEDDED mode and `runsc/mcshimbin` removed. Boot, config, control and nvproxy tests, nogo, and `//tools/mcshim:glibc_floor_test` (fastbuild and `-c opt`) pass; `//runsc` builds and rejects `--cuda-multicast-shim-source`. |
+| R22 (upstream drift) | `daa5614de` | Merge of `a676ebdd0` (76 upstream commits) with no conflicts. Seven files changed on both sides (`Makefile`, three nvproxy files, three `runsc/config` files); the tests and nogo below pass on the merge, and `//runsc` builds. |
+| R12 (the path without the interposer) | `83c1fd194` | Without the interposer, `preSaveCuda` and `postRestoreCuda` run #14817's code unchanged; a diff of `state_cuda.go` against #14817 shows only additions behind `CudaMulticastShim`. Control, boot, config and nvproxy tests and nogo pass. No CPU test runs `cuda-checkpoint`; the GPU round covers both paths. |
+| R24 (CI on the shipped artifact) | `9e6d8a05a` | New `//tools/mcshim:preload_test` passes on fastbuild and `-c opt`, and fails (exit 99) on the shim built at `-O0`. With `_FORTIFY_SOURCE` pinned, fastbuild and opt import the same 60 glibc symbols, all within 2.17. `run.sh preload noeffect glibc ctlsec` passes. |
+| R23 (stale docs) | `43da4f2fb` | The one remaining wrong statement (the proposal said `--cuda-checkpoint-path` alone wraps containers in a job) is corrected. The other four had already been fixed by earlier commits, which a re-read confirms. |
 
 How each was fixed:
 
@@ -243,6 +248,21 @@ returns NULL, as without the shim. Before, it returned the shim's wrapper.
   path for restores, so use a versioned path per release. There is no
   version handshake between the interposer and the sentry yet (N22).
 
+- **R12.** Without the interposer, checkpoint and restore run #14817's
+  `runCudaCheckpointOp` unchanged: its timeline markers, stopping at the
+  first exec failure, re-pausing before the SIGSEGV unlock, and undoing a
+  failed toggle as upstream does. Only with the interposer does
+  `cuda-checkpoint` run with `MCSHIM_DISABLE=1` (recorded in the checkpoint
+  as `cuda-multicast-shim` so restore does the same), does a failed save
+  with `Resume` undo the CUDA checkpoint, and does restore resume the
+  interposer. Item 3 of the original finding (a failed toggle no longer
+  re-toggled) referred to restore, where #14817 itself stops undoing; that
+  change is #14817's and already reviewed.
+- **R24.** `//tools/mcshim:preload_test` (an `sh_test`) runs the `RTLD_NEXT`
+  check on the interposer Bazel builds; `run.sh preload` calls the same
+  script. `_FORTIFY_SOURCE` is pinned to 2 in `BUILD`, `build.sh` and
+  `run.sh`.
+
 - **R14.** `nvproxy.Options.TrackExports`, set only when the interposer is
   enabled, turns on export/import tracking and the fdinfo line. The line is
   shown only to readers with ptrace access to the task. One small change
@@ -285,7 +305,7 @@ Status:
 | R9 | Marker operations run as root on `/tmp/mcshim/<name>`, protecting only the last path component from symlinks. A container user who makes `/tmp/mcshim` a symlink first gets the sentry to create and delete files as root elsewhere, including on writable bind mounts. | **Fixed** (`26e35715b`); was: Verified (code) | Open the directory once without following symlinks and resolve each marker relative to it; consider the process's own credentials. |
 | R10 | A FIFO planted as a marker, error file or log hangs the checkpoint RPC forever. | **Fixed** (`26e35715b`); was: Reported | Open non-blocking and require a regular file. |
 | R11 | If the checkpoint phase fails, restore runs on every locked process, including those that did not checkpoint; the error says "unrecoverable" but the interposer is unwound anyway. | **Fixed** (`72756209d`); was: Verified (first half); reported (second) | Restore only processes that checkpointed, then unlock all; skip the unwind on the unrecoverable path. |
-| R12 | The path without the interposer differs from upstream: `--device-map` on restore, a failed save-and-resume now undoes CUDA state, a failed toggle is no longer re-toggled, exec failures continue instead of stopping, an extra environment variable, unlock/pause order, missing timeline markers. | Verified (`--device-map`); reported (rest) | Gate each on the interposer option, or justify it in its own PR. `--device-map` is resolved by landing #14817. |
+| R12 | The path without the interposer differs from upstream: `--device-map` on restore, a failed save-and-resume now undoes CUDA state, a failed toggle is no longer re-toggled, exec failures continue instead of stopping, an extra environment variable, unlock/pause order, missing timeline markers. | **Fixed** (`83c1fd194`); was: Verified | Without the interposer the code is #14817's, unchanged; everything else is behind the interposer option. `--device-map` is resolved by landing #14817. |
 | R13 | A code comment from the latest round claims every `cuda-checkpoint` invocation is reaped; untrue when a killed one never exits. | **Fixed** (`72756209d`); was: Reported; regression | Correct it (real fix: N4). |
 
 ### 5.3 nvproxy
@@ -307,13 +327,13 @@ Status:
 
 ### 5.5 Build, docs and hygiene
 
-| ID | Problem | Fix |
-| :--- | :--- | :--- |
-| R21 | `MCSHIM_STATUS.md` is a tracked dev-only file naming internal people and companies; other scratch files are untracked but not ignored. | Exclude from every PR. |
-| R22 | Upstream drift and BUILD conventions. | Rebase on current `master`; use `embed =` and explicit `importpath` in new BUILD files. |
-| R23 | Stale or wrong docs: the README threat model says marker content is never parsed (one file is); the proposal says any `--cuda-checkpoint-path` triggers the job wrap; flag help says "R610+"; two docs disagree on whether `ld.so.preload` survives restore; the README overstates what one test catches (regression). | Correct each. |
-| R24 | CI never tests the artifact that ships. | A CPU-only Bazel `sh_test` on the built interposer; check its library dependencies in `//tools/mcshim:glibc_floor_test` (moved from `runsc/mcshimbin`); pin `_FORTIFY_SOURCE` so debug and release builds need the same glibc versions. |
-| R25 | Open decisions block the runsc PR. | See section 8. |
+| ID | Problem | Status | Fix |
+| :--- | :--- | :--- | :--- |
+| R21 | `MCSHIM_STATUS.md` is a tracked dev-only file naming internal people and companies; other scratch files are untracked but not ignored. | **Resolved: a checklist item** when cutting each PR | Leave out `MCSHIM_STATUS.md` and `mcshim-merge-plan.md`; no untracked scratch files remain, and `.gitignore` covers built `tools/mcshim/*.so`. Keep `tools/mcshim/build.sh` and `test/torch_gate_test.py` in PR3: the user guide tells operators to build with `build.sh` (now that runsc does not carry the interposer), and `run.sh` uses both. |
+| R22 | Upstream drift and BUILD conventions. | **Fixed** (`daa5614de`) | Merged `a676ebdd0` with no conflicts. `tools/mcshim/BUILD` is the only new BUILD file and has no `go_library`, so the `embed =` convention does not apply. PR branches are cut from `master`. |
+| R23 | Stale or wrong docs: the README threat model says marker content is never parsed (one file is); the proposal says any `--cuda-checkpoint-path` triggers the job wrap; flag help says "R610+"; two docs disagree on whether `ld.so.preload` survives restore; the README overstates what one test catches (regression). | **Fixed** (`43da4f2fb` and earlier) | Corrected; the flag help's "R610+" became accurate when the driver gate became "R610 or newer". |
+| R24 | CI never tests the artifact that ships. | **Fixed** (`9e6d8a05a`) | `//tools/mcshim:preload_test` on the built interposer; `//tools/mcshim:glibc_floor_test` checks its glibc versions and library dependencies; `_FORTIFY_SOURCE` pinned. |
+| R25 | Open decisions block the runsc PR. | Open | See section 8 (decisions 3 and 4). |
 
 ## 6. Nice-to-haves
 
@@ -368,16 +388,17 @@ in parallel with PR0, PR1 and PR2.
 | :--- | :--- | :--- | :--- | :--- |
 | PR0 | `--device-map` on restore: the existing #14817. Land it, then rebase. | Part of R12 | No: restore onto different GPUs changes, by design and already reviewed | Small, done |
 | PR1 | Design proposal, trimmed. Settles: interposer in-tree or not, writing `ld.so.preload`, the fdinfo line as a `/proc` contract, fabric policy. | R23 (proposal), N12 | Docs only | Small |
-| PR2 | `state_cuda` refactor (generic action runner, null stdin, per-action arguments) with the path without the interposer identical to upstream; nil-leader fix. | R12 | Yes | Medium |
+| PR2 | `state_cuda` groundwork for the interposer path (bounded `wait`, `runCudaAction`, `openCudaCheckpointNullFD`), with the path without the interposer left as #14817 has it; nil-leader fix. | R12 | Yes | Small |
 | PR3 | `tools/mcshim`: sources, glibc stubs, BUILD, README, CPU tests, GPU harness. | R1-R6, R23 (README), R24 | Nothing links it | Large |
 | PR4 | nvproxy export/import tracking, behind a new option. | R14, R15, R22 | Yes, once gated | Medium |
 | PR5 | fdinfo hook for exported objects. | R14 (gating, access check) | Yes | Small |
 | PR6 | Checkpoint-blocker inventory. | None | No callers yet | Small |
-| PR7 | Bounded pre-save invocations (fixed 2-minute bound on `--get-state`, lock and unlock), lock-then-checkpoint behind the interposer option, the `--get-state` timeout and unlock fixes. No new flag or checkpoint key. | R11, R13 | Yes | Medium |
-| PR8 | Interposer protocol: `state_cuda_shim.go`, the "suspended" checkpoint key, `MCSHIM_DISABLE`. | R9, R10 | Yes | Medium |
-| PR9 | runsc: flags, validation, `IMAGE` mode, job wrap (supersedes #13987), `LD_PRELOAD` and `ld.so.preload`, save options, the R610-or-newer driver check. May split into job wrap and preload. | R16, R17, R20, R25 | Yes | Medium |
+| PR7 | Bounded pre-save invocations (fixed 2-minute bound on `--get-state`, lock and unlock), lock-then-checkpoint behind the interposer option, the `--get-state` timeout and unlock fixes. No new flag. | R11, R13 | Yes | Medium |
+| PR8 | Interposer protocol: `state_cuda_shim.go`, the "suspended" and `cuda-multicast-shim` checkpoint keys, `MCSHIM_DISABLE`. | R9, R10 | Yes | Medium |
+| PR9 | runsc: flags, validation, job wrap (supersedes #13987), `LD_PRELOAD` and `ld.so.preload`, save options, the R610-or-newer driver check. May split into job wrap and preload. | R16, R17, R20, R25 | Yes | Medium |
 
-R21 and R22 apply to every PR.
+R21 applies to every PR. Each PR branch is cut from `master` at the time,
+not from this branch's history.
 
 ### 7.3 After the merge
 
@@ -386,8 +407,8 @@ robustness fixes; N8 and N11 as interposer refactors; N17 as the GPU target.
 
 ### 7.4 Validation
 
-R1-R6, R11, R15 and R16 change code paths that run on GPUs. Before PR3,
-PR4, PR7 and PR9 merge, rerun on the fixed binary:
+R1-R6, R11, R12, R15 and R16 change code paths that run on GPUs. Before
+PR2, PR3, PR4, PR7 and PR9 merge, rerun on the fixed binary:
 
 - The full interposer suite, including the CPU-only `preload`, `noeffect`,
   `glibc` and `ctlsec` tests. (`tables` at its default size, `fuzz 20000 8`, runs past
@@ -396,6 +417,9 @@ PR4, PR7 and PR9 merge, rerun on the fixed binary:
 - `rtres` with a renamed cudart (`libcudart-<hash>.so.12`).
 - The stub `cuda-checkpoint` tests, including a hung `--get-state` and the
   `undo` case for a failed checkpoint.
+- A checkpoint and restore with `--cuda-checkpoint-path` alone (no
+  interposer), in parallel and sequential mode, and one that fails partway,
+  to confirm the path without the interposer behaves as upstream (R12).
 - A GPU container whose image lacks `cuda-checkpoint` starts, and
   `runsc checkpoint` refuses with its name; a pod's pause container gets
   neither the wrap nor the interposer.
