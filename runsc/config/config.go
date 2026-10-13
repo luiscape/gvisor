@@ -405,7 +405,8 @@ type Config struct {
 	// CUDAMulticastShimPath is the path, inside the container filesystem, to
 	// the multicast suspend/resume interposer (mcshim.so). When it is set, a
 	// container given GPU access on driver R610+ is run with the interposer
-	// LD_PRELOADed. The operator puts it there (built from tools/mcshim):
+	// LD_PRELOADed. The operator puts it there (built from
+	// https://github.com/modal-projects/mcshim):
 	// in the image, or through a mount. A path that is not a file in the
 	// container is not preloaded.
 	//

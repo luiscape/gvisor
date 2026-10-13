@@ -4,7 +4,7 @@
 | :--- | :--- |
 | Status | Draft for review |
 | Date | 2026-10-12 |
-| Branch | `luis/multicast-xgpu-upstream` at `1cb37f608` (github.com/luiscape/gvisor) |
+| Branch | `luis/multicast-xgpu-upstream` (head after the interposer's removal) (github.com/luiscape/gvisor) |
 | Upstream | `google/gvisor` `master` at `58251e7c0` (merged into the branch) |
 | Design doc | `g3doc/proposals/cuda_multigpu_checkpoint.md` (on the branch) |
 
@@ -87,7 +87,7 @@ interposer runs in the container's trust domain).
 
 | Component | Location | Role |
 | :--- | :--- | :--- |
-| Interposer (`mcshim.so`) | `tools/mcshim` (C, about 2,900 lines) | Tracks multicast groups, VMM allocations, exports, imports, binds and mappings at the libcuda layer. On request, gates the application off the GPU, tears that state down, and rebuilds it later at identical virtual addresses, translating handles so the application only sees the values it was given. Interposes `cu*` entry points, `dlsym`, `cuGetProcAddress*` and cudart's `cudaGetDriverEntryPoint*`. |
+| Interposer (`mcshim.so`) | [modal-projects/mcshim](https://github.com/modal-projects/mcshim) (C, about 3,600 lines); removed from gVisor's tree | Tracks multicast groups, VMM allocations, exports, imports, binds and mappings at the libcuda layer. On request, gates the application off the GPU, tears that state down, and rebuilds it later at identical virtual addresses, translating handles so the application only sees the values it was given. Interposes `cu*` entry points, `dlsym`, `cuGetProcAddress*` and cudart's `cudaGetDriverEntryPoint*`. |
 | Sentry sequencing | `pkg/sentry/control/state_cuda.go`, `state_cuda_shim.go` | Runs the `cuda-checkpoint` phases and drives the interposer through marker files. With the interposer, the invocations that run before GPU state is saved (`--get-state`, lock, unlock) are bounded at 2 minutes; checkpoint and restore invocations are not (section 3.5). |
 | nvproxy additions | `pkg/sentry/devices/nvproxy`, `pkg/sentry/fsimpl/proc` | Records exported RM objects and fd imports; reports an exported object's identity on a `nvproxy_exported_object:` line in `/proc/<pid>/fdinfo/<fd>`; provides the *checkpoint-blocker inventory* (objects `cuda-checkpoint` cannot handle), so a checkpoint is refused up front instead of hanging. |
 | runsc delivery | `runsc/boot`, `runsc/config` | Flags; preloads the interposer, which the operator provides at `--cuda-multicast-shim-path`, through `LD_PRELOAD` and `/etc/ld.so.preload`; wraps the container command in `cuda-checkpoint --launch-job`. |
@@ -329,8 +329,8 @@ Status:
 
 | ID | Problem | Status | Fix |
 | :--- | :--- | :--- | :--- |
-| R21 | `MCSHIM_STATUS.md` is a tracked dev-only file naming internal people and companies; other scratch files are untracked but not ignored. | **Resolved: a checklist item** when cutting each PR | Leave out `MCSHIM_STATUS.md` and `mcshim-merge-plan.md`; no untracked scratch files remain, and `.gitignore` covers built `tools/mcshim/*.so`. Keep `tools/mcshim/build.sh` and `test/torch_gate_test.py` in PR3: the user guide tells operators to build with `build.sh` (now that runsc does not carry the interposer), and `run.sh` uses both. |
-| R22 | Upstream drift and BUILD conventions. | **Fixed** (`daa5614de`) | Merged `a676ebdd0` with no conflicts. `tools/mcshim/BUILD` is the only new BUILD file and has no `go_library`, so the `embed =` convention does not apply. PR branches are cut from `master`. |
+| R21 | `MCSHIM_STATUS.md` is a tracked dev-only file naming internal people and companies; other scratch files are untracked but not ignored. | **Resolved: a checklist item** when cutting each PR | Leave out `MCSHIM_STATUS.md`, `mcshim-merge-plan.md` and `mcshim-split-plan.md`; no untracked scratch files remain. (The interposer's sources, build and test harness have left gVisor.) |
+| R22 | Upstream drift and BUILD conventions. | **Fixed** (`daa5614de`) | Merged `a676ebdd0` with no conflicts. The branch adds no new BUILD file (the interposer's left with it), so the `embed =` convention does not apply. PR branches are cut from `master`. |
 | R23 | Stale or wrong docs: the README threat model says marker content is never parsed (one file is); the proposal says any `--cuda-checkpoint-path` triggers the job wrap; flag help says "R610+"; two docs disagree on whether `ld.so.preload` survives restore; the README overstates what one test catches (regression). | **Fixed** (`43da4f2fb` and earlier) | Corrected; the flag help's "R610+" became accurate when the driver gate became "R610 or newer". |
 | R24 | CI never tests the artifact that ships. | **Fixed** (`9e6d8a05a`) | `//tools/mcshim:preload_test` on the built interposer; `//tools/mcshim:glibc_floor_test` checks its glibc versions and library dependencies; `_FORTIFY_SOURCE` pinned. |
 | R25 | Open decisions block the runsc PR. | Open | See section 8 (decisions 3 and 4). |
@@ -374,27 +374,27 @@ PR0 --device-map (#14817) ---> PR2 control refactor ---> PR7 bounded two-phase c
 PR4 nvproxy tracking ---+---> PR5 fdinfo line                                                |
                         +---> PR6 blocker inventory ------------------------------------------+--> PR8 interposer protocol
                                                                                                           |
-PR3 tools/mcshim ---------------------------------------------------------------------------+            |
-                                                                                            +--> PR9 runsc flags, job wrap, preload
+                                                                                                          |
+                                                                                                          +--> PR9 runsc flags, job wrap, preload
 PR1 design proposal (settles open questions; informs PR4, PR8, PR9)
 ```
 
-PR3 depends on nothing and is the largest review, so it should start first,
-in parallel with PR0, PR1 and PR2.
+PR3 is gone: the interposer lives in its own repository (decision 3).
+PR0, PR1, PR2 and PR4 can start in parallel.
 
 ### 7.2 PRs
 
 | PR | Contents | Requirements carried | Inert unless enabled? | Size |
 | :--- | :--- | :--- | :--- | :--- |
 | PR0 | `--device-map` on restore: the existing #14817. Land it, then rebase. | Part of R12 | No: restore onto different GPUs changes, by design and already reviewed | Small, done |
-| PR1 | Design proposal, trimmed. Settles: interposer in-tree or not, writing `ld.so.preload`, the fdinfo line as a `/proc` contract, fabric policy. | R23 (proposal), N12 | Docs only | Small |
+| PR1 | Design proposal, trimmed. States the out-of-tree model and links the protocol spec. Settles: writing `ld.so.preload`, the fdinfo line as a `/proc` contract, fabric policy. | R23 (proposal), N12 | Docs only | Small |
 | PR2 | `state_cuda` groundwork for the interposer path (bounded `wait`, `runCudaAction`, `openCudaCheckpointNullFD`), with the path without the interposer left as #14817 has it; nil-leader fix. | R12 | Yes | Small |
-| PR3 | `tools/mcshim`: sources, glibc stubs, BUILD, README, CPU tests, GPU harness. | R1-R6, R23 (README), R24 | Nothing links it | Large |
+| ~~PR3~~ | Removed: the interposer (sources, build, CPU tests, GPU harness) moved to `modal-projects/mcshim`, which now carries R1-R6, the README part of R23 and the interposer part of R24. | — | — | — |
 | PR4 | nvproxy export/import tracking, behind a new option. | R14, R15, R22 | Yes, once gated | Medium |
 | PR5 | fdinfo hook for exported objects. | R14 (gating, access check) | Yes | Small |
 | PR6 | Checkpoint-blocker inventory. | None | No callers yet | Small |
 | PR7 | Bounded pre-save invocations (fixed 2-minute bound on `--get-state`, lock and unlock), lock-then-checkpoint behind the interposer option, the `--get-state` timeout and unlock fixes. No new flag. | R11, R13 | Yes | Medium |
-| PR8 | Interposer protocol: `state_cuda_shim.go`, the "suspended" and `cuda-multicast-shim` checkpoint keys, `MCSHIM_DISABLE`, the protocol version check. | R9, R10, N22 | Yes | Medium |
+| PR8 | Interposer protocol: `state_cuda_shim.go`, the "suspended" and `cuda-multicast-shim` checkpoint keys, `MCSHIM_DISABLE`, the protocol version check; the protocol specification and CPU tests of the sentry's side against a stub interposer (split plan, phase 1; not yet written). | R9, R10, N22 | Yes | Medium |
 | PR9 | runsc: flags, validation, job wrap (supersedes #13987), `LD_PRELOAD` and `ld.so.preload`, save options, the R610-or-newer driver check. May split into job wrap and preload. | R16, R17, R20, R25 | Yes | Medium |
 
 R21 applies to every PR. Each PR branch is cut from `master` at the time,
@@ -408,7 +408,8 @@ robustness fixes; N8 and N11 as interposer refactors; N17 as the GPU target.
 ### 7.4 Validation
 
 R1-R6, R11, R12, R15 and R16 change code paths that run on GPUs. Before
-PR2, PR3, PR4, PR7 and PR9 merge, rerun on the fixed binary:
+PR2, PR4, PR7 and PR9 merge, and before mcshim's first release, rerun on
+the fixed binaries:
 
 - The full interposer suite, including the CPU-only `preload`, `noeffect`,
   `glibc`, `ctlsec` and `tables` tests. (`tables` used to run past 20
@@ -443,16 +444,18 @@ newer, so R615 must be validated before it is deployed there.
    R610 or newer and keeps it off, with a warning, on older drivers. There
    is no flag; whether an unvalidated newer release is used is left to the
    deployment (for example, the scheduler).
-3. **Where the interposer lives.** In-tree (PR3), or in its own repository.
-   See section 9. Either way runsc no longer carries it: `EMBEDDED` mode was
-   removed, and the operator provides the interposer at
-   `--cuda-multicast-shim-path`.
+3. **Where the interposer lives. Resolved: its own repository**,
+   [modal-projects/mcshim](https://github.com/modal-projects/mcshim), like
+   `cuda-checkpoint`. It was removed from gVisor's tree; the operator
+   provides it at `--cuda-multicast-shim-path`. Upstream's view is still to
+   be confirmed in the PR1 review (see section 9).
 4. **#13987.** Update it to match PR9, or close it in favour of PR9.
 
-## 9. Alternative under consideration: a separate repository for the interposer
+## 9. The interposer's own repository
 
-Tabled for now; recorded here so reviewers can weigh it. The step-by-step
-plan, if chosen, is `mcshim-split-plan.md`.
+Chosen (decision 3). The plan is `mcshim-split-plan.md`; phases 2 (the
+repository) and 3 (removal from gVisor) are done, phase 1 (the protocol spec
+and stub-interposer tests in gVisor) is not yet.
 
 The coupling is narrow: the marker directory and file names, the
 `MCSHIM_DISABLE` variable, and the fdinfo line format. runsc no longer
@@ -464,4 +467,4 @@ already takes `runsc` as an argument.
 | :--- | :--- |
 | Gains | The largest and riskiest upstream review (PR3) leaves gVisor. The Bazel-specific build work (glibc stubs) disappears. The interposer gets its own CI (GPU runners, Docker smoke tests) and release cadence. |
 | Costs | The protocol spans two repositories; the version handshake it needs is in place (N22). Restore must find the same interposer bytes at the same path, as it must already. Upstream would want a stub interposer to test the protocol on CPU. |
-| Effect on the plan | PR3 leaves the upstream plan, with R1-R6, the README part of R23 and the interposer part of R24. `TestCudaShimProtocolMatchesInterposer` would move to the interposer's repository, or check a pinned version. |
+| Effect on the plan | PR3 left the upstream plan, with R1-R6, the README part of R23 and the interposer part of R24. `TestCudaShimProtocolMatchesInterposer` was removed from gVisor; mcshim's CI should compare its version with gVisor's (split plan, phase 2). |

@@ -236,11 +236,6 @@ runsc-plugin-stack:
 	@$(call build,-c opt $(PLUGIN_STACK_FLAGS) //runsc:runsc-plugin-stack)
 .PHONY: runsc-plugin-stack
 
-mcshim: ## Builds the CUDA multicast interposer (tools/mcshim/mcshim.so), which GPU containers need at --cuda-multicast-shim-path. Requires Docker, or gcc with MCSHIM_HOST_BUILD=1.
-	@$(call header,MCSHIM)
-	@tools/mcshim/build.sh
-.PHONY: mcshim
-
 debian: ## Builds the debian packages.
 	@$(call build,-c opt //debian:debian)
 .PHONY: debian

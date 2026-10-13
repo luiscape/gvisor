@@ -100,7 +100,7 @@ flowchart TD
     N --> H[host NVIDIA driver]
 ```
 
-### The interposer (`tools/mcshim`)
+### The interposer ([mcshim](https://github.com/modal-projects/mcshim))
 
 A single C file (~2,600 lines, no CUDA toolkit dependency) that interposes 148
 exported CUDA driver symbols: 118 that submit GPU work or wait on it
@@ -265,7 +265,7 @@ unwinds: unlock, rebuild, release the gate, and the application keeps running.
 A process whose state cannot be carried refuses the gate, before anything is
 torn down: a table overflow, an unknown entry-point ABI, memory-pool IPC,
 logical endpoints, non-POSIX-fd handles, sparse array mappings, managed
-memory, or references it could not restore (see `tools/mcshim/README.md`).
+memory, or references it could not restore (see mcshim's [design document](https://github.com/modal-projects/mcshim/blob/main/docs/design.md)).
 Once every process is gated, the sentry refuses an import whose exported
 object no longer exists in a process that runs the interposer, since nobody
 would re-export it after restore; with every process gated, none can free an
@@ -430,9 +430,11 @@ including one that pins the fdinfo line format.
 
 ## Open questions
 
-1.  **Where the interposer lives.** In-tree (`tools/mcshim`, built but not
-    carried by runsc), or out of tree, with runsc only preloading the path it
-    is given?
+1.  **Where the interposer lives.** Out of tree, in its own repository
+    ([mcshim](https://github.com/modal-projects/mcshim)), like
+    `cuda-checkpoint`: runsc only preloads the path it is given, and checks
+    the protocol version the interposer announces. gVisor defines the
+    protocol. Acceptable, or should it live in-tree?
 2.  **Writing `/etc/ld.so.preload`** into the container rootfs (into the
     overlay by default; into the host rootfs with `--overlay2=none`).
     `LD_PRELOAD` alone fails silently for SGLang. Acceptable, or behind its
@@ -443,7 +445,7 @@ including one that pins the fdinfo line format.
     sentry-provided device or socket be preferred?
 4.  **The fdinfo line as a `/proc` contract.** It is now shown only with the
     interposer enabled, and only to readers with ptrace access. Acceptable?
-5.  **Testing.** `tools/mcshim/test` drives the interposer through the marker
+5.  **Testing.** mcshim's own tests drive the interposer through the marker
     protocol on two NVLS GPUs (lookup ABIs, gate draining, multicast rebuild,
     references, refusals, two-process imports), and checks that
     `runsc checkpoint` refuses an import nobody would re-export. End-to-end
@@ -462,7 +464,7 @@ the interposer flag is set:
     sentry control protocol and interposer sequencing (`pkg/sentry/control`).
 3.  The `cuda-checkpoint` job wrap (#13987), then the preload flag
     (`runsc/boot`, `runsc/config`).
-4.  The interposer sources, if it lives in-tree.
+The interposer itself is released from its own repository.
 
 ## Appendix: operational notes
 

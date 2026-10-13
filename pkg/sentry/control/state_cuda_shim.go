@@ -110,8 +110,9 @@ const (
 	// cudaShimProtocol is the version of the protocol with the interposer,
 	// which each interposer announces in its present.<pid> marker ("mcshim
 	// protocol N"); runsc and the interposer ship separately. It must equal
-	// MCSHIM_PROTOCOL in tools/mcshim/mcshim.c. Bump both with any change the
-	// other side would misread: marker names or meanings, acks, the order of
+	// MCSHIM_PROTOCOL in the interposer (mcshim.c in
+	// https://github.com/modal-projects/mcshim), whose README lists the
+	// pairings. Bump both with any change the other side would misread: marker names or meanings, acks, the order of
 	// transitions, the published fd format, or the fdinfo line the interposer
 	// parses.
 	cudaShimProtocol = 1

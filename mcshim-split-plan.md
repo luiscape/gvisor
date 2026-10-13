@@ -2,7 +2,7 @@
 
 | | |
 | :--- | :--- |
-| Status | Draft for review |
+| Status | In progress: phases 2 and 3 done; phase 1 (spec, stub tests), CI and releases (phase 2 steps 4-5), phase 4 and 5 remaining |
 | Date | 2026-10-13 |
 | Branch | `luis/multicast-xgpu-upstream` (github.com/luiscape/gvisor) |
 | Related | `mcshim-merge-plan.md` (decision 3, section 9) |
@@ -106,6 +106,11 @@ the transition order or ack handling changes.
 
 ### Phase 2: create the interposer repository
 
+**Steps 1-3 done** in `modal-projects/mcshim` (a copy, not `filter-repo`;
+not yet committed): sources, `Makefile`, `check_glibc.sh`, README,
+`docs/design.md`, Modal Labs copyright headers. CI (step 4) and releases
+(step 5) remain.
+
 1. **Extract** from the branch head:
    ```sh
    pip install git-filter-repo
@@ -147,6 +152,10 @@ same sources the branch tests; `run.sh` passes against a runsc from the
 gVisor branch.
 
 ### Phase 3: remove the interposer from gVisor
+
+**Done** on the branch, ahead of phase 1: the stub-interposer tests are not
+written yet, so until they are, gVisor has no CPU test of its side of the
+protocol beyond `TestCudaShimProtocol` and `TestCudaShimFS`.
 
 On the branch (and so from the PRs cut from it):
 

@@ -228,14 +228,15 @@ alone:
 
 Multi-GPU tensor-parallel workloads hold all three. gVisor can checkpoint them
 using a small LD_PRELOAD interposer,
-[mcshim](https://github.com/google/gvisor/tree/master/tools/mcshim), that
+[mcshim](https://github.com/modal-projects/mcshim), that
 releases multicast objects and VMM imports before the checkpoint and rebuilds
 them at identical GPU virtual addresses after restore, so application
 pointers and captured CUDA graphs remain valid, and runs the container in a
 `cuda-checkpoint` job for CUDA IPC.
 
-To enable it, build `mcshim.so` (`tools/mcshim/build.sh` or the
-`//tools/mcshim` Bazel target), make it available in each GPU container (in
+To enable it, build `mcshim.so` from the mcshim repository (`make`, or
+`make portable` for a build in a pinned container), make it available in
+each GPU container (in
 the image, or through a mount), and set two runtime flags:
 `--cuda-checkpoint-path` to the path of the `cuda-checkpoint` binary inside
 the container filesystem, and `--cuda-multicast-shim-path` to the
@@ -245,10 +246,10 @@ A restore needs the same interposer bytes at the same path as the
 checkpoint, since restored processes map the library they had mapped. If the
 interposer reaches containers through a mount, give its path a version (for
 example `/opt/mcshim/mcshim-<sha256>.so`) and keep every version that
-existing checkpoints use available on the hosts that restore them. Use the
-interposer built from the same gVisor release as `runsc`: `runsc checkpoint`
-refuses, and `runsc restore` fails, if the interposer speaks a different
-version of their protocol.
+existing checkpoints use available on the hosts that restore them. Use an
+interposer release that speaks the same protocol version as your `runsc`
+(see the compatibility table in mcshim's README): `runsc checkpoint` refuses,
+and `runsc restore` fails, if the interposer speaks a different version.
 
 gVisor then arranges for the container's processes to load the
 interposer (via the `LD_PRELOAD` environment variable *and* an entry appended

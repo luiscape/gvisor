@@ -22,7 +22,7 @@ import (
 )
 
 // TestProcFDInfoExtraFormat locks the fdinfo oracle line format: the
-// interposer (tools/mcshim) parses it to identify exported allocations across
+// interposer (https://github.com/modal-projects/mcshim) parses it to identify exported allocations across
 // processes.
 func TestProcFDInfoExtraFormat(t *testing.T) {
 	exp := exportedObjInfo{

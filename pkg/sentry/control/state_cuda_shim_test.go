@@ -16,9 +16,6 @@ package control
 
 import (
 	"fmt"
-	"os"
-	"regexp"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -31,7 +28,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -314,25 +310,5 @@ func TestCudaShimProtocol(t *testing.T) {
 		if tc.want == "" && why != "" || tc.want != "" && !strings.Contains(why, tc.want) {
 			t.Errorf("protocolMismatch(%d) = %q, want %q", tc.pid, why, tc.want)
 		}
-	}
-}
-
-// TestCudaShimProtocolMatchesInterposer checks that the sentry and the
-// interposer in this tree speak the same protocol version.
-func TestCudaShimProtocolMatchesInterposer(t *testing.T) {
-	path, err := testutil.FindFile("tools/mcshim/mcshim.c")
-	if err != nil {
-		t.Fatalf("finding mcshim.c: %v", err)
-	}
-	src, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("reading mcshim.c: %v", err)
-	}
-	m := regexp.MustCompile(`(?m)^#define MCSHIM_PROTOCOL (\d+)$`).FindSubmatch(src)
-	if m == nil {
-		t.Fatalf("no MCSHIM_PROTOCOL in %s", path)
-	}
-	if got := string(m[1]); got != strconv.Itoa(cudaShimProtocol) {
-		t.Errorf("mcshim.c has MCSHIM_PROTOCOL %s, the sentry cudaShimProtocol %d", got, cudaShimProtocol)
 	}
 }
