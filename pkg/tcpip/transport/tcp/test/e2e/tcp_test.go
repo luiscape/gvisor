@@ -48,6 +48,121 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
+func TestCubicWindowGrowthAfterPacketLoss(t *testing.T) {
+	for _, recovery := range []string{"fast_retransmit", "retransmission_timeout"} {
+		// Individual ACKs expose lost fractional credit; delayed and batched
+		// ACKs exercise the same progress requirement with different grouping.
+		for _, segmentsPerACK := range []int{1, 2, 10} {
+			t.Run(fmt.Sprintf("%s/segments_per_ack=%d", recovery, segmentsPerACK), func(t *testing.T) {
+				testCubicWindowGrowthAfterPacketLoss(t, recovery, segmentsPerACK)
+			})
+		}
+	}
+}
+
+func testCubicWindowGrowthAfterPacketLoss(t *testing.T, recovery string, segmentsPerACK int) {
+	t.Helper()
+	const segmentBytes = 32
+	const slowStartRounds = 6
+	const rtt = 100 * time.Millisecond
+	clock := faketime.NewManualClock()
+	c := context.NewWithOpts(t, context.Options{
+		EnableV4: true,
+		MTU:      header.TCPMinimumSize + header.IPv4MinimumSize + segmentBytes,
+		Clock:    clock,
+	})
+	defer c.Cleanup()
+	e2e.EnableCUBIC(t, c)
+	c.CreateConnected(789, 30000, -1)
+	// Pause drains queued TCP work before returning. With virtual time held
+	// still, the next step observes all effects of the ACK without sleeping.
+	ackAndWait := func(receivedBytes int) {
+		c.SendAck(790, receivedBytes)
+		c.Stack().Pause()
+		c.Stack().Resume()
+	}
+	tcpInfo := func() tcpip.TCPInfoOption {
+		var info tcpip.TCPInfoOption
+		if err := c.EP.GetSockOpt(&info); err != nil {
+			t.Fatalf("GetSockOpt(TCPInfoOption): %s", err)
+		}
+		return info
+	}
+	// Keep data queued throughout warmup and every post-loss window, so an
+	// application-limited sender cannot explain a window that stops growing.
+	queuedData := make([]byte, 256<<10)
+	n, err := c.EP.Write(bytes.NewReader(queuedData), tcpip.WriteOptions{})
+	if err != nil {
+		t.Fatalf("Write: %s", err)
+	}
+	if got, want := n, int64(len(queuedData)); got != want {
+		t.Fatalf("Write = %d, want %d", got, want)
+	}
+	// Grow a large window before loss: in congestion avoidance the increase
+	// earned by one ACK is then less than a segment. The old implementation
+	// truncated each such increase instead of accumulating it across ACKs.
+	receivedBytes := 0
+	for round := 0; round < slowStartRounds; round++ {
+		for range tcp.InitialCwnd << round {
+			c.ReceiveAndCheckPacket(queuedData, receivedBytes, segmentBytes)
+			receivedBytes += segmentBytes
+		}
+		clock.Advance(rtt)
+		ackAndWait(receivedBytes)
+	}
+	beforeLoss := int(tcpInfo().SndCwnd)
+	firstLostByte := receivedBytes
+	for range beforeLoss {
+		c.ReceiveAndCheckPacket(queuedData, receivedBytes, segmentBytes)
+		receivedBytes += segmentBytes
+	}
+	recoveryWindows := 1
+	if recovery == "retransmission_timeout" {
+		// These packets were sent at the current virtual time. Withhold
+		// their ACKs until the actual retransmission timer expires.
+		clock.Advance(tcpInfo().RTO)
+		if got, want := tcpInfo().SndCwnd, uint32(1); got != want {
+			t.Fatalf("cwnd after retransmission timeout = %d, want %d", got, want)
+		}
+		// After RTO the cubic epoch starts with K=0, so its initial
+		// growth is slower than after fast recovery.
+		recoveryWindows = 10
+	} else {
+		clock.Advance(rtt)
+		// Retain later packets at the peer, but report the gap left by
+		// the first packet to trigger fast retransmission.
+		for range 3 {
+			ackAndWait(firstLostByte)
+		}
+	}
+	c.ReceiveAndCheckPacket(queuedData, firstLostByte, segmentBytes)
+	ackAndWait(receivedBytes)
+	afterLoss := int(tcpInfo().SndCwnd)
+	if got, want := afterLoss, beforeLoss; got >= want {
+		t.Fatalf("loss did not reduce cwnd: before=%d after=%d", want, got)
+	}
+	// ACK a full window over one RTT, changing only ACK grouping. We check
+	// eventual growth, not an implementation-specific CUBIC window formula.
+	for range recoveryWindows {
+		window := int(tcpInfo().SndCwnd)
+		ackedBytes := receivedBytes
+		for range window {
+			c.ReceiveAndCheckPacket(queuedData, receivedBytes, segmentBytes)
+			receivedBytes += segmentBytes
+		}
+		for remaining := window; remaining > 0; {
+			n := min(segmentsPerACK, remaining)
+			clock.Advance(rtt * time.Duration(n) / time.Duration(window))
+			ackedBytes += n * segmentBytes
+			ackAndWait(ackedBytes)
+			remaining -= n
+		}
+	}
+	if got, want := int(tcpInfo().SndCwnd), afterLoss; got <= want {
+		t.Fatalf("cwnd did not recover after %d windows of ACKs: before=%d after=%d", recoveryWindows, want, got)
+	}
+}
+
 // endpointTester provides helper functions to test a tcpip.Endpoint.
 type endpointTester struct {
 	ep tcpip.Endpoint
@@ -1280,6 +1395,37 @@ func TestUserSuppliedMSSOnListenAccept(t *testing.T) {
 	}
 }
 
+func listenAndAccept(t *testing.T, c *context.Context, cookieEnabled bool) tcpip.Endpoint {
+	t.Helper()
+	if err := c.EP.Bind(tcpip.FullAddress{Port: context.StackPort}); err != nil {
+		t.Fatal("Bind failed:", err)
+	}
+
+	if err := c.EP.Listen(10); err != nil {
+		t.Fatal("Listen failed:", err)
+	}
+
+	we, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
+	c.WQ.EventRegister(&we)
+	defer c.WQ.EventUnregister(&we)
+
+	executeHandshake(t, c, context.TestPort, cookieEnabled)
+
+	ep, _, err := c.EP.Accept(nil)
+	if cmp.Equal(&tcpip.ErrWouldBlock{}, err) {
+		select {
+		case <-ch:
+			ep, _, err = c.EP.Accept(nil)
+		case <-time.After(1 * time.Second):
+			t.Fatalf("Timed out waiting for accept")
+		}
+	}
+	if err != nil {
+		t.Fatalf("Accept failed: %s", err)
+	}
+	return ep
+}
+
 // TestAcceptedInheritsDelayOption tests that an accepted endpoint inherits the
 // delay option (the inverse of TCP_NODELAY) from the listening endpoint.
 func TestAcceptedInheritsDelayOption(t *testing.T) {
@@ -1302,38 +1448,60 @@ func TestAcceptedInheritsDelayOption(t *testing.T) {
 				c.Create(-1)
 				c.EP.SocketOptions().SetDelayOption(delay)
 
-				if err := c.EP.Bind(tcpip.FullAddress{Port: context.StackPort}); err != nil {
-					t.Fatal("Bind failed:", err)
-				}
-
-				if err := c.EP.Listen(10); err != nil {
-					t.Fatal("Listen failed:", err)
-				}
-
-				we, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
-				c.WQ.EventRegister(&we)
-				defer c.WQ.EventUnregister(&we)
-
-				executeHandshake(t, c, context.TestPort, bool(cookieEnabled))
-
-				ep, _, err := c.EP.Accept(nil)
-				if cmp.Equal(&tcpip.ErrWouldBlock{}, err) {
-					select {
-					case <-ch:
-						ep, _, err = c.EP.Accept(nil)
-					case <-time.After(1 * time.Second):
-						t.Fatalf("Timed out waiting for accept")
-					}
-				}
-				if err != nil {
-					t.Fatalf("Accept failed: %s", err)
-				}
+				ep := listenAndAccept(t, c, bool(cookieEnabled))
 				defer ep.Close()
 
 				if got := ep.SocketOptions().GetDelayOption(); got != delay {
 					t.Errorf("got accepted GetDelayOption() = %t, want = %t", got, delay)
 				}
 			})
+		}
+	}
+}
+
+// TestAcceptedCongestionControl distinguishes explicit listener selections from
+// defaults that can change after the listener is created.
+func TestAcceptedCongestionControl(t *testing.T) {
+	for _, cookieEnabled := range []tcpip.TCPAlwaysUseSynCookies{false, true} {
+		for _, initialCC := range []tcpip.CongestionControlOption{"reno", "cubic"} {
+			for _, explicit := range []bool{false, true} {
+				t.Run(fmt.Sprintf("syn-cookies=%t/initial=%s/explicit=%t", cookieEnabled, initialCC, explicit), func(t *testing.T) {
+					c := context.New(t, e2e.DefaultMTU)
+					defer c.Cleanup()
+					if err := c.Stack().SetTransportProtocolOption(tcp.ProtocolNumber, &cookieEnabled); err != nil {
+						t.Fatal("SetTransportProtocolOption(TCPAlwaysUseSynCookies):", err)
+					}
+					if err := c.Stack().SetTransportProtocolOption(tcp.ProtocolNumber, &initialCC); err != nil {
+						t.Fatal("SetTransportProtocolOption(CongestionControlOption):", err)
+					}
+					c.Create(-1)
+					if explicit {
+						if err := c.EP.SetSockOpt(&initialCC); err != nil {
+							t.Fatal("SetSockOpt(CongestionControlOption):", err)
+						}
+					}
+					newCC := tcpip.CongestionControlOption("cubic")
+					if initialCC == newCC {
+						newCC = "reno"
+					}
+					if err := c.Stack().SetTransportProtocolOption(tcp.ProtocolNumber, &newCC); err != nil {
+						t.Fatal("SetTransportProtocolOption(CongestionControlOption):", err)
+					}
+					ep := listenAndAccept(t, c, bool(cookieEnabled))
+					defer ep.Close()
+					var got tcpip.CongestionControlOption
+					if err := ep.GetSockOpt(&got); err != nil {
+						t.Fatal("GetSockOpt(CongestionControlOption):", err)
+					}
+					want := newCC
+					if explicit {
+						want = initialCC
+					}
+					if got != want {
+						t.Errorf("accepted congestion control = %s, want %s", got, want)
+					}
+				})
+			}
 		}
 	}
 }
