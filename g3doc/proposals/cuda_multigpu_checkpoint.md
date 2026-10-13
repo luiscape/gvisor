@@ -169,10 +169,11 @@ absent by default, so frameworks choose POSIX fds).
 ### Delivery and injection (runsc)
 
 -   `--cuda-checkpoint-path` (#13987) names `cuda-checkpoint` inside the
-    container. On R610+ the loader wraps each GPU container's command in
-    `cuda-checkpoint --launch-job`, so that its CUDA processes share a job,
-    and checkpoints default to that binary and run it one process at a time,
-    as jobs require (in parallel, SGLang's restore fails).
+    container, which checkpoints default to. Alone it changes nothing else.
+    With `--cuda-multicast-shim-path` as well, on R610+, the loader wraps
+    each GPU container's command in `cuda-checkpoint --launch-job`, so that
+    its CUDA processes share a job, and checkpoints run it one process at a
+    time, as jobs require (in parallel, SGLang's restore fails).
 -   `--cuda-multicast-shim-path` names the interposer inside the container,
     which the operator provides there, in the image or through a mount; runsc
     does not carry it. A restore needs the same bytes at the same path. The
