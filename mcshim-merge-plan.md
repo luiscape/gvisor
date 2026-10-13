@@ -451,7 +451,8 @@ newer, so R615 must be validated before it is deployed there.
 
 ## 9. Alternative under consideration: a separate repository for the interposer
 
-Tabled for now; recorded here so reviewers can weigh it.
+Tabled for now; recorded here so reviewers can weigh it. The step-by-step
+plan, if chosen, is `mcshim-split-plan.md`.
 
 The coupling is narrow: the marker directory and file names, the
 `MCSHIM_DISABLE` variable, and the fdinfo line format. runsc no longer
