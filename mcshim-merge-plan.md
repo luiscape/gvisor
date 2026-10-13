@@ -4,8 +4,8 @@
 | :--- | :--- |
 | Status | Draft for review |
 | Date | 2026-10-12 |
-| Branch | `luis/multicast-xgpu-upstream` at `43da4f2fb` (github.com/luiscape/gvisor) |
-| Upstream | `google/gvisor` `master` at `a676ebdd0` (merged into the branch) |
+| Branch | `luis/multicast-xgpu-upstream` at `1cb37f608` (github.com/luiscape/gvisor) |
+| Upstream | `google/gvisor` `master` at `58251e7c0` (merged into the branch) |
 | Design doc | `g3doc/proposals/cuda_multigpu_checkpoint.md` (on the branch) |
 
 ## 1. Summary
@@ -245,8 +245,8 @@ returns NULL, as without the shim. Before, it returned the shim's wrapper.
 - **R19.** runsc no longer carries the interposer. The operator provides
   `mcshim.so` inside each GPU container, in the image or through a mount,
   at the path given in `--cuda-multicast-shim-path`. That file must stay available at the same
-  path for restores, so use a versioned path per release. There is no
-  version handshake between the interposer and the sentry yet (N22).
+  path for restores, so use a versioned path per release. A protocol
+  version check (N22, done) refuses a mismatched interposer.
 
 - **R12.** Without the interposer, checkpoint and restore run #14817's
   `runCudaCheckpointOp` unchanged: its timeline markers, stopping at the
@@ -362,7 +362,7 @@ These can follow the merge as separate PRs.
 | N19 | Environment slice aliasing when appending to the spec's environment. |
 | N20 | nvproxy cleanups: a dead parameter check, a duplicated handler, structured blocker results. |
 | N21 | R18's guard: write the interposer and the `ld.so.preload` entry only into the rootfs overlay (refuse without one, and refuse a path that crosses a bind mount), treating a refusal like a missing `cuda-checkpoint` (no wrap, no interposer, checkpoints refused). Falling back to `LD_PRELOAD` alone would be worse: SGLang's workers would lose the interposer silently. |
-| N22 | A protocol version handshake between the interposer and the sentry (for example, a version in each `gated.<pid>` marker), now that runsc and the interposer ship separately. A mismatch refuses the checkpoint. |
+| N22 | **Done** (`1cb37f608`). A protocol version handshake between the interposer and the sentry: the interposer writes `mcshim protocol N` into `present.<pid>`; the sentry refuses a checkpoint on a mismatch, before gating anything, and fails a restore rather than drive the rebuild. `TestCudaShimProtocol`, `TestCudaShimProtocolMatchesInterposer`, and a new `ctlsec` case (the previous interposer fails it). Belongs in PR3 (interposer) and PR8 (sentry). |
 
 ## 7. Merge plan
 
@@ -394,7 +394,7 @@ in parallel with PR0, PR1 and PR2.
 | PR5 | fdinfo hook for exported objects. | R14 (gating, access check) | Yes | Small |
 | PR6 | Checkpoint-blocker inventory. | None | No callers yet | Small |
 | PR7 | Bounded pre-save invocations (fixed 2-minute bound on `--get-state`, lock and unlock), lock-then-checkpoint behind the interposer option, the `--get-state` timeout and unlock fixes. No new flag. | R11, R13 | Yes | Medium |
-| PR8 | Interposer protocol: `state_cuda_shim.go`, the "suspended" and `cuda-multicast-shim` checkpoint keys, `MCSHIM_DISABLE`. | R9, R10 | Yes | Medium |
+| PR8 | Interposer protocol: `state_cuda_shim.go`, the "suspended" and `cuda-multicast-shim` checkpoint keys, `MCSHIM_DISABLE`, the protocol version check. | R9, R10, N22 | Yes | Medium |
 | PR9 | runsc: flags, validation, job wrap (supersedes #13987), `LD_PRELOAD` and `ld.so.preload`, save options, the R610-or-newer driver check. May split into job wrap and preload. | R16, R17, R20, R25 | Yes | Medium |
 
 R21 applies to every PR. Each PR branch is cut from `master` at the time,
@@ -411,9 +411,9 @@ R1-R6, R11, R12, R15 and R16 change code paths that run on GPUs. Before
 PR2, PR3, PR4, PR7 and PR9 merge, rerun on the fixed binary:
 
 - The full interposer suite, including the CPU-only `preload`, `noeffect`,
-  `glibc` and `ctlsec` tests. (`tables` at its default size, `fuzz 20000 8`, runs past
-  400 s with the shim both before and after these fixes; at 2,000 operations
-  it passes.)
+  `glibc`, `ctlsec` and `tables` tests. (`tables` used to run past 20
+  minutes: its consistency checks made the fuzz run quadratic. Since
+  `d836ba09a` they are amortized and the test takes 15 s.)
 - `rtres` with a renamed cudart (`libcudart-<hash>.so.12`).
 - The stub `cuda-checkpoint` tests, including a hung `--get-state` and the
   `undo` case for a failed checkpoint.
@@ -462,5 +462,5 @@ already takes `runsc` as an argument.
 | | |
 | :--- | :--- |
 | Gains | The largest and riskiest upstream review (PR3) leaves gVisor. The Bazel-specific build work (glibc stubs) disappears. The interposer gets its own CI (GPU runners, Docker smoke tests) and release cadence. |
-| Costs | The protocol spans two repositories and needs a version handshake (also worth having now that runsc and the interposer ship separately). Restore must find the same interposer bytes at the same path, as it must already. Upstream would want a stub interposer to test the protocol on CPU. |
-| Effect on the plan | PR3 leaves the upstream plan, with R1-R6, the README part of R23 and the interposer part of R24. PR8 gains the protocol version check. |
+| Costs | The protocol spans two repositories; the version handshake it needs is in place (N22). Restore must find the same interposer bytes at the same path, as it must already. Upstream would want a stub interposer to test the protocol on CPU. |
+| Effect on the plan | PR3 leaves the upstream plan, with R1-R6, the README part of R23 and the interposer part of R24. `TestCudaShimProtocolMatchesInterposer` would move to the interposer's repository, or check a pinned version. |
