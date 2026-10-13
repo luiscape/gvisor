@@ -183,9 +183,11 @@ type Config struct {
 	// Platform is the platform to run on.
 	Platform string `flag:"platform"`
 
-	// PlatformDevicePath is the path to the device file used by the platform.
-	// e.g. "/dev/kvm" for the KVM platform.
-	// If unset, a sane platform-specific default will be used.
+	// PlatformDevicePath is the raw value of --platform_device_path: either a
+	// single device file path, which applies to any platform, or
+	// comma-separated platform=path pairs, which apply only to the named
+	// platforms. Use PlatformDeviceFor to read it. If unset, a sane
+	// platform-specific default will be used.
 	PlatformDevicePath string `flag:"platform_device_path"`
 
 	// MetricServer, if set, indicates that metrics should be exported on this address.
@@ -403,7 +405,9 @@ type Config struct {
 	// CUDAMulticastShimPath is the path, inside the container filesystem, to
 	// the multicast suspend/resume interposer (mcshim.so). When it is set, a
 	// container given GPU access on driver R610+ is run with the interposer
-	// LD_PRELOADed.
+	// LD_PRELOADed. The operator puts it there (built from tools/mcshim):
+	// in the image, or through a mount. A path that is not a file in the
+	// container is not preloaded.
 	//
 	// cuda-checkpoint cannot checkpoint a process holding live multicast
 	// (NV_MEMORY_MULTICAST_FABRIC, 0x00fd) objects, which NCCL NVLS and
@@ -415,22 +419,6 @@ type Config struct {
 	// transitions around the cuda-checkpoint phases; see
 	// pkg/sentry/control/state_cuda.go.
 	CUDAMulticastShimPath string `flag:"cuda-multicast-shim-path"`
-
-	// CUDAMulticastShimSource selects where the multicast interposer comes
-	// from. CUDAMulticastShimSourceImage (the default) expects the container
-	// image to carry it at CUDAMulticastShimPath. CUDAMulticastShimSourceEmbedded
-	// materializes the interposer bundled inside the runsc binary (mcshim.so,
-	// built from tools/mcshim) into each GPU container's
-	// filesystem at container creation, at CUDAMulticastShimPath (or
-	// DefaultCUDAMulticastShimPath when no path is given), so the container
-	// image does not need to carry the interposer itself.
-	//
-	// The write goes through the container's VFS: with a rootfs overlay (the
-	// default --overlay2 configuration) the files land in the overlay, never
-	// in the user's rootfs on the host. They are therefore part of checkpoint
-	// images, so a restored process re-maps exactly the interposer bytes it
-	// had mapped at checkpoint time, even across runsc upgrades.
-	CUDAMulticastShimSource CUDAMulticastShimSource `flag:"cuda-multicast-shim-source"`
 
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
@@ -545,11 +533,60 @@ func (c *Config) UseNetworkProxy() bool {
 	return c.NetworkProxyPath != ""
 }
 
+// platformDevicePaths is the parsed value of --platform_device_path.
+type platformDevicePaths struct {
+	// any is the device file path for every platform. The single-path form
+	// sets it.
+	any string
+	// byPlatform maps a platform name to its device file path. The
+	// platform=path form sets it.
+	byPlatform map[string]string
+}
+
+// parsePlatformDevicePaths parses v, a --platform_device_path value. A value
+// without "=" is a single path. Otherwise it is comma-separated platform=path
+// pairs.
+func parsePlatformDevicePaths(v string) (platformDevicePaths, error) {
+	if !strings.Contains(v, "=") {
+		return platformDevicePaths{any: v}, nil
+	}
+	paths := platformDevicePaths{byPlatform: make(map[string]string)}
+	for _, pair := range strings.Split(v, ",") {
+		name, path, ok := strings.Cut(pair, "=")
+		if !ok || name == "" || path == "" {
+			return platformDevicePaths{}, fmt.Errorf("expected format is --platform_device_path={path} or --platform_device_path={platform}={path}[,{platform}={path}...], got %q", v)
+		}
+		if _, dup := paths.byPlatform[name]; dup {
+			return platformDevicePaths{}, fmt.Errorf("--platform_device_path=%q names platform %q more than once", v, name)
+		}
+		paths.byPlatform[name] = path
+	}
+	return paths, nil
+}
+
+// PlatformDeviceFor returns the device file path that --platform_device_path
+// assigns to platform, or "" if it assigns none, in which case the platform
+// uses its default. Validate rejects malformed values, which this treats as
+// unset.
+func (c *Config) PlatformDeviceFor(platform string) string {
+	paths, err := parsePlatformDevicePaths(c.PlatformDevicePath)
+	if err != nil {
+		return ""
+	}
+	if path, ok := paths.byPlatform[platform]; ok {
+		return path
+	}
+	return paths.any
+}
+
 // Validate checks that the Config is in a consistent state, e.g. that no
 // interdependent or mutually-exclusive flag values conflict. Note that
 // Config.Override does not validate, so callers must call Validate once they
 // are done overriding.
 func (c *Config) Validate() error {
+	if _, err := parsePlatformDevicePaths(c.PlatformDevicePath); err != nil {
+		return err
+	}
 	if c.Overlay && c.Overlay2.Enabled() {
 		// Deprecated flag was used together with flag that replaced it.
 		return fmt.Errorf("overlay flag has been replaced with overlay2 flag")
@@ -609,8 +646,8 @@ func (c *Config) Validate() error {
 	}
 	// The interposer leaves CUDA IPC (cuIpc*) to cuda-checkpoint, which carries
 	// it only for processes in a job.
-	if c.CUDAMulticastShimContainerPath() != "" && c.CUDACheckpointPath == "" {
-		return fmt.Errorf("the multicast interposer (--cuda-multicast-shim-path or --cuda-multicast-shim-source=EMBEDDED) requires --cuda-checkpoint-path")
+	if c.CUDAMulticastShimPath != "" && c.CUDACheckpointPath == "" {
+		return fmt.Errorf("the multicast interposer (--cuda-multicast-shim-path) requires --cuda-checkpoint-path")
 	}
 	// Both are paths inside the container: the job wrap execs the first as a
 	// container's argv[0], which must be absolute, and the dynamic linker
@@ -702,63 +739,6 @@ func (c *Config) GetOverlay2() Overlay2 {
 		return Overlay2{rootMount: true, subMounts: true, medium: "memory"}
 	}
 	return c.Overlay2
-}
-
-// DefaultCUDAMulticastShimPath is the in-container path at which
-// CUDAMulticastShimSourceEmbedded materializes the multicast interposer when
-// CUDAMulticastShimPath does not name a path itself.
-const DefaultCUDAMulticastShimPath = "/usr/local/lib/mcshim.so"
-
-// CUDAMulticastShimSource selects where the multicast interposer comes from.
-type CUDAMulticastShimSource string
-
-// CUDAMulticastShimSource values.
-const (
-	// CUDAMulticastShimSourceImage: the container image carries the
-	// interposer at --cuda-multicast-shim-path (which enables it).
-	CUDAMulticastShimSourceImage CUDAMulticastShimSource = "IMAGE"
-	// CUDAMulticastShimSourceEmbedded: runsc writes its bundled interposer
-	// into the container at creation.
-	CUDAMulticastShimSourceEmbedded CUDAMulticastShimSource = "EMBEDDED"
-)
-
-// Set implements flag.Value. Set(String()) should be idempotent.
-func (s *CUDAMulticastShimSource) Set(v string) error {
-	src := CUDAMulticastShimSource(strings.ToUpper(v))
-	switch src {
-	case CUDAMulticastShimSourceImage, CUDAMulticastShimSourceEmbedded:
-		*s = src
-		return nil
-	}
-	return fmt.Errorf("invalid value %q; must be %s or %s", v, CUDAMulticastShimSourceImage, CUDAMulticastShimSourceEmbedded)
-}
-
-// Ptr returns a pointer to `s`. Useful in flag declaration line.
-func (s CUDAMulticastShimSource) Ptr() *CUDAMulticastShimSource {
-	return &s
-}
-
-// Get implements flag.Get.
-func (s *CUDAMulticastShimSource) Get() any {
-	return *s
-}
-
-// String implements flag.String.
-func (s CUDAMulticastShimSource) String() string {
-	return string(s)
-}
-
-// CUDAMulticastShimContainerPath returns the in-container path of the
-// multicast suspend/resume interposer, or "" if the interposer is not
-// enabled.
-func (c *Config) CUDAMulticastShimContainerPath() string {
-	if c.CUDAMulticastShimPath != "" {
-		return c.CUDAMulticastShimPath
-	}
-	if c.CUDAMulticastShimSource == CUDAMulticastShimSourceEmbedded {
-		return DefaultCUDAMulticastShimPath
-	}
-	return ""
 }
 
 // Bundle is a set of flag name-value pairs.
@@ -1351,12 +1331,10 @@ func setOverlay2Err(v string) error {
 const overlay2SizeEq = "size="
 
 // Set implements flag.Value. Set(String()) should be idempotent.
+// On error, the receiver is unchanged.
 func (o *Overlay2) Set(v string) error {
 	if v == "none" {
-		o.rootMount = false
-		o.subMounts = false
-		o.medium = NoOverlay
-		o.size = ""
+		*o = Overlay2{}
 		return nil
 	}
 	parts := strings.Split(v, ",")
@@ -1369,34 +1347,34 @@ func (o *Overlay2) Set(v string) error {
 		return setOverlay2Err(v)
 	}
 
+	var next Overlay2
 	switch mount := vs[0]; mount {
 	case "root":
-		o.rootMount = true
+		next.rootMount = true
 	case "all":
-		o.rootMount = true
-		o.subMounts = true
+		next.rootMount = true
+		next.subMounts = true
 	default:
 		return fmt.Errorf("unexpected mount specifier for --overlay2: %q", mount)
 	}
 
-	err := o.medium.Set(vs[1])
+	err := next.medium.Set(vs[1])
 	if err != nil {
 		return err
 	}
 
-	if len(parts) == 1 {
-		o.size = ""
-	} else if len(parts) == 2 {
+	if len(parts) == 2 {
 		sizeArg := parts[1]
 		size, cut := strings.CutPrefix(sizeArg, overlay2SizeEq)
 		if !cut {
 			return setOverlay2Err(v)
 		}
-		o.size = size
-	} else {
+		next.size = size
+	} else if len(parts) > 2 {
 		return setOverlay2Err(v)
 	}
 
+	*o = next
 	return nil
 }
 

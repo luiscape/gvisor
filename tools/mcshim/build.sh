@@ -33,7 +33,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 OUT="${1:-mcshim.so}"
-CFLAGS="-O2 -g -Wall -Wextra -fPIC -shared"
+# _FORTIFY_SOURCE is pinned as in BUILD: compilers set it differently.
+CFLAGS="-O2 -g -Wall -Wextra -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -fPIC -shared"
 # The stubs must stay NEEDED even where the build environment's glibc defines
 # all their symbols in libc: hence --no-as-needed.
 STUBS=".mcshim-stubs-$$"

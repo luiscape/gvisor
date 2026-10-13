@@ -23,25 +23,35 @@ unchanged: one `cuda-checkpoint --toggle` per process, no job.
 
 Build with `./build.sh` (toolkit-free; runs in a pinned ubuntu:22.04 container
 by default). The Bazel target `//tools/mcshim:mcshim` builds the same
-artifact, and `//runsc` embeds it (through `//runsc/mcshimbin`) so that a
-stock runsc binary can inject the interposer into containers whose images do
-not carry it (`--cuda-multicast-shim-source=EMBEDDED`). Either way the result
-needs no glibc symbol version newer than **GLIBC_2.17** (CentOS 7, Amazon
-Linux 2; see Known limitations), whatever the build environment's glibc.
+artifact. Either way the result needs no glibc symbol version newer than
+**GLIBC_2.17** (CentOS 7, Amazon Linux 2; see Known limitations), whatever
+the build environment's glibc. runsc does not carry the interposer: the
+operator provides it in each GPU container, in the image or through a mount
+(see below).
 
 ## How it gets into a container
 
 With `runsc --cuda-checkpoint-path=... --cuda-multicast-shim-path=/path/to/mcshim.so`
-(for containers given GPU access, on driver R610 or newer) -- or with
-`--cuda-multicast-shim-source=EMBEDDED`, in which case
-runsc first writes its embedded copy of `mcshim.so` into the container
-filesystem at that path (default `/usr/local/lib/mcshim.so`) --
+(for containers given GPU access, on driver R610 or newer),
 `Loader.setupCudaMulticastShim` (`runsc/boot/loader.go`) appends the shim to
 the container's `LD_PRELOAD` **and** to `/etc/ld.so.preload` through the
 container's VFS (launchers like SGLang's `torch_memory_saver` rewrite
 `LD_PRELOAD` for exactly the worker processes that matter; `ld.so.preload` is
-immune). In IMAGE mode, a path that is not a file in the container is not
-preloaded at all, since the dynamic loader would print an error on every exec.
+immune). A path that is not a file in the container is not preloaded at all,
+since the dynamic loader would print an error on every exec. The
+`ld.so.preload` entry lands where the container's own view of the path
+leads: in the rootfs overlay by default, which is private to the sandbox and
+part of checkpoints, but in the user's rootfs on the host with
+`--overlay2=none`, or in a bind mount if the path crosses one.
+
+The interposer itself is the operator's to provide at that path, and a
+restore needs the same bytes at the same path: a restored process maps the
+library it had mapped at checkpoint time. If it reaches the container
+through a mount rather than the image, use a path that names its version
+(say `/opt/mcshim/mcshim-<sha256>.so`) and keep every version that
+checkpoints reference available where they are restored. runsc and the
+interposer can also come from different builds; nothing yet checks that
+they speak the same marker protocol.
 A container without GPU access (a pod's pause container or sidecars, even
 with `--nvproxy` set for the whole sandbox) gets neither. If a GPU container
 cannot be wrapped -- `cuda-checkpoint` is not a file at the absolute path
@@ -80,7 +90,7 @@ processes sharing one directory.
 | :-------------------- | :--------- | :------------------------------------------------------------- |
 | `gate`                | sentry     | created: arm the gate, wait for tracked calls in flight, check the state can be carried (else `error.<pid>` and disarm); removed: release the application, once this process is not torn down (refused after a failed transition) |
 | `suspend`             | sentry     | created: tear down tracked state; removed: rebuild it          |
-| `present.<pid>`       | shim       | this pid runs a control thread and will ack transitions        |
+| `present.<pid>`       | shim       | this pid runs a control thread and will ack transitions; contains `mcshim protocol N` (see below) |
 | `gated.<pid>`         | shim       | gate armed and drained                                         |
 | `suspended.<pid>` / `resumed.<pid>` | shim | teardown / rebuild finished                      |
 | `error.<pid>`         | shim       | the transition in flight failed (sentry fails fast on this)    |
@@ -89,6 +99,17 @@ The sentry waits up to 5 minutes for acks, and removes stale acks of the kind
 it waits for before each request. On startup the control thread removes any
 stale acks a dead predecessor with the same (reused) pid left behind, then
 writes `present.<pid>`.
+
+**Versioning.** runsc and the shim ship separately, so `present.<pid>`
+carries the protocol version the shim speaks (`MCSHIM_PROTOCOL` in
+`mcshim.c`), written under a temporary name and renamed into place so it
+never appears empty. The sentry (`cudaShimProtocol` in
+`state_cuda_shim.go`) checks every announcing process before a checkpoint,
+which it refuses on a mismatch before gating anything, and again before the
+rebuild after a restore, which it fails rather than drive a shim it may
+misread. A shim built before versioning writes `ok` and is refused. Bump
+both constants together with any change the other side would misread; a
+test (`TestCudaShimProtocolMatchesInterposer`) checks that they agree.
 
 The markers live in the container filesystem, so they are **part of the
 checkpoint image**: after a restore they still exist, and the shim stays
@@ -183,8 +204,10 @@ interposer's rebuild runs against the same ordinals it recorded.
     tables. Running out of entries or memory is loud and sticky
     (`g_untracked`): arming the gate refuses thereafter, failing the
     checkpoint before anything is torn down. `test/run.sh tables` checks the
-    tables and indexes after every call, under random multi-threaded traffic
-    with suspend/resume cycles, against a fake `libcuda` (no GPU).
+    tables and indexes under random multi-threaded traffic with
+    suspend/resume cycles, against a fake `libcuda` (no GPU): after every
+    call while the tables are small or the gate is armed, and otherwise
+    every size/64 calls, which keeps the run to seconds.
 *   **Handles.** The application only ever sees the handle values it was
     given. A rebuild gives objects new driver handles, and every
     handle-taking entry point translates (`xlate`), including
@@ -362,6 +385,11 @@ inside the container's trust domain, not gVisor's:
     exporter's pid and fd), from which an importer copies the fd with
     `pidfd_getfd`; a forged one can only make that import fail or take the
     wrong fd, inside the container.
+*   The sentry reads the content of `present.<pid>` (at most 64 bytes, a
+    regular file with one link, opened without following a symlink or
+    blocking), for the protocol version. A forged one can only refuse that
+    container's checkpoint, or let a mismatched shim through, which running
+    a mismatched shim could do anyway.
 *   The directory cannot be turned against processes that load the shim,
     root and setuid ones included (`/etc/ld.so.preload` loads it into every
     process; gVisor has no `protected_symlinks` or `protected_hardlinks`).
@@ -425,9 +453,9 @@ inside the container's trust domain, not gVisor's:
     it was built against: it links against stubs of `libdl.so.2` and
     `libpthread.so.0` that pin the entry points glibc 2.34 re-versioned
     (`glibc_stubs.sh`), and parses text without `scanf`/`strtoul`, which
-    glibc 2.38 re-versioned. `//runsc/mcshimbin:mcshimbin_test` checks the
-    embedded copy, `build.sh` the standalone one, and `test/run.sh glibc`
-    loads it in old images. Images with glibc older than 2.17 are not
+    glibc 2.38 re-versioned. `//tools/mcshim:glibc_floor_test` checks the
+    Bazel build, `build.sh` its own, and `test/run.sh glibc` loads it in old
+    images. Images with glibc older than 2.17 are not
     supported.
 *   **`dlsym` is interposed for every process.** The shim rewrites only
     `cu[A-Z]*` and `cudaGetDriverEntryPoint*` lookups, and forwards everything

@@ -38,7 +38,7 @@
 #                                under random multi-threaded traffic with
 #                                suspend/resume cycles, and at 100k objects,
 #                                against a fake libcuda (tables.c, fakecuda.c),
-#                                with every index checked at each unlock
+#                                with every index checked as it runs
 #   rtres                        native: cudart's resolvers reach each caller's
 #                                own runtime; needs MCSHIM_TEST_CUDART, two
 #                                libcudart.so files of different majors, neither
@@ -97,7 +97,8 @@ cleanup() {
 trap cleanup EXIT
 # Linked as in ../BUILD, against stubs that pin the glibc floor.
 ../glibc_stubs.sh "$W/stubs"
-gcc -O2 -g -Wall -Wextra -fPIC -shared -o "$W/mcshim.so" ../mcshim.c \
+gcc -O2 -g -Wall -Wextra -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -fPIC -shared \
+  -o "$W/mcshim.so" ../mcshim.c \
   -Wl,--no-as-needed "$W/stubs/libdl.so.2" "$W/stubs/libpthread.so.0" \
   -Wl,--as-needed
 gcc -O2 -g -Wall -Wextra -rdynamic -o "$W/mcshim_test" mcshim_test.c -ldl \
@@ -255,18 +256,11 @@ silent() {
 
 # preload: the shim forwards dlsym lookups it does not rewrite with a tail
 # call, so RTLD_NEXT resolves relative to the real caller, whatever the order.
+# Bazel runs the same check on the shim it builds (//tools/mcshim:preload_test).
 preload() {
-  local order out rc
   gcc -O2 -fPIC -shared -o "$W/libinterp.so" interp.c -ldl || return 1
   gcc -O2 -DMAIN -o "$W/interp_main" interp.c || return 1
-  for order in "$W/mcshim.so:$W/libinterp.so" "$W/libinterp.so:$W/mcshim.so"; do
-    rc=0
-    out=$(LD_PRELOAD="$order" "$W/interp_main" 2>&1) || rc=$?
-    if [ $rc -ne 0 ] || [ "$out" != ok ]; then
-      echo "LD_PRELOAD=$order: exit $rc (99: RTLD_NEXT found the interposer itself), output: $out"
-      return 1
-    fi
-  done
+  ./preload_test.sh "$W/mcshim.so" "$W/libinterp.so" "$W/interp_main"
 }
 
 # glibc: no symbol version above the floor (README.md), and the shim loads in
@@ -305,8 +299,8 @@ ctlsec() {
 }
 
 # tables: the shim built with MCSHIM_TABLE_CHECKS, which checks the tables'
-# consistency each time it releases its lock, over a fake libcuda.so.1 that
-# rejects any handle or address it did not issue.
+# consistency as it releases its lock (see check_tables_amortized), over a
+# fake libcuda.so.1 that rejects any handle or address it did not issue.
 tables() {
   local fake=$W/fake seed
   mkdir -p "$fake"

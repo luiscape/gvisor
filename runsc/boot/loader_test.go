@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"path"
 	"reflect"
 	"runtime"
 	"strings"
@@ -42,6 +43,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
+	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/fsgofer"
@@ -650,17 +652,14 @@ func TestCudaMulticastShimEnabled(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		path, shim string
-		embedded   bool
 		major      int
 		want       bool
 	}{
 		{name: "cuda-checkpoint-path only", path: "/cc", major: 610},
 		{name: "shim path", path: "/cc", shim: "/s.so", major: 610, want: true},
-		{name: "embedded shim", path: "/cc", embedded: true, major: 610, want: true},
 		{name: "old driver", path: "/cc", shim: "/s.so", major: 580},
 		{name: "driver just below R610", path: "/cc", shim: "/s.so", major: 609},
 		{name: "newer driver", path: "/cc", shim: "/s.so", major: 615, want: true},
-		{name: "newer driver, embedded shim", path: "/cc", embedded: true, major: 615, want: true},
 		{name: "newer driver, no shim", path: "/cc", major: 615},
 		{name: "nothing", major: 610},
 	} {
@@ -668,9 +667,6 @@ func TestCudaMulticastShimEnabled(t *testing.T) {
 			conf := testConfig()
 			conf.CUDACheckpointPath = tc.path
 			conf.CUDAMulticastShimPath = tc.shim
-			if tc.embedded {
-				conf.CUDAMulticastShimSource = config.CUDAMulticastShimSourceEmbedded
-			}
 
 			if got := cudaMulticastShimEnabled(conf, tc.major); got != tc.want {
 				t.Errorf("cudaMulticastShimEnabled() = %v, want %v", got, tc.want)
@@ -726,8 +722,8 @@ func TestContainerFileExists(t *testing.T) {
 	}
 	info := &containerInfo{procArgs: l.root.procArgs}
 	info.procArgs.MountNamespace = mns
-	if err := l.writeContainerFile(info, "/test/lib/mcshim.so", []byte("x"), 0755); err != nil {
-		t.Fatalf("writeContainerFile: %v", err)
+	if err := l.writeTestFile(info, "/test/lib/mcshim.so", []byte("x"), 0755); err != nil {
+		t.Fatalf("writeTestFile: %v", err)
 	}
 	for _, tc := range []struct {
 		path string
@@ -770,9 +766,9 @@ func TestSetupCudaCheckpointJob(t *testing.T) {
 	}
 	base := &containerInfo{procArgs: l.root.procArgs}
 	base.procArgs.MountNamespace = mns
-	if err := l.writeContainerFile(base, "/test/bin/cuda-checkpoint", []byte("x"), 0755); err != nil {
+	if err := l.writeTestFile(base, "/test/bin/cuda-checkpoint", []byte("x"), 0755); err != nil {
 		l.mu.Unlock()
-		t.Fatalf("writeContainerFile: %v", err)
+		t.Fatalf("writeTestFile: %v", err)
 	}
 	l.mu.Unlock()
 
@@ -831,6 +827,48 @@ func TestSetupCudaCheckpointJob(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), `container "cuda-checkpoint missing"`) || !strings.Contains(err.Error(), `container "cuda-checkpoint is a directory"`) {
 		t.Errorf("cudaJobSkippedError() = %v, want both skipped containers named", err)
 	}
+}
+
+// writeTestFile creates (or truncates) dstPath in the container's filesystem,
+// creating parent directories as needed, and writes data to it with mode.
+func (l *Loader) writeTestFile(info *containerInfo, dstPath string, data []byte, mode linux.FileMode) error {
+	mntns := info.procArgs.MountNamespace
+	if mntns == nil {
+		return fmt.Errorf("container mount namespace is not set up yet")
+	}
+	ctx := info.procArgs.NewContext(l.k)
+	creds := auth.NewRootCredentials(l.k.RootUserNamespace())
+	root := mntns.Root(ctx)
+	defer root.DecRef(ctx)
+	vfsObj := root.Mount().Filesystem().VirtualFilesystem()
+	if dir := path.Dir(dstPath); dir != "/" && dir != "." {
+		if err := vfsObj.MkdirAllAt(ctx, dir, root, creds, &vfs.MkdirOptions{Mode: 0755}, true /* mustBeDir */); err != nil {
+			return fmt.Errorf("creating directory %q: %w", dir, err)
+		}
+	}
+	fd, err := vfsObj.OpenAt(ctx, creds, &vfs.PathOperation{
+		Root:  root,
+		Start: root,
+		Path:  fspath.Parse(dstPath),
+	}, &vfs.OpenOptions{
+		Flags: linux.O_WRONLY | linux.O_CREAT | linux.O_TRUNC,
+		Mode:  mode,
+	})
+	if err != nil {
+		return fmt.Errorf("opening %q: %w", dstPath, err)
+	}
+	defer fd.DecRef(ctx)
+	for written := 0; written < len(data); {
+		n, err := fd.Write(ctx, usermem.BytesIOSequence(data[written:]), vfs.WriteOptions{})
+		written += int(n)
+		if err != nil {
+			return fmt.Errorf("writing %q: %w", dstPath, err)
+		}
+		if n == 0 {
+			return fmt.Errorf("writing %q: short write", dstPath)
+		}
+	}
+	return nil
 }
 
 func TestMain(m *testing.M) {

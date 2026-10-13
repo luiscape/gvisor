@@ -365,6 +365,10 @@ func (l *listenContext) performHandshake(s *segment, opts header.TCPSynOptions, 
 // +checklocks:e.mu
 // +checklocks:n.mu
 func (e *Endpoint) propagateInheritableOptionsLocked(n *Endpoint) {
+	if e.ccSetBySockOpt {
+		n.cc = e.cc
+		n.ccSetBySockOpt = true
+	}
 	n.userTimeout = e.userTimeout
 	n.portFlags = e.portFlags
 	n.boundBindToDevice = e.boundBindToDevice
@@ -715,7 +719,6 @@ func (e *Endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 			mss:                 rcvdSynOptions.MSS,
 			sampleRTTWithTSOnly: true,
 		}
-		h.ep.AssertLockHeld(n)
 		h.transitionToStateEstablishedLocked(s)
 		n.mu.Unlock()
 

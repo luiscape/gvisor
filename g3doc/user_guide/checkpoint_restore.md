@@ -234,27 +234,27 @@ them at identical GPU virtual addresses after restore, so application
 pointers and captured CUDA graphs remain valid, and runs the container in a
 `cuda-checkpoint` job for CUDA IPC.
 
-To enable it, set the runtime `--cuda-checkpoint-path` flag to the path of the
-`cuda-checkpoint` binary inside the container filesystem, and either:
+To enable it, build `mcshim.so` (`tools/mcshim/build.sh` or the
+`//tools/mcshim` Bazel target), make it available in each GPU container (in
+the image, or through a mount), and set two runtime flags:
+`--cuda-checkpoint-path` to the path of the `cuda-checkpoint` binary inside
+the container filesystem, and `--cuda-multicast-shim-path` to the
+interposer's in-container path.
 
-*   set the runtime `--cuda-multicast-shim-source=EMBEDDED` flag: `runsc` carries
-    `mcshim.so` inside its own binary and writes it into the container's
-    filesystem at container creation (at
-    `--cuda-multicast-shim-path` if set, `/usr/local/lib/mcshim.so` by
-    default). The container image needs no changes, and because the write
-    lands in the container's filesystem (the rootfs overlay under the
-    default `--overlay2` configuration), the exact interposer bytes travel
-    inside checkpoint images — restores are immune to runsc version skew;
-    or
-*   build `mcshim.so` yourself (`tools/mcshim/build.sh` or the
-    `//tools/mcshim` Bazel target), place it in the container
-    image, and set `--cuda-multicast-shim-path` to the interposer's
-    in-container path.
+A restore needs the same interposer bytes at the same path as the
+checkpoint, since restored processes map the library they had mapped. If the
+interposer reaches containers through a mount, give its path a version (for
+example `/opt/mcshim/mcshim-<sha256>.so`) and keep every version that
+existing checkpoints use available on the hosts that restore them. Use the
+interposer built from the same gVisor release as `runsc`: `runsc checkpoint`
+refuses, and `runsc restore` fails, if the interposer speaks a different
+version of their protocol.
 
-In both modes gVisor then arranges for the container's processes to load the
+gVisor then arranges for the container's processes to load the
 interposer (via the `LD_PRELOAD` environment variable *and* an entry appended
 to the container's `/etc/ld.so.preload`, which covers launchers that rewrite
-their children's environment), wraps each GPU container's command in
+their children's environment; with `--overlay2=none` that entry is added to
+the rootfs on the host), wraps each GPU container's command in
 `cuda-checkpoint --launch-job` so that all of its CUDA processes share a job,
 and drives the interposer automatically during `runsc checkpoint` and `runsc
 restore`. Jobs must be checkpointed sequentially, which `runsc checkpoint` then

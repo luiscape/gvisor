@@ -30,6 +30,8 @@ fi
 SHIM=$(realpath "$1")
 DIR=$(realpath "$2")
 IMAGE=${CTLSEC_IMAGE:-ubuntu:24.04}
+# The protocol version the shim announces in present.<pid>.
+PROTOCOL=$(sed -n 's/^#define MCSHIM_PROTOCOL \([0-9]*\)$/\1/p' "$(dirname "$0")/../mcshim.c")
 docker="docker"
 $docker info >/dev/null 2>&1 || docker="sudo docker"
 
@@ -67,6 +69,11 @@ run "log hard-linked to another file" '
   /t/ctlsec; intact'
 run "marker symlinked to another file" '' '
   bash -c "ln -s /victim /tmp/mcshim/present.\$\$; exec /t/ctlsec"; intact'
+run "present marker announces the protocol" '' '
+  bash -c "echo stale >/tmp/mcshim/present.\$\$; exec /t/ctlsec"
+  got=$(cat /tmp/mcshim/present.*)
+  [ "$got" = "mcshim protocol '"$PROTOCOL"'" ] || { echo "present.<pid> says: $got"; exit 1; }
+  if ls -A /tmp/mcshim | grep -q "^\.present"; then echo "left $(ls -A /tmp/mcshim)"; exit 1; fi'
 
 run "control directory symlinked elsewhere" '
   rmdir /tmp/mcshim; mkdir /target; ln -s /target /tmp/mcshim' '

@@ -15,6 +15,11 @@
 package control
 
 import (
+	"fmt"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,8 +28,10 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -219,6 +226,8 @@ func TestCudaShimFS(t *testing.T) {
 		f.mkfifo(cudaShimDir + "/error.9")
 		f.mkfifo(cudaShimDir + "/mcshim.log")
 		f.mkfifo(cudaShimDir + "/present.10")
+		f.write("/etc/protocol", fmt.Sprintf("%s%d\n", cudaShimProtocolPrefix, cudaShimProtocol), 0644)
+		f.symlink("/etc/protocol", cudaShimDir+"/present.8")
 		fs, err := f.shimFS()
 		if err != nil {
 			t.Fatalf("newCudaShimFS: %v", err)
@@ -247,11 +256,19 @@ func TestCudaShimFS(t *testing.T) {
 				t.Errorf("readTail(FIFO log) = %q", got)
 			}
 		})
+		within(t, "protocol check of a FIFO", func() {
+			if why := fs.protocolMismatch(10); why == "" {
+				t.Errorf("protocolMismatch(FIFO) accepted it")
+			}
+		})
 		within(t, "create over a FIFO", func() {
 			if err := fs.create("present.10"); err == nil {
 				t.Errorf("create over a FIFO succeeded")
 			}
 		})
+		if why := fs.protocolMismatch(8); why == "" {
+			t.Errorf("protocolMismatch read present.8 through a symlink")
+		}
 		// Removing a planted name removes it, not what it points to.
 		for _, name := range []string{"gate", "error.7"} {
 			if err := fs.remove(name); err != nil {
@@ -260,4 +277,62 @@ func TestCudaShimFS(t *testing.T) {
 		}
 		f.victimIntact()
 	})
+}
+
+// TestCudaShimProtocol covers the version check of the interposer's
+// present.<pid> marker, which refuses a checkpoint with an interposer this
+// sentry cannot drive.
+func TestCudaShimProtocol(t *testing.T) {
+	f := newShimTestFS(t)
+	f.mkdir(cudaShimDir, 01777)
+	for pid, body := range map[int]string{
+		1: fmt.Sprintf("mcshim protocol %d\n", cudaShimProtocol),
+		2: "ok\n",
+		3: fmt.Sprintf("mcshim protocol %d\n", cudaShimProtocol+1),
+		4: "mcshim protocol one\n",
+		5: "",
+	} {
+		f.write(fmt.Sprintf("%s/present.%d", cudaShimDir, pid), body, 0644)
+	}
+	fs, err := f.shimFS()
+	if err != nil {
+		t.Fatalf("newCudaShimFS: %v", err)
+	}
+	defer fs.release()
+	for _, tc := range []struct {
+		pid  kernel.ThreadID
+		want string // in the reason, or "" if accepted
+	}{
+		{pid: 1},
+		{pid: 2, want: "no protocol version"},
+		{pid: 3, want: fmt.Sprintf("protocol \"%d\"", cudaShimProtocol+1)},
+		{pid: 4, want: "protocol \"one\""},
+		{pid: 5, want: "no protocol version"},
+		{pid: 6, want: "no protocol version"}, // no marker
+	} {
+		why := fs.protocolMismatch(tc.pid)
+		if tc.want == "" && why != "" || tc.want != "" && !strings.Contains(why, tc.want) {
+			t.Errorf("protocolMismatch(%d) = %q, want %q", tc.pid, why, tc.want)
+		}
+	}
+}
+
+// TestCudaShimProtocolMatchesInterposer checks that the sentry and the
+// interposer in this tree speak the same protocol version.
+func TestCudaShimProtocolMatchesInterposer(t *testing.T) {
+	path, err := testutil.FindFile("tools/mcshim/mcshim.c")
+	if err != nil {
+		t.Fatalf("finding mcshim.c: %v", err)
+	}
+	src, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading mcshim.c: %v", err)
+	}
+	m := regexp.MustCompile(`(?m)^#define MCSHIM_PROTOCOL (\d+)$`).FindSubmatch(src)
+	if m == nil {
+		t.Fatalf("no MCSHIM_PROTOCOL in %s", path)
+	}
+	if got := string(m[1]); got != strconv.Itoa(cudaShimProtocol) {
+		t.Errorf("mcshim.c has MCSHIM_PROTOCOL %s, the sentry cudaShimProtocol %d", got, cudaShimProtocol)
+	}
 }

@@ -43,6 +43,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <ctime>
 #include <functional>
@@ -50,6 +51,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <regex>  // NOLINT
 #include <string>
@@ -73,6 +75,7 @@
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/blocking_counter.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
@@ -1756,6 +1759,45 @@ TEST_P(ProcPidStatTest, HasBasicFields) {
 INSTANTIATE_TEST_SUITE_P(SelfAndNumericPid, ProcPidStatTest,
                          ::testing::Values("self", absl::StrCat(getpid())));
 
+// PF_EXITING from include/linux/sched.h.
+constexpr uint64_t kPFExiting = 0x4;
+
+TEST(ProcPidStatTest, SelfIsNotExiting) {
+  std::string proc_pid_stat =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/stat"));
+  std::vector<std::string> fields =
+      ASSERT_NO_ERRNO_AND_VALUE(ParseProcPidStat(proc_pid_stat));
+  ASSERT_GE(fields.size(), 9);
+  uint64_t flags;
+  ASSERT_TRUE(absl::SimpleAtoi(fields[8], &flags));
+  EXPECT_EQ(flags & kPFExiting, 0);
+}
+
+TEST(ProcPidStatTest, ZombieIsExiting) {
+  pid_t child = fork();
+  if (child == 0) {
+    _exit(0);
+  }
+  ASSERT_THAT(child, SyscallSucceeds());
+  auto reap = Cleanup([child] {
+    EXPECT_THAT(RetryEINTR(waitpid)(child, nullptr, 0),
+                SyscallSucceedsWithValue(child));
+  });
+  siginfo_t info = {};
+  ASSERT_THAT(RetryEINTR(waitid)(P_PID, child, &info, WEXITED | WNOWAIT),
+              SyscallSucceeds());
+
+  std::string proc_pid_stat = ASSERT_NO_ERRNO_AND_VALUE(
+      GetContents(absl::StrCat("/proc/", child, "/stat")));
+  std::vector<std::string> fields =
+      ASSERT_NO_ERRNO_AND_VALUE(ParseProcPidStat(proc_pid_stat));
+  ASSERT_GE(fields.size(), 9);
+  EXPECT_EQ("Z", fields[2]);
+  uint64_t flags;
+  ASSERT_TRUE(absl::SimpleAtoi(fields[8], &flags));
+  EXPECT_NE(flags & kPFExiting, 0);
+}
+
 using ProcPidStatmTest = ::testing::TestWithParam<std::string>;
 
 TEST_P(ProcPidStatmTest, HasBasicFields) {
@@ -2850,29 +2892,22 @@ TEST(ProcTask, VerifyTaskChildrenNeverReportsZeroTID) {
   const std::string path = JoinPath("/proc", absl::StrCat(getpid()), "task",
                                     absl::StrCat(gettid()), "children");
 
-  std::atomic<bool> stop = false;
   std::atomic<bool> reported_zero = false;
   auto scan = [&] {
-    while (!stop.load(std::memory_order_relaxed)) {
-      auto contents = GetContents(path);
-      if (!contents.ok()) {
-        continue;
-      }
-      for (absl::string_view tid :
-           absl::StrSplit(contents.ValueOrDie(), ' ', absl::SkipWhitespace())) {
-        if (tid == "0") {
-          reported_zero.store(true, std::memory_order_relaxed);
-        }
+    auto contents = GetContents(path);
+    if (!contents.ok()) {
+      ADD_FAILURE() << "GetContents(" << path
+                    << "): " << contents.error().ToString();
+      return false;
+    }
+    for (absl::string_view tid :
+         absl::StrSplit(contents.ValueOrDie(), ' ', absl::SkipWhitespace())) {
+      if (tid == "0") {
+        reported_zero.store(true, std::memory_order_relaxed);
       }
     }
+    return true;
   };
-  ScopedThread reader1(scan);
-  ScopedThread reader2(scan);
-  ScopedThread reader3(scan);
-  ScopedThread reader4(scan);
-  // Stop the readers before they are joined, including on a failed assertion.
-  auto stop_readers =
-      Cleanup([&] { stop.store(true, std::memory_order_relaxed); });
 
   constexpr int kChildrenPerBatch = 64;
   for (int batch = 0; batch < 32; ++batch) {
@@ -2887,24 +2922,47 @@ TEST(ProcTask, VerifyTaskChildrenNeverReportsZeroTID) {
       children.push_back(child);
     }
 
-    // Ensure all children are zombies, then reap the whole batch while readers
-    // repeatedly snapshot children and resolve each snapshot's TID.
+    // Prepare all zombies before starting readers. The regression is a read
+    // racing with reaping, not with child creation or waiting for exit.
     for (pid_t child : children) {
       siginfo_t info = {};
       ASSERT_THAT(RetryEINTR(waitid)(P_PID, child, &info, WEXITED | WNOWAIT),
                   SyscallSucceeds());
     }
+
+    std::atomic<bool> stop = false;
+    std::array<std::optional<ScopedThread>, 4> readers;
+    absl::BlockingCounter readers_started(readers.size());
+    auto read = [&] {
+      bool success = scan();
+      readers_started.DecrementCount();
+      while (success && !stop.load(std::memory_order_relaxed)) {
+        success = scan();
+      }
+    };
+    // Stop before joining, including when a reap assertion fails. Joining the
+    // readers also keeps them out of the next batch's setup.
+    auto stop_readers = Cleanup([&] {
+      stop.store(true, std::memory_order_relaxed);
+      for (auto& reader : readers) {
+        if (reader) {
+          reader->Join();
+        }
+      }
+    });
+    for (auto& reader : readers) {
+      reader.emplace(read);
+    }
+    readers_started.Wait();
+
+    // Every reader has attempted a scan and successful readers continue while
+    // we reap. Failed readers still release the readiness counter.
     for (pid_t child : children) {
       ASSERT_THAT(RetryEINTR(waitpid)(child, nullptr, 0),
                   SyscallSucceedsWithValue(child));
     }
   }
 
-  stop_readers.Release()();
-  reader1.Join();
-  reader2.Join();
-  reader3.Join();
-  reader4.Join();
   EXPECT_FALSE(reported_zero.load(std::memory_order_relaxed));
 }
 
@@ -3750,47 +3808,42 @@ TEST(Proc, NoDuplicates) { CheckDuplicatesRecursively("/proc"); }
 
 // Most /proc/PID files are owned by the task user with SUID_DUMP_USER.
 TEST(ProcPid, UserDumpableOwner) {
-  int before;
-  ASSERT_THAT(before = prctl(PR_GET_DUMPABLE), SyscallSucceeds());
-  auto cleanup = Cleanup([before] {
-    ASSERT_THAT(prctl(PR_SET_DUMPABLE, before), SyscallSucceeds());
-  });
+  // A child leaves the parent's dumpability intact even when it is
+  // SUID_DUMP_ROOT, which PR_SET_DUMPABLE cannot restore.
+  EXPECT_THAT(InForkedProcess([] {
+                TEST_PCHECK(prctl(PR_SET_DUMPABLE, SUID_DUMP_USER) == 0);
 
-  EXPECT_THAT(prctl(PR_SET_DUMPABLE, SUID_DUMP_USER), SyscallSucceeds());
+                // This applies to the task directory itself and files inside.
+                struct stat st;
+                TEST_PCHECK(stat("/proc/self/", &st) == 0);
+                TEST_CHECK(st.st_uid == geteuid());
+                TEST_CHECK(st.st_gid == getegid());
 
-  // This applies to the task directory itself and files inside.
-  struct stat st;
-  ASSERT_THAT(stat("/proc/self/", &st), SyscallSucceeds());
-  EXPECT_EQ(st.st_uid, geteuid());
-  EXPECT_EQ(st.st_gid, getegid());
-
-  ASSERT_THAT(stat("/proc/self/stat", &st), SyscallSucceeds());
-  EXPECT_EQ(st.st_uid, geteuid());
-  EXPECT_EQ(st.st_gid, getegid());
+                TEST_PCHECK(stat("/proc/self/stat", &st) == 0);
+                TEST_CHECK(st.st_uid == geteuid());
+                TEST_CHECK(st.st_gid == getegid());
+              }),
+              IsPosixErrorOkAndHolds(0));
 }
 
 // /proc/PID files are owned by root with SUID_DUMP_DISABLE.
 TEST(ProcPid, RootDumpableOwner) {
-  int before;
-  ASSERT_THAT(before = prctl(PR_GET_DUMPABLE), SyscallSucceeds());
-  auto cleanup = Cleanup([before] {
-    ASSERT_THAT(prctl(PR_SET_DUMPABLE, before), SyscallSucceeds());
-  });
+  EXPECT_THAT(InForkedProcess([] {
+                TEST_PCHECK(prctl(PR_SET_DUMPABLE, SUID_DUMP_DISABLE) == 0);
 
-  EXPECT_THAT(prctl(PR_SET_DUMPABLE, SUID_DUMP_DISABLE), SyscallSucceeds());
+                // This does not apply to the task directory itself (or other
+                // 0555 directories), but does to files inside.
+                struct stat st;
+                TEST_PCHECK(stat("/proc/self/", &st) == 0);
+                TEST_CHECK(st.st_uid == geteuid());
+                TEST_CHECK(st.st_gid == getegid());
 
-  // This *does not* applies to the task directory itself (or other 0555
-  // directories), but does to files inside.
-  struct stat st;
-  ASSERT_THAT(stat("/proc/self/", &st), SyscallSucceeds());
-  EXPECT_EQ(st.st_uid, geteuid());
-  EXPECT_EQ(st.st_gid, getegid());
-
-  // This file is owned by root. Also allow nobody in case this test is running
-  // in a userns without root mapped.
-  ASSERT_THAT(stat("/proc/self/stat", &st), SyscallSucceeds());
-  EXPECT_THAT(st.st_uid, AnyOf(Eq(0), Eq(65534)));
-  EXPECT_THAT(st.st_gid, AnyOf(Eq(0), Eq(65534)));
+                // Also allow nobody in a userns without root mapped.
+                TEST_PCHECK(stat("/proc/self/stat", &st) == 0);
+                TEST_CHECK(st.st_uid == 0 || st.st_uid == 65534);
+                TEST_CHECK(st.st_gid == 0 || st.st_gid == 65534);
+              }),
+              IsPosixErrorOkAndHolds(0));
 }
 
 TEST(Proc, GetdentsEnoent) {
@@ -4036,6 +4089,59 @@ TEST(ProcSysKernel, RandomizeVaSpace) {
     // gVisor always uses full ASLR, so expect 2.
     EXPECT_EQ(randomize_va, 2);
   }
+}
+
+// Parses /proc/sys/fs/file-nr into its three fields.
+PosixErrorOr<std::vector<int64_t>> ReadFileNr() {
+  ASSIGN_OR_RETURN_ERRNO(std::string contents,
+                         GetContents("/proc/sys/fs/file-nr"));
+  std::vector<int64_t> fields;
+  for (absl::string_view f :
+       absl::StrSplit(absl::StripAsciiWhitespace(contents),
+                      absl::ByAnyChar(" \t"), absl::SkipEmpty())) {
+    int64_t v;
+    if (!absl::SimpleAtoi(f, &v)) {
+      return PosixError(EINVAL, absl::StrCat("bad file-nr field: ", f));
+    }
+    fields.push_back(v);
+  }
+  return fields;
+}
+
+TEST(ProcSysFsFileNr, TracksOpenFiles) {
+  constexpr int kNumFiles = 200;
+
+  std::vector<int64_t> before = ASSERT_NO_ERRNO_AND_VALUE(ReadFileNr());
+  ASSERT_EQ(before.size(), 3);
+  EXPECT_GT(before[0], 0);
+  EXPECT_EQ(before[1], 0);
+
+  std::vector<FileDescriptor> fds;
+  for (int i = 0; i < kNumFiles; i++) {
+    fds.push_back(ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/null", O_RDONLY)));
+  }
+  std::vector<int64_t> during = ASSERT_NO_ERRNO_AND_VALUE(ReadFileNr());
+  ASSERT_EQ(during.size(), 3);
+  // Other processes on a shared host may open and close files concurrently,
+  // so only require that most of the new files are visible.
+  EXPECT_GE(during[0], before[0] + kNumFiles / 2);
+  EXPECT_EQ(during[1], 0);
+
+  fds.clear();
+  std::vector<int64_t> after = ASSERT_NO_ERRNO_AND_VALUE(ReadFileNr());
+  ASSERT_EQ(after.size(), 3);
+  EXPECT_LE(after[0], during[0] - kNumFiles / 2);
+  EXPECT_EQ(after[1], 0);
+}
+
+TEST(ProcSysFsFileNr, MaxMatchesFileMax) {
+  std::vector<int64_t> fields = ASSERT_NO_ERRNO_AND_VALUE(ReadFileNr());
+  ASSERT_EQ(fields.size(), 3);
+  std::string file_max =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/fs/file-max"));
+  int64_t max;
+  ASSERT_TRUE(absl::SimpleAtoi(absl::StripAsciiWhitespace(file_max), &max));
+  EXPECT_EQ(fields[2], max);
 }
 
 }  // namespace
