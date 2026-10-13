@@ -41,7 +41,8 @@
 #                                with every index checked at each unlock
 #   rtres                        native: cudart's resolvers reach each caller's
 #                                own runtime; needs MCSHIM_TEST_CUDART, two
-#                                libcudart.so files of different majors
+#                                libcudart.so files of different majors, neither
+#                                newer than the driver's CUDA version
 #   ipc                          under runsc (-r), over the host's libraries:
 #                                needs nvproxy's exported-object identity
 #   orphan                       under runsc (-r): `runsc checkpoint` refuses an

@@ -1305,6 +1305,19 @@ static int ipc_rank(int d, int peer, int ctl) {
   return g_failed;
 }
 
+/* Reaps ranks that stopped early: exits 77 if every one of them skipped (see
+ * setup), else returns 1. */
+static int ranks_stopped(const pid_t* pids, int n) {
+  int skipped = 0;
+  for (int d = 0; d < n; d++) {
+    int st;
+    waitpid(pids[d], &st, 0);
+    skipped += WIFEXITED(st) && WEXITSTATUS(st) == 77;
+  }
+  if (skipped == n) exit(77);
+  return 1;
+}
+
 static int t_ipc(void) {
   int peer[2], ctl0[2], ctl1[2];
   socketpair(AF_UNIX, SOCK_STREAM, 0, peer);
@@ -1315,11 +1328,16 @@ static int t_ipc(void) {
     pids[d] = fork();
     if (pids[d] == 0) exit(ipc_rank(d, peer[d], d ? ctl1[1] : ctl0[1]));
   }
+  /* So that a rank that exits early is seen as EOF, not waited on forever. */
+  close(peer[0]);
+  close(peer[1]);
+  close(ctl0[1]);
+  close(ctl1[1]);
   int ctl[2] = {ctl0[0], ctl1[0]};
   char c;
   for (int round = 0; round < 2; round++) {
     for (int d = 0; d < 2; d++)
-      if (read(ctl[d], &c, 1) != 1) return 1;
+      if (read(ctl[d], &c, 1) != 1) return ranks_stopped(pids, 2);
     if (round == 1) EXPECT(cycle(pids, 2) == 0, "suspend/resume failed");
     for (int d = 0; d < 2; d++)
       if (write(ctl[d], "g", 1) != 1) return 1;
@@ -1410,6 +1428,12 @@ static int t_mapwait(void) {
       kill(pids[0], SIGKILL);
       kill(pids[1], SIGKILL);
       EXPECT(0, "rank %d still mapping after 60 s: deadlock", d);
+      return g_failed;
+    }
+    if (d == 0 && WIFEXITED(st) && WEXITSTATUS(st) == 77) {
+      waitpid(pids[1], &st, 0);
+      if (WIFEXITED(st) && WEXITSTATUS(st) == 77) exit(77);
+      EXPECT(0, "rank 0 skipped, rank 1 exited 0x%x", st);
       return g_failed;
     }
     EXPECT(WIFEXITED(st) && WEXITSTATUS(st) == 0, "rank %d exited 0x%x", d, st);
@@ -1574,11 +1598,16 @@ static int t_rtres(int n, char** pairs) {
   EXPECT(gate_up(&me, 1) == 0, "gate refused after the lookups");
   gate_down();
 
+  /* No runtime is loaded globally, so a lookup in the global scope finds
+   * nothing, as without the shim. */
+  EXPECT(!dlsym(RTLD_DEFAULT, "cudaGetDriverEntryPoint"),
+         "dlsym(RTLD_DEFAULT) found a resolver no runtime defines globally");
   /* A caller the shim cannot place (here the main program, which links no
-   * runtime) gets the only runtime loaded. With several, it gets the newest,
-   * and checkpoints are refused. */
+   * runtime, calling the shim's definition, as its PLT would bind) gets the
+   * only runtime loaded. With several, it gets the newest, and checkpoints are
+   * refused. */
   GdepFn generic;
-  *(void**)&generic = dlsym(RTLD_DEFAULT, "cudaGetDriverEntryPoint");
+  *(void**)&generic = rdlsym(shim, "cudaGetDriverEntryPoint");
   void* pg = NULL;
   int st;
   CK(generic(sym, &pg, 0, &st));
