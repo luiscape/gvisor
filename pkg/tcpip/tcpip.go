@@ -634,7 +634,7 @@ type SendableControlMessages struct {
 type ReceivableControlMessages struct {
 	// Timestamp is the time that the last packet used to create the read data
 	// was received.
-	Timestamp time.Time `state:".(int64)"`
+	Timestamp time.Time
 
 	// HasInq indicates whether Inq is valid/set.
 	HasInq bool
@@ -1284,6 +1284,9 @@ type TCPInfoOption struct {
 
 	// SndCwnd is the congestion window, in packets.
 	SndCwnd uint32
+
+	// SndMss is the maximum TCP payload size, in bytes.
+	SndMss uint32
 
 	// SndSsthresh is the threshold between slow start and congestion
 	// avoidance.

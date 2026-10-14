@@ -458,7 +458,7 @@ type sock struct {
 	// valid when timestampValid is true.
 	//
 	// +checklocks:readMu
-	timestamp time.Time `state:".(int64)"`
+	timestamp time.Time
 
 	// TODO(b/153685824): Move this to SocketOptions.
 	// sockOptInq corresponds to TCP_INQ.
@@ -1277,6 +1277,7 @@ func (s *sock) getSockOptTCP(t *kernel.Task, ep commonEndpoint, name, outLen int
 			RTTVar:      uint32(v.RTTVar / time.Microsecond),
 			SndSsthresh: v.SndSsthresh,
 			SndCwnd:     v.SndCwnd,
+			SndMss:      v.SndMss,
 		}
 		switch v.CcState {
 		case tcpip.RTORecovery:

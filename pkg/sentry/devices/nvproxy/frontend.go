@@ -67,16 +67,17 @@ func (dev *frontendDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.D
 	if err != nil {
 		return nil, err
 	}
+	fd.internalEntry.Init(fd, waiter.AllEvents)
+	fd.internalQueue.EventRegister(&fd.internalEntry)
+	if err := fdnotifier.AddFD(fd.hostFD, &fd.internalQueue); err != nil {
+		unix.Close(int(fd.hostFD))
+		return nil, err
+	}
 	if err := fd.vfsfd.Init(fd, opts.Flags, auth.CredentialsFromContext(ctx), mnt, vfsd, &vfs.FileDescriptionOptions{
 		UseDentryMetadata: true,
 		SpecialFile:       true,
 	}); err != nil {
-		unix.Close(int(fd.hostFD))
-		return nil, err
-	}
-	fd.internalEntry.Init(fd, waiter.AllEvents)
-	fd.internalQueue.EventRegister(&fd.internalEntry)
-	if err := fdnotifier.AddFD(fd.hostFD, &fd.internalQueue); err != nil {
+		fdnotifier.RemoveFD(fd.hostFD)
 		unix.Close(int(fd.hostFD))
 		return nil, err
 	}
@@ -1632,6 +1633,39 @@ func rmAllocIMEXSession(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAME
 
 	allocParams.CapDescriptor = origCapDescriptor
 	allocParams.POsEvent = origEventFD
+	if _, err := allocParams.CopyOut(fi.t, addrFromP64(ioctlParams.PAllocParms)); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+func rmAllocMNCCSession(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
+	var allocParams nvgpu.NV77CC_ALLOC_PARAMETERS
+	if _, err := allocParams.CopyIn(fi.t, addrFromP64(ioctlParams.PAllocParms)); err != nil {
+		return 0, err
+	}
+
+	origCapDescriptor := allocParams.CapDescriptor
+	capsFileGeneric, _ := fi.t.FDTable().Get(int32(allocParams.CapDescriptor))
+	if capsFileGeneric == nil {
+		return 0, linuxerr.EINVAL
+	}
+	defer capsFileGeneric.DecRef(fi.ctx)
+	capsFile, ok := capsFileGeneric.Impl().(*openOnlyFD)
+	if !ok {
+		fi.ctx.Warningf("nvproxy: rmAllocMNCCSession got capDescriptor file of incompatible type %T", capsFileGeneric.Impl())
+		return 0, linuxerr.EINVAL
+	}
+	allocParams.CapDescriptor = uint64(capsFile.hostFD)
+
+	n, err := rmAllocInvoke(fi, ioctlParams, &allocParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV77CC_ALLOC_PARAMETERS) {
+		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, &miscObject{}, ioctlParams.HObjectParent)
+	})
+	if err != nil {
+		return n, err
+	}
+
+	allocParams.CapDescriptor = origCapDescriptor
 	if _, err := allocParams.CopyOut(fi.t, addrFromP64(ioctlParams.PAllocParms)); err != nil {
 		return n, err
 	}

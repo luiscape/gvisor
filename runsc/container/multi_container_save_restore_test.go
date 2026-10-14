@@ -31,7 +31,6 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 	"gvisor.dev/gvisor/pkg/cleanup"
-	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fscheckpoint"
 	fspb "gvisor.dev/gvisor/pkg/sentry/fscheckpoint/fscheckpoint_proto_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
@@ -160,27 +159,13 @@ func testMultiContainerCheckpointRestore(t *testing.T, conf *config.Config, comp
 		t.Fatalf("Failed to wait for output file: %v", err)
 	}
 
-	checkpointWaiter := make(chan error, 1)
-	go func() {
-		// WaitCheckpoint on the second container.
-		checkpointWaiter <- conts[1].WaitCheckpoint()
-	}()
-
 	// Checkpoint root container; save state into new file.
 	if err := conts[0].Checkpoint(conf, dir, sandbox.CheckpointOpts{Compression: compression}); err != nil {
 		t.Fatalf("error checkpointing container to empty file: %v", err)
 	}
 
-	// Wait for the checkpoint to complete. The initial sandbox not destroyed yet
-	// to check that no conflict with it occurs during restore.
-	select {
-	case waitErr := <-checkpointWaiter:
-		if waitErr != nil {
-			t.Errorf("error waiting for checkpoint to complete: %v", waitErr)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatalf("timed out waiting for checkpoint to complete")
-	}
+	// Checkpoint returns after saving. Keep the initial sandbox alive to check
+	// that it does not conflict with the restored containers.
 
 	lastNum, err := readOutputNum(outputPath, -1)
 	if err != nil {
@@ -453,14 +438,14 @@ func TestFSCheckpointCommand(t *testing.T) {
 			if tc.all {
 				fsSavePathArg = fscheckpoint.AllTmpfsPath
 			}
-			var paths []checkpoint.ResourceID
+			var paths []string
 			if tc.multipaths {
-				paths = []checkpoint.ResourceID{
-					{ContainerName: rootName, Path: "/data1"},
-					{ContainerName: subName, Path: "/data2"},
+				paths = []string{
+					rootName + ":/data1",
+					subName + ":/data2",
 				}
 			} else {
-				paths = []checkpoint.ResourceID{{Path: fsSavePathArg}}
+				paths = []string{fsSavePathArg}
 			}
 			if err := conts[0].FSSave(conf, imagePath, sandbox.FSSaveOpts{
 				ExitAfterSaving: true,
@@ -677,11 +662,9 @@ func TestCheckpointRestoreAnnotation(t *testing.T) {
 	}
 	defer cleanup()
 
-	if err := conts[0].WaitCheckpoint(); err != nil {
-		t.Fatalf("error waiting for checkpoint: %v", err)
-	}
-
-	// Wait until the checkpoint read unblocks and writes to `out`.
+	// The proc fd was opened before the trigger, so its read waits for that
+	// checkpoint even if it has already completed. A new WaitCheckpoint RPC
+	// would instead wait for the next generation.
 	if err := waitForContent(out, "resume\n"); err != nil {
 		t.Fatal(err)
 	}
@@ -1117,9 +1100,9 @@ func TestFSCheckpointSharedVolume(t *testing.T) {
 	// Specifying both ensures it matches container0's mount and gets saved.
 	if err := conts[0].FSSave(conf, imagePath, sandbox.FSSaveOpts{
 		ExitAfterSaving: true,
-		Paths: []checkpoint.ResourceID{
-			{ContainerName: rootName, Path: "/shared"},
-			{ContainerName: subName, Path: "/shared"},
+		Paths: []string{
+			rootName + ":/shared",
+			subName + ":/shared",
 		},
 	}); err != nil {
 		t.Fatalf("Error saving filesystem checkpoint: %v", err)
@@ -1467,41 +1450,34 @@ func testMultiContainerChainedCheckpointRestore(t *testing.T, conf *config.Confi
 	hostCounter2 := filepath.Join(tmpfsSource2, "counter")
 	checkHostFilesAbsent(t, hostCounter1, hostCounter2)
 
-	const iterations = 3
-	for iter := 0; iter < iterations; iter++ {
+	iterCases := []struct {
+		specPrefix string
+		wantPrefix string
+	}{
+		{specPrefix: "", wantPrefix: checkpointfiles.FSCheckpointDir},
+		{specPrefix: "custom/=", wantPrefix: "custom/"},
+		{specPrefix: "custom=", wantPrefix: "custom"},
+	}
+	for iter, tc := range iterCases {
 		checkpointDir := filepath.Join(testDir, fmt.Sprintf("checkpoint-%d", iter))
 		if err := os.MkdirAll(checkpointDir, 0777); err != nil {
 			t.Fatalf("iter %d: os.MkdirAll failed: %v", iter, err)
 		}
 
-		checkpointWaiter := make(chan error, 1)
-		go func() {
-			checkpointWaiter <- conts[1].WaitCheckpoint()
-		}()
-
 		// Checkpoint root container with SplitFSCheckpointPaths targeting both
 		// sub-containers' tmpfs mounts.
 		checkpointOpts := sandbox.CheckpointOpts{
 			Compression: statefile.CompressionLevelDefault,
-			SplitFSCheckpointPaths: []checkpoint.ResourceID{
-				{ContainerName: container1Name, Path: tmpfsMount1},
-				{ContainerName: container2Name, Path: tmpfsMount2},
+			SplitFSCheckpointPaths: []string{
+				tc.specPrefix + container1Name + ":" + tmpfsMount1,
+				tc.specPrefix + container2Name + ":" + tmpfsMount2,
 			},
 		}
 		if err := conts[0].Checkpoint(conf, checkpointDir, checkpointOpts); err != nil {
 			t.Fatalf("iter %d: error checkpointing container: %v", iter, err)
 		}
 
-		select {
-		case waitErr := <-checkpointWaiter:
-			if waitErr != nil {
-				t.Errorf("iter %d: error waiting for checkpoint to complete: %v", iter, waitErr)
-			}
-		case <-time.After(10 * time.Second):
-			t.Fatalf("iter %d: timed out waiting for checkpoint to complete", iter)
-		}
-
-		checkFSCheckpointFiles(t, checkpointDir)
+		checkFSCheckpointFiles(t, checkpointDir, tc.wantPrefix)
 
 		lastNum1, err := readOutputNum(outputPath1, -1)
 		if err != nil {
