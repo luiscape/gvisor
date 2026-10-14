@@ -141,13 +141,13 @@ logic and its tests port nearly as they are.
 - **The sequence.** As in section 3.2, with today's code: parallel lock with
   `--timeout 30000`, sequential checkpoint stopping at the first failure,
   `--get-state` of the rest, restore only the checkpointed, unlock all
-  (`checkpointLocked`, R11); the 2-minute bound on `--get-state`, lock and
+  (`checkpointLocked`); the 2-minute bound on `--get-state`, lock and
   unlock; the unwind and the "torn down" refusal.
 - **The markers.** Opened as `cudaShimFS` does today (directory without
   following a symlink, one component at a time, `O_NOFOLLOW | O_NONBLOCK`,
   regular files with one link): the hook runs as root in a directory any
   container user can write to.
-- **The protocol version** (N22) stays, now between `mcshim-ckpt` and
+- **The protocol version** (`mcshim protocol N` in `present.<pid>`) stays, now between `mcshim-ckpt` and
   `libmcshim` from the same repository; it catches an image whose `.so`
   and hook come from different releases.
 - **`cuda-checkpoint`'s path**: an argument or environment variable set by
