@@ -1,22 +1,26 @@
-# Design: a generic in-container checkpoint hook
+# Multi-GPU CUDA checkpoint/restore: plan
+
+Dev-only: not part of any upstream PR.
 
 | | |
 | :--- | :--- |
-| Status | Implemented on the branch (CPU-tested; not yet validated on GPUs); D1-D4 decided, D5 pending |
+| Status | Implemented on the branch, CPU-tested; GPU validation, design review and PR cutting remain (section 8) |
 | Date | 2026-10-14 |
-| Branch | `luis/multicast-xgpu-upstream` at `12146bebf` (upstream `a9f9fd444` merged) |
-| Related | `mcshim-merge-plan.md`, `mcshim-split-plan.md` |
+| Branch | `luis/multicast-xgpu-upstream` (github.com/luiscape/gvisor), current with upstream `master` |
+| mcshim | github.com/modal-projects/mcshim (interposer and `mcshim-ckpt`) |
+| Upstream proposal | `g3doc/proposals/cuda_multigpu_checkpoint.md` |
+| History | The earlier merge plan, split plan and status file (requirements R1-R25, N1-N22, the sentry-driven design) were removed in the commit after `28c39e73c`; see git history |
 
 ## 1. Summary
 
-Today the sentry carries mcshim's whole checkpoint protocol: it gates the
+The sentry used to carry mcshim's whole checkpoint protocol: it gates the
 application, locks every process, has the interposer tear down its state,
 re-locks, checkpoints, and reverses all of it on restore, through marker files
 in `/tmp/mcshim`. That is about 1,700 lines in `pkg/sentry/control`, plus a
 blocker inventory in nvproxy, and every future `cuda-checkpoint` release that
 learns to carry more state would mean removing more of it.
 
-This design replaces it with a **generic hook**: a program inside the
+It was replaced by a **generic hook**: a program inside the
 container that runsc runs at fixed points of a checkpoint and a restore. gVisor
 keeps only what it alone can do (run the hook with the container's namespaces,
 hold page faults while GPU state is away, unpause a paused kernel, compute the
@@ -32,7 +36,7 @@ blocker inventory is removed.
 | Piece | Why gVisor | PR |
 | :--- | :--- | :--- |
 | `--device-map` on restore | Only runsc knows how GPUs were remapped | #14817 (unchanged) |
-| `cuda-checkpoint --launch-job` wrap, its checks, and refusing checkpoints while a GPU container could not be wrapped | Must happen when the container starts | #13987, updated with R16, R17, R20 |
+| `cuda-checkpoint --launch-job` wrap, its checks, and refusing checkpoints while a GPU container could not be wrapped | Must happen when the container starts | #13987, updated (GPU containers only; skip with a warning if `cuda-checkpoint` is missing or the entrypoint is `--exec-fd`; absolute paths) |
 | Export identity in nvproxy and the `nvproxy_exported_object` fdinfo line | Only the sentry sees RM objects | nvproxy PR (reduced, section 6) |
 | The checkpoint hook | This design | New |
 
@@ -124,6 +128,8 @@ Net: the gVisor changes go from about 3,600 lines (without #14817) to about
 
 ## 4. `mcshim-ckpt` (in the mcshim repository)
 
+Implemented in mcshim (`cmd/mcshim-ckpt`, `internal/ckpt`), CPU-tested.
+
 A static Go binary (`cmd/mcshim-ckpt`): static so that `/etc/ld.so.preload`
 does not load the interposer into it, and Go so that the existing sentry
 logic and its tests port nearly as they are.
@@ -193,34 +199,77 @@ Implementation notes (differences from sections 3-6):
   `execInContainerOf` helper (also used by the hook) that skips a thread
   group whose leader has exited.
 
-## 8. Plan
+## 8. Remaining work
 
-1. **Design review** with a gVisor maintainer (D3, D5).
-2. **mcshim**: write `mcshim-ckpt` by porting the Go code, with CPU tests
-   against fakes; add the interposer change for section 5.
-3. **gVisor**, on the branch:
-   - remove the blocker inventory, import tracking and, per D2,
-     `TrackExports`;
-   - add the hook (flag, runner, sequence, checkpoint keys) and tests with a
-     fake hook (a shell script per phase);
-   - remove `state_cuda_shim.go`, the interposer sequence, and, per D1, the
-     preload flag;
-   - give #13987 its own enable flag (D4).
-4. **GPU validation**: the full matrix from the merge plan's section 7.4,
-   now with `runsc --checkpoint-hook` and `mcshim-ckpt`.
-5. **Merge plan**: rewrite the PR list (section 9).
+### 8.1 GPU validation
 
-Rough effort (estimates, not measured): `mcshim-ckpt` 3-5 days; gVisor
-changes 2-3 days; GPU validation 2 days.
+Nothing above has run on a GPU. On an H100 x8 host with driver R610, with
+`runsc --nvproxy --cuda-checkpoint-path=... --cuda-checkpoint-job=launch
+--checkpoint-hook=/opt/mcshim/mcshim-ckpt`, the operator preloading
+`mcshim.so` (`LD_PRELOAD` and a read-only `/etc/ld.so.preload` bind mount):
 
+1. **One checkpoint and restore first**, to confirm what CPU tests cannot:
+   `mcshim-ckpt` finds CUDA processes through `/proc/<pid>/fd` inside gVisor;
+   the `/etc/ld.so.preload` bind mount works (it may need a mount point in
+   the image); page faults are held across `checkpoint` and `restore` and
+   released before `resume`.
+2. **mcshim's suite**: `make test`, `make test-docker`, and `test/run.sh`
+   with `-r RUNSC` (stub tests: `deadline`, `reason`, `undo`, `optout`).
+3. **Failure paths through runsc**: a hook exiting 1 (resume runs, the
+   application keeps running), exiting 2 (no resume), a hung `--get-state`,
+   and Docker's pause-then-checkpoint flow.
+4. **Without the hook**: `--cuda-checkpoint-path` alone (one `--toggle` per
+   process, as #14817), and `--cuda-checkpoint-job=launch` without a hook; a
+   GPU container whose image lacks `cuda-checkpoint` starts and checkpoints
+   are refused naming it; a pod's pause container is not wrapped.
+5. **The matrix**: the 15 engine configurations and the 3 without
+   `CAP_SYS_PTRACE`; Qwen2.5-72B at TP=8 on vLLM and SGLang; restores onto
+   other GPUs (`--device-map` through the hook); a tokens/s comparison with
+   and without the interposer.
+6. Update the proposal's validation tables, which are from the
+   sentry-driven design.
+
+R615 is a separate run before deploying there.
+
+### 8.2 Upstream
+
+- **#14817** (`--device-map`): open, labelled *ready to pull*, no review
+  comments. Ping a maintainer; PR4 depends on its `cudaCheckpointDeviceMap`.
+- **#13987** (job wrap): its flags (`nvproxy-cuda-checkpoint-*`) no longer
+  match. Update it to PR2 below, or close it in favour of PR2.
+- **Design review (D5)** of the proposal before opening PR4.
+
+### 8.3 Cutting the PRs
+
+Each from `master`, not from this branch's history; this file stays out.
+
+| PR | Files from the branch |
+| :--- | :--- |
+| PR1 | #14817 as is |
+| PR2 | `runsc/config` (`CUDACheckpointJob`, `--cuda-checkpoint-job`, validation, tests); `runsc/boot/loader.go` (`setupCudaCheckpointJob`, `cudaJobSkipped`, `containerFileExists`) and `loader_test.go`; `runsc/boot/restore.go` (sequential and refusal in `save`) |
+| PR3 | `pkg/sentry/devices/nvproxy/exported_objects.go` and test, the export handlers in `version.go`, `frontendFD.exportedObj`, `pkg/abi/nvgpu/ctrl.go` constants, `pkg/sentry/fsimpl/proc/task_fds.go` |
+| PR4 | `pkg/sentry/control/state_hook.go` and test, `execInContainerOf`/`openNullFD` in `state_cuda.go`, `state.go`, `pkg/sentry/state/state.go`, `--checkpoint-hook` (config, flags, `save`), the proposal and user guide |
+
+### 8.4 Gaps
+
+- The hook's kernel-backed code (`gpuProcs`, `kernelHookOps`,
+  `preSaveHook`, `postRestoreHook`, the failed-save undo) has no automated
+  test: it needs NVIDIA device fds. Reviewers may ask for a runsc container
+  test with a fake hook.
+- The hook path is sandbox-wide (the root container's config), and runs only
+  in containers with an NVIDIA device open.
+- mcshim no longer refuses an import whose exporter is gone at checkpoint
+  time (formerly nvproxy's `UnresolvableImports`): the rebuild fails in
+  `resume` instead, leaving the application gated. TODO in `mcshim-ckpt`
+  (interposers listing their export and import identities).
 ## 9. Resulting PRs
 
 | PR | Contents | Approx. lines |
 | :--- | :--- | :--- |
-| PR0 | #14817, `--device-map` on restore | 300 (done) |
-| PR1 | Design: the hook, the fdinfo line, the job wrap | Docs |
-| PR2 | #13987, the `cuda-checkpoint --launch-job` wrap, with R16, R17, R20 and its enable flag | 300 |
+| PR1 | #14817, `--device-map` on restore | 300 (open) |
+| PR2 | #13987, the `cuda-checkpoint --launch-job` wrap, with its checks and enable flag | 300 |
 | PR3 | nvproxy: export identity and the fdinfo line | 400 |
 | PR4 | The checkpoint hook | 450 |
 
-Down from nine code PRs to four, none of which mentions multicast or mcshim.
+Four code PRs (the design doc goes with PR4), none of which mentions
+multicast or mcshim.
