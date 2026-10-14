@@ -10,6 +10,12 @@
 
 ## 1. Summary
 
+> **Superseded in part (2026-10-14).** The interposer protocol is to move out
+> of gVisor behind a generic in-container checkpoint hook, and the blocker
+> inventory is to be removed: see `mcshim-hook-design.md`. The PR list below
+> (section 7) is replaced by that document's section 9 once the design is
+> agreed.
+
 The branch makes `runsc checkpoint` and `runsc restore` work for single-node,
 multi-process, multi-GPU CUDA workloads (tensor-parallel vLLM and SGLang),
 including restore onto different GPUs. It has been validated end to end on
