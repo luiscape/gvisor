@@ -37,7 +37,7 @@ blocker inventory is removed.
 | :--- | :--- | :--- |
 | `--device-map` on restore | Only runsc knows how GPUs were remapped | #14817 (unchanged) |
 | `cuda-checkpoint --launch-job` wrap, its checks, and refusing checkpoints while a GPU container could not be wrapped | Must happen when the container starts | #13987, updated (GPU containers only; skip with a warning if `cuda-checkpoint` is missing or the entrypoint is `--exec-fd`; absolute paths) |
-| Export identity in nvproxy and the `nvproxy_exported_object` fdinfo line | Only the sentry sees RM objects | nvproxy PR (reduced, section 6) |
+| Export identity in nvproxy and the `nvproxy_exported_object` fdinfo line | Only the sentry sees RM objects | #15761 (section 6) |
 | The checkpoint hook | This design | New |
 
 ## 3. The hook
@@ -124,7 +124,8 @@ Added: the hook flag, its validation, the hook runner (generalizing
 above, and tests, about 450 lines.
 
 Net: the gVisor changes go from about 3,600 lines (without #14817) to about
-1,300, of which about 300 are #13987 and 400 are nvproxy's export identity.
+1,300, of which about 450 are #13987 and 180 are nvproxy's export identity
+(#15761).
 
 ## 4. `mcshim-ckpt` (in the mcshim repository)
 
@@ -170,7 +171,7 @@ driving runsc with `--checkpoint-hook`.
 ## 6. nvproxy after the change
 
 Kept: when an object is exported into an fd (`EXPORT_OBJECT(S)_TO_FD`), record
-its (client, object, class) on the fd, and report it in
+its (client, object) on the fd, and report it in
 `/proc/[pid]/fdinfo/[fd]` to readers with ptrace access, as Linux does for
 dma-buf. Removed: import tracking (`importedObject`, the two import
 handlers, which return to upstream's `ctrlHasFrontendFD`), `rootClient.tgid`,
@@ -235,8 +236,8 @@ R615 is a separate run before deploying there.
 
 - **#14817** (`--device-map`): open, labelled *ready to pull*, no review
   comments. Ping a maintainer; PR4 depends on its `cudaCheckpointDeviceMap`.
-- **#13987** (job wrap): its flags (`nvproxy-cuda-checkpoint-*`) no longer
-  match. Update it to PR2 below, or close it in favour of PR2.
+- **#15761** (fdinfo line): open.
+- **#13987** (job wrap): updated to `--cuda-checkpoint-job=launch`; open.
 - **Design review (D5)** of the proposal before opening PR4.
 
 ### 8.3 Cutting the PRs
@@ -246,8 +247,8 @@ Each from `master`, not from this branch's history; this file stays out.
 | PR | Files from the branch |
 | :--- | :--- |
 | PR1 | #14817 as is |
-| PR2 | `runsc/config` (`CUDACheckpointJob`, `--cuda-checkpoint-job`, validation, tests); `runsc/boot/loader.go` (`setupCudaCheckpointJob`, `cudaJobSkipped`, `containerFileExists`) and `loader_test.go`; `runsc/boot/restore.go` (sequential and refusal in `save`) |
-| PR3 | `pkg/sentry/devices/nvproxy/exported_objects.go` and test, the export handlers in `version.go`, `frontendFD.exportedObj`, `pkg/abi/nvgpu/ctrl.go` constants, `pkg/sentry/fsimpl/proc/task_fds.go` |
+| PR2 | Done: #13987 (updated) |
+| PR3 | Done: #15761 |
 | PR4 | `pkg/sentry/control/state_hook.go` and test, `execInContainerOf`/`openNullFD` in `state_cuda.go`, `state.go`, `pkg/sentry/state/state.go`, `--checkpoint-hook` (config, flags, `save`), the proposal and user guide |
 
 ### 8.4 Gaps
@@ -267,8 +268,8 @@ Each from `master`, not from this branch's history; this file stays out.
 | PR | Contents | Approx. lines |
 | :--- | :--- | :--- |
 | PR1 | #14817, `--device-map` on restore | 300 (open) |
-| PR2 | #13987, the `cuda-checkpoint --launch-job` wrap, with its checks and enable flag | 300 |
-| PR3 | nvproxy: export identity and the fdinfo line | 400 |
+| PR2 | #13987, the `cuda-checkpoint --launch-job` wrap, with its checks and enable flag | 450 (open) |
+| PR3 | #15761, nvproxy: export identity and the fdinfo line | 180 (open) |
 | PR4 | The checkpoint hook | 450 |
 
 Four code PRs (the design doc goes with PR4), none of which mentions

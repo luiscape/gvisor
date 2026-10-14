@@ -261,7 +261,7 @@ exported, the object's identity in `/proc/[pid]/fdinfo/[fd]`, as Linux does
 for dma-buf, to readers allowed to ptrace the process:
 
 ```
-nvproxy_exported_object:	client=0xc1d00922 object=0x5c000123 class=0xfd
+nvproxy_exported_object:	client=0xc1d00922 object=0x5c000123
 ```
 
 Interposers use it to match imported memory with its export across a restore.

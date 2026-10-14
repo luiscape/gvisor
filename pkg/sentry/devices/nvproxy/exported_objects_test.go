@@ -15,66 +15,46 @@
 package nvproxy
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
 	"gvisor.dev/gvisor/pkg/context"
 )
 
-// TestProcFDInfoExtraFormat locks the fdinfo line format: userspace (e.g. the
-// checkpoint interposer at https://github.com/modal-projects/mcshim) parses it
-// to identify exported allocations across processes.
-func TestProcFDInfoExtraFormat(t *testing.T) {
-	exp := exportedObjInfo{
-		client: nvgpu.Handle{Val: 0xc1d00922},
-		object: nvgpu.Handle{Val: 0x5c000123},
-		class:  nvgpu.NV01_MEMORY_LOCAL_USER,
+// TestProcFDInfoExtra pins the fdinfo line, which userspace parses.
+func TestProcFDInfoExtra(t *testing.T) {
+	ctx := context.Background()
+	fd := &frontendFD{dev: &frontendDevice{nvp: &nvproxy{}}}
+	if got := fd.ProcFDInfoExtra(ctx); got != "" {
+		t.Errorf("ProcFDInfoExtra() without an export = %q, want empty", got)
 	}
-	got := procFDInfoExportedObjectLine(exp)
-	want := "nvproxy_exported_object:\tclient=0xc1d00922 object=0x5c000123 class=0x40\n"
-	if got != want {
-		t.Errorf("fdinfo line = %q, want %q", got, want)
+	fd.exported = exportedObject{client: nvgpu.Handle{Val: 0xc1d00922}, object: nvgpu.Handle{Val: 0x5c000123}}
+	want := "nvproxy_exported_object:\tclient=0xc1d00922 object=0x5c000123\n"
+	if got := fd.ProcFDInfoExtra(ctx); got != want {
+		t.Errorf("ProcFDInfoExtra() = %q, want %q", got, want)
 	}
 }
 
-// TestExportedObj covers what an export records on an fd, and what fdinfo then
-// shows: the exported object's identity, with its class if nvproxy tracks it;
-// nothing for an fd without an export, or one cleared by a zero handle.
-func TestExportedObj(t *testing.T) {
-	ctx := context.Background()
-	nvp := &nvproxy{clients: make(map[nvgpu.Handle]*rootClient)}
-	fi := &frontendIoctlState{fd: &frontendFD{dev: &frontendDevice{nvp: nvp}}, ctx: ctx}
-	clientH := nvgpu.Handle{Val: 0xc1d00001}
-	c := &rootClient{resources: make(map[nvgpu.Handle]*object)}
-	nvp.clients[clientH] = c
-	memH := nvgpu.Handle{Val: 0x5c000001}
-	c.objsMu.Lock()
-	nvp.objAdd(ctx, c, clientH, nvgpu.NV01_ROOT_CLIENT, c, nvgpu.Handle{Val: nvgpu.NV01_NULL_OBJECT})
-	nvp.objAdd(ctx, c, memH, nvgpu.NV_MEMORY_MULTICAST_FABRIC, &miscObject{}, clientH)
-	c.objsMu.Unlock()
-
-	fd := &frontendFD{dev: &frontendDevice{nvp: nvp}}
-	if got := fd.ProcFDInfoExtra(ctx); got != "" {
-		t.Errorf("ProcFDInfoExtra() before any export = %q, want empty", got)
+func TestObjectExported(t *testing.T) {
+	var single nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS
+	single.Object.Type = nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM
+	binary.LittleEndian.PutUint32(single.Object.Data[8:], 0x5c000001)
+	if h, ok := objectExported(&single); !ok || h.Val != 0x5c000001 {
+		t.Errorf("objectExported() = %v, %v, want 0x5c000001, true", h, ok)
+	}
+	single.Flags = nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_FLAGS_EMPTY_FD
+	if _, ok := objectExported(&single); ok {
+		t.Errorf("objectExported() with EMPTY_FD = _, true, want false")
 	}
 
-	exp := exportedObjOf(fi, clientH, memH)
-	want := exportedObjInfo{client: clientH, object: memH, class: nvgpu.NV_MEMORY_MULTICAST_FABRIC}
-	if exp != want {
-		t.Fatalf("exportedObjOf() = %+v, want %+v", exp, want)
+	batch := nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECTS_TO_FD_PARAMS{NumObjects: 2}
+	batch.Objects[0] = nvgpu.Handle{Val: 0x5c000002}
+	if h, ok := objectsExported(&batch); !ok || h.Val != 0x5c000002 {
+		t.Errorf("objectsExported() = %v, %v, want 0x5c000002, true", h, ok)
 	}
-	setExportedObj(nvp, fd, exp)
-	if got, want := fd.ProcFDInfoExtra(ctx), procFDInfoExportedObjectLine(want); got != want {
-		t.Errorf("ProcFDInfoExtra() = %q, want %q", got, want)
-	}
-
-	unknown := nvgpu.Handle{Val: 0xc1d00002}
-	if got := exportedObjOf(fi, unknown, memH); got != (exportedObjInfo{client: unknown, object: memH}) {
-		t.Errorf("exportedObjOf(unknown client) = %+v, want the handles only", got)
-	}
-
-	setExportedObj(nvp, fd, exportedObjOf(fi, clientH, nvgpu.Handle{}))
-	if got := fd.ProcFDInfoExtra(ctx); got != "" {
-		t.Errorf("ProcFDInfoExtra() after clearing = %q, want empty", got)
+	batch.Index = 1
+	if _, ok := objectsExported(&batch); ok {
+		t.Errorf("objectsExported() past slot 0 = _, true, want false")
 	}
 }

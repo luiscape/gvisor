@@ -26,7 +26,7 @@ This proposal adds three small, generic pieces to gVisor:
 2.  **A checkpoint hook**: a program inside the container that runsc runs in
     place of the built-in `cuda-checkpoint` handling, at fixed points of a
     checkpoint and a restore.
-3.  **Exported-object identity in fdinfo** (nvproxy): which RM object an
+3.  **Exported-object identity in fdinfo** (nvproxy, #15761): which RM object an
     exported fd carries, as Linux reports for dma-buf.
 
 The rest, an interposer that releases multicast groups and imported memory
@@ -150,7 +150,7 @@ reports it in `/proc/[pid]/fdinfo/[fd]` to readers allowed to ptrace the
 process, as Linux does for dma-buf:
 
 ```
-nvproxy_exported_object:	client=0xc1d00922 object=0x5c000123 class=0xfd
+nvproxy_exported_object:	client=0xc1d00922 object=0x5c000123
 ```
 
 Exporters and importers read the same line, since they share the file
@@ -301,7 +301,7 @@ As independent PRs, each inert unless its flag is set:
 
 1.  `--device-map` on restore (#14817).
 2.  `cuda-checkpoint` jobs (#13987, updated).
-3.  Exported-object identity and the fdinfo line (nvproxy, `fsimpl/proc`).
+3.  Exported-object identity and the fdinfo line (#15761).
 4.  The checkpoint hook (`pkg/sentry/control`, `runsc`).
 
 ## Appendix: operational notes

@@ -245,15 +245,7 @@ type NV0000_CTRL_OS_UNIX_EXPORT_OBJECT struct {
 
 // From src/common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000unix.h:
 const (
-	// NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM is the
-	// NV0000_CTRL_OS_UNIX_EXPORT_OBJECT.Type value for which Data is
-	// struct {hDevice, hParent, hObject Handle}.
-	NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM = 1
-
-	// NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_FLAGS_EMPTY_FD is the
-	// EMPTY_FD flag bit in NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS.Flags:
-	// the fd is created without an associated object (objects are attached
-	// later, e.g. by NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECTS_TO_FD).
+	NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM              = 1
 	NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_FLAGS_EMPTY_FD = 0x1
 )
 
