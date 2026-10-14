@@ -1,6 +1,6 @@
 # Multi-GPU CUDA Checkpoint/Restore
 
-Status as of 2026-10-05: Draft, seeking feedback on the
+Status as of 2026-10-14: Draft, seeking feedback on the
 [open questions](#open-questions).
 
 ## Synopsis
@@ -16,20 +16,31 @@ gVisor already checkpoints CUDA processes by running NVIDIA's
 That works for processes that share no GPU state. Multi-GPU workloads do share
 it: ranks map each other's GPU memory and, on NVSwitch systems, create NVLink
 multicast groups, and `cuda-checkpoint` can neither checkpoint nor restore
-that state. This proposal adds an opt-in interposer, preloaded into the
-container's CUDA processes, that releases this state through the CUDA driver
-API before `cuda-checkpoint` runs and rebuilds it at identical virtual
-addresses after restore, plus the sentry support to drive it. Legacy CUDA IPC
-is left to `cuda-checkpoint` itself: R610 carries it for processes in the same
-*job*, which runsc arranges with `--cuda-checkpoint-path` (#13987).
+that state.
+
+This proposal adds three small, generic pieces to gVisor:
+
+1.  **`cuda-checkpoint` jobs** (#13987): run each GPU container in a
+    `cuda-checkpoint --launch-job` job, which lets R610's `cuda-checkpoint`
+    carry legacy CUDA IPC.
+2.  **A checkpoint hook**: a program inside the container that runsc runs in
+    place of the built-in `cuda-checkpoint` handling, at fixed points of a
+    checkpoint and a restore.
+3.  **Exported-object identity in fdinfo** (nvproxy): which RM object an
+    exported fd carries, as Linux reports for dma-buf.
+
+The rest, an interposer that releases multicast groups and imported memory
+before the checkpoint and rebuilds them at identical virtual addresses after
+restore, and the hook that drives it and `cuda-checkpoint`, lives outside
+gVisor, in [mcshim](https://github.com/modal-projects/mcshim), much as
+`cuda-checkpoint` does.
 
 Non-goals:
 
 -   Multi-node / MNNVL (IMEX, fabric-handle memory shared across hosts).
 -   NVIDIA drivers older than R610.
 -   Checkpointing device memory contents. That remains `cuda-checkpoint`'s job.
--   Isolation. The interposer runs in the container's trust domain and is not
-    a security boundary.
+-   Isolation. Hooks and interposers run in the container's trust domain.
 
 ## Background
 
@@ -51,8 +62,7 @@ exports; it cannot carry managed memory ("operation not supported").
 Both engines hit this in their default configurations. vLLM 0.29.0 at TP=2
 dispatches all-reduce to FlashInfer, custom and symmetric-memory backends
 ahead of NCCL, and one rank holds 4 multicast objects; SGLang 0.5.20 at TP=4
-holds 2. Without the interposer, the blocker inventory refuses the checkpoint
-in both cases. Avoiding all of this means disabling
+holds 2. Without the interposer, `cuda-checkpoint` hangs in both cases. Avoiding all of this means disabling
 NVLS, custom all-reduce and symmetric memory in the engine and forcing NCCL off
 its IPC transports, which gives up the intra-node NVLink paths these engines
 are built around.
@@ -79,253 +89,86 @@ sentry free or recreate RM objects on the application's behalf.
 
 ## Design
 
-```mermaid
-flowchart TD
-    subgraph runsc
-        F["flags: --cuda-checkpoint-path, --cuda-multicast-shim-path"] --> L["Loader: cuda-checkpoint job wrap, preload mcshim.so"]
-    end
-    subgraph Sentry
-        S["control: preSaveCuda / postRestoreCuda"] -->|exec| CC[cuda-checkpoint]
-        S --> N["nvproxy: blocker inventory, exported objects"]
-    end
-    subgraph "Container (each rank)"
-        A["app: NCCL, PyTorch, engine"] --> M[mcshim.so]
-        M --> LC[libcuda]
-    end
-    L --> M
-    S <-->|"marker files in /tmp/mcshim"| M
-    M <-->|"pidfd_getfd: re-exported fds"| P["peer ranks' mcshim"]
-    LC -->|ioctls| N
-    CC -->|ioctls| N
-    N --> H[host NVIDIA driver]
+### `cuda-checkpoint` jobs (runsc)
+
+`--cuda-checkpoint-job=launch`, with `--cuda-checkpoint-path`, wraps the
+command of each container given GPU access in `cuda-checkpoint --launch-job`
+on driver R610 or newer, and makes `runsc checkpoint` run `cuda-checkpoint`
+one process at a time, as jobs require (in parallel, SGLang's restore fails).
+A GPU container that cannot be wrapped (its image lacks `cuda-checkpoint`, or
+its entrypoint is `--exec-fd`) still starts, outside a job, and checkpoints
+are refused while it exists: `cuda-checkpoint` hangs on legacy IPC outside a
+job. Containers without GPU access (a pod's pause container, sidecars) are
+never wrapped.
+
+### The checkpoint hook (`pkg/sentry/control`)
+
+`--checkpoint-hook=PATH` names a program inside each GPU container. With it,
+the sentry does not run `cuda-checkpoint` itself; for each container with a
+process holding an NVIDIA device open, it runs the hook with the container's
+mount and PID namespaces and environment:
+
+Phase                               | When                                                         | Page faults
+----------------------------------- | ------------------------------------------------------------ | -----------
+`<hook> checkpoint`                 | before the sandbox is saved                                  | held
+`<hook> restore [--device-map MAP]` | after a restore, or a save with `--resume` (successful or not) | held
+`<hook> resume`                     | after `restore` has finished in every container              | released
+
+`MAP` is the `--device-map` value `cuda-checkpoint` takes (#14817), passed
+when the sandbox was restored onto different GPUs.
+
+Page faults of the GPU processes are held (`ThreadGroup.SigsegvLock`) while
+their GPU memory is away, as for the built-in path. That is the one ordering
+constraint the sentry imposes: work that touches GPU memory faults forever
+while they are held (every rank failed with `CUDA_ERROR_ILLEGAL_ADDRESS` when
+an interposer rebuilt its state before they were released), so it belongs in
+`resume`.
+
+`checkpoint` exits 0 on success. Status 1 means it failed and undid its work,
+except for what `resume` completes, which the sentry then runs, after
+releasing page faults; the application keeps running. Any other status (or a
+crash) means it could not undo its work: the sentry does not run `resume`, and
+the application may be left blocked. If one container's `checkpoint` fails
+after another's succeeded, the sentry runs `restore` and `resume` in the
+latter. A failed `restore` or `resume` fails the restore, which kills the
+sandbox, as a failed `cuda-checkpoint` restore does today. The hook has no
+time limit: its duration grows with GPU memory, and it bounds its own steps.
+
+When the kernel is paused (Docker pauses before it checkpoints), the sentry
+unpauses it around the hook, as it does for `cuda-checkpoint`. The hook's
+path and the processes it ran for are kept in the checkpoint, so `runsc
+restore` needs no flags.
+
+### Exported-object identity (nvproxy)
+
+Every fd that `cuMemExportToShareableHandle` returns is an open of
+`/dev/nvidiactl`: `fstat` cannot tell them apart, and a process that receives
+one over `SCM_RIGHTS` cannot tell which allocation it carries. nvproxy records,
+when an RM object is exported into an fd
+(`NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT(S)_TO_FD`), the object's identity, and
+reports it in `/proc/[pid]/fdinfo/[fd]` to readers allowed to ptrace the
+process, as Linux does for dma-buf:
+
+```
+nvproxy_exported_object:	client=0xc1d00922 object=0x5c000123 class=0xfd
 ```
 
-### The interposer ([mcshim](https://github.com/modal-projects/mcshim))
+Exporters and importers read the same line, since they share the file
+description. An interposer uses it to pair each import with its export when
+it rebuilds them after a restore.
 
-A single C file (~2,600 lines, no CUDA toolkit dependency) that interposes 148
-exported CUDA driver symbols: 118 that submit GPU work or wait on it
-(launches, copies, memsets, stream memory operations and batches, with their
-per-thread-stream variants), which the gate blocks, and 30 that track state,
-refuse checkpoints, initialize, or resolve entry points. It is inert until a
-process calls `cuInit`.
+### mcshim (out of tree)
 
--   **Lookups.** torch, NCCL and ctypes resolve entry points with `dlsym`,
-    `cuGetProcAddress` or cudart's `cudaGetDriverEntryPoint*`. The
-    interposer redirects by the address a lookup returns, which identifies
-    the exact exported symbol and so its ABI: `cuMulticastBindMem` resolves
-    to the 7-argument `cuMulticastBindMem_v2` from CUDA 13.1, for example.
-    A lookup of a tracked entry point that returns a symbol without a
-    wrapper refuses checkpoints. A cudart resolver answers with its own
-    runtime's ABI, so each call goes to the runtime of the caller's own
-    dependencies, since libraries can load different runtimes `RTLD_LOCAL`.
--   **Tracking.** VMM allocations, mappings and access (`cuMemCreate`,
-    `cuMemMap`, `cuMemSetAccess`, `cuMemUnmap`, `cuMemRetainAllocationHandle`,
-    `cuMemRelease`), multicast groups (`cuMulticastCreate`, `AddDevice`,
-    `BindMem`, `BindAddr` and their `_v2` forms, `Unbind`), and VMM
-    export/import. Legacy IPC is not interposed. Tracking is live state: an
-    object is forgotten once it has no application reference, mapping or
-    bind. Tables grow on demand (up to 1M entries each) and are indexed, so
-    no wrapper scans them: 100,000 live allocations cost under 0.5 µs per
-    create, map or release. Running out makes every later checkpoint fail
-    up front.
--   **Suspend.** Unbind and release multicast groups, unmap (keeping the VA
-    reservations), and release imports.
-    Multicast-bound exporter allocations are copied to host memory (which the
-    checkpoint carries) and released, because a resident one fails its next
-    export after restore.
--   **Resume**, in phases across ranks: every exporter recreates its object,
-    re-exports it, and publishes the new fd number under the original
-    export's identity; importers copy the fd with `pidfd_getfd` and re-import;
-    every group gets its devices back, then every bind, then every mapping at
-    its original VA; finally the reference counts are restored.
-    `cuMulticastBindMem` blocks until every device has joined, so adding all
-    devices before any bind keeps ranks that hold groups in different orders
-    from deadlocking, and publishing before fetching does the same for
-    exports. `pidfd_getfd` needs ptrace access, which YAMA denies between
-    sibling processes, so exporters set `PR_SET_PTRACER_ANY` until the sentry
-    removes the gate after every process has resumed.
--   **Handles and references.** The application only sees the handle values
-    it was given: rebuilt objects get new driver handles, and every
-    handle-taking entry point translates. A new object whose driver handle
-    equals a live object's application value gets a synthetic value. The
-    interposer counts the application's references (create, import, retain,
-    release) and restores that count after a rebuild. Calls are issued from
-    each recorded device's primary context.
--   **Gate.** While armed, submission entry points and tracked mutators
-    block. Calls are counted from entry to return and arming waits for them
-    to drain, so no application thread can finish a call over the teardown
-    or create shared state after the sentry verified there is none. A
-    teardown or rebuild that fails partway leaves the application gated
-    rather than running on inconsistent state. The application is released
-    only when the sentry removes the gate, after every process has resumed: a
-    bind waits for every device to be added, not for every rank's memory to
-    be bound.
-
-Settings: `MCSHIM_LOG` (by default `/tmp/mcshim/mcshim.log`; the interposer is
-loaded into every process in the container, so it never prints),
-`MCSHIM_DISABLE`, `MCSHIM_ALLOW_FABRIC` (fabric-handle support is reported as
-absent by default, so frameworks choose POSIX fds).
-
-### Delivery and injection (runsc)
-
--   `--cuda-checkpoint-path` (#13987) names `cuda-checkpoint` inside the
-    container, which checkpoints default to. Alone it changes nothing else.
-    With `--cuda-multicast-shim-path` as well, on R610+, the loader wraps
-    each GPU container's command in `cuda-checkpoint --launch-job`, so that
-    its CUDA processes share a job, and checkpoints run it one process at a
-    time, as jobs require (in parallel, SGLang's restore fails).
--   `--cuda-multicast-shim-path` names the interposer inside the container,
-    which the operator provides there, in the image or through a mount; runsc
-    does not carry it. A restore needs the same bytes at the same path. The
-    `/etc/ld.so.preload` entry runsc adds lands in the rootfs overlay by
-    default, and in the user's rootfs on the host with `--overlay2=none`.
--   It requires `--cuda-checkpoint-path`: the interposer leaves legacy CUDA
-    IPC to `cuda-checkpoint`, which carries it only for processes in a job.
--   It applies only to containers given GPU access (not a pod's pause
-    container, even when nvproxy is enabled for the whole sandbox), and logs
-    a warning and does nothing on drivers older than R610.
--   A GPU container whose image lacks `cuda-checkpoint` (both paths must be
-    absolute) still starts, without the job or the interposer, and
-    checkpoints are refused while it exists: its processes would otherwise
-    be checkpointed outside a job.
--   The loader appends the interposer to `LD_PRELOAD` and to
-    `/etc/ld.so.preload`. The second is needed because launchers rewrite
-    `LD_PRELOAD` for exactly the worker processes that hold GPU state (SGLang's
-    `torch_memory_saver`), and the failure is silent: the checkpoint succeeds
-    and the restore fails.
--   Preloaded into every process of the container, the interposer must change
-    nothing for the ones that never checkpoint: its `dlsym` forwards the
-    lookups it does not rewrite with a tail call, so `RTLD_NEXT` resolves
-    relative to the real caller, and it needs no glibc symbol version newer
-    than GLIBC_2.17 (CentOS 7, Amazon Linux 2), since one the image's glibc
-    lacks would make the dynamic linker fail every process at startup.
-
-### Control protocol
-
-The sentry and the interposer communicate through files in `/tmp/mcshim`,
-which must be part of the checkpoint image (not a host mount). Markers are
-existence-based and edge-triggered. The sentry drives the interposer in the
-processes that announced themselves (`present.<pid>`), whose one line,
-`mcshim protocol N`, is the only content the sentry parses: runsc and the
-interposer ship separately, so the sentry refuses a checkpoint, before gating
-anything, if any interposer speaks another version, and fails a restore
-rather than drive a rebuild it may get wrong.
-
-File                                | Writer      | Meaning
------------------------------------ | ----------- | -------
-`gate`                              | sentry      | created: block GPU submission, drain calls in flight, check the state can be carried; removed: release the application
-`suspend`                           | sentry      | created: tear down; removed: rebuild
-`present.<pid>`                     | interposer  | this process participates; carries the protocol version
-`gated.<pid>`                       | interposer  | gate armed and drained
-`suspended.<pid>`, `resumed.<pid>`  | interposer  | teardown / rebuild finished
-`error.<pid>`                       | interposer  | the transition failed; the sentry fails fast
-
-The markers live in the container filesystem, so they are part of the
-checkpoint: after restore the interposer stays suspended, and the application
-gated, until the sentry removes them.
-
-### Checkpoint and restore sequence
-
-```mermaid
-sequenceDiagram
-    participant S as Sentry
-    participant C as cuda-checkpoint
-    participant M as mcshim (each rank)
-    Note over S: checkpoint
-    S->>S: collect CUDA processes
-    S->>M: create gate
-    M-->>S: gated.pid
-    S->>S: every import's exported object must still exist
-    S->>C: lock all ranks in parallel
-    S->>C: unlock
-    S->>M: create suspend
-    M->>M: release multicast and imports, keep VAs
-    M-->>S: suspended.pid
-    S->>S: blocker inventory must be empty
-    S->>C: lock, then checkpoint one process at a time
-    S->>S: save sandbox
-    Note over S: restore
-    S->>C: one process at a time: toggle, or restore with --device-map, then unlock
-    S->>M: remove suspend
-    M->>M: publish, re-import, re-bind, re-map at original VAs
-    M-->>S: resumed.pid
-    S->>M: remove gate
-    M->>M: release the application
-```
-
-The gate and the lock handle different halves of quiescing: the gate stops
-new submissions, and `cuda-checkpoint --action lock` drains work in flight. A
-rank gated just before a collective can starve peers already inside it; the
-lock then times out and the checkpoint fails. Checkpoints are therefore taken
-of a quiesced (asleep or idle) engine. The teardown runs between an unlock and
-a re-lock because it has to call libcuda, which a locked process cannot do.
-
-A failure before the teardown, or after it completed on every process,
-unwinds: unlock, rebuild, release the gate, and the application keeps running.
-A process whose state cannot be carried refuses the gate, before anything is
-torn down: a table overflow, an unknown entry-point ABI, memory-pool IPC,
-logical endpoints, non-POSIX-fd handles, sparse array mappings, managed
-memory, or references it could not restore (see mcshim's [design document](https://github.com/modal-projects/mcshim/blob/main/docs/design.md)).
-Once every process is gated, the sentry refuses an import whose exported
-object no longer exists in a process that runs the interposer, since nobody
-would re-export it after restore; with every process gated, none can free an
-object during the check. The sentry likewise refuses up front when a process
-that does not run the interposer holds multicast objects or imported memory.
-If the teardown itself fails partway, peers may already have released state
-the failed process needs, so nothing is rolled back: the application stays
-blocked, the checkpoint fails, later attempts are refused at once, and the
-workload must be restarted.
-
-Everything above is opt-in: it applies only when the interposer is enabled,
-which also turns on job mode. Without it, CUDA checkpoints are exactly as
-today: one unbounded `cuda-checkpoint --toggle` per process, no job, and no
-blocker inventory. With it, the checkpoint uses `cuda-checkpoint`'s two-phase
-lock/checkpoint instead of a per-process `--toggle`, because a rank spinning
-in a collective can only be quiesced while its peers are locking too, and
-the `cuda-checkpoint` invocations that precede saving GPU state
-(`--get-state`, lock, unlock) are bounded, since one killed there can be
-undone. Checkpoint and restore invocations are not: their duration grows with
-GPU memory, and killing one partway cannot be undone.
-Refusing up front what `cuda-checkpoint` would hang on, and bounding its
-invocations, would help without the interposer too; both are left for later,
-since they change the behavior of existing configurations.
-
-### nvproxy additions
-
--   **Exported-object identity.** Every fd from `cuMemExportToShareableHandle`
-    is an open of `/dev/nvidiactl`, so all of them share one inode, and a
-    process that receives one over `SCM_RIGHTS` cannot tell which allocation
-    it names. nvproxy already sees the `EXPORT_OBJECT(S)_TO_FD` controls; it
-    records the exported `(client, object)` per fd and exposes it in
-    `/proc/[pid]/fdinfo/[fd]`:
-
-    ```
-    nvproxy_exported_object:	client=0xc1d00922 object=0x5c000123 class=0x40
-    ```
-
-    This is the rendezvous key exporters and importers agree on after
-    restore. Linux precedent: dmabuf and DRM `show_fdinfo`. Without it the
-    interposer refuses the checkpoint.
-
--   **Imported objects.** nvproxy records objects imported through
-    `IMPORT_OBJECT(S)_FROM_FD` with the exported object they came from (by
-    object, not handle: libcuda reuses a freed handle at once). Imports are
-    checkpoint blockers, since `cuda-checkpoint` cannot restore them, and the
-    sentry checks that each import's source still exists before a teardown.
-
-Both are off unless the interposer is enabled (`nvproxy.Options.TrackExports`):
-without it, the export and import controls are proxied exactly as before and
-fdinfo shows nothing new. With it, the fdinfo line is shown only to a reader
-with ptrace access to the task, as Linux requires for fdinfo.
-
-This builds on #14525 (merged) and #14817 (approved) for restore onto other
-GPUs, and #14850 (merged), a control libcuda issues on NVSwitch systems when
-allocating and exporting VMM memory. It also uses a checkpoint blocker
-inventory, to be proposed separately: nvproxy reports, per process, the live
-multicast groups and fabric-memory imports that would make `cuda-checkpoint`
-hang or fail, including the imports above. Without the interposer the sentry
-refuses such a checkpoint up front; with it, the inventory verifies the
-teardown.
+[mcshim](https://github.com/modal-projects/mcshim) is the hook this was built
+for: an `LD_PRELOAD` interposer, which the operator preloads into the GPU
+containers (`LD_PRELOAD`, and `/etc/ld.so.preload` for launchers that rewrite
+the environment), and `mcshim-ckpt`, its hook. On `checkpoint`, `mcshim-ckpt`
+gates the application's GPU work, locks every process with `cuda-checkpoint`,
+has the interposer release multicast groups and imported memory (keeping the
+virtual address reservations), re-locks, and checkpoints one process at a
+time. On `restore` it restores every process with `cuda-checkpoint`; on
+`resume` it has the interposer rebuild its state at the same addresses and
+releases the gate. Its design, tests and limitations are documented there.
 
 ## Validation
 
@@ -339,8 +182,7 @@ engine to sleep, checkpoints, restores (onto other GPUs where listed), wakes
 it, and repeats the completion. A run passes if the output is identical and
 the sandbox is on the requested GPUs.
 
-All runs use `--cuda-checkpoint-path` (job mode) and the engines' custom
-all-reduce. TP=8 serves Qwen2.5-3B-Instruct, since the 1.5B model's 12
+All runs use job mode and the engines' custom all-reduce. TP=8 serves Qwen2.5-3B-Instruct, since the 1.5B model's 12
 attention heads do not split 8 ways.
 
 H100:
@@ -399,11 +241,11 @@ each of vLLM TP=4 and SGLang TP=4 with and without fusion), checkpoints took
 14.5 to 16.2 s instead of 12.1 to 13.2 s, and the first inference after
 restore 10.9 to 12.0 s instead of 8.6 to 9.2 s.
 
-The same engines without the interposer are refused at checkpoint (see
-[Background](#what-cuda-checkpoint-cannot-do)). The new nvproxy code (the
-blocker inventory and exported- and imported-object tracking) has unit tests,
-including one that pins the fdinfo line format.
-
+These results are from the previous revision of this proposal, in which the
+sentry drove the interposer itself (see
+[Alternatives](#alternatives-considered)). The hook runs the same sequence
+from inside the container; the matrix is to be rerun with it before the hook
+merges.
 ## Alternatives considered
 
 -   **RM-layer replay in nvproxy.** Rejected: see
@@ -424,47 +266,43 @@ including one that pins the fdinfo line format.
     but cost ~400 lines of interposer code that job mode makes unnecessary.
 -   **Disabling the features.** Works today, at the performance cost described
     above.
--   **Waiting for NVIDIA.** Preferred long term. The interposer is opt-in,
-    stores no persistent state format, and can be deleted once
+-   **The interposer's protocol in the sentry.** The previous revision of
+    this proposal had the sentry drive the interposer directly: marker files
+    in the container, the lock/teardown/checkpoint sequence, a protocol
+    version check, and an nvproxy inventory of objects `cuda-checkpoint`
+    would hang on (about 1,700 lines in `pkg/sentry/control` and 450 in
+    nvproxy). It worked, but put a CUDA-specific protocol in the sentry that
+    would have to shrink with every `cuda-checkpoint` release that carries
+    more state. The hook moves all of it into the container.
+-   **Waiting for NVIDIA.** Preferred long term. With the hook, gVisor carries
+    nothing interposer-specific, so nothing in gVisor has to be removed when
     `cuda-checkpoint` handles this state itself.
 
 ## Open questions
 
-1.  **Where the interposer lives.** Out of tree, in its own repository
-    ([mcshim](https://github.com/modal-projects/mcshim)), like
-    `cuda-checkpoint`: runsc only preloads the path it is given, and checks
-    the protocol version the interposer announces. gVisor defines the
-    protocol. Acceptable, or should it live in-tree?
-2.  **Writing `/etc/ld.so.preload`** into the container rootfs (into the
-    overlay by default; into the host rootfs with `--overlay2=none`).
-    `LD_PRELOAD` alone fails silently for SGLang. Acceptable, or behind its
-    own flag, or refused without a rootfs overlay?
-3.  **Marker files as the control channel.** Chosen because the `suspend`
-    marker is naturally part of the checkpoint, it needs no new sentry ABI,
-    and forged markers only affect the container's own checkpoint. Would a
-    sentry-provided device or socket be preferred?
-4.  **The fdinfo line as a `/proc` contract.** It is now shown only with the
-    interposer enabled, and only to readers with ptrace access. Acceptable?
-5.  **Testing.** mcshim's own tests drive the interposer through the marker
-    protocol on two NVLS GPUs (lookup ABIs, gate draining, multicast rebuild,
-    references, refusals, two-process imports), and checks that
-    `runsc checkpoint` refuses an import nobody would re-export. End-to-end
-    coverage needs
-    multiple GPUs on an NVSwitch host. Is a hardware-gated `test/gpu` target
-    acceptable, with unit tests for the rest?
+1.  **A generic hook.** Is `--checkpoint-hook` acceptable as a runtime
+    feature, given that it runs a container-provided program during a
+    checkpoint? Should it be CUDA-specific in name
+    (`--cuda-checkpoint-hook`), since it runs only in GPU containers and its
+    `restore`/`resume` split exists for GPU memory?
+2.  **Where the hook runs.** In each container with a process holding an
+    NVIDIA device open. Should it instead run in every container, or only in
+    containers that opt in through an annotation?
+3.  **The fdinfo line as a `/proc` contract.** Always shown, to readers with
+    ptrace access, like dma-buf's. Acceptable?
+4.  **Testing.** The sentry's hook sequence has unit tests against a fake
+    hook; the job wrap and fdinfo line have unit tests; mcshim tests its own
+    sequence on CPU against fakes, and end to end on GPUs. Is a
+    hardware-gated `test/gpu` target wanted in gVisor as well?
 
 ## Rollout
 
-Once the open questions are settled, as independent PRs, each inert unless
-the interposer flag is set:
+As independent PRs, each inert unless its flag is set:
 
-1.  Exported- and imported-object tracking and the fdinfo line (nvproxy,
-    `fsimpl/proc`).
-2.  Two-phase lock/checkpoint, then the
-    sentry control protocol and interposer sequencing (`pkg/sentry/control`).
-3.  The `cuda-checkpoint` job wrap (#13987), then the preload flag
-    (`runsc/boot`, `runsc/config`).
-The interposer itself is released from its own repository.
+1.  `--device-map` on restore (#14817).
+2.  `cuda-checkpoint` jobs (#13987, updated).
+3.  Exported-object identity and the fdinfo line (nvproxy, `fsimpl/proc`).
+4.  The checkpoint hook (`pkg/sentry/control`, `runsc`).
 
 ## Appendix: operational notes
 
@@ -475,7 +313,7 @@ The interposer itself is released from its own repository.
     load may fail the lock phase; the application keeps running.
 -   Only a single checkpoint then restore is validated. Chained restores,
     resuming after a successful save, and the failure unwinds have not been
-    re-validated on R610.
+    re-validated on R610, nor anything with the hook.
 -   Restore performance depends on host settings:
     `transparent_hugepage/shmem_enabled=always` and pinning the sandbox to the
     GPUs' NUMA node.

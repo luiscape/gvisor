@@ -723,11 +723,11 @@ func (r *restorer) calculateWallTimeSavings(s *Savings) error {
 }
 
 func (l *Loader) save(o *control.SaveOpts) error {
-	// The runtime --cuda-checkpoint-path is the default binary. With the
-	// multicast interposer, the containers run in a cuda-checkpoint job (see
-	// setupCudaCheckpointJob): checkpoint them one process at a time, as jobs
-	// require, and with the interposer's protocol. Otherwise CUDA checkpoints
-	// are unchanged.
+	// The runtime --cuda-checkpoint-path is the default binary. With
+	// --cuda-checkpoint-job=launch the GPU containers run in a cuda-checkpoint
+	// job (see setupCudaCheckpointJob): checkpoint them one process at a
+	// time, as jobs require. With --checkpoint-hook, the hook checkpoints the
+	// GPU state instead of cuda-checkpoint.
 	conf := l.root.conf
 	fail := func(err error) error {
 		l.k.OnCheckpointAttempt(err)
@@ -739,14 +739,17 @@ func (l *Loader) save(o *control.SaveOpts) error {
 	if o.CudaCheckpointPath == "" {
 		o.CudaCheckpointPath = conf.CUDACheckpointPath
 	}
-	if cudaMulticastShimEnabled(conf, l.k.NvidiaDriverVersion.Major()) {
+	if cudaCheckpointJobEnabled(conf, l.k.NvidiaDriverVersion.Major()) {
 		// A GPU container outside the job would be checkpointed outside it, and
 		// cuda-checkpoint hangs on its legacy CUDA IPC there.
 		if err := l.cudaJobSkippedError(); err != nil {
 			return fail(err)
 		}
 		o.CudaCheckpointSequential = true
-		o.CudaMulticastShim = true
+	}
+	if conf.CheckpointHook != "" {
+		o.CheckpointHook = conf.CheckpointHook
+		o.CudaCheckpointPath = ""
 	}
 	saveOpts, err := control.ConvertToStateSaveOpts(o)
 	if err != nil {

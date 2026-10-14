@@ -211,71 +211,60 @@ restore` does not require any special flags. If the snapshot was created with
 `runsc checkpoint --cuda-checkpoint-path`, then the same configuration will
 automatically be used on restore.
 
-### Multi-process, multi-GPU support
+### CUDA IPC: `cuda-checkpoint` jobs
 
-Processes that share GPU memory cannot be checkpointed by `cuda-checkpoint`
-alone:
+CUDA IPC memory (`cuIpcGetMemHandle`, used for example by the custom
+all-reduce of inference engines) can only be checkpointed and restored when
+the processes that share it belong to the same `cuda-checkpoint` *job*, which
+requires driver R610 or newer (see
+[cuda-checkpoint 610 features](https://github.com/NVIDIA/cuda-checkpoint#610-features)).
 
-*   CUDA IPC (`cuIpcGetMemHandle`, used for example by the custom all-reduce
-    of inference engines) can only be checkpointed and restored when the
-    processes belong to the same `cuda-checkpoint` *job*, which requires
-    driver R610+ (see
-    [cuda-checkpoint 610 features](https://github.com/NVIDIA/cuda-checkpoint#610-features)).
-*   `cuda-checkpoint` refuses a process that holds live *multicast* objects
-    (created via `cuMulticastCreate`, used by NCCL NVLS on NVSwitch systems and
-    by PyTorch symmetric memory) or live CUDA VMM imports
-    (`cuMemImportFromShareableHandle`).
+With `--cuda-checkpoint-job=launch` and `--cuda-checkpoint-path` set to the
+path of `cuda-checkpoint` inside the container, gVisor wraps each GPU
+container's command in `cuda-checkpoint --launch-job`, so that all of its CUDA
+processes share a job, and `runsc checkpoint` runs `cuda-checkpoint` one
+process at a time, as jobs require. A GPU container whose image lacks
+`cuda-checkpoint`, or whose entrypoint is `--exec-fd`, still starts, outside a
+job, and checkpoints of the sandbox are refused while it exists. CUDA
+processes started with `runsc exec` are not part of the job. On drivers older
+than R610 the flag has no effect.
 
-Multi-GPU tensor-parallel workloads hold all three. gVisor can checkpoint them
-using a small LD_PRELOAD interposer,
-[mcshim](https://github.com/modal-projects/mcshim), that
-releases multicast objects and VMM imports before the checkpoint and rebuilds
-them at identical GPU virtual addresses after restore, so application
-pointers and captured CUDA graphs remain valid, and runs the container in a
-`cuda-checkpoint` job for CUDA IPC.
+### Checkpoint hooks
 
-To enable it, build `mcshim.so` from the mcshim repository (`make`, or
-`make portable` for a build in a pinned container), make it available in
-each GPU container (in
-the image, or through a mount), and set two runtime flags:
-`--cuda-checkpoint-path` to the path of the `cuda-checkpoint` binary inside
-the container filesystem, and `--cuda-multicast-shim-path` to the
-interposer's in-container path.
+Some GPU state needs more than `cuda-checkpoint`: for example, it refuses
+processes holding NVLink multicast objects (NCCL NVLS, PyTorch symmetric
+memory) and cannot restore memory imported from another process. A
+*checkpoint hook* takes over the GPU part of checkpoint and restore:
+`--checkpoint-hook` names a program inside each GPU container, which `runsc`
+runs, with the container's namespaces and environment, as
 
-A restore needs the same interposer bytes at the same path as the
-checkpoint, since restored processes map the library they had mapped. If the
-interposer reaches containers through a mount, give its path a version (for
-example `/opt/mcshim/mcshim-<sha256>.so`) and keep every version that
-existing checkpoints use available on the hosts that restore them. Use an
-interposer release that speaks the same protocol version as your `runsc`
-(see the compatibility table in mcshim's README): `runsc checkpoint` refuses,
-and `runsc restore` fails, if the interposer speaks a different version.
+*   `<hook> checkpoint` before the sandbox is saved,
+*   `<hook> restore [--device-map OLD=NEW,...]` after it is restored or
+    resumed, with the device map when it was restored onto different GPUs,
+*   `<hook> resume` once that has finished.
 
-gVisor then arranges for the container's processes to load the
-interposer (via the `LD_PRELOAD` environment variable *and* an entry appended
-to the container's `/etc/ld.so.preload`, which covers launchers that rewrite
-their children's environment; with `--overlay2=none` that entry is added to
-the rootfs on the host), wraps each GPU container's command in
-`cuda-checkpoint --launch-job` so that all of its CUDA processes share a job,
-and drives the interposer automatically during `runsc checkpoint` and `runsc
-restore`. Jobs must be checkpointed sequentially, which `runsc checkpoint` then
-does automatically; it also uses the same `cuda-checkpoint` binary unless given
-its own `--cuda-checkpoint-path`. A `cuda-checkpoint` invocation that runs
-before any GPU state is saved and does not finish within 2 minutes is killed,
-and the checkpoint fails with the application still running. CUDA processes
-started with `runsc exec` are not part of the job.
+The hook replaces the built-in `cuda-checkpoint` handling: with a hook,
+`--cuda-checkpoint-path` only matters for the job wrap above. If
+`checkpoint` exits 1, the hook undid its work up to what `resume` completes,
+which `runsc` then runs, and the application keeps running; any other
+non-zero status means the hook could not undo its work, and the application
+may be left blocked. A failed `restore` or `resume` fails the restore.
 
-This requires driver R610 or newer (on older drivers the interposer stays off)
-and works when restoring onto *different* GPUs than the workload was
-checkpointed on. Without the interposer, the runtime `--cuda-checkpoint-path`
-flag only sets the default binary for `runsc checkpoint`, and CUDA checkpoints
-work as described above.
-The interposer loads in any image whose glibc is 2.17 or newer.
+[mcshim](https://github.com/modal-projects/mcshim) is such a hook, with an
+`LD_PRELOAD` interposer that releases multicast objects and imported memory
+before the checkpoint and rebuilds them at the same GPU virtual addresses
+after restore. See its README for how to install it; the operator provides
+both in the container and preloads the interposer.
 
-The interposer and gVisor rendezvous through `/tmp/mcshim` inside the
-container. It must reside on a filesystem that is part of the checkpoint image —
-not a host bind mount — because a marker file in it must survive the restore.
-Restoring such a snapshot needs no extra flags.
+nvproxy reports, for each file descriptor into which an RM object was
+exported, the object's identity in `/proc/[pid]/fdinfo/[fd]`, as Linux does
+for dma-buf, to readers allowed to ptrace the process:
+
+```
+nvproxy_exported_object:	client=0xc1d00922 object=0x5c000123 class=0xfd
+```
+
+Interposers use it to match imported memory with its export across a restore.
 
 ### Limitation
 

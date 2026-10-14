@@ -337,11 +337,11 @@ func TestValidationFail(t *testing.T) {
 			error: "qdisc=tbf requires setting qdisc-tbf-burst",
 		},
 		{
-			name: "cuda-multicast-shim-path-without-cuda-checkpoint-path",
+			name: "cuda-checkpoint-job-without-cuda-checkpoint-path",
 			flags: map[string]string{
-				"cuda-multicast-shim-path": "/usr/local/lib/mcshim.so",
+				"cuda-checkpoint-job": "launch",
 			},
-			error: "requires --cuda-checkpoint-path",
+			error: "--cuda-checkpoint-job=launch requires --cuda-checkpoint-path",
 		},
 		{
 			name: "cuda-checkpoint-path-relative",
@@ -351,20 +351,11 @@ func TestValidationFail(t *testing.T) {
 			error: "--cuda-checkpoint-path=\"usr/bin/cuda-checkpoint\" must be an absolute path",
 		},
 		{
-			name: "cuda-multicast-shim-path-relative",
+			name: "checkpoint-hook-relative",
 			flags: map[string]string{
-				"cuda-checkpoint-path":     "/usr/bin/cuda-checkpoint",
-				"cuda-multicast-shim-path": "mcshim.so",
+				"checkpoint-hook": "opt/mcshim/mcshim-ckpt",
 			},
-			error: "must be an absolute path without colons or whitespace",
-		},
-		{
-			name: "cuda-multicast-shim-path-colon",
-			flags: map[string]string{
-				"cuda-checkpoint-path":     "/usr/bin/cuda-checkpoint",
-				"cuda-multicast-shim-path": "/lib/a.so:/lib/b.so",
-			},
-			error: "must be an absolute path without colons or whitespace",
+			error: "--checkpoint-hook=\"opt/mcshim/mcshim-ckpt\" must be an absolute path",
 		},
 		{
 			name: "fsgofer-host-uds+host-uds:open",

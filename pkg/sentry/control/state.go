@@ -110,11 +110,10 @@ type SaveOpts struct {
 	// sequentially (rather than in parallel).
 	CudaCheckpointSequential bool `json:"cuda_checkpoint_sequential"`
 
-	// CudaMulticastShim is set when the CUDA processes run in a cuda-checkpoint
-	// job with the multicast interposer: they are checkpointed with the
-	// interposer's protocol (see state_cuda.go). Otherwise each is checkpointed
-	// with one cuda-checkpoint --toggle.
-	CudaMulticastShim bool `json:"cuda_multicast_shim"`
+	// CheckpointHook is the path, inside each GPU container, of a program that
+	// checkpoints the container's GPU state in place of cuda-checkpoint (see
+	// state_hook.go). It excludes CudaCheckpointPath.
+	CheckpointHook string `json:"checkpoint_hook"`
 
 	// SplitFSCheckpointPaths lists the filesystem checkpoint bundles to save in
 	// separate files. Filesystems not in any bundle are saved in the regular
@@ -150,7 +149,7 @@ func ConvertToStateSaveOpts(o *SaveOpts) (*state.SaveOpts, error) {
 		Resume:                         o.Resume,
 		CudaCheckpointPath:             o.CudaCheckpointPath,
 		CudaCheckpointSequential:       o.CudaCheckpointSequential,
-		CudaMulticastShim:              o.CudaMulticastShim,
+		CheckpointHook:                 o.CheckpointHook,
 	}
 	if err := setSaveOpts(o, saveOpts); err != nil {
 		saveOpts.Close()
@@ -309,18 +308,16 @@ func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *SaveRestoreExec
 		return err
 	}
 	if err := saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog); err != nil {
-		// With the multicast interposer, preSaveCuda has already released the
-		// GPU state, gated the application, and stashed the checkpoint keys;
-		// if the kernel will resume running, undo all of that -- postRestoreCuda
-		// is exactly that inverse and is a no-op if preSaveCuda did not run.
-		// Skip it while the kernel is paused (the docker flow, where
-		// preSaveCuda re-took docker's pause): exec'd cuda-checkpoint processes
-		// would be born frozen and hang this RPC. The keys survive, and
-		// docker's eventual unpause runs the same inverse via Resume ->
-		// PostResume.
-		if saveOpts.CudaMulticastShim && saveOpts.Resume && !s.Kernel.IsPaused() {
-			if rerr := postRestoreCuda(s.Kernel, nil, nil); rerr != nil {
-				log.Warningf("Failed to resume CUDA processes after failed save: %v", rerr)
+		// preSaveHook has already run the checkpoint hook; if the kernel will
+		// resume running, undo it -- postRestoreHook is exactly that inverse,
+		// and does nothing if preSaveHook did not run. Skip it while the
+		// kernel is paused (the docker flow, where preSaveHook re-took
+		// docker's pause): the hook would be born frozen and hang this RPC.
+		// Its state survives, and docker's eventual unpause runs the same
+		// inverse via Resume -> PostResume.
+		if saveOpts.CheckpointHook != "" && saveOpts.Resume && !s.Kernel.IsPaused() {
+			if rerr := postRestoreHook(s.Kernel, nil, nil); rerr != nil {
+				log.Warningf("Failed to undo the checkpoint hook after failed save: %v", rerr)
 			}
 		}
 		return err
@@ -348,6 +345,9 @@ func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *SaveRestoreExecOpts)
 			return fmt.Errorf("failed to exec save/restore binary: %w", err)
 		}
 	}
+	if o.CheckpointHook != "" {
+		return preSaveHook(k, o)
+	}
 	return preSaveCuda(k, o)
 }
 
@@ -374,7 +374,10 @@ func PostResume(k *kernel.Kernel, timeline *timing.Timeline) error {
 		return err
 	}
 
-	return postRestoreCuda(k, timeline, nil)
+	if err := postRestoreCuda(k, timeline, nil); err != nil {
+		return err
+	}
+	return postRestoreHook(k, timeline, nil)
 }
 
 // PostRestore is called after restoring the kernel. nvproxyRemapping, if
@@ -401,7 +404,10 @@ func PostRestore(k *kernel.Kernel, timeline *timing.Timeline, nvproxyRemapping *
 		return err
 	}
 
-	return postRestoreCuda(k, timeline, nvproxyRemapping)
+	if err := postRestoreCuda(k, timeline, nvproxyRemapping); err != nil {
+		return err
+	}
+	return postRestoreHook(k, timeline, nvproxyRemapping)
 }
 
 // SaveRestoreExec creates a new process that executes the save/restore

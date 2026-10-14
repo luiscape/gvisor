@@ -42,7 +42,6 @@ go_template_instance(
 go_library(
     name = "nvproxy",
     srcs = [
-        "checkpoint_blockers.go",
         "exported_objects.go",
         "fds_mutex.go",
         "frontend.go",
@@ -105,7 +104,6 @@ go_library(
 go_test(
     name = "nvproxy_test",
     srcs = [
-        "checkpoint_blockers_test.go",
         "exported_objects_test.go",
         "nvproxy_test.go",
     ],
@@ -115,7 +113,6 @@ go_test(
         "//pkg/context",
         "//pkg/seccomp",
         "//pkg/sentry/devices/nvproxy/nvconf",
-        "//pkg/sentry/kernel",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )

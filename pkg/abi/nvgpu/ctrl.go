@@ -250,11 +250,6 @@ const (
 	// struct {hDevice, hParent, hObject Handle}.
 	NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM = 1
 
-	// NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_TYPE_* are the
-	// NV0000_CTRL_OS_UNIX_IMPORT_OBJECTS_FROM_FD_PARAMS.ObjectTypes values.
-	NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_TYPE_NONE      = 0
-	NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_TYPE_FABRIC_MC = 4
-
 	// NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_FLAGS_EMPTY_FD is the
 	// EMPTY_FD flag bit in NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS.Flags:
 	// the fd is created without an associated object (objects are attached

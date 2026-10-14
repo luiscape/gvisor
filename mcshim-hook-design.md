@@ -2,7 +2,7 @@
 
 | | |
 | :--- | :--- |
-| Status | Draft for review |
+| Status | Implemented on the branch (CPU-tested; not yet validated on GPUs); D1-D4 decided, D5 pending |
 | Date | 2026-10-14 |
 | Branch | `luis/multicast-xgpu-upstream` at `12146bebf` (upstream `a9f9fd444` merged) |
 | Related | `mcshim-merge-plan.md`, `mcshim-split-plan.md` |
@@ -170,15 +170,28 @@ dma-buf. Removed: import tracking (`importedObject`, the two import
 handlers, which return to upstream's `ctrlHasFrontendFD`), `rootClient.tgid`,
 holding the client lock across the host call, and the import constants.
 
-## 7. Decisions needed
+## 7. Decisions
 
-| # | Decision | Recommendation |
+| # | Decision | Outcome |
 | :--- | :--- | :--- |
-| D1 | Does runsc keep preloading the interposer (`--cuda-multicast-shim-path`, `LD_PRELOAD`, `/etc/ld.so.preload`)? | Move it to the operator: `LD_PRELOAD` in the spec's environment, and `/etc/ld.so.preload` as a read-only bind mount of a one-line file. Then gVisor knows nothing about mcshim but the fdinfo line. Keeping it costs about 250 lines and a mcshim-specific flag |
-| D2 | Is the fdinfo line always on, or behind an option? | Always on, as for dma-buf in Linux: one record per export, shown only to tracers. Removes `TrackExports` and the second code path in four handlers. If upstream objects, keep the option |
-| D3 | Name and phases of the hook | `--checkpoint-hook`, phases `checkpoint`, `restore`, `resume`. Upstream may prefer a CUDA-specific name (`--cuda-checkpoint-hook`), since the `restore`/`resume` split exists for GPU memory |
-| D4 | How #13987 is enabled now that it is not tied to the interposer flag | An enum (new boolean flags are refused), e.g. `--cuda-checkpoint-job=launch`, requiring `--cuda-checkpoint-path`; R610 or newer |
-| D5 | Ask a gVisor maintainer before building it | Yes: in the PR1 design review, with this document |
+| D1 | Does runsc keep preloading the interposer? | **No.** The operator preloads it: `LD_PRELOAD` in the spec and `/etc/ld.so.preload` as a read-only bind mount. `--cuda-multicast-shim-path` is removed |
+| D2 | Is the fdinfo line always on? | **Yes**, like dma-buf's. `TrackExports` is removed; import tracking and the blocker inventory too |
+| D3 | Name and phases | `--checkpoint-hook`; `checkpoint`, `restore [--device-map]`, `resume`. Runs in each container with a process holding an NVIDIA device open |
+| D4 | How #13987 is enabled | `--cuda-checkpoint-job=launch` (enum), with `--cuda-checkpoint-path`, R610 or newer |
+| D5 | Maintainer review before merging | Pending: PR1 review of `g3doc/proposals/cuda_multigpu_checkpoint.md` (rewritten for the hook) |
+
+Implementation notes (differences from sections 3-6):
+
+- On a `checkpoint` failure with status 1, the hook does not unwind the
+  interposer itself: the sentry releases page faults and runs `resume`,
+  which rebuilds what was torn down and releases the gate. The rebuild
+  touches GPU memory, so it cannot run while page faults are held. Status 2
+  or a crash: no `resume`.
+- A hook that could not be started changed nothing; it is reported as such,
+  and is not resumed.
+- The CUDA path without a hook is #14817's code exactly, plus a shared
+  `execInContainerOf` helper (also used by the hook) that skips a thread
+  group whose leader has exited.
 
 ## 8. Plan
 

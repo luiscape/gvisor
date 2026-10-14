@@ -89,7 +89,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/timing"
-	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/runsc/boot/filter"
 	pf "gvisor.dev/gvisor/runsc/boot/portforward"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
@@ -331,9 +330,9 @@ type Loader struct {
 	// +checklocks:mu
 	failedToStart map[string]struct{}
 
-	// cudaJobSkipped maps the name of each GPU container that the multicast
-	// interposer is enabled for but that does not run in a cuda-checkpoint job
-	// to the reason (see setupCudaCheckpointJob).
+	// cudaJobSkipped maps the name of each GPU container that should run in a
+	// cuda-checkpoint job but does not to the reason (see
+	// setupCudaCheckpointJob).
 	//
 	// +checklocks:mu
 	cudaJobSkipped map[string]string
@@ -1666,47 +1665,42 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	return nil
 }
 
-// cudaMulticastShimMinDriverMajor is the oldest driver release the multicast
-// interposer can be used on: cuda-checkpoint's job mode and lock/checkpoint
-// actions, which it relies on, need R610.
-const cudaMulticastShimMinDriverMajor = 610
+// cudaCheckpointJobMinDriverMajor is the oldest driver release with
+// cuda-checkpoint's job mode (--launch-job).
+const cudaCheckpointJobMinDriverMajor = 610
 
-// cudaMulticastShimEnabled reports whether conf opts into the multicast
-// interposer, which needs --cuda-checkpoint-path and driver R610 or newer.
-// Only then do containers run in a cuda-checkpoint job and checkpoint with the
-// interposer's protocol; otherwise CUDA checkpoints are unchanged.
-func cudaMulticastShimEnabled(conf *config.Config, driverMajor int) bool {
-	return conf.CUDAMulticastShimPath != "" && conf.CUDACheckpointPath != "" && driverMajor >= cudaMulticastShimMinDriverMajor
+// cudaCheckpointJobEnabled reports whether conf runs GPU containers in a
+// cuda-checkpoint job on a driver with major version driverMajor.
+func cudaCheckpointJobEnabled(conf *config.Config, driverMajor int) bool {
+	return conf.CUDACheckpointJob == config.CUDACheckpointJobLaunch && conf.CUDACheckpointPath != "" && driverMajor >= cudaCheckpointJobMinDriverMajor
 }
 
 // setupCudaCheckpointJob groups a GPU container's CUDA processes into a
 // cuda-checkpoint job, so that CUDA IPC state (cuIpcGetMemHandle) can be
 // checkpointed/restored coherently, and reports whether it did. Only a
 // container given GPU access is wrapped (not, say, a pod's pause container
-// when nvproxy is enabled for the whole sandbox), and only when the multicast
-// interposer is enabled (see cudaMulticastShimEnabled). The interposer is
-// preloaded only into a wrapped container.
+// when nvproxy is enabled for the whole sandbox), and only with
+// --cuda-checkpoint-job=launch on driver R610 or newer.
 //
 // It works by prepending `cuda-checkpoint --launch-job` to the container's
 // command. See https://github.com/NVIDIA/cuda-checkpoint#610-features.
 //
-// A GPU container it cannot wrap still starts, with neither the job nor the
-// interposer, and is recorded in l.cudaJobSkipped: checkpoints with the
-// interposer's protocol are refused while it exists, since its processes
-// would be checkpointed outside a job.
+// A GPU container it cannot wrap still starts, outside a job, and is recorded
+// in l.cudaJobSkipped: checkpoints are refused while it exists, since its
+// processes would be checkpointed outside the job.
 //
 // +checklocks:l.mu
 func (l *Loader) setupCudaCheckpointJob(info *containerInfo) bool {
 	conf := info.conf
-	if conf.CUDAMulticastShimPath == "" || !specutils.GPUFunctionalityRequested(info.spec, conf) {
+	if conf.CUDACheckpointJob != config.CUDACheckpointJobLaunch || !specutils.GPUFunctionalityRequested(info.spec, conf) {
 		return false
 	}
-	if major := l.k.NvidiaDriverVersion.Major(); !cudaMulticastShimEnabled(conf, major) {
-		log.Warningf("The multicast interposer is enabled but driver R%d is older than R%d; not using it in container %q", major, cudaMulticastShimMinDriverMajor, info.containerName)
+	if major := l.k.NvidiaDriverVersion.Major(); !cudaCheckpointJobEnabled(conf, major) {
+		log.Warningf("--cuda-checkpoint-job=launch needs driver R%d or newer, have R%d; not running container %q in a cuda-checkpoint job", cudaCheckpointJobMinDriverMajor, major, info.containerName)
 		return false
 	}
 	skip := func(why string) bool {
-		log.Warningf("Not running container %q in a cuda-checkpoint job, nor preloading the multicast interposer into it: %s. Checkpoints of the sandbox will be refused while the container exists.", info.containerName, why)
+		log.Warningf("Not running container %q in a cuda-checkpoint job: %s. Checkpoints of the sandbox will be refused while the container exists.", info.containerName, why)
 		l.cudaJobSkipped[info.containerName] = why
 		return false
 	}
@@ -1745,73 +1739,7 @@ func (l *Loader) cudaJobSkippedError() error {
 	for _, name := range slices.Sorted(maps.Keys(l.cudaJobSkipped)) {
 		why = append(why, fmt.Sprintf("container %q: %s", name, l.cudaJobSkipped[name]))
 	}
-	return fmt.Errorf("cannot checkpoint with the multicast interposer: GPU containers that do not run in a cuda-checkpoint job (%s)", strings.Join(why, "; "))
-}
-
-// setupCudaMulticastShim LD_PRELOADs the multicast suspend/resume interposer
-// into a GPU container that setupCudaCheckpointJob wrapped (which requires
-// --cuda-multicast-shim-path, GPU access, and driver R610 or newer). The
-// operator provides the interposer at --cuda-multicast-shim-path, in the image
-// or through a mount.
-//
-// cuda-checkpoint cannot checkpoint a process holding live multicast (0x00fd)
-// objects, which NCCL NVLS and torch _symmetric_memory both create. The
-// interposer releases them before the checkpoint and rebuilds them at
-// byte-identical VAs afterwards; control/state_cuda.go drives both transitions
-// around the cuda-checkpoint phases via marker files in /tmp/mcshim.
-func (l *Loader) setupCudaMulticastShim(info *containerInfo) {
-	shimPath := info.conf.CUDAMulticastShimPath
-	if ok, err := l.containerFileExists(info, shimPath); !ok {
-		// Preloading a missing library makes the dynamic loader print an
-		// error on every exec in the container.
-		log.Warningf("Multicast interposer %q is not a file in container %q (%v); not preloading it", shimPath, info.containerName, err)
-		return
-	}
-	info.procArgs.Envv = appendLdPreload(info.procArgs.Envv, shimPath)
-
-	// The env append above only covers processes that inherit the initial
-	// environment. Launchers that REWRITE LD_PRELOAD when spawning workers --
-	// SGLang's torch_memory_saver needs its own hook library there -- evict
-	// the interposer from exactly the processes that hold the shared GPU
-	// state, and the resulting failure is silent: the checkpoint succeeds and
-	// the restore toggle fails. /etc/ld.so.preload is immune, because the
-	// loader consults it on every exec regardless of environment. Write it
-	// through the container's VFS (see writeLdSoPreload for where it lands),
-	// appending rather than clobbering, and treat failure (e.g. a read-only
-	// root) as non-fatal: the env append above still covers the common
-	// case.
-	//
-	// This does preload the interposer into every binary in the container,
-	// including the cuda-checkpoint processes the sentry execs, which run it
-	// disabled (MCSHIM_DISABLE). That is benign regardless: the interposer only
-	// activates when a tracked CUDA symbol is resolved.
-	if err := l.writeLdSoPreload(info, shimPath); err != nil {
-		log.Warningf("Could not add the multicast interposer to /etc/ld.so.preload for container %q (continuing with env-based preload only, which a launcher that rewrites LD_PRELOAD can defeat): %v", info.containerName, err)
-	}
-	log.Infof("Preloaded multicast interposer %q into container %q", shimPath, info.containerName)
-}
-
-// appendLdPreload returns env with lib added to its LD_PRELOAD, after any
-// entries the container already sets rather than clobbering or preceding
-// them: that is the order /etc/ld.so.preload gives them anyway, since the
-// dynamic linker loads LD_PRELOAD first, and it lets the container's own
-// interposers wrap lib's. (The multicast interposer forwards the dlsym
-// lookups it does not rewrite with a tail call, so an entry after it
-// resolves RTLD_NEXT correctly too; the order is not for correctness.)
-func appendLdPreload(env []string, lib string) []string {
-	const preloadKey = "LD_PRELOAD="
-	for i, e := range env {
-		if !strings.HasPrefix(e, preloadKey) {
-			continue
-		}
-		if existing := e[len(preloadKey):]; existing != "" {
-			env[i] = preloadKey + existing + ":" + lib
-		} else {
-			env[i] = preloadKey + lib
-		}
-		return env
-	}
-	return append(env, preloadKey+lib)
+	return fmt.Errorf("cannot checkpoint: GPU containers that do not run in a cuda-checkpoint job (%s)", strings.Join(why, "; "))
 }
 
 // containerFileExists reports whether p is a regular file in the container's
@@ -1835,82 +1763,6 @@ func (l *Loader) containerFileExists(info *containerInfo, p string) (bool, error
 		return false, err
 	}
 	return stat.Mode&linux.S_IFMT == linux.S_IFREG, nil
-}
-
-// writeLdSoPreload appends the interposer path (shimPath) to the container's
-// /etc/ld.so.preload (creating the file if absent), through the container's
-// own mount namespace. Idempotent: a path already listed is not added again,
-// which also makes container restarts and restores safe.
-//
-// The write goes through the container's VFS with root credentials,
-// following symlinks in every component but the last, so it lands wherever
-// the container's own view of /etc/ld.so.preload leads: with a rootfs overlay
-// (the default --overlay2 configuration) in the overlay's upper layer, which
-// is part of the checkpoint, so processes started after a restore see it too;
-// with --overlay2=none, or if /etc is reached through a bind mount, in the
-// file on the host, where the line stays.
-func (l *Loader) writeLdSoPreload(info *containerInfo, shimPath string) error {
-	mntns := info.procArgs.MountNamespace
-	if mntns == nil {
-		return fmt.Errorf("container mount namespace is not set up yet")
-	}
-	ctx := info.procArgs.NewContext(l.k)
-	// Root credentials, not the container's: this is sentry-managed
-	// configuration (like the marker files), and a non-root container must
-	// not fail the injection just because /etc is root-owned.
-	creds := auth.NewRootCredentials(l.k.RootUserNamespace())
-	root := mntns.Root(ctx)
-	defer root.DecRef(ctx)
-	vfsObj := root.Mount().Filesystem().VirtualFilesystem()
-	target := &vfs.PathOperation{
-		Root:  root,
-		Start: root,
-		Path:  fspath.Parse("/etc/ld.so.preload"),
-	}
-
-	// Read what is already there, if anything, so the write is append-only
-	// and idempotent. 64 KiB is far beyond any plausible ld.so.preload; a
-	// larger file only risks a harmless duplicate append.
-	existing := ""
-	if fd, err := vfsObj.OpenAt(ctx, creds, target, &vfs.OpenOptions{Flags: linux.O_RDONLY}); err == nil {
-		buf := make([]byte, 64<<10)
-		filled := 0
-		for filled < len(buf) {
-			n, rerr := fd.Read(ctx, usermem.BytesIOSequence(buf[filled:]), vfs.ReadOptions{})
-			filled += int(n)
-			if rerr != nil || n == 0 {
-				break
-			}
-		}
-		existing = string(buf[:filled])
-		fd.DecRef(ctx)
-	}
-	for _, line := range strings.Fields(existing) {
-		if line == shimPath {
-			return nil // already present
-		}
-	}
-
-	fd, err := vfsObj.OpenAt(ctx, creds, target, &vfs.OpenOptions{
-		Flags: linux.O_WRONLY | linux.O_CREAT | linux.O_APPEND,
-		Mode:  0644,
-	})
-	if err != nil {
-		return fmt.Errorf("opening /etc/ld.so.preload: %w", err)
-	}
-	defer fd.DecRef(ctx)
-	data := shimPath + "\n"
-	if existing != "" && !strings.HasSuffix(existing, "\n") {
-		// Never concatenate onto an existing entry: a missing trailing
-		// newline would corrupt both entries and make the loader print an
-		// error into every process's stderr.
-		data = "\n" + data
-	}
-	if _, err := fd.Write(ctx, usermem.BytesIOSequence([]byte(data)), vfs.WriteOptions{}); err != nil {
-		return fmt.Errorf("writing /etc/ld.so.preload: %w", err)
-	}
-	log.Infof("Added multicast interposer to /etc/ld.so.preload in container %q", info.containerName)
-	return nil
 }
 
 // +checklocks:l.mu
@@ -2000,16 +1852,11 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	}
 	info.procArgs.StartupTimeline.Reached("exec user home resolved")
 
-	// If configured, run a GPU container in a cuda-checkpoint job and preload
-	// the multicast suspend/resume interposer, so that its CUDA IPC and
-	// multicast state can be checkpointed/restored. Neither stops the
-	// container from starting: one that cannot be wrapped runs without both,
-	// and checkpoints are refused (see setupCudaCheckpointJob); one whose
-	// interposer cannot be set up runs in the job without it, and processes
-	// holding multicast objects or imports refuse checkpoints.
-	if l.setupCudaCheckpointJob(info) {
-		l.setupCudaMulticastShim(info)
-	}
+	// If configured, run a GPU container in a cuda-checkpoint job, so that its
+	// CUDA IPC state can be checkpointed. This never stops the container from
+	// starting: one that cannot be wrapped runs outside the job, and
+	// checkpoints are refused (see setupCudaCheckpointJob).
+	l.setupCudaCheckpointJob(info)
 
 	// Create and start the new process.
 	tg, _, err := l.k.CreateProcess(info.procArgs)

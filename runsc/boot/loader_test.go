@@ -645,61 +645,37 @@ func TestCreateMountPoint(t *testing.T) {
 	}
 }
 
-// TestCudaMulticastShimEnabled covers the opt-in that alone enables the
-// cuda-checkpoint job and the interposer's checkpoint protocol: both paths,
-// and driver R610 or newer.
-func TestCudaMulticastShimEnabled(t *testing.T) {
+// TestCudaCheckpointJobEnabled covers what enables the cuda-checkpoint job:
+// --cuda-checkpoint-job=launch, --cuda-checkpoint-path, and driver R610 or
+// newer.
+func TestCudaCheckpointJobEnabled(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		path, shim string
-		major      int
-		want       bool
+		name  string
+		path  string
+		job   config.CUDACheckpointJob
+		major int
+		want  bool
 	}{
 		{name: "cuda-checkpoint-path only", path: "/cc", major: 610},
-		{name: "shim path", path: "/cc", shim: "/s.so", major: 610, want: true},
-		{name: "old driver", path: "/cc", shim: "/s.so", major: 580},
-		{name: "driver just below R610", path: "/cc", shim: "/s.so", major: 609},
-		{name: "newer driver", path: "/cc", shim: "/s.so", major: 615, want: true},
-		{name: "newer driver, no shim", path: "/cc", major: 615},
-		{name: "nothing", major: 610},
+		{name: "launch", path: "/cc", job: config.CUDACheckpointJobLaunch, major: 610, want: true},
+		{name: "old driver", path: "/cc", job: config.CUDACheckpointJobLaunch, major: 580},
+		{name: "driver just below R610", path: "/cc", job: config.CUDACheckpointJobLaunch, major: 609},
+		{name: "newer driver", path: "/cc", job: config.CUDACheckpointJobLaunch, major: 615, want: true},
+		{name: "no cuda-checkpoint-path", job: config.CUDACheckpointJobLaunch, major: 610},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			conf := testConfig()
 			conf.CUDACheckpointPath = tc.path
-			conf.CUDAMulticastShimPath = tc.shim
-
-			if got := cudaMulticastShimEnabled(conf, tc.major); got != tc.want {
-				t.Errorf("cudaMulticastShimEnabled() = %v, want %v", got, tc.want)
+			conf.CUDACheckpointJob = tc.job
+			if got := cudaCheckpointJobEnabled(conf, tc.major); got != tc.want {
+				t.Errorf("cudaCheckpointJobEnabled() = %v, want %v", got, tc.want)
 			}
 		})
 	}
 }
 
-// TestCudaMulticastShimPreloadOrder covers where setupCudaMulticastShim puts
-// the interposer in a container's LD_PRELOAD: after the container's own
-// entries, as /etc/ld.so.preload orders them too.
-func TestCudaMulticastShimPreloadOrder(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		env  []string
-		want []string
-	}{
-		{name: "no LD_PRELOAD", env: []string{"A=1"}, want: []string{"A=1", "LD_PRELOAD=/s.so"}},
-		{name: "empty LD_PRELOAD", env: []string{"LD_PRELOAD=", "A=1"}, want: []string{"LD_PRELOAD=/s.so", "A=1"}},
-		{name: "one entry", env: []string{"LD_PRELOAD=/u.so"}, want: []string{"LD_PRELOAD=/u.so:/s.so"}},
-		{name: "two entries", env: []string{"A=1", "LD_PRELOAD=/u.so:/v.so"}, want: []string{"A=1", "LD_PRELOAD=/u.so:/v.so:/s.so"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got := appendLdPreload(append([]string(nil), tc.env...), "/s.so")
-			if !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("appendLdPreload(%q) = %q, want %q", tc.env, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestContainerFileExists covers the check that keeps a missing IMAGE-mode
-// multicast interposer out of the container's preload list.
+// TestContainerFileExists covers the check that keeps a container whose image
+// lacks cuda-checkpoint out of a cuda-checkpoint job.
 func TestContainerFileExists(t *testing.T) {
 	spec := testSpec()
 	spec.Root = &specs.Root{Path: os.TempDir()}
@@ -722,16 +698,16 @@ func TestContainerFileExists(t *testing.T) {
 	}
 	info := &containerInfo{procArgs: l.root.procArgs}
 	info.procArgs.MountNamespace = mns
-	if err := l.writeTestFile(info, "/test/lib/mcshim.so", []byte("x"), 0755); err != nil {
+	if err := l.writeTestFile(info, "/test/bin/cuda-checkpoint", []byte("x"), 0755); err != nil {
 		t.Fatalf("writeTestFile: %v", err)
 	}
 	for _, tc := range []struct {
 		path string
 		want bool
 	}{
-		{"/test/lib/mcshim.so", true},
-		{"/test/lib/missing.so", false},
-		{"/test/lib", false},
+		{"/test/bin/cuda-checkpoint", true},
+		{"/test/bin/missing", false},
+		{"/test/bin", false},
 	} {
 		if got, err := l.containerFileExists(info, tc.path); got != tc.want {
 			t.Errorf("containerFileExists(%q) = %v (%v), want %v", tc.path, got, err, tc.want)
@@ -740,7 +716,8 @@ func TestContainerFileExists(t *testing.T) {
 }
 
 // TestSetupCudaCheckpointJob covers which containers are wrapped in a
-// cuda-checkpoint job: only those given GPU access, only on driver R610 or
+// cuda-checkpoint job with --cuda-checkpoint-job=launch: only those given GPU
+// access, only on driver R610 or
 // newer, and only if cuda-checkpoint is in the container; a GPU container
 // that cannot be wrapped is recorded, and checkpoints are refused while it
 // exists.
@@ -797,7 +774,7 @@ func TestSetupCudaCheckpointJob(t *testing.T) {
 			conf := testConfig()
 			conf.NVProxy = tc.nvproxy
 			conf.CUDACheckpointPath = tc.ckpt
-			conf.CUDAMulticastShimPath = "/test/lib/mcshim.so"
+			conf.CUDACheckpointJob = config.CUDACheckpointJobLaunch
 			info := &containerInfo{
 				containerName: tc.name,
 				spec:          tc.spec,
