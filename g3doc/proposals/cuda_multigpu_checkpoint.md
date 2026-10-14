@@ -101,10 +101,21 @@ are refused while it exists: `cuda-checkpoint` hangs on legacy IPC outside a
 job. Containers without GPU access (a pod's pause container, sidecars) are
 never wrapped.
 
+The wrap is a convenience: an operator that builds the spec can write
+`cuda-checkpoint --launch-job` into the entrypoint itself, and with the
+checkpoint hook below, which runs `cuda-checkpoint` itself, needs no runsc
+flag at all. runsc then cannot refuse a checkpoint of a GPU container left
+outside the job; the operator guarantees there is none.
+
 ### The checkpoint hook (`pkg/sentry/control`)
 
-`--checkpoint-hook=PATH` names a program inside each GPU container. With it,
-the sentry does not run `cuda-checkpoint` itself; for each container with a
+The root container's annotation `dev.gvisor.internal.checkpoint.hook=PATH`
+names, by absolute path, a program inside each GPU container. It adds no runsc
+flag: like the other checkpoint annotations
+(`dev.gvisor.internal.checkpoint.*`), it is set in the spec by the operator,
+per sandbox, and read when a checkpoint starts; the path is kept in the
+checkpoint for the restore. With it, the sentry does not run
+`cuda-checkpoint` itself; for each container with a
 process holding an NVIDIA device open, it runs the hook with the container's
 mount and PID namespaces and environment:
 
@@ -280,11 +291,11 @@ merges.
 
 ## Open questions
 
-1.  **A generic hook.** Is `--checkpoint-hook` acceptable as a runtime
+1.  **A generic hook.** Is the hook annotation acceptable as a runtime
     feature, given that it runs a container-provided program during a
     checkpoint? Should it be CUDA-specific in name
-    (`--cuda-checkpoint-hook`), since it runs only in GPU containers and its
-    `restore`/`resume` split exists for GPU memory?
+    (`dev.gvisor.internal.checkpoint.cuda-hook`), since it runs only in GPU
+    containers and its `restore`/`resume` split exists for GPU memory?
 2.  **Where the hook runs.** In each container with a process holding an
     NVIDIA device open. Should it instead run in every container, or only in
     containers that opt in through an annotation?

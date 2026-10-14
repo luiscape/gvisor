@@ -44,14 +44,20 @@ blocker inventory is removed.
 
 ### 3.1 Configuration
 
-A per-container runsc flag, like `--cuda-checkpoint-path`:
+No new runsc flag: a spec annotation on the root container, like the other
+checkpoint annotations (`dev.gvisor.internal.checkpoint.*`):
 
 ```
---checkpoint-hook=/opt/mcshim/mcshim-ckpt    # absolute path inside the container
+"dev.gvisor.internal.checkpoint.hook": "/opt/mcshim/mcshim-ckpt"   # absolute path inside the container
 ```
 
-Validation as for `--cuda-checkpoint-path` (absolute, a regular file in the
-container at checkpoint time). A container with a hook is excluded from the
+It must be absolute (checked at sandbox start and when a checkpoint starts),
+and is read when a checkpoint starts; the path is kept in the checkpoint for
+the restore. `mcshim-ckpt` finds `cuda-checkpoint` itself
+(`MCSHIM_CUDA_CHECKPOINT` in the container's environment), and the operator
+may write the job wrap into the entrypoint (`cuda-checkpoint --launch-job
+<command>`) instead of using `--cuda-checkpoint-path
+--cuda-checkpoint-job=launch`. A container with a hook is excluded from the
 built-in `cuda-checkpoint` handling: the hook owns its CUDA processes. The
 built-in path is unchanged for everyone else (#14817's code).
 
@@ -158,7 +164,7 @@ logic and its tests port nearly as they are.
 Tests run without a GPU: a fake `cuda-checkpoint` (as `TestCheckpointLocked`
 uses) and a fake interposer answering the markers. The stub tests in
 `test/run.sh` (`deadline`, `reason`, `undo`, `optout`, `orphan`) move to
-driving runsc with `--checkpoint-hook`.
+driving runsc with the hook annotation.
 
 ## 5. Replacing the blocker inventory
 
@@ -183,7 +189,7 @@ holding the client lock across the host call, and the import constants.
 | :--- | :--- | :--- |
 | D1 | Does runsc keep preloading the interposer? | **No.** The operator preloads it: `LD_PRELOAD` in the spec and `/etc/ld.so.preload` as a read-only bind mount. `--cuda-multicast-shim-path` is removed |
 | D2 | Is the fdinfo line always on? | **Yes**, like dma-buf's. `TrackExports` is removed; import tracking and the blocker inventory too |
-| D3 | Name and phases | `--checkpoint-hook`; `checkpoint`, `restore [--device-map]`, `resume`. Runs in each container with a process holding an NVIDIA device open |
+| D3 | Name and phases | annotation `dev.gvisor.internal.checkpoint.hook` (was `--checkpoint-hook`); `checkpoint`, `restore [--device-map]`, `resume`. Runs in each container with a process holding an NVIDIA device open |
 | D4 | How #13987 is enabled | `--cuda-checkpoint-job=launch` (enum), with `--cuda-checkpoint-path`, R610 or newer |
 | D5 | Maintainer review before merging | Pending: PR1 review of `g3doc/proposals/cuda_multigpu_checkpoint.md` (rewritten for the hook) |
 
@@ -205,8 +211,9 @@ Implementation notes (differences from sections 3-6):
 ### 8.1 GPU validation
 
 Nothing above has run on a GPU. On an H100 x8 host with driver R610, with
-`runsc --nvproxy --cuda-checkpoint-path=... --cuda-checkpoint-job=launch
---checkpoint-hook=/opt/mcshim/mcshim-ckpt`, the operator preloading
+`runsc --nvproxy --cuda-checkpoint-path=... --cuda-checkpoint-job=launch`
+and the annotation `dev.gvisor.internal.checkpoint.hook=/opt/mcshim/mcshim-ckpt`
+(at first `--checkpoint-hook`), the operator preloading
 `mcshim.so` (`LD_PRELOAD` and a read-only `/etc/ld.so.preload` bind mount):
 
 1. **One checkpoint and restore first**, to confirm what CPU tests cannot:
@@ -249,7 +256,7 @@ Each from `master`, not from this branch's history; this file stays out.
 | PR1 | #14817 as is |
 | PR2 | Done: #13987 (updated) |
 | PR3 | Done: #15761 |
-| PR4 | `pkg/sentry/control/state_hook.go` and test, `execInContainerOf`/`openNullFD` in `state_cuda.go`, `state.go`, `pkg/sentry/state/state.go`, `--checkpoint-hook` (config, flags, `save`), the proposal and user guide |
+| PR4 | `pkg/sentry/control/state_hook.go` and test, `execInContainerOf`/`openNullFD` in `state_cuda.go`, `state.go`, `pkg/sentry/state/state.go`, the hook annotation (`runsc/boot/restore.go`: `save`, checked in `loader.New`), the proposal and user guide |
 
 ### 8.4 Gaps
 

@@ -13,7 +13,8 @@ sentry drove the interposer itself) passed this matrix on B300 with driver
   `luis/multicast-xgpu-upstream`, at `702e62ba6` or later):
   - `--cuda-checkpoint-job=launch` wraps GPU containers in
     `cuda-checkpoint --launch-job`.
-  - `--checkpoint-hook=PATH` runs a program inside each GPU container at
+  - The annotation `dev.gvisor.internal.checkpoint.hook=PATH` (originally the
+    flag `--checkpoint-hook=PATH`) runs a program inside each GPU container at
     `checkpoint`, `restore [--device-map MAP]` and `resume`, instead of
     gVisor's built-in `cuda-checkpoint` handling. Page faults of GPU
     processes are held from before `checkpoint` until after `restore`.
@@ -62,7 +63,7 @@ restore time, not correctness), and note whether you did.
 cd gvisor && git checkout luis/multicast-xgpu-upstream && git log --oneline -1
 make build TARGETS=//runsc
 RUNSC=$(realpath bazel-out/k8-fastbuild/bin/runsc/runsc_/runsc)
-$RUNSC --cuda-checkpoint-path=/x --cuda-checkpoint-job=launch --checkpoint-hook=/h flags >/dev/null && echo flags ok
+$RUNSC --cuda-checkpoint-path=/x --cuda-checkpoint-job=launch flags >/dev/null && echo flags ok
 
 # mcshim
 cd ../mcshim && git log --oneline -1
@@ -94,7 +95,8 @@ exported `nvcr.io/nvidia/pytorch` image; see the header of `test/run.sh`.)
 If the runner's tests do not exercise a full checkpoint/restore through the
 hook, do one by hand with a two-rank PyTorch program that uses symmetric
 memory or NCCL with NVLS, under `runsc --nvproxy --cuda-checkpoint-path=...
---cuda-checkpoint-job=launch --checkpoint-hook=/mnt/mcshim-ckpt`, with
+--cuda-checkpoint-job=launch` and the spec annotation
+`dev.gvisor.internal.checkpoint.hook=/mnt/mcshim-ckpt`, with
 `LD_PRELOAD=/mnt/mcshim.so` in the spec and `/etc/ld.so.preload` bind-mounted
 read-only from a file containing `/mnt/mcshim.so`:
 `runsc checkpoint --image-path=DIR <id>`, then `runsc restore
@@ -157,7 +159,7 @@ exit 0
 | :--- | :--- | :--- |
 | Recoverable failure | `HOOK_CKPT_STATUS=1` in the spec env | `runsc checkpoint` fails with the hook's output; `hook.log` shows `checkpoint` then `resume`; the application keeps running |
 | Unrecoverable failure | `HOOK_CKPT_STATUS=2` | fails, message says it could not be undone; `hook.log` shows `checkpoint` only |
-| Hook missing | `--checkpoint-hook=/nonexistent` | fails with "could not start the checkpoint hook"; application keeps running |
+| Hook missing | annotation `dev.gvisor.internal.checkpoint.hook=/nonexistent` | fails with "could not start the checkpoint hook"; application keeps running |
 | Docker-style pause | `runsc pause <id>` then checkpoint with the real `mcshim-ckpt` and `--leave-running` (or the equivalent resume path) | succeeds; application runs after resume |
 | Failed save with resume | if you can make the save itself fail after the hook succeeded (e.g. image path on a full or read-only filesystem) with `--leave-running` | `restore` and `resume` run; application keeps running |
 

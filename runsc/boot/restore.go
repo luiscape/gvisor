@@ -17,6 +17,7 @@ package boot
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	time2 "time"
@@ -106,6 +107,16 @@ const (
 	// exec binary.
 	annotationSaveRestoreExecTimeout = annotationCheckpointPrefix + "save-restore-exec-timeout"
 
+	// annotationCheckpointHook is the absolute path, inside each GPU container,
+	// of a program that checkpoints the container's GPU state in place of the
+	// built-in cuda-checkpoint handling. runsc runs it with the container's
+	// namespaces and environment, as `<hook> checkpoint` before the sandbox is
+	// saved, and as `<hook> restore [--device-map MAP]` then `<hook> resume`
+	// after it is restored or resumed. It is read from the root container's
+	// spec when a checkpoint starts, and kept in the checkpoint for the
+	// restore. See pkg/sentry/control/state_hook.go.
+	annotationCheckpointHook = annotationCheckpointPrefix + "hook"
+
 	networkKey = "network"
 )
 
@@ -125,6 +136,18 @@ func GetAnnotationCheckpointPath(conf *config.Config, spec *specs.Spec) (string,
 // specified in the container annotation.
 func GetAnnotationCheckpointCompression(spec *specs.Spec) (statefile.CompressionLevel, error) {
 	return statefile.CompressionLevelFromString(spec.Annotations[annotationCheckpointCompression])
+}
+
+// GetAnnotationCheckpointHook returns the checkpoint hook specified in the
+// container annotation, or "" if there is none.
+func GetAnnotationCheckpointHook(spec *specs.Spec) (string, error) {
+	hook := spec.Annotations[annotationCheckpointHook]
+	// A path inside the container, which the sentry execs: it must not be
+	// resolved against a working directory.
+	if hook != "" && !filepath.IsAbs(hook) {
+		return "", fmt.Errorf("annotation %s=%q must be an absolute path", annotationCheckpointHook, hook)
+	}
+	return hook, nil
 }
 
 // GetAnnotationCheckpointDirect returns true if the checkpoint is direct.
@@ -726,8 +749,8 @@ func (l *Loader) save(o *control.SaveOpts) error {
 	// The runtime --cuda-checkpoint-path is the default binary. With
 	// --cuda-checkpoint-job=launch the GPU containers run in a cuda-checkpoint
 	// job (see setupCudaCheckpointJob): checkpoint them one process at a
-	// time, as jobs require. With --checkpoint-hook, the hook checkpoints the
-	// GPU state instead of cuda-checkpoint.
+	// time, as jobs require. With a checkpoint hook (annotationCheckpointHook),
+	// the hook checkpoints the GPU state instead of cuda-checkpoint.
 	conf := l.root.conf
 	fail := func(err error) error {
 		l.k.OnCheckpointAttempt(err)
@@ -747,8 +770,12 @@ func (l *Loader) save(o *control.SaveOpts) error {
 		}
 		o.CudaCheckpointSequential = true
 	}
-	if conf.CheckpointHook != "" {
-		o.CheckpointHook = conf.CheckpointHook
+	hook, err := GetAnnotationCheckpointHook(l.root.spec)
+	if err != nil {
+		return fail(err)
+	}
+	if hook != "" {
+		o.CheckpointHook = hook
 		o.CudaCheckpointPath = ""
 	}
 	saveOpts, err := control.ConvertToStateSaveOpts(o)

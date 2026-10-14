@@ -234,17 +234,26 @@ than R610 the flag has no effect.
 Some GPU state needs more than `cuda-checkpoint`: for example, it refuses
 processes holding NVLink multicast objects (NCCL NVLS, PyTorch symmetric
 memory) and cannot restore memory imported from another process. A
-*checkpoint hook* takes over the GPU part of checkpoint and restore:
-`--checkpoint-hook` names a program inside each GPU container, which `runsc`
-runs, with the container's namespaces and environment, as
+*checkpoint hook* takes over the GPU part of checkpoint and restore. The
+root container's annotation `dev.gvisor.internal.checkpoint.hook` names, by
+absolute path, a program inside each GPU container, which `runsc` runs, with
+the container's namespaces and environment, as
 
 *   `<hook> checkpoint` before the sandbox is saved,
 *   `<hook> restore [--device-map OLD=NEW,...]` after it is restored or
     resumed, with the device map when it was restored onto different GPUs,
 *   `<hook> resume` once that has finished.
 
-The hook replaces the built-in `cuda-checkpoint` handling: with a hook,
-`--cuda-checkpoint-path` only matters for the job wrap above. If
+The annotation is read when a checkpoint starts, and the hook's path is kept
+in the checkpoint for the restore. The hook replaces the built-in
+`cuda-checkpoint` handling: with a hook, `--cuda-checkpoint-path` only matters
+for the job wrap above, and the hook finds `cuda-checkpoint` by its own means
+(mcshim's reads `MCSHIM_CUDA_CHECKPOINT` from the container's environment).
+The job wrap may also be written into the container's entrypoint by the
+operator (`/path/to/cuda-checkpoint --launch-job <command>`), in which case
+no runsc flag is needed at all; `runsc` then cannot refuse a checkpoint of a
+GPU container left outside the job, so the operator must make sure there is
+none. If
 `checkpoint` exits 1, the hook undid its work up to what `resume` completes,
 which `runsc` then runs, and the application keeps running; any other
 non-zero status means the hook could not undo its work, and the application

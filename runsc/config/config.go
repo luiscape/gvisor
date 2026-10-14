@@ -404,14 +404,6 @@ type Config struct {
 	// https://github.com/NVIDIA/cuda-checkpoint#610-features.
 	CUDACheckpointJob CUDACheckpointJob `flag:"cuda-checkpoint-job"`
 
-	// CheckpointHook is the path, inside each GPU container, of a program that
-	// checkpoints the container's GPU state in place of the built-in
-	// cuda-checkpoint handling. runsc runs it with the container's namespaces
-	// and environment, as `<hook> checkpoint` before the sandbox is saved, and
-	// as `<hook> restore [--device-map MAP]` then `<hook> resume` after it is
-	// restored or resumed. See pkg/sentry/control/state_hook.go.
-	CheckpointHook string `flag:"checkpoint-hook"`
-
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 
@@ -639,14 +631,10 @@ func (c *Config) Validate() error {
 	if c.CUDACheckpointJob == CUDACheckpointJobLaunch && c.CUDACheckpointPath == "" {
 		return fmt.Errorf("--cuda-checkpoint-job=launch requires --cuda-checkpoint-path")
 	}
-	// Both are paths inside the container: the job wrap execs the first as a
-	// container's argv[0], and the sentry execs the hook, so neither may be
-	// resolved against a working directory.
+	// A path inside the container, which the job wrap execs as a container's
+	// argv[0]: it must not be resolved against a working directory.
 	if c.CUDACheckpointPath != "" && !filepath.IsAbs(c.CUDACheckpointPath) {
 		return fmt.Errorf("--cuda-checkpoint-path=%q must be an absolute path", c.CUDACheckpointPath)
-	}
-	if c.CheckpointHook != "" && !filepath.IsAbs(c.CheckpointHook) {
-		return fmt.Errorf("--checkpoint-hook=%q must be an absolute path", c.CheckpointHook)
 	}
 	allowedCaps, _, err := nvconf.DriverCapsFromString(c.NVProxyAllowedDriverCapabilities)
 	if err != nil {

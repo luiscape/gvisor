@@ -915,3 +915,37 @@ func TestSignalUnkillablePolicyMapping(t *testing.T) {
 		}
 	}
 }
+
+func TestGetAnnotationCheckpointHook(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		want        string
+		wantErr     string
+	}{
+		{name: "none"},
+		{
+			name:        "absolute",
+			annotations: map[string]string{annotationCheckpointHook: "/opt/mcshim/mcshim-ckpt"},
+			want:        "/opt/mcshim/mcshim-ckpt",
+		},
+		{
+			name:        "relative",
+			annotations: map[string]string{annotationCheckpointHook: "opt/mcshim/mcshim-ckpt"},
+			wantErr:     `annotation dev.gvisor.internal.checkpoint.hook="opt/mcshim/mcshim-ckpt" must be an absolute path`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := GetAnnotationCheckpointHook(&specs.Spec{Annotations: tc.annotations})
+			if tc.wantErr != "" {
+				if err == nil || err.Error() != tc.wantErr {
+					t.Fatalf("GetAnnotationCheckpointHook() error = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("GetAnnotationCheckpointHook() = %q, %v, want %q, nil", got, err, tc.want)
+			}
+		})
+	}
+}

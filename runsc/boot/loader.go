@@ -678,6 +678,11 @@ func New(args Args) (*Loader, error) {
 		nvproxy.Init()
 		args.StartupTimer.Reached("nvproxy initialized")
 	}
+	// Refuse a malformed checkpoint hook now rather than at the first
+	// checkpoint.
+	if _, err := GetAnnotationCheckpointHook(args.Spec); err != nil {
+		return nil, err
+	}
 	if specutils.RDMAEnabled(args.Spec, args.Conf) {
 		cxproxy.Init()
 		efaproxy.Init()
