@@ -16,6 +16,7 @@ package sentryapi
 
 import (
 	"fmt"
+	"path/filepath"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/state/statefile"
@@ -43,6 +44,11 @@ const (
 	// AnnotationCheckpointDirect indicates whether the checkpoint IOs should use O_DIRECT. Optional,
 	// defaults to false.
 	AnnotationCheckpointDirect = AnnotationCheckpointPrefix + "direct"
+
+	// AnnotationCheckpointHook is the absolute path, inside each GPU
+	// container, of a program that checkpoints GPU state in place of
+	// cuda-checkpoint. See pkg/sentry/control/state_hook.go.
+	AnnotationCheckpointHook = AnnotationCheckpointPrefix + "hook"
 )
 
 // GetAnnotationCheckpointPath returns the checkpoint path specified in the
@@ -61,6 +67,16 @@ func GetAnnotationCheckpointPath(conf *config.Config, spec *specs.Spec) (string,
 // specified in the container annotation.
 func GetAnnotationCheckpointCompression(spec *specs.Spec) (statefile.CompressionLevel, error) {
 	return statefile.CompressionLevelFromString(spec.Annotations[AnnotationCheckpointCompression])
+}
+
+// GetAnnotationCheckpointHook returns the checkpoint hook specified in the
+// container annotation, or "" if there is none.
+func GetAnnotationCheckpointHook(spec *specs.Spec) (string, error) {
+	hook := spec.Annotations[AnnotationCheckpointHook]
+	if hook != "" && !filepath.IsAbs(hook) {
+		return "", fmt.Errorf("annotation %s=%q must be an absolute path", AnnotationCheckpointHook, hook)
+	}
+	return hook, nil
 }
 
 // GetAnnotationCheckpointDirect returns true if the checkpoint is direct.

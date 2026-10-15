@@ -34,6 +34,7 @@ go_library(
         "proc.go",
         "state.go",
         "state_cuda.go",
+        "state_hook.go",
         "tpu_control.go",
         "usage.go",
     ],
@@ -97,6 +98,7 @@ go_test(
         "fs_test.go",
         "proc_test.go",
         "state_cuda_test.go",
+        "state_hook_test.go",
     ],
     embed = [":control"],
     deps = [

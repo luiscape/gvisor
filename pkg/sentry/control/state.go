@@ -76,6 +76,7 @@ func ConvertToStateSaveOpts(o *controlapi.SaveOpts) (*state.SaveOpts, error) {
 		Resume:                         o.Resume,
 		CudaCheckpointPath:             o.CudaCheckpointPath,
 		CudaCheckpointSequential:       o.CudaCheckpointSequential,
+		CheckpointHook:                 o.CheckpointHook,
 	}
 	if err := setSaveOpts(o, saveOpts); err != nil {
 		saveOpts.Close()
@@ -243,7 +244,17 @@ func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Save
 	if err := preSave(s.Kernel, saveOpts, execOpts); err != nil {
 		return err
 	}
-	return saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog)
+	if err := saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog); err != nil {
+		// Undo the hook if the sandbox keeps running. While it is paused
+		// (docker), the eventual unpause does it through PostResume.
+		if saveOpts.CheckpointHook != "" && saveOpts.Resume && !s.Kernel.IsPaused() {
+			if rerr := postRestoreHook(s.Kernel, nil, nil); rerr != nil {
+				log.Warningf("Failed to undo the checkpoint hook after a failed save: %v", rerr)
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 // preSave is called before saving the kernel.
@@ -260,6 +271,9 @@ func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *controlapi.SaveResto
 		if err := SaveRestoreExec(k, SaveRestoreExecSave); err != nil {
 			return fmt.Errorf("failed to exec save/restore binary: %w", err)
 		}
+	}
+	if o.CheckpointHook != "" {
+		return preSaveHook(k, o)
 	}
 	return preSaveCuda(k, o)
 }
@@ -281,6 +295,9 @@ func PostResume(k *kernel.Kernel, timeline *timing.Timeline) error {
 	}
 	// Undo preSave in reverse order.
 	if err := postRestoreCuda(k, timeline, nil); err != nil {
+		return err
+	}
+	if err := postRestoreHook(k, timeline, nil); err != nil {
 		return err
 	}
 
@@ -309,6 +326,9 @@ func PostRestore(k *kernel.Kernel, timeline *timing.Timeline, nvproxyRemapping *
 	}
 	// Undo preSave in reverse order.
 	if err := postRestoreCuda(k, timeline, nvproxyRemapping); err != nil {
+		return err
+	}
+	if err := postRestoreHook(k, timeline, nvproxyRemapping); err != nil {
 		return err
 	}
 
