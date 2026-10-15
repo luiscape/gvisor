@@ -17,6 +17,7 @@ package boot
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	time2 "time"
@@ -106,6 +107,11 @@ const (
 	// exec binary.
 	annotationSaveRestoreExecTimeout = annotationCheckpointPrefix + "save-restore-exec-timeout"
 
+	// annotationCheckpointHook is the absolute path, inside each GPU
+	// container, of a program that checkpoints GPU state in place of
+	// cuda-checkpoint. See pkg/sentry/control/state_hook.go.
+	annotationCheckpointHook = annotationCheckpointPrefix + "hook"
+
 	networkKey = "network"
 )
 
@@ -125,6 +131,16 @@ func GetAnnotationCheckpointPath(conf *config.Config, spec *specs.Spec) (string,
 // specified in the container annotation.
 func GetAnnotationCheckpointCompression(spec *specs.Spec) (statefile.CompressionLevel, error) {
 	return statefile.CompressionLevelFromString(spec.Annotations[annotationCheckpointCompression])
+}
+
+// GetAnnotationCheckpointHook returns the checkpoint hook specified in the
+// container annotation, or "" if there is none.
+func GetAnnotationCheckpointHook(spec *specs.Spec) (string, error) {
+	hook := spec.Annotations[annotationCheckpointHook]
+	if hook != "" && !filepath.IsAbs(hook) {
+		return "", fmt.Errorf("annotation %s=%q must be an absolute path", annotationCheckpointHook, hook)
+	}
+	return hook, nil
 }
 
 // GetAnnotationCheckpointDirect returns true if the checkpoint is direct.
@@ -743,7 +759,15 @@ func (r *restorer) calculateWallTimeSavings(s *Savings) error {
 }
 
 func (l *Loader) save(o *control.SaveOpts) error {
-	saveOpts, err := control.ConvertToStateSaveOpts(o)
+	hook, err := GetAnnotationCheckpointHook(l.root.spec)
+	if err == nil && hook != "" {
+		o.CheckpointHook = hook
+		o.CudaCheckpointPath = ""
+	}
+	var saveOpts *state.SaveOpts
+	if err == nil {
+		saveOpts, err = control.ConvertToStateSaveOpts(o)
+	}
 	if err != nil {
 		l.k.OnCheckpointAttempt(err)
 		if len(o.SplitFSCheckpointPaths) > 0 {

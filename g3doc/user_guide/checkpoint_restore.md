@@ -211,6 +211,25 @@ restore` does not require any special flags. If the snapshot was created with
 `runsc checkpoint --cuda-checkpoint-path`, then the same configuration will
 automatically be used on restore.
 
+### Checkpoint hook
+
+Some GPU state needs more than `cuda-checkpoint`. A checkpoint hook takes over
+the GPU part of checkpoint and restore: the root container's annotation
+`dev.gvisor.internal.checkpoint.hook` names, by absolute path, a program inside
+each GPU container, which gVisor runs with the container's namespaces and
+environment instead of `cuda-checkpoint`:
+
+*   `<hook> checkpoint` before the sandbox is saved;
+*   `<hook> restore [--device-map OLD=NEW,...]` after it is restored or
+    resumed, with the device map if it was restored onto other GPUs;
+*   `<hook> resume` once `restore` has finished in every container.
+
+Page faults of the GPU processes are held from before `checkpoint` until after
+`restore`, so work that touches GPU memory belongs in `resume`. If `checkpoint`
+exits 1, it undid its work except for what `resume` undoes, which gVisor then
+runs, and the application keeps running; any other non-zero status means it
+could not undo its work. A failed `restore` or `resume` fails the restore.
+
 ### Limitation
 
 GPU checkpoint/restore is not supported on the arm64 architecture due to lack of
@@ -277,6 +296,7 @@ Annotation                                                    | Description     
 `dev.gvisor.internal.checkpoint.exclude-committed-zero-pages` | Skip saving committed zero pages (see [Exclude Committed Zero Pages](#exclude-committed-zero-pages)). | `false`
 `dev.gvisor.internal.checkpoint.cuda-checkpoint-path`         | Path to the `cuda-checkpoint` binary (see [GPU Checkpoint/Restore](#gpu-checkpointrestore)).          | (unset)
 `dev.gvisor.internal.checkpoint.cuda-checkpoint-sequential`   | Run `cuda-checkpoint` sequentially instead of in parallel.                                            | `false`
+`dev.gvisor.internal.checkpoint.hook`                         | Absolute path of a checkpoint hook in each GPU container (see [Checkpoint hook](#checkpoint-hook)).   | (unset)
 `dev.gvisor.internal.checkpoint.save-restore-exec-argv`       | Argv of a binary to exec around save/restore.                                                         | (unset)
 `dev.gvisor.internal.checkpoint.save-restore-exec-timeout`    | Timeout for the save/restore exec binary (e.g. `30s`).                                                | 10 minutes
 

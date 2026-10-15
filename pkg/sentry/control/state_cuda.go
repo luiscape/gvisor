@@ -265,11 +265,26 @@ type checkpointProc struct {
 // (checkpointProc.tg == nil, err == nil).
 func invokeCudaCheckpoint(sctx context.Context, k *kernel.Kernel, proc *Proc, cudaCheckpointPath string, cudaProc *kernel.ThreadGroup, op cudaCheckpointOp, nullFD *vfs.FileDescription) (checkpointProc, func(), error) {
 	pid := cudaProc.ID()
-	leader := cudaProc.Leader()
+	argv := make([]string, 0, 3+len(op.args))
+	argv = append(argv, "cuda-checkpoint")
+	argv = append(argv, op.args...)
+	argv = append(argv, "--pid", strconv.FormatInt(int64(pid), 10))
+	return execInContainerOf(sctx, k, proc, cudaProc, cudaCheckpointPath, argv, fmt.Sprintf("cuda-checkpoint %s for PID %d", op.desc, pid), nullFD)
+}
+
+// execInContainerOf starts filename with argv in tg's container, as
+// invokeCudaCheckpoint does. desc describes it in logs and errors.
+func execInContainerOf(sctx context.Context, k *kernel.Kernel, proc *Proc, tg *kernel.ThreadGroup, filename string, argv []string, desc string, nullFD *vfs.FileDescription) (checkpointProc, func(), error) {
+	pid := tg.ID()
+	leader := tg.Leader()
+	if leader == nil {
+		log.Warningf("PID %d has exited, skipping %s", pid, desc)
+		return checkpointProc{}, nil, nil
+	}
 	contID := leader.ContainerID()
 	mntns := leader.MountNamespace()
 	if mntns == nil || !mntns.TryIncRef() {
-		log.Warningf("PID %d in container %q has exited, skipping CUDA checkpoint for it", pid, contID)
+		log.Warningf("PID %d in container %q has exited, skipping %s", pid, contID, desc)
 		return checkpointProc{}, nil, nil
 	}
 	root := mntns.Root(sctx)
@@ -281,12 +296,8 @@ func invokeCudaCheckpoint(sctx context.Context, k *kernel.Kernel, proc *Proc, cu
 	cu.Add(func() {
 		mntns.DecRef(ctx)
 	})
-	argv := make([]string, 0, 3+len(op.args))
-	argv = append(argv, "cuda-checkpoint")
-	argv = append(argv, op.args...)
-	argv = append(argv, "--pid", strconv.FormatInt(int64(pid), 10))
 	args := &ExecArgs{
-		Filename:       cudaCheckpointPath,
+		Filename:       filename,
 		Argv:           argv,
 		ContainerID:    contID,
 		MountNamespace: mntns,
@@ -296,9 +307,9 @@ func invokeCudaCheckpoint(sctx context.Context, k *kernel.Kernel, proc *Proc, cu
 	contName := k.ContainerName(contID)
 	args.Envv = k.Saver().SpecEnviron(contName)
 
-	// Provide standard streams to cuda-checkpoint. Use /dev/null as stdin
-	// and direct cuda-checkpoint's stdout/stderr to a pipe.
-	ckptDesc := fmt.Sprintf("cuda-checkpoint %s for PID %d in container %q", op.desc, pid, contID)
+	// Provide standard streams. Use /dev/null as stdin and direct stdout and
+	// stderr to a pipe.
+	ckptDesc := fmt.Sprintf("%s in container %q", desc, contID)
 	args.FDTable = k.NewFDTable()
 	cu.Add(func() {
 		args.FDTable.DecRef(ctx)
@@ -355,17 +366,26 @@ func filterCudaProcsUsingThreadName(sctx context.Context, cudaProcs []*kernel.Th
 	return res
 }
 
+// openNullFD opens /dev/null for the stdin of processes the sentry execs, or
+// returns nil. The returned function releases it.
+func openNullFD(sctx context.Context, k *kernel.Kernel) (*vfs.FileDescription, func()) {
+	nullVD := k.VFS().NewAnonVirtualDentry("null")
+	nullFD, err := memdev.NewNullFD(sctx, nullVD.Mount(), nullVD.Dentry(), vfs.OpenOptions{})
+	if err != nil {
+		log.Warningf("Failed to open /dev/null for stdin: %v", err)
+		return nil, func() { nullVD.DecRef(sctx) }
+	}
+	return nullFD, func() {
+		nullFD.DecRef(sctx)
+		nullVD.DecRef(sctx)
+	}
+}
+
 func filterCudaProcsUsingGetState(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup) []*kernel.ThreadGroup {
 	log.Debugf("Filtering CUDA processes using 'cuda-checkpoint --get-state'")
 	// Open /dev/null once for the stdin of all cuda-checkpoint processes.
-	nullVD := k.VFS().NewAnonVirtualDentry("null")
-	defer nullVD.DecRef(sctx)
-	nullFD, err := memdev.NewNullFD(sctx, nullVD.Mount(), nullVD.Dentry(), vfs.OpenOptions{})
-	if err != nil {
-		log.Warningf("Failed to open /dev/null for cuda-checkpoint stdin: %v", err)
-	} else {
-		defer nullFD.DecRef(sctx)
-	}
+	nullFD, closeNull := openNullFD(sctx, k)
+	defer closeNull()
 
 	// Call cuda-checkpoint for each CUDA PID parallelly.
 	proc := &Proc{Kernel: k}
@@ -415,14 +435,8 @@ func runCudaCheckpointOp(sctx context.Context, k *kernel.Kernel, cudaCheckpointP
 	start := time.Now()
 
 	// Open /dev/null once for the stdin of all cuda-checkpoint processes.
-	nullVD := k.VFS().NewAnonVirtualDentry("null")
-	defer nullVD.DecRef(sctx)
-	nullFD, err := memdev.NewNullFD(sctx, nullVD.Mount(), nullVD.Dentry(), vfs.OpenOptions{})
-	if err != nil {
-		log.Warningf("Failed to open /dev/null for cuda-checkpoint stdin: %v", err)
-	} else {
-		defer nullFD.DecRef(sctx)
-	}
+	nullFD, closeNull := openNullFD(sctx, k)
+	defer closeNull()
 
 	// Call cuda-checkpoint for each CUDA PID.
 	ckptTimerNames := make([]string, len(cudaProcs))

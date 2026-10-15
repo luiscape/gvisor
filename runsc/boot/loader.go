@@ -667,6 +667,9 @@ func New(args Args) (*Loader, error) {
 		nvproxy.Init()
 		args.StartupTimer.Reached("nvproxy initialized")
 	}
+	if _, err := GetAnnotationCheckpointHook(args.Spec); err != nil {
+		return nil, err
+	}
 	if specutils.RDMAEnabled(args.Spec, args.Conf) {
 		cxproxy.Init()
 		efaproxy.Init()

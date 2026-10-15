@@ -110,6 +110,10 @@ type SaveOpts struct {
 	// sequentially (rather than in parallel).
 	CudaCheckpointSequential bool `json:"cuda_checkpoint_sequential"`
 
+	// CheckpointHook is the path, inside each GPU container, of a program
+	// that checkpoints GPU state in place of cuda-checkpoint (state_hook.go).
+	CheckpointHook string `json:"checkpoint_hook"`
+
 	// SplitFSCheckpointPaths lists the filesystem checkpoint bundles to save in
 	// separate files. Filesystems not in any bundle are saved in the regular
 	// checkpoint files. Use the path "all-tmpfs" to include all tmpfs mounts.
@@ -144,6 +148,7 @@ func ConvertToStateSaveOpts(o *SaveOpts) (*state.SaveOpts, error) {
 		Resume:                         o.Resume,
 		CudaCheckpointPath:             o.CudaCheckpointPath,
 		CudaCheckpointSequential:       o.CudaCheckpointSequential,
+		CheckpointHook:                 o.CheckpointHook,
 	}
 	if err := setSaveOpts(o, saveOpts); err != nil {
 		saveOpts.Close()
@@ -302,6 +307,13 @@ func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *SaveRestoreExec
 		return err
 	}
 	if err := saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog); err != nil {
+		// Undo the hook if the sandbox keeps running. While it is paused
+		// (docker), the eventual unpause does it through PostResume.
+		if saveOpts.CheckpointHook != "" && saveOpts.Resume && !s.Kernel.IsPaused() {
+			if rerr := postRestoreHook(s.Kernel, nil, nil); rerr != nil {
+				log.Warningf("Failed to undo the checkpoint hook after a failed save: %v", rerr)
+			}
+		}
 		return err
 	}
 	if saveOpts.Resume {
@@ -326,6 +338,9 @@ func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *SaveRestoreExecOpts)
 		if err := SaveRestoreExec(k, SaveRestoreExecSave); err != nil {
 			return fmt.Errorf("failed to exec save/restore binary: %w", err)
 		}
+	}
+	if o.CheckpointHook != "" {
+		return preSaveHook(k, o)
 	}
 	return preSaveCuda(k, o)
 }
@@ -353,7 +368,10 @@ func PostResume(k *kernel.Kernel, timeline *timing.Timeline) error {
 		return err
 	}
 
-	return postRestoreCuda(k, timeline, nil)
+	if err := postRestoreCuda(k, timeline, nil); err != nil {
+		return err
+	}
+	return postRestoreHook(k, timeline, nil)
 }
 
 // PostRestore is called after restoring the kernel. nvproxyRemapping, if
@@ -380,7 +398,10 @@ func PostRestore(k *kernel.Kernel, timeline *timing.Timeline, nvproxyRemapping *
 		return err
 	}
 
-	return postRestoreCuda(k, timeline, nvproxyRemapping)
+	if err := postRestoreCuda(k, timeline, nvproxyRemapping); err != nil {
+		return err
+	}
+	return postRestoreHook(k, timeline, nvproxyRemapping)
 }
 
 // SaveRestoreExec creates a new process that executes the save/restore
