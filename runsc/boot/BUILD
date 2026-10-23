@@ -201,6 +201,7 @@ go_test(
         "//pkg/sentry/vfs",
         "//pkg/sync",
         "//pkg/unet",
+        "//pkg/usermem",
         "//runsc/boot/sentryapi",
         "//runsc/config",
         "//runsc/flag",

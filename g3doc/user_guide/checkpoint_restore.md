@@ -227,6 +227,61 @@ restore` does not require any special flags. If the snapshot was created with
 `runsc checkpoint --cuda-checkpoint-path`, then the same configuration will
 automatically be used on restore.
 
+### CUDA IPC: `cuda-checkpoint` jobs
+
+CUDA IPC memory (`cuIpcGetMemHandle`, used for example by the custom
+all-reduce of inference engines) can only be checkpointed and restored when
+the processes that share it belong to the same `cuda-checkpoint` *job*, which
+requires driver R610 or newer (see
+[cuda-checkpoint 610 features](https://github.com/NVIDIA/cuda-checkpoint#610-features)).
+
+With `--cuda-checkpoint-job=launch` and `--cuda-checkpoint-path` set to the
+path of `cuda-checkpoint` inside the container, gVisor wraps each GPU
+container's command in `cuda-checkpoint --launch-job`, so that all of its CUDA
+processes share a job, and `runsc checkpoint` runs `cuda-checkpoint` one
+process at a time, as jobs require. A GPU container whose image lacks
+`cuda-checkpoint`, or whose entrypoint is `--exec-fd`, still starts, outside a
+job, and checkpoints of the sandbox are refused while it exists. CUDA
+processes started with `runsc exec` are not part of the job. On drivers older
+than R610 the flag has no effect.
+
+### Checkpoint hooks
+
+Some GPU state needs more than `cuda-checkpoint`: for example, it refuses
+processes holding NVLink multicast objects (NCCL NVLS, PyTorch symmetric
+memory) and cannot restore memory imported from another process. A
+*checkpoint hook* takes over the GPU part of checkpoint and restore:
+`--checkpoint-hook` names a program inside each GPU container, which `runsc`
+runs, with the container's namespaces and environment, as
+
+*   `<hook> checkpoint` before the sandbox is saved,
+*   `<hook> restore [--device-map OLD=NEW,...]` after it is restored or
+    resumed, with the device map when it was restored onto different GPUs,
+*   `<hook> resume` once that has finished.
+
+The hook replaces the built-in `cuda-checkpoint` handling: with a hook,
+`--cuda-checkpoint-path` only matters for the job wrap above. If
+`checkpoint` exits 1, the hook undid its work up to what `resume` completes,
+which `runsc` then runs, and the application keeps running; any other
+non-zero status means the hook could not undo its work, and the application
+may be left blocked. A failed `restore` or `resume` fails the restore.
+
+[mcshim](https://github.com/modal-projects/mcshim) is such a hook, with an
+`LD_PRELOAD` interposer that releases multicast objects and imported memory
+before the checkpoint and rebuilds them at the same GPU virtual addresses
+after restore. See its README for how to install it; the operator provides
+both in the container and preloads the interposer.
+
+nvproxy reports, for each file descriptor into which an RM object was
+exported, the object's identity in `/proc/[pid]/fdinfo/[fd]`, as Linux does
+for dma-buf, to readers allowed to ptrace the process:
+
+```
+nvproxy_exported_object:	client=0xc1d00922 object=0x5c000123
+```
+
+Interposers use it to match imported memory with its export across a restore.
+
 ### Limitation
 
 GPU checkpoint/restore is not supported on the arm64 architecture due to lack of

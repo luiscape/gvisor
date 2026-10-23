@@ -69,6 +69,11 @@ type SaveOpts struct {
 	// sequentially (rather than in parallel).
 	CudaCheckpointSequential bool `json:"cuda_checkpoint_sequential"`
 
+	// CheckpointHook is the path, inside each GPU container, of a program that
+	// checkpoints the container's GPU state in place of cuda-checkpoint (see
+	// control/state_hook.go). It excludes CudaCheckpointPath.
+	CheckpointHook string `json:"checkpoint_hook"`
+
 	// SplitFSCheckpointPaths lists the filesystem checkpoint bundles to save in
 	// separate files. Filesystems not in any bundle are saved in the regular
 	// checkpoint files. Use the path "all-tmpfs" to include all tmpfs mounts.

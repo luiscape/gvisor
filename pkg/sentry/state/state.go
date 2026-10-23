@@ -81,6 +81,10 @@ type SaveOpts struct {
 	// sequentially (rather than in parallel).
 	CudaCheckpointSequential bool
 
+	// CheckpointHook is the in-container path of the checkpoint hook (see
+	// control.SaveOpts).
+	CheckpointHook string
+
 	// FSSaveOpts contains options for filesystem checkpoint. If non-nil, we
 	// should split filesystem to separate pages from the full checkpoint.
 	FSSaveOpts *kernel.FSSaveOpts

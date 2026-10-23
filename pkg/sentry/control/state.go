@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/fdcollector"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -75,6 +76,7 @@ func ConvertToStateSaveOpts(o *controlapi.SaveOpts) (*state.SaveOpts, error) {
 		Resume:                         o.Resume,
 		CudaCheckpointPath:             o.CudaCheckpointPath,
 		CudaCheckpointSequential:       o.CudaCheckpointSequential,
+		CheckpointHook:                 o.CheckpointHook,
 	}
 	if err := setSaveOpts(o, saveOpts); err != nil {
 		saveOpts.Close()
@@ -242,7 +244,22 @@ func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Save
 	if err := preSave(s.Kernel, saveOpts, execOpts); err != nil {
 		return err
 	}
-	return saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog)
+	if err := saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog); err != nil {
+		// preSaveHook has already run the checkpoint hook; if the kernel will
+		// resume running, undo it -- postRestoreHook is exactly that inverse,
+		// and does nothing if preSaveHook did not run. Skip it while the
+		// kernel is paused (the docker flow, where preSaveHook re-took
+		// docker's pause): the hook would be born frozen and hang this RPC.
+		// Its state survives, and docker's eventual unpause runs the same
+		// inverse via Resume -> PostResume.
+		if saveOpts.CheckpointHook != "" && saveOpts.Resume && !s.Kernel.IsPaused() {
+			if rerr := postRestoreHook(s.Kernel, nil, nil); rerr != nil {
+				log.Warningf("Failed to undo the checkpoint hook after failed save: %v", rerr)
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 // preSave is called before saving the kernel.
@@ -259,6 +276,9 @@ func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *controlapi.SaveResto
 		if err := SaveRestoreExec(k, SaveRestoreExecSave); err != nil {
 			return fmt.Errorf("failed to exec save/restore binary: %w", err)
 		}
+	}
+	if o.CheckpointHook != "" {
+		return preSaveHook(k, o)
 	}
 	return preSaveCuda(k, o)
 }
@@ -279,7 +299,10 @@ func PostResume(k *kernel.Kernel, timeline *timing.Timeline) error {
 		return nil
 	}
 	// Undo preSave in reverse order.
-	if err := postResumeCuda(k, timeline); err != nil {
+	if err := postRestoreCuda(k, timeline, nil); err != nil {
+		return err
+	}
+	if err := postRestoreHook(k, timeline, nil); err != nil {
 		return err
 	}
 
@@ -290,10 +313,11 @@ func PostResume(k *kernel.Kernel, timeline *timing.Timeline) error {
 	return postResumeTPU(k)
 }
 
-// PostRestore is called after restoring the kernel.
+// PostRestore is called after restoring the kernel. nvproxyRemapping, if
+// non-nil, describes how GPUs were remapped by this restore.
 //
 // Precondition: The kernel should be running.
-func PostRestore(k *kernel.Kernel, timeline *timing.Timeline) error {
+func PostRestore(k *kernel.Kernel, timeline *timing.Timeline, nvproxyRemapping *nvproxy.DeviceRemapping) error {
 	if k.IsPaused() {
 		// The kernel is still paused (double-pause can happen with Docker which
 		// calls pause first and then checkpoint command). The final resume command
@@ -306,7 +330,10 @@ func PostRestore(k *kernel.Kernel, timeline *timing.Timeline) error {
 		return nil
 	}
 	// Undo preSave in reverse order.
-	if err := postRestoreCuda(k, timeline); err != nil {
+	if err := postRestoreCuda(k, timeline, nvproxyRemapping); err != nil {
+		return err
+	}
+	if err := postRestoreHook(k, timeline, nvproxyRemapping); err != nil {
 		return err
 	}
 

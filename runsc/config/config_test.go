@@ -362,6 +362,27 @@ func TestValidationFail(t *testing.T) {
 			error: "qdisc=tbf requires setting qdisc-tbf-burst",
 		},
 		{
+			name: "cuda-checkpoint-job-without-cuda-checkpoint-path",
+			flags: map[string]string{
+				"cuda-checkpoint-job": "launch",
+			},
+			error: "--cuda-checkpoint-job=launch requires --cuda-checkpoint-path",
+		},
+		{
+			name: "cuda-checkpoint-path-relative",
+			flags: map[string]string{
+				"cuda-checkpoint-path": "usr/bin/cuda-checkpoint",
+			},
+			error: "--cuda-checkpoint-path=\"usr/bin/cuda-checkpoint\" must be an absolute path",
+		},
+		{
+			name: "checkpoint-hook-relative",
+			flags: map[string]string{
+				"checkpoint-hook": "opt/mcshim/mcshim-ckpt",
+			},
+			error: "--checkpoint-hook=\"opt/mcshim/mcshim-ckpt\" must be an absolute path",
+		},
+		{
 			name: "fsgofer-host-uds+host-uds:open",
 			flags: map[string]string{
 				"fsgofer-host-uds": "true",
