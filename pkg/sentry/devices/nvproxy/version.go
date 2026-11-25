@@ -1586,7 +1586,7 @@ func Init() {
 		// 620.06.00 through 620.51.03 are pre-release builds without public
 		// source. 620.70.06's ABI changes may apply to some of them too, but are
 		// only introduced at 620.70.06 until that can be verified.
-		_ = addDriverABI(620, 70, 06, "29118e3abd08c07559bcca3d9c76238d039490af0362a2e5bcfcbe7204afd4b1", "3fa65a9271e0dde2a4e58c4965c38885a02a3a42accdcb26fc817410607f3e03", func() *driverABI {
+		v620_70_06 := addDriverABI(620, 70, 06, "29118e3abd08c07559bcca3d9c76238d039490af0362a2e5bcfcbe7204afd4b1", "3fa65a9271e0dde2a4e58c4965c38885a02a3a42accdcb26fc817410607f3e03", func() *driverABI {
 			abi := v620_51_03()
 			abi.allocationClass[nvgpu.FERMI_CONTEXT_SHARE_A] = allocHandler(rmAllocContextShareV620, compUtil)
 			abi.allocationClass[nvgpu.KEPLER_CHANNEL_GROUP_A] = allocHandler(rmAllocChannelGroupV620, compUtil)
@@ -1610,6 +1610,11 @@ func Init() {
 			}
 			return abi
 		})
+		_ = addDriverABIWithChecksums(620, 70, 10, Checksums{
+			X86_64:                 "bbb776fd040c92504af9dfd286f1f7c4dca50740ce1b60042985b7251a099154",
+			ARM64:                  "69f650a209aa0358b63691875b58e2f98d00843c6ee1be57b64020758b08488c",
+			NoPublicARM64Installer: true,
+		}, v620_70_06)
 	})
 }
 
